@@ -77,7 +77,10 @@ ls -lt debug-artifacts-* | head -1
 # Look at test metadata first
 cat debug-artifacts-*/test-metadata.txt
 
-# Check operator decision-making
+# Check operator decision-making. The per-reconcile "Reconciling <mode>" lines are
+# debug-level; they are present here because the e2e suite deploys the operator with
+# LOG_LEVEL=debug (see e2e_suite_test.go). A production operator at the chart's default
+# `logLevel: info` does not emit them.
 grep "Reconciling cluster mode" debug-artifacts-*/operator-logs.txt
 
 # See final CR status

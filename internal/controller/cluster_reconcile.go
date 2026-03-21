@@ -42,7 +42,7 @@ import (
 // reconcileCluster reconciles cluster mode
 func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
-	log.Info("Reconciling cluster mode")
+	log.V(1).Info("Reconciling cluster mode")
 
 	// Set initial phase
 	if littleRed.Status.Phase == "" {
@@ -89,7 +89,7 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 		return ctrl.Result{}, err
 	}
 	if !allShardsExist {
-		log.Info("Shard StatefulSet(s) not yet created, requeueing")
+		log.V(1).Info("Shard StatefulSet(s) not yet created, requeueing")
 		fast, _ := littleRed.GetRequeueIntervals()
 		return ctrl.Result{RequeueAfter: fast}, nil
 	}
@@ -99,7 +99,7 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 
 	// 3. If not all pods ready, wait (update status to Initializing)
 	if !allPodsReady {
-		log.Info("Waiting for all pods to be ready",
+		log.V(1).Info("Waiting for all pods to be ready",
 			"ready", readyReplicas,
 			"expected", expectedReplicas)
 
@@ -845,7 +845,7 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 
 	// 2. Assign Slots to Masters (shard K's master is {name}-shard-K-0).
 	if littleRed.Annotations[AnnotationDebugSkipSlotAssignment] == annotationValueTrue {
-		auditLog.Info("DEBUG: Skipping slot assignment due to annotation")
+		auditLog.V(1).Info("Skipping slot assignment due to annotation")
 	} else {
 		slotRanges := redisclient.GenerateSlotRanges(cluster.Shards)
 
@@ -864,7 +864,7 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 					}
 				}
 				if hasSlots {
-					log.Info("Node already has slots, skipping assignment", "shard", k, "pod", masterName)
+					log.V(1).Info("Node already has slots, skipping assignment", "shard", k, "pod", masterName)
 					continue
 				}
 			}
@@ -1044,7 +1044,7 @@ func (r *LittleRedReconciler) updateClusterStatus(ctx context.Context, littleRed
 		}
 		littleRed.Status.Status = "Initializing"
 
-		log.Info("Not yet Running, requeueing",
+		log.V(1).Info("Not yet Running, requeueing",
 			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total),
 			"clusterHealthy", clusterOK)
 

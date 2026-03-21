@@ -471,6 +471,10 @@ endif
 # Helm only installs CRDs on initial install, not on upgrades.
 # kubectl apply ensures CRDs are always up to date.
 PULL_POLICY ?= Always
+# Operator log level passed to the chart (--zap-log-level). The e2e suite deploys with
+# LOG_LEVEL=debug so the per-reconcile "Reconciling <mode>" lines land in its captured
+# operator logs; a production install keeps the chart default (info).
+LOG_LEVEL ?= info
 
 # Example: make deploy KUBECONTEXT=kind-littlered-test-e2e
 KUBECTL_CTX_FLAGS :=
@@ -500,7 +504,8 @@ deploy: install ## Deploy the operator to the cluster via Helm (override image w
 		-n littlered-system --create-namespace \
 		--set image.repository=$(IMG_REPOSITORY) \
 		--set image.tag=$(IMG_TAG) \
-		--set image.pullPolicy=$(PULL_POLICY)
+		--set image.pullPolicy=$(PULL_POLICY) \
+		--set logLevel=$(LOG_LEVEL)
 
 .PHONY: undeploy
 undeploy: ## Uninstall the operator's Helm release from the cluster.

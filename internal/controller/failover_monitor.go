@@ -116,7 +116,7 @@ func (r *LittleRedReconciler) ensureFailoverMonitor(ctx context.Context, littleR
 	// Annotation kill switch — exact sentinel-mode parity (the e2e suite's
 	// polling-only tier depends on it).
 	if littleRed.Annotations[AnnotationDisableEventMonitoring] == annotationValueTrue {
-		log.Info("Failover event monitoring disabled via annotation")
+		log.V(1).Info("Failover event monitoring disabled via annotation")
 		r.stopFailoverMonitor(nn)
 		return
 	}

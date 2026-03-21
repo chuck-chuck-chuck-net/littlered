@@ -95,7 +95,7 @@ type failoverEngineView struct {
 // master label -> PDB -> ServiceMonitor -> status.
 func (r *LittleRedReconciler) reconcileFailover(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
-	log.Info("Reconciling failover mode")
+	log.V(1).Info("Reconciling failover mode")
 
 	if littleRed.Status.Phase == "" {
 		littleRed.Status.Phase = littleredv1alpha1.PhasePending
@@ -981,7 +981,7 @@ func (r *LittleRedReconciler) updateFailoverStatus(ctx context.Context, lr *litt
 			} else if replicasLinkedUp < expectedReplicas {
 				notReadyReasons = append(notReadyReasons, fmt.Sprintf("replica links up %d/%d", replicasLinkedUp, expectedReplicas))
 			}
-			log.Info("Not yet Running, requeueing", "reasons", strings.Join(notReadyReasons, "; "))
+			log.V(1).Info("Not yet Running, requeueing", "reasons", strings.Join(notReadyReasons, "; "))
 
 			latest.Status.Phase = littleredv1alpha1.PhaseInitializing
 			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
@@ -1020,7 +1020,7 @@ func (r *LittleRedReconciler) updateFailoverStatus(ctx context.Context, lr *litt
 		return ctrl.Result{RequeueAfter: fast}, nil
 	}
 	if latest.Annotations[AnnotationDisablePolling] == annotationValueTrue {
-		log.Info("Failover polling disabled via annotation")
+		log.V(1).Info("Failover polling disabled via annotation")
 		return ctrl.Result{}, nil
 	}
 	return ctrl.Result{RequeueAfter: steady}, nil

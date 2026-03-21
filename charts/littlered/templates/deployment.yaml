@@ -34,6 +34,7 @@ spec:
             - /manager
           args:
             - --health-probe-bind-address=:8081
+            - --zap-log-level={{ .Values.logLevel }}
             {{- if .Values.metrics.enabled }}
             - --metrics-bind-address=:{{ .Values.metrics.port }}
             - --metrics-secure=false

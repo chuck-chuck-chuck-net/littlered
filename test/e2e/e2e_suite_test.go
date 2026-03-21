@@ -296,7 +296,7 @@ func deployOperator() {
 
 		By("deploying the operator via Helm (Kind mode)")
 		// We use PULL_POLICY=Never to ensure Kind uses the local image we just loaded
-		cmd = exec.Command("make", "deploy", "PULL_POLICY=Never")
+		cmd = exec.Command("make", "deploy", "PULL_POLICY=Never", "LOG_LEVEL=debug")
 		_, err = utils.Run(cmd)
 		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the operator via Helm")
 	} else {
@@ -307,7 +307,7 @@ func deployOperator() {
 
 		By("deploying the operator via Helm (Registry mode)")
 		// Use default PULL_POLICY (Always) from Makefile for generic clusters
-		cmd = exec.Command("make", "deploy")
+		cmd = exec.Command("make", "deploy", "LOG_LEVEL=debug")
 		_, err = utils.Run(cmd)
 		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the operator via Helm")
 	}
