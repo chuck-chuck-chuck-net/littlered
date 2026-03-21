@@ -327,7 +327,7 @@ func (r *LittleRedReconciler) getLogger(ctx context.Context, lr *littleredv1alph
 // reconcileDelete handles cleanup when the resource is deleted
 func (r *LittleRedReconciler) reconcileDelete(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
-	log.Info("Reconciling delete")
+	log.V(1).Info("Reconciling delete")
 
 	// Update phase
 	littleRed.Status.Phase = littleredv1alpha1.PhaseTerminating
@@ -460,7 +460,7 @@ func (r *LittleRedReconciler) validatePlacementSpec(littleRed *littleredv1alpha1
 // reconcileStandalone reconciles standalone mode
 func (r *LittleRedReconciler) reconcileStandalone(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
-	log.Info("Reconciling standalone mode")
+	log.V(1).Info("Reconciling standalone mode")
 
 	// Set initial phase
 	if littleRed.Status.Phase == "" {
@@ -691,7 +691,7 @@ func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littl
 	// correcting LR-042) for the cadence choice, shared with updateSentinelStatus.
 	if littleRed.Status.Phase != littleredv1alpha1.PhaseRunning {
 		after := requeueAfterNotRunning(littleRed.Status.Phase, littleRed.Status.Conditions, fast, steady)
-		log.Info("Not yet Running, requeueing",
+		log.V(1).Info("Not yet Running, requeueing",
 			"phase", littleRed.Status.Phase,
 			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total),
 			"requeueAfter", after)
@@ -704,7 +704,7 @@ func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littl
 // reconcileSentinel reconciles sentinel mode
 func (r *LittleRedReconciler) reconcileSentinel(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
-	log.Info("Reconciling sentinel mode")
+	log.V(1).Info("Reconciling sentinel mode")
 
 	// Set initial phase
 	if littleRed.Status.Phase == "" {
@@ -1975,7 +1975,7 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 			if masterPodName != "" && sentinelReplicasOK < expectedReplicas {
 				notReadyReasons = append(notReadyReasons, fmt.Sprintf("Sentinel knows %d/%d replicas as healthy", sentinelReplicasOK, expectedReplicas))
 			}
-			log.Info("Not yet Running, requeueing", "reasons", strings.Join(notReadyReasons, "; "))
+			log.V(1).Info("Not yet Running, requeueing", "reasons", strings.Join(notReadyReasons, "; "))
 
 			latest.Status.Phase = littleredv1alpha1.PhaseInitializing
 			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
@@ -2032,7 +2032,7 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 
 	// Periodically requeue to update master info, unless disabled via annotation
 	if latest.Annotations[AnnotationDisablePolling] == annotationValueTrue {
-		log.Info("Sentinel polling disabled via annotation")
+		log.V(1).Info("Sentinel polling disabled via annotation")
 		return ctrl.Result{}, nil
 	}
 

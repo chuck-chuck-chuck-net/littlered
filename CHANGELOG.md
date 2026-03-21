@@ -12,6 +12,10 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Added
 
+- **`logLevel` chart value.** Sets the operator's `--zap-log-level` (`debug`, `info`, `error`,
+  or an integer); default `info`. The binary accepted the flag already, the chart had no way
+  to set it. `make deploy LOG_LEVEL=debug` passes it through.
+
 - **An agreement test between the `go` directive and the container builders**
   (`hack/toolchain`). Every CI job, govulncheck included, selects its toolchain from
   `go.mod`, while Dependabot patches the `golang:` builder tags in the two Dockerfiles
@@ -31,6 +35,18 @@ cut a release (`scripts/prepare-release.sh`).
   itself shipped in 0.3.0.
 
 ### Changed
+
+- **Per-pass log lines that restate a persisting state are debug-level now.** The
+  "Reconciling <mode>" and "Reconciling delete" lines in all four modes, and the lines a
+  pass emits while a state it is already reporting in `status` persists: "Not yet Running,
+  requeueing" (all modes; the structured reasons stay attached at debug), "Waiting for all
+  pods to be ready" and "Shard StatefulSet(s) not yet created" (cluster), "Node already has
+  slots, skipping assignment" (cluster bootstrap), and the four "polling / event monitoring
+  disabled via annotation" lines. At the steady poll these were the bulk of a healthy or
+  converging operator's log and said nothing a `kubectl get littlered` does not. Everything
+  the operator *does* to an instance, every refusal, and every deadlock-recovery decision
+  stays at info. The e2e suite deploys with `LOG_LEVEL=debug` so its captured operator logs
+  keep all of them.
 
 - **Kubernetes client libraries move from 0.36.3 to 0.37.1, controller-runtime from 0.24.1
   to 0.25.1.** The move arrived in two steps. The prometheus-operator monitoring API module

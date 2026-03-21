@@ -23,6 +23,12 @@ tolerations: []
 
 affinity: {}
 
+# Log level for the operator, passed as --zap-log-level. Accepts debug, info,
+# error, or an integer (0 = info, 1 = debug). The per-reconcile "Reconciling
+# <mode>" lines are emitted at debug; everything the operator *does* to an
+# instance stays at info.
+logLevel: info
+
 # topologySpreadConstraints for the OPERATOR pods (only meaningful with replicas > 1).
 # Passed through verbatim. To spread operator replicas across nodes, e.g.:
 #   topologySpreadConstraints:
