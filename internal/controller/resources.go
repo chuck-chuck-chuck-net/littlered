@@ -44,6 +44,13 @@ const (
 	AnnotationDisablePolling          = "redis.chuck-chuck-chuck.net/disable-polling"
 	AnnotationDisableEventMonitoring  = "redis.chuck-chuck-chuck.net/disable-event-monitoring"
 	AnnotationDebugSkipSlotAssignment = "redis.chuck-chuck-chuck.net/debug-skip-slot-assignment"
+
+	// Failover-mode assignment channel (ADR-011 §3): the operator stamps these
+	// annotations on each data pod; the pod reads them back through a
+	// downward-API volume and starts redis-server only on a fresh assignment.
+	AnnotationAssignedRole     = "redis.chuck-chuck-chuck.net/assigned-role"
+	AnnotationAssignedMasterIP = "redis.chuck-chuck-chuck.net/assigned-master-ip"
+	AnnotationAssignmentEpoch  = "redis.chuck-chuck-chuck.net/assignment-epoch"
 )
 
 // Resource name helpers
@@ -109,6 +116,7 @@ const (
 	ModeStandalone        = "standalone"
 	ModeSentinel          = "sentinel"
 	ModeCluster           = "cluster"
+	ModeFailover          = "failover"
 	RoleMaster            = "master"
 	RoleReplica           = "replica"
 	RoleOrphan            = "orphan"
