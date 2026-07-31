@@ -54,8 +54,11 @@ with an explicit opt-in only where no non-lossy path exists (ADR-005 vs ADR-006)
   and the `LeaderlessRecovery`-style condition machinery. New monitoring surfaces
   (nothing load-bearing is persisted — every value is re-derivable from live state):
   `status.failover.masterDownSince` (detection window / recovery cooldown marker, the
-  `...Since` pattern of ADR-005/008) and `status.failover.assignmentEpoch` (mirror of
-  the epoch stamped on pods, see §3). `ConditionSentinelReady` is not used; phase
+  `...Since` pattern of ADR-005/008), `status.failover.assignmentEpoch` (mirror of
+  the epoch stamped on pods, see §3), and `status.failover.transitionSince` (stamped on
+  every epoch bump; anchors the §6 post-transition cooldown — the one value a live
+  re-derivation cannot reconstruct, and losing it merely skips one cooldown window, so
+  still nothing load-bearing). `ConditionSentinelReady` is not used; phase
   computation is derived from operator ground truth (readiness + gathered
   `master_link_status`), not from any Sentinel view.
 
@@ -163,9 +166,16 @@ the guard set differs:
 
 - **Promotion is never blocked by the dead master's own termination** (a crash failover
   is exactly the moment a pod is terminating). It is gated on: the decision inputs
-  being a completed gather, and **no unsettled prior transition** — the previous
-  assignment epoch's intent (label, target role) observed converged, plus a short
-  post-transition cooldown keyed on `masterDownSince`/epoch bump, serializing cascades.
+  being a completed gather, and **no unsettled prior transition**, plus a short
+  post-transition cooldown keyed on `status.failover.transitionSince`, serializing
+  cascades. "Unsettled" is deliberately narrower than "not settled": a transition
+  blocks a NEW mastership decision only while its target — the intended master — is
+  still **alive and converging** (reachable but not yet `role:master`+labeled). A
+  dead/unreachable intended master never blocks its own replacement — gating on bare
+  unsettledness would deadlock exactly the crash and graceful-handover recoveries this
+  mode exists for, since a dead target can never again converge (red-first proven,
+  `failoverPromotionUnsettled`). Secondary healing (below) still gates on full
+  settledness.
 - **Secondary healing** (straggler repoint, status-label corrections) keeps the
   conservative gate: a verified live consensus master and no terminating pods.
 - Probes make no topology decisions (LR-016): liveness is a plain local health check;

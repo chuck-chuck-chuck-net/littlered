@@ -2279,6 +2279,16 @@ spec:
                       Monitoring surface only — re-derivable from live state.
                     format: date-time
                     type: string
+                  transitionSince:
+                    description: |-
+                      TransitionSince records when the operator last stamped a new master
+                      intent (an assignment-epoch bump: bootstrap seed, failover promotion, or
+                      unsafe elect). It anchors the short post-transition cooldown that
+                      serializes cascading failovers (ADR-011 §6). Monitoring surface only —
+                      if lost, at worst one cooldown window is skipped; nothing load-bearing
+                      is persisted.
+                    format: date-time
+                    type: string
                 type: object
               ghostMasterStuckSince:
                 description: |-

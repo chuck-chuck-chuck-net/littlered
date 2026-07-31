@@ -182,9 +182,12 @@ func (r *LittleRedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		r.stopSentinelMonitor(req.NamespacedName)
 	}
 
-	// Initialize BootstrapRequired for Sentinel mode
-	if littleRed.Spec.Mode == ModeSentinel && littleRed.Status.Phase == "" && !littleRed.Status.BootstrapRequired {
-		log.Info("Initializing new Sentinel cluster: setting bootstrapRequired flag")
+	// Initialize BootstrapRequired for the operator-led-bootstrap modes: sentinel
+	// (pillar 3.6) and failover (ADR-011 §3 — same contract, the assignment
+	// annotations replace the Sentinel registration).
+	if (littleRed.Spec.Mode == ModeSentinel || littleRed.Spec.Mode == ModeFailover) &&
+		littleRed.Status.Phase == "" && !littleRed.Status.BootstrapRequired {
+		log.Info("Initializing new instance: setting bootstrapRequired flag", "mode", littleRed.Spec.Mode)
 		err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 			latest := &littleredv1alpha1.LittleRed{}
 			if err := r.Get(ctx, req.NamespacedName, latest); err != nil {
@@ -212,6 +215,8 @@ func (r *LittleRedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		return r.reconcileSentinel(ctx, littleRed)
 	case ModeCluster:
 		return r.reconcileCluster(ctx, littleRed)
+	case ModeFailover:
+		return r.reconcileFailover(ctx, littleRed)
 	default:
 		return r.setFailedStatus(ctx, littleRed, "InvalidMode", fmt.Sprintf("Unknown mode: %s", littleRed.Spec.Mode))
 	}
@@ -1125,13 +1130,18 @@ func (r *LittleRedReconciler) updateMasterLabel(ctx context.Context, littleRed *
 		}
 	}
 
-	// surgical role updates:
-	// 1. If we have a masterPodName, ensure ONLY that pod is labeled Master.
-	// 2. If we DON'T have a masterPodName, ensure NO pod is labeled Master.
-	// 3. We only change Replica/Orphan labels if we are sure of the state.
-	//    During failover (masterPodName == ""), we just strip the Master label
-	//    from whoever had it and leave others alone.
+	return r.applyRoleLabels(ctx, littleRed, podList, masterPodName)
+}
 
+// applyRoleLabels performs the surgical role-label updates shared by sentinel
+// and failover mode (the flip mechanics; only the master SOURCE differs —
+// Sentinel consensus vs operator intent):
+//  1. If we have a masterPodName, ensure ONLY that pod is labeled Master.
+//  2. If we DON'T have a masterPodName, ensure NO pod is labeled Master.
+//  3. We only change Replica/Orphan labels if we are sure of the state.
+//     During failover (masterPodName == ""), we just strip the Master label
+//     from whoever had it and leave others alone.
+func (r *LittleRedReconciler) applyRoleLabels(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, podList *corev1.PodList, masterPodName string) error {
 	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
 	for i := range podList.Items {
 		pod := &podList.Items[i]
@@ -1146,7 +1156,7 @@ func (r *LittleRedReconciler) updateMasterLabel(ctx context.Context, littleRed *
 				expectedRole = RoleReplica
 			}
 		} else {
-			// No master identified by Sentinel (failover in progress).
+			// No master identified (failover in progress).
 			// Be surgical: only strip the Master label if someone has it.
 			if currentRole == RoleMaster {
 				expectedRole = RoleReplica // downgrade to replica while waiting
