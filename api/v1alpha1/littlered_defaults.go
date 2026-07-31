@@ -71,6 +71,10 @@ const (
 	ClusterBusPortOffset       = 10000
 	ClusterBusPort             = RedisPort + ClusterBusPortOffset // 16379
 
+	// Failover-mode defaults (experimental; see ADR-011)
+	DefaultFailoverDownAfterMs       = 5000
+	DefaultFailoverReplicas    int32 = 2
+
 	// Placement defaults (cluster-mode shard anti-affinity)
 	DefaultShardTopologyKey       = "kubernetes.io/hostname"
 	DefaultShardWhenUnsatisfiable = corev1.ScheduleAnyway
@@ -178,6 +182,14 @@ func (r *LittleRed) SetDefaults() {
 		spec.Cluster.SetDefaults()
 	}
 
+	// Failover defaults (only if failover mode)
+	if spec.Mode == "failover" && spec.Failover == nil {
+		spec.Failover = &FailoverSpec{}
+	}
+	if spec.Failover != nil {
+		spec.Failover.SetDefaults()
+	}
+
 	// Placement defaults (only when the block is present; not mode-gated / never auto-created)
 	if spec.Placement != nil {
 		spec.Placement.SetDefaults()
@@ -283,6 +295,17 @@ func (c *ClusterSpec) SetDefaults() {
 	if c.FailoverGracePeriod == 0 {
 		c.FailoverGracePeriod = DefaultFailoverGracePeriod
 	}
+}
+
+// SetDefaults applies default values to FailoverSpec
+func (f *FailoverSpec) SetDefaults() {
+	if f.Replicas == nil {
+		f.Replicas = new(DefaultFailoverReplicas)
+	}
+	if f.DownAfterMilliseconds == 0 {
+		f.DownAfterMilliseconds = DefaultFailoverDownAfterMs
+	}
+	// MinReplicasToWrite defaults to 0 (off) — the zero value, nothing to set.
 }
 
 // GetTotalNodes returns the total number of cluster nodes (shards * (1 + replicas))

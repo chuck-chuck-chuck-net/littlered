@@ -158,6 +158,52 @@ spec:
                     description: Timeout is client idle timeout in seconds (0 = disabled)
                     type: integer
                 type: object
+              failover:
+                description: |-
+                  Failover defines failover-specific settings (failover mode only).
+                  Mode failover is experimental: operator-managed HA without Sentinel,
+                  under active validation — see docs for current status and trade-offs
+                  vs sentinel mode.
+                properties:
+                  allowUnsafeRebootstrapOnDeadlock:
+                    default: false
+                    description: |-
+                      AllowUnsafeRebootstrapOnDeadlock permits the operator to break a
+                      no-master deadlock when the surviving data-holding Redis pods have
+                      DIVERGED replication lineages. (A deadlock with no data, or with all
+                      survivors on a single lineage — including a normal post-failover
+                      promotion chain — is always broken automatically and safely: the
+                      most-complete holder is promoted, discarding nothing, regardless of
+                      this flag.) With diverged lineages, electing one master necessarily
+                      DISCARDS the data on the other lineages, which full-resync from the
+                      elected pod. With this flag set the operator force-elects the
+                      best-effort most-complete pod (highest replication offset); with it
+                      unset it refuses and waits for manual intervention. Only enable for
+                      instances where data loss is acceptable (e.g. caches).
+                    type: boolean
+                  downAfterMilliseconds:
+                    default: 5000
+                    description: |-
+                      DownAfterMilliseconds is the sustained-failure window before the operator
+                      declares the master down on probe evidence and initiates a failover.
+                    type: integer
+                  minReplicasToWrite:
+                    default: 0
+                    description: |-
+                      MinReplicasToWrite is rendered into redis.conf as min-replicas-to-write:
+                      the master stops accepting writes when fewer than this many replicas are
+                      connected. 0 (the default) disables the check; setting it trades write
+                      availability for a bound on data lost in a failover.
+                    minimum: 0
+                    type: integer
+                  replicas:
+                    default: 2
+                    description: Replicas is the number of Redis replicas; total data
+                      pods = 1 + replicas.
+                    format: int32
+                    minimum: 1
+                    type: integer
+                type: object
               image:
                 description: Image defines the container image to use
                 properties:
@@ -314,12 +360,13 @@ spec:
                 type: object
               mode:
                 default: standalone
-                description: 'Mode is the deployment mode: standalone, sentinel, or
-                  cluster'
+                description: 'Mode is the deployment mode: standalone, sentinel, cluster,
+                  or failover (experimental)'
                 enum:
                 - standalone
                 - sentinel
                 - cluster
+                - failover
                 type: string
               placement:
                 description: Placement defines topology/failure-domain placement rules
@@ -2038,6 +2085,8 @@ spec:
               rule: self.mode == 'cluster' || !has(self.cluster)
             - message: spec.sentinel may only be set when spec.mode is 'sentinel'
               rule: self.mode == 'sentinel' || !has(self.sentinel)
+            - message: spec.failover may only be set when spec.mode is 'failover'
+              rule: self.mode == 'failover' || !has(self.failover)
           status:
             description: LittleRedStatus defines the observed state of LittleRed
             properties:
@@ -2210,6 +2259,27 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              failover:
+                description: Failover contains failover-mode state (failover mode
+                  only)
+                properties:
+                  assignmentEpoch:
+                    description: |-
+                      AssignmentEpoch mirrors the monotonic assignment epoch stamped on the
+                      data pods' annotations. Monitoring surface only — the authoritative
+                      epoch lives on the pods and is re-derived from live state, never read
+                      back from status.
+                    format: int64
+                    type: integer
+                  masterDownSince:
+                    description: |-
+                      MasterDownSince records when the operator first observed the current
+                      master as unreachable (the detection window / recovery cooldown marker).
+                      Cleared as soon as the master is reachable again or a failover completes.
+                      Monitoring surface only — re-derivable from live state.
+                    format: date-time
+                    type: string
+                type: object
               ghostMasterStuckSince:
                 description: |-
                   GhostMasterStuckSince records when the operator first observed the instance stuck
