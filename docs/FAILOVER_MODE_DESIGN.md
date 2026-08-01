@@ -174,7 +174,52 @@ Pick one:
    *Done: confirmed as LR-024 (the ghost-replica RESET → crash deadlock); the graceful+crash sequence
    is a graduation scenario per §4.*
 
-## 7. Pointers
+## 7. How it started vs. how it's going (implementation day 0, 2026-08-01)
+
+§2.1's hypothesis, restated: *managing a plain replication setup directly from the operator is
+less work, less fragile, and has fewer race conditions than carefully steering Sentinel — because
+there is only one decider.* Day-0 scorecard, axis by axis. (LOC figures are approximate:
+mode-specific production code, whole files where cleanly attributable, function spans in shared
+files otherwise; tests excluded.)
+
+**"Less work" — no, roughly a wash (~2,850 vs ~2,275 LOC).** Removing Sentinel did not remove
+the work; the operator now owns detection and promotion itself, and that costs lines
+(`failover_reconcile.go` alone is ~1,000). What sentinel mode spends on steering an external
+authority (`SentinelClient`, ~390 LOC / 13 methods; the sentinel-process StatefulSet/config
+builders, ~340) failover mode spends on owning the mechanism (watcher, assignment engine,
+startup protocol). LOC is the footnote, not the slide.
+
+**"Fewer race conditions" — yes, structurally.** Sentinel mode's mastership logic is **seven
+interacting rules** (Rule 0, A, D, R, L, LR-008 REMOVE+MONITOR, LR-024 recovery), each born from
+an incident, each with ordering/gating interactions against Sentinel's own state machine — Rule D
+was hardened five times and still self-inflicted LR-024. Failover mode's entire mastership logic
+is **two pure functions** (`planFailover`, 6 rows; `planMasterDeath`, 6 outcomes) plus two
+mechanical loops (repoint, re-auth). Every topology decision is table-tested; nothing waits on or
+races a second consensus.
+
+**"Less fragile" — the changelog is the quantitative statement.** 13 of 23 LR entries are
+sentinel-mode (LR-001/004/005/007/008/009/010/011/013/015/016/017/024), and at least six of those
+(001, 007, 008, 011, 013, 024) are one recurring class: operator nudges racing Sentinel's tables.
+That class is **impossible by construction** here — no Sentinel tables, no ghost-replica list, no
+bare-sentinel state, no RESET to mistime; ADR-010's entire subject does not exist in this mode.
+
+**Day-0 evidence.** The hybrid double-failover — the scenario sentinel mode deadlocked on twice
+(LR-007/008, then LR-024) — went green on the first e2e run, 16/16 on a real 3-node cluster, with
+zero operator-code fixes needed. Client contract identical to sentinel mode (same label-routed
+Services, no cluster-aware client), at half the pods (3 vs 6), plus a configurable replica count
+sentinel mode never had.
+
+**What this scorecard cannot claim.** It compares day 0 against six-months-hardened: sentinel's
+13 entries are *discovered* complexity, and failover's equivalent bill has not arrived. Expected
+first collectors: detection under real network weirdness — blackholing IPs, informer lag, kubelet
+annotation-propagation latency under load (the LR-012/LR-017 class that unit tables cannot catch
+and one clean e2e run did not stress) — concentrated in the corroboration matrix and the epoch
+fence. The operator-liveness coupling (§2.3) is untested in anger: MTTR with the operator down
+during a master death has not been measured. So the claim we are entitled to make today:
+**failover mode eliminates the bug class that dominated sentinel's changelog; whether it has
+fewer bugs overall is what the §4 gate remainder (chaos/soak, dogfooding) gets to decide.**
+
+## 8. Pointers
 
 - `CLAUDE.md` §2 (terminology — note "cluster" is reserved for Redis Cluster), §3.4–3.9 (pillars), §4 (modes).
 - `docs/RECONCILIATION_LOOP_SENTINEL.md`, `docs/RECONCILIATION_ALGORITHM_CHANGELOG.md` (LR-007/008).
