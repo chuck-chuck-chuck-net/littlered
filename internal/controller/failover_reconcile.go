@@ -167,6 +167,10 @@ func (r *LittleRedReconciler) reconcileFailover(ctx context.Context, littleRed *
 		}
 	}
 
+	// Ensure the background master watcher is running (ADR-011 §4 fast path;
+	// mirrors reconcileSentinel's ensureSentinelMonitor placement)
+	r.ensureFailoverMonitor(ctx, littleRed)
+
 	// Update status
 	res, err := r.updateFailoverStatus(ctx, littleRed, eng)
 	if err != nil {

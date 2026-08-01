@@ -93,10 +93,18 @@ type LittleRedReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
 
-	// Sentinel monitoring
-	sentinelEvents chan event.GenericEvent
-	monitors       map[types.NamespacedName]func()
-	monitorsMu     sync.Mutex
+	// Background fast-detection monitors. sentinelEvents is the mode-agnostic
+	// GenericEvent channel wired into SetupWithManager (both the sentinel
+	// +switch-master subscriber and the failover-mode master watcher push onto
+	// it; the name predates failover mode). monitors holds the sentinel
+	// subscribers, failoverMonitors the failover-mode watchers — separate maps
+	// because the mode-mismatch stop branches in Reconcile are per-kind (a
+	// shared map could not tell WHICH monitor runs under a key across a mode
+	// switch). Both share monitorsMu (bookkeeping only, no contention).
+	sentinelEvents   chan event.GenericEvent
+	monitors         map[types.NamespacedName]func()
+	failoverMonitors map[types.NamespacedName]func()
+	monitorsMu       sync.Mutex
 }
 
 // event emits a Kubernetes Event for lr, tolerating a nil Recorder (e.g. in unit
@@ -177,9 +185,14 @@ func (r *LittleRedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		LastTransitionTime: metav1.Now(),
 	})
 
-	// Reconcile based on mode
+	// Reconcile based on mode: stop the fast-detection monitor of any mode
+	// this instance is NOT in (mode switch cleanup; per-kind maps, so a
+	// sentinel subscriber and a failover watcher can never survive each other).
 	if littleRed.Spec.Mode != ModeSentinel {
 		r.stopSentinelMonitor(req.NamespacedName)
+	}
+	if littleRed.Spec.Mode != ModeFailover {
+		r.stopFailoverMonitor(req.NamespacedName)
 	}
 
 	// Initialize BootstrapRequired for the operator-led-bootstrap modes: sentinel
@@ -254,11 +267,13 @@ func (r *LittleRedReconciler) reconcileDelete(ctx context.Context, littleRed *li
 		return ctrl.Result{}, err
 	}
 
-	// Stop sentinel monitor if running
-	r.stopSentinelMonitor(types.NamespacedName{
+	// Stop background monitors if running
+	nn := types.NamespacedName{
 		Name:      littleRed.Name,
 		Namespace: littleRed.Namespace,
-	})
+	}
+	r.stopSentinelMonitor(nn)
+	r.stopFailoverMonitor(nn)
 
 	return ctrl.Result{}, nil
 }
@@ -1451,6 +1466,7 @@ func (r *LittleRedReconciler) setFailedStatus(ctx context.Context, lr *littlered
 func (r *LittleRedReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.sentinelEvents = make(chan event.GenericEvent)
 	r.monitors = make(map[types.NamespacedName]func())
+	r.failoverMonitors = make(map[types.NamespacedName]func())
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&littleredv1alpha1.LittleRed{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).
