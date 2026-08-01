@@ -86,8 +86,12 @@ make test-e2e FOCUS="Sentinel"
 # Only cluster tests
 make test-e2e FOCUS="Cluster Mode"
 
-# Only failover tests
-make test-e2e FOCUS="Failover"
+# Only sentinel advanced-failover tests (sentinel mode; FOCUS="Failover" would
+# be ambiguous — it also matches the failover-mode suite)
+make test-e2e FOCUS="Sentinel Advanced Failover"
+
+# Only failover-mode tests (mode: failover) — use the Ginkgo label
+make test-e2e LABEL_FILTER='failover-mode'
 
 # Only kill-9 / crash tests
 make test-e2e FOCUS="Kill-9"
@@ -277,7 +281,7 @@ kubectl delete pod <master-cluster-pod> --grace-period=0 --force
 - Rapid double kill (graceful then crash before the cluster settles)
 
 **Recovery criteria:**
-- **Sentinel**: cluster stabilizes, chaos client shows 0 data corruptions, `{name}-master` service routes to new master
+- **Sentinel**: cluster stabilizes, chaos client shows 0 data corruptions, `{name}` service routes to new master
 - **Cluster**: all 16384 slots covered, 0 data corruptions, `cluster_state:ok`
 
 ### Observe with lrctl

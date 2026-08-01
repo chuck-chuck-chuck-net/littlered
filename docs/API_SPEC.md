@@ -582,6 +582,7 @@ status:
 
   # Sentinel mode only
   leaderlessSince: "2026-07-09T13:10:37Z"  # Set when a bootstrap deadlock is observed; cleared once a master is known
+  ghostMasterStuckSince: "2026-07-31T10:15:00Z"  # Set when a ghost-master failover deadlock is observed; cleared once a master is known
   sentinels:
     ready: 3
     total: 3
@@ -611,6 +612,7 @@ status:
         nodeId: mno345pqr678...
         masterNodeId: abc123def456...
         detectedAt: "2026-02-03T12:01:00Z"
+    wipeDeadlockSince: "2026-07-31T08:00:00Z"  # Set when the total-/partial-wipe deadlock signature is observed; cleared once it no longer holds
 ```
 
 | Field | Type | Description |
@@ -619,6 +621,7 @@ status:
 | `status` | `string` | Human-readable summary: master pod name when Running, phase otherwise. Shown in `kubectl get littlered` output. |
 | `bootstrapRequired` | `bool` | True on creation, cleared after the first master is elected (sentinel + failover modes) |
 | `leaderlessSince` | `Time` | Set when the operator first observes a leaderless, all-Sentinels-bare bootstrap deadlock; cleared once a master is known. Gates the leaderless-recovery cooldown (sentinel mode). |
+| `ghostMasterStuckSince` | `Time` | Set when the operator first observes a ghost-master failover deadlock: a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so Sentinel aborts every failover `no-good-slave` while living survivors still hold the data. Cleared once a master is known again. Gates the ghost-master-recovery cooldown, so a recent master death gets its full Sentinel election window first (sentinel mode). |
 | `observedGeneration` | `int64` | Last processed `.metadata.generation` |
 | `conditions` | `[]Condition` | Detailed status conditions |
 | `redis.ready` | `int32` | Ready Redis pod count |
@@ -645,6 +648,7 @@ status:
 | `cluster.orphanedReplicas[].nodeId` | `string` | Node ID of the orphaned replica |
 | `cluster.orphanedReplicas[].masterNodeId` | `string` | Node ID of the (now gone) master |
 | `cluster.orphanedReplicas[].detectedAt` | `Time` | When the orphan was first detected |
+| `cluster.wipeDeadlockSince` | `Time` | Set when the operator first observes the total-/partial-wipe deadlock signature: cluster pods stuck not-Ready and crash-looping (redis down, so — pure in-memory — holding no data) while the instance cannot reach a healthy topology. Arms the cooldown before the operator recycles the stuck pods; cleared as soon as the signature no longer holds (cluster mode). |
 
 ### 3.1 Condition Types
 
@@ -654,6 +658,8 @@ status:
 | `Initialized` | ✅ | Initial setup complete |
 | `ConfigValid` | ✅ | Configuration is valid (set `False` on validation failure) |
 | `SentinelReady` | ✅ | Sentinel quorum established (sentinel mode; never set in failover mode) |
+| `LeaderlessRecovery` | ✅ | Sentinel mode only: reflects a leaderless bootstrap deadlock (every Sentinel bare, no master) and the operator's response — `True` means the instance is deadlocked and needs attention (in cooldown, or refusing because data is present); `False` records a completed recovery |
+| `GhostMasterRecovery` | ✅ | Sentinel mode only: reflects a ghost-master failover deadlock — a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so failover aborts `no-good-slave` while living survivors hold the data — and the operator's recovery of it. `True` means deadlocked/needs attention (in cooldown, or refusing because divergent data is present); `False` records a completed recovery |
 | `FailoverRecovery` | ✅ | Failover mode only: `True` means the instance needs attention — most importantly the refuse-and-wait state, where the surviving data holders span divergent replication lineages and electing any one would discard independent writes (set `failover.allowUnsafeRebootstrapOnDeadlock` to authorize); `False` records a completed recovery |
 | `TLSReady` | — | Reserved for future use (defined but not currently set) |
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |
@@ -1200,7 +1206,7 @@ type ConfigSpec struct {
 | `spec.failover` only allowed with `mode: failover` (CEL rule on the CRD; `spec.sentinel`/`spec.cluster` are gated to their modes the same way) | Rejected at admission |
 | `failover.replicas` must be ≥ 1; `failover.minReplicasToWrite` must be ≥ 0 | Enforced by the CRD schema, mirrored in controller validation |
 | `spec.placement.shardAntiAffinity` rejected unless `mode: cluster` (failover included) | Validation failure |
-| `cluster.shards` must be exactly `3` | Currently only 3-shard clusters are supported (CRD schema allows ≥3, controller enforces exactly 3 until slot migration is implemented) |
+| `cluster.shards` must be ≥ `3` | Enforced by the CRD schema (minimum 3, default 3) and mirrored in controller validation (`cluster mode requires at least 3 shards`) |
 | `cluster.replicasPerShard` must be `0` or `1` | Currently only 0 or 1 replica per shard supported |
 | `maxmemory` must parse as quantity | Invalid memory format |
 

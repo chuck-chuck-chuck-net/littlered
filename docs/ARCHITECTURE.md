@@ -287,7 +287,7 @@ status:
 │                                                                      │
 │  ┌─────────────────────┐  ┌─────────────────────┐                   │
 │  │ Service:            │  │ Service:            │                   │
-│  │ {name}-master       │  │ {name}-replicas     │                   │
+│  │ {name}              │  │ {name}-replicas     │                   │
 │  │ (selector: role=    │  │ (headless, all      │                   │
 │  │  master)            │  │  Redis pods)        │                   │
 │  └─────────────────────┘  └─────────────────────┘                   │
@@ -303,7 +303,7 @@ status:
 **Sentinel Mode Resources**:
 - StatefulSet: `{name}-redis` (3 pods: 1 master + 2 replicas)
 - StatefulSet: `{name}-sentinel` (3 sentinel pods)
-- Service: `{name}-master` (ClusterIP, selector `role=master`)
+- Service: `{name}` (ClusterIP, selector `role=master`)
 - Service: `{name}-replicas` (headless, all Redis pods)
 - Service: `{name}-sentinel` (headless, all Sentinel pods)
 - ConfigMap: `{name}-config` (redis.conf + startup script)
@@ -492,7 +492,7 @@ When a Redis process is killed (OOM, kill -9) but the pod stays alive, the conta
 
 ### 5.4 Master Service Routing
 
-The `{name}-master` service uses a label selector (`redis.chuck-chuck-chuck.net/role: master`). The operator surgically updates this label on each reconcile cycle:
+The `{name}` service uses a label selector (`redis.chuck-chuck-chuck.net/role: master`). The operator surgically updates this label on each reconcile cycle:
 
 - **Master known**: the master pod gets `role=master`, all others get `role=replica`.
 - **No master** (failover in progress): only the `role=master` label is stripped from whoever had it. Other pods are left untouched to avoid churn.
