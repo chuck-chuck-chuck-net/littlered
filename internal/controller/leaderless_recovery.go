@@ -71,7 +71,7 @@ type leaderlessPlan struct {
 // bootstrapMasterIP is the pre-resolved redis-0 IP for the no-data case ("" if none
 // is eligible yet). now/leaderlessSince/cooldown drive the persistence gate.
 func planLeaderlessRecovery(
-	state *redisclient.SentinelClusterState,
+	state *redisclient.ReplicationState,
 	quorum int,
 	allowUnsafe bool,
 	bootstrapMasterIP string,
@@ -116,7 +116,7 @@ func planLeaderlessRecovery(
 // currently a replica (following a now-dead master). An unreachable / wait-looping
 // elect starts fresh as master via its startup script, and an elect already
 // reporting role:master needs nothing.
-func needsPromotion(state *redisclient.SentinelClusterState, masterIP string) bool {
+func needsPromotion(state *redisclient.ReplicationState, masterIP string) bool {
 	rn := state.RedisNodes[masterIP]
 	return rn != nil && rn.Reachable && rn.Role != RoleMaster
 }

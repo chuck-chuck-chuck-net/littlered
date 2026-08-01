@@ -240,7 +240,7 @@ type clusterVerifyJSON struct {
 
 func buildSentinelVerifyJSON(
 	name, namespace string, redisMap map[string]string,
-	state *redisclient.SentinelClusterState, sentinelMasterName string,
+	state *redisclient.ReplicationState, sentinelMasterName string,
 	expectedSentinels, expectedReplicas int,
 ) sentinelVerifyJSON {
 	actions := state.GetHealActions(sentinelMasterName)

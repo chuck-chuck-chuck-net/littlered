@@ -93,7 +93,7 @@ graph TD
 ## Ground Truth Gathering
 
 The operator queries **every** Redis and Sentinel pod on each reconcile cycle to build a
-`SentinelClusterState`. The probes run **concurrently**, each under a hard `ProbeTimeout` (3 s)
+`ReplicationState`. The probes run **concurrently**, each under a hard `ProbeTimeout` (3 s)
 deadline — sequential, unbounded probes let a single blackholing dead pod IP stall one reconcile
 for ~146 s on a managed cloud, starving the recovery rules of the loop iterations they needed
 (LR-017; the sentinel-mode completion of LR-012):
@@ -169,7 +169,7 @@ The **ghost-majority guard** (LR-004) is critical: if most sentinels still point
 
 **Action**: `SENTINEL RESET <masterName>` (broadcast to all sentinels via headless service).
 
-**Safety** (LR-001, LR-007, LR-008, LR-011, LR-013): RESET is only issued when ALL of these hold (encoded in the pure predicate `SentinelClusterState.GhostReplicaResetSafe`):
+**Safety** (LR-001, LR-007, LR-008, LR-011, LR-013): RESET is only issued when ALL of these hold (encoded in the pure predicate `ReplicationState.GhostReplicaResetSafe`):
 1. The cluster is **whole** — every expected Redis pod (`SentinelRedisReplicas` = 3) is reachable
 2. `RealMasterIP` is confirmed living and reachable
 3. At least 1 healthy (non-ghost, non-`s_down`) replica is known to Sentinel

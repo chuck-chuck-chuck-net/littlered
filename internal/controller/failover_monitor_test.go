@@ -187,7 +187,7 @@ var _ = Describe("Failover master watcher scaffolding", func() {
 		return &LittleRedReconciler{
 			Client:           k8sClient,
 			Scheme:           k8sClient.Scheme(),
-			sentinelEvents:   events,
+			monitorEvents:    events,
 			failoverMonitors: make(map[types.NamespacedName]func()),
 		}
 	}

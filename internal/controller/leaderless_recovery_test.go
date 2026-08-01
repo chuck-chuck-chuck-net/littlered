@@ -41,8 +41,8 @@ type rnSpec struct {
 	role      string
 }
 
-func buildState(sentinels []snSpec, redis []rnSpec) *redisclient.SentinelClusterState {
-	s := redisclient.NewSentinelClusterState()
+func buildState(sentinels []snSpec, redis []rnSpec) *redisclient.ReplicationState {
+	s := redisclient.NewReplicationState()
 	for i, sn := range sentinels {
 		ip := "10.0.1." + string(rune('0'+i))
 		s.SentinelNodes[ip] = &redisclient.SentinelNodeState{
@@ -207,7 +207,7 @@ func TestNeedsPromotion(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			s := redisclient.NewSentinelClusterState()
+			s := redisclient.NewReplicationState()
 			if tt.node != nil {
 				s.RedisNodes[ipTest] = tt.node
 			}

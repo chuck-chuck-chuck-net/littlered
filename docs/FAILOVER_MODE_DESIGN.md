@@ -151,7 +151,7 @@ Kept as written for the reasoning trail; each item carries its resolution.
   *Resolved (ADR-011 §3): operator-stamped assignment annotations read back through a downward-API
   volume, epoch-fenced by an EmptyDir run-marker (the ADR-001 kill-9 yield, re-owned). ADR-002's
   no-PING constraint is kept.*
-- ✅ **Reuse inventory.** `gatherer.go`, `internal/redis/sentinel_state.go`'s offset logic (the
+- ✅ **Reuse inventory.** `gatherer.go`, `internal/redis/replication_state.go`'s offset logic (the
   offset-based promotion removed from sentinel mode per ADR-003 *is* the right primitive here, since
   there is no Sentinel consensus to wait for), `updateMasterLabel`, `resources.go` STS/SVC/CM builders
   (drop the Sentinel StatefulSet + sentinel.conf; reuse the master-label Service unchanged).
@@ -227,4 +227,4 @@ fewer bugs overall is what the §4 gate remainder (chaos/soak, dogfooding) gets 
   `003-low-interference-sentinel-reconciliation.md`.
 - `docs/SCOPE.md`, `docs/REQUIREMENTS.md`.
 - Code: `internal/controller/{gatherer,sentinel_monitor,resources,littlered_controller}.go`,
-  `internal/redis/{sentinel_state,gather}.go`.
+  `internal/redis/{replication_state,gather}.go`.

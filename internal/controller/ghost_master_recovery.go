@@ -61,7 +61,7 @@ const ghostMasterRecoveryCooldown = 30 * time.Second
 //
 // The caller invokes this only while state.RealMasterIP == "" (majority-ghost implies it).
 func planGhostMasterRecovery(
-	state *redisclient.SentinelClusterState,
+	state *redisclient.ReplicationState,
 	quorum int,
 	allowUnsafe bool,
 	bootstrapMasterIP string,
@@ -119,7 +119,7 @@ func planGhostMasterRecovery(
 func (r *LittleRedReconciler) recoverGhostMasterDeadlock(
 	ctx context.Context,
 	lr *littleredv1alpha1.LittleRed,
-	state *redisclient.SentinelClusterState,
+	state *redisclient.ReplicationState,
 	redisMap map[string]string,
 	password string,
 ) error {

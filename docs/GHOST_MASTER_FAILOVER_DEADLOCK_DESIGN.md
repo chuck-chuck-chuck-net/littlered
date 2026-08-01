@@ -101,7 +101,7 @@ re-learned → no promotion candidate → `no-good-slave` in perpetuity.
 
 `DetermineRealMaster` deliberately keeps `RealMasterIP == ""` here (majority monitor a ghost
 master → it refuses the Redis-only fallback, precisely to avoid RESETing away failover
-state; `sentinel_state.go:106-113`). So the operator loops
+state; the ghost-majority guard in `DetermineRealMaster`, `replication_state.go`). So the operator loops
 `ghost master → no master in status → requeue`, forever.
 
 ### 2.5 Regression classification

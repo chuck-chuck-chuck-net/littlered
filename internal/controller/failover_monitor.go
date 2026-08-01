@@ -37,9 +37,9 @@ import (
 // sentinel_monitor.go's +switch-master subscription as the FAST path. It
 // probes the current master IP on a ~1s cadence with a ProbeTimeout-bounded
 // INFO and, when a failure streak crosses downAfterMilliseconds, pushes ONE
-// GenericEvent onto the shared reconcile-trigger channel (r.sentinelEvents —
-// mode-agnostic despite the name) so a reconcile looks immediately instead of
-// at the steady requeue interval.
+// GenericEvent onto the shared mode-agnostic reconcile-trigger channel
+// (r.monitorEvents) so a reconcile looks immediately instead of at the steady
+// requeue interval.
 //
 // The watcher NEVER decides topology (LR-016): declaring the master dead —
 // with its kubelet-readiness evidence and replica-link corroboration — stays
@@ -126,7 +126,7 @@ func (r *LittleRedReconciler) ensureFailoverMonitor(ctx context.Context, littleR
 	// exist, so there is nothing to accelerate — reconcile-cadence detection
 	// still works. This also keeps envtest reconciles from leaking probe
 	// goroutines.
-	if r.sentinelEvents == nil {
+	if r.monitorEvents == nil {
 		return
 	}
 
@@ -232,7 +232,7 @@ func (r *LittleRedReconciler) monitorFailoverMaster(ctx context.Context, littleR
 		log.Info("Failover master watcher: master unreachable past downAfterMilliseconds, triggering reconcile",
 			"masterIP", masterIP, "failingSince", streak.failingSince.Format(time.RFC3339), "downAfter", downAfter.String())
 		select {
-		case r.sentinelEvents <- event.GenericEvent{
+		case r.monitorEvents <- event.GenericEvent{
 			Object: &littleredv1alpha1.LittleRed{
 				ObjectMeta: ctrl.ObjectMeta{
 					Name:      littleRed.Name,

@@ -123,8 +123,8 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 	node := func(ip, role string, reachable bool) *redisclient.RedisNodeState {
 		return &redisclient.RedisNodeState{IP: ip, Role: role, Reachable: reachable}
 	}
-	stateOf := func(nodes ...*redisclient.RedisNodeState) *redisclient.SentinelClusterState {
-		s := redisclient.NewSentinelClusterState()
+	stateOf := func(nodes ...*redisclient.RedisNodeState) *redisclient.ReplicationState {
+		s := redisclient.NewReplicationState()
 		for _, n := range nodes {
 			s.RedisNodes[n.IP] = n
 			s.ValidIPs[n.IP] = true
@@ -134,7 +134,7 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 
 	tests := []struct {
 		name       string
-		state      *redisclient.SentinelClusterState
+		state      *redisclient.ReplicationState
 		intendedIP string
 		want       string
 	}{
@@ -192,8 +192,8 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 
 func TestFailoverTransitionSettled(t *testing.T) {
 	intent := failoverIntent{masterName: "r-redis-1", masterIP: "10.0.0.2", maxEpoch: 2}
-	stateWith := func(role string, reachable bool) *redisclient.SentinelClusterState {
-		s := redisclient.NewSentinelClusterState()
+	stateWith := func(role string, reachable bool) *redisclient.ReplicationState {
+		s := redisclient.NewReplicationState()
 		s.RedisNodes["10.0.0.2"] = &redisclient.RedisNodeState{IP: "10.0.0.2", Role: role, Reachable: reachable}
 		return s
 	}
@@ -201,14 +201,14 @@ func TestFailoverTransitionSettled(t *testing.T) {
 	tests := []struct {
 		name   string
 		intent failoverIntent
-		state  *redisclient.SentinelClusterState
+		state  *redisclient.ReplicationState
 		labels map[string]string
 		want   bool
 	}{
 		{
 			name:   "no intent -> settled (nothing to converge)",
 			intent: failoverIntent{},
-			state:  redisclient.NewSentinelClusterState(),
+			state:  redisclient.NewReplicationState(),
 			labels: nil,
 			want:   true,
 		},
@@ -243,7 +243,7 @@ func TestFailoverTransitionSettled(t *testing.T) {
 		{
 			name:   "intended master unknown to gather -> unsettled",
 			intent: intent,
-			state:  redisclient.NewSentinelClusterState(),
+			state:  redisclient.NewReplicationState(),
 			labels: map[string]string{"r-redis-1": RoleMaster},
 			want:   false,
 		},
@@ -267,8 +267,8 @@ func TestFailoverTransitionSettled(t *testing.T) {
 
 func TestFailoverPromotionUnsettled(t *testing.T) {
 	intent := failoverIntent{masterName: "r-redis-1", masterIP: "10.0.0.2", maxEpoch: 2}
-	stateWith := func(role string, reachable bool) *redisclient.SentinelClusterState {
-		s := redisclient.NewSentinelClusterState()
+	stateWith := func(role string, reachable bool) *redisclient.ReplicationState {
+		s := redisclient.NewReplicationState()
 		s.RedisNodes["10.0.0.2"] = &redisclient.RedisNodeState{IP: "10.0.0.2", Role: role, Reachable: reachable}
 		return s
 	}
@@ -278,14 +278,14 @@ func TestFailoverPromotionUnsettled(t *testing.T) {
 	tests := []struct {
 		name   string
 		intent failoverIntent
-		state  *redisclient.SentinelClusterState
+		state  *redisclient.ReplicationState
 		labels map[string]string
 		want   bool
 	}{
 		{
 			name:   "no intent: nothing in flight",
 			intent: failoverIntent{},
-			state:  redisclient.NewSentinelClusterState(),
+			state:  redisclient.NewReplicationState(),
 			want:   false,
 		},
 		{
@@ -323,7 +323,7 @@ func TestFailoverPromotionUnsettled(t *testing.T) {
 		{
 			name:   "intended master unknown to the gather entirely: NOT blocking",
 			intent: intent,
-			state:  redisclient.NewSentinelClusterState(),
+			state:  redisclient.NewReplicationState(),
 			labels: masterLabel,
 			want:   false,
 		},
@@ -441,8 +441,8 @@ func TestPlanFailoverReauth(t *testing.T) {
 
 func TestPlanFailoverRepoints(t *testing.T) {
 	const liveMaster = "10.0.0.1"
-	stateOf := func(nodes ...*redisclient.RedisNodeState) *redisclient.SentinelClusterState {
-		s := redisclient.NewSentinelClusterState()
+	stateOf := func(nodes ...*redisclient.RedisNodeState) *redisclient.ReplicationState {
+		s := redisclient.NewReplicationState()
 		for _, n := range nodes {
 			s.RedisNodes[n.IP] = n
 		}
@@ -454,7 +454,7 @@ func TestPlanFailoverRepoints(t *testing.T) {
 
 	tests := []struct {
 		name  string
-		state *redisclient.SentinelClusterState
+		state *redisclient.ReplicationState
 		want  []string
 	}{
 		{

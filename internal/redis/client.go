@@ -532,7 +532,7 @@ type ReplicationSnapshot struct {
 	// Replid2 is the master_replid2 — the lineage this node descended from before its
 	// last promotion/resync rotated the replid. Needed to recognise a promotion chain as
 	// a single lineage; comparing Replid alone flags a normal post-failover survivor as
-	// divergent. See SentinelClusterState.holdersDiverged.
+	// divergent. See ReplicationState.holdersDiverged.
 	Replid2 string
 }
 

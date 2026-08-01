@@ -208,7 +208,7 @@ type failoverPlan struct {
 // dead master simply appears in state as an unreachable node and never suppresses
 // a decision.
 func planFailover(
-	state *redisclient.SentinelClusterState,
+	state *redisclient.ReplicationState,
 	liveMasterIP string,
 	allowUnsafe bool,
 	bootstrapMasterIP string,

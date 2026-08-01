@@ -105,7 +105,7 @@ The engine executes **one class of action per pass** (stamping one consistent as
 
 ## Ground Truth Gathering
 
-The operator queries **every** Redis pod on each reconcile (there are no Sentinels to query). It reuses the sentinel-mode gather (`GatherClusterState` with an empty sentinel map): concurrent probes, hard `ProbeTimeout` per pod (LR-012/LR-017 discipline — a blackholing dead IP costs ≤3s, never a stalled reconcile).
+The operator queries **every** Redis pod on each reconcile (there are no Sentinels to query). It reuses the shared replication-state gather (`GatherReplicationState` with an empty sentinel map): concurrent probes, hard `ProbeTimeout` per pod (LR-012/LR-017 discipline — a blackholing dead IP costs ≤3s, never a stalled reconcile).
 
 | Source | Data Collected |
 |--------|---------------|

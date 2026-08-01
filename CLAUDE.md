@@ -177,9 +177,9 @@ internal/controller/        # Core Reconciliation Logic
 internal/redis/             # Redis/Cluster API clients
   ├── client.go               # Sentinel client wrapper
   ├── cluster_client.go       # Cluster client wrapper
-  ├── sentinel_state.go       # SentinelClusterState + DetermineRealMaster
+  ├── replication_state.go    # ReplicationState + DetermineRealMaster
   ├── cluster_state.go        # ClusterGroundTruth + health checks
-  └── gather.go               # GatherClusterState / GatherClusterGroundTruth
+  └── gather.go               # GatherReplicationState / GatherClusterGroundTruth
 internal/cli/               # CLI support packages for lrctl
   ├── discovery/              # Resource discovery
   ├── k8s/                    # K8s exec-based gatherer
@@ -207,7 +207,7 @@ test/e2e/                   # End-to-end tests (requires Kind)
 9. **Lint before pushing**: Always run `make lint` (and `make test`) before pushing. Do not push a branch that has unresolved lint issues — CI enforces the same `golangci-lint` config, so a dirty branch will fail there anyway. Fix lint locally first.
 10. **Licensing**: The project is Apache-2.0 (`LICENSE`). Every Go source file carries the standard header `Copyright <year> The littlered Authors.` from `hack/boilerplate.go.txt` — do not attribute copyright to any individual or company. Third-party attributions live in `NOTICE`; the full dependency-license inventory is generated (`make licenses`) into `THIRD_PARTY_LICENSES`. Regenerate it whenever dependencies change. See `AUTHORS` for maintainers.
 
-11. **Cross-mode parity — fix the sibling, don't wait to be bitten**: The modes (standalone, sentinel, cluster) share the same underlying concerns — gather/probe fan-out, dial timeouts and retries, ghost/stale-IP handling, status computation — implemented in *parallel* code paths. A bug in one of these is almost always latent in the others. When you identify and fix such a bug in one mode, **immediately audit the other modes for the same pattern and fix them in the same change**. Do not ship a fix for cluster (or sentinel) alone and leave the twin defect waiting. Example: LR-012 made the *cluster* gather (`gatherNodeIdentities`) concurrent but left the *sentinel* gather (`GatherClusterState`) sequential — the identical blackhole-dial stall then resurfaced in sentinel mode on a managed cloud.
+11. **Cross-mode parity — fix the sibling, don't wait to be bitten**: The modes (standalone, sentinel, cluster) share the same underlying concerns — gather/probe fan-out, dial timeouts and retries, ghost/stale-IP handling, status computation — implemented in *parallel* code paths. A bug in one of these is almost always latent in the others. When you identify and fix such a bug in one mode, **immediately audit the other modes for the same pattern and fix them in the same change**. Do not ship a fix for cluster (or sentinel) alone and leave the twin defect waiting. Example: LR-012 made the *cluster* gather (`gatherNodeIdentities`) concurrent but left the *sentinel* gather (`GatherClusterState`, since renamed `GatherReplicationState`) sequential — the identical blackhole-dial stall then resurfaced in sentinel mode on a managed cloud.
 
 ### Test Discipline (test-first, red-first)
 
@@ -232,7 +232,7 @@ Applied per tier:
    ADR/spec, see it fail, implement to green. Fast red-green lives here. Most sentinel/cluster
    healing decisions already have a pure seam for exactly this — `planLeaderlessRecovery`,
    `DetermineRealMaster`, `BestDataHolder`, and the injectable `Gatherer` interface behind
-   `GatherClusterState` / `GatherClusterGroundTruth`.
+   `GatherReplicationState` / `GatherClusterGroundTruth`.
 3. **e2e-only behavior (reconcile/replication) → target assertion first.** Adjust the e2e to
    the intended behavior, confirm it is red against current code, then implement (slow loop
    accepted). Design corollary: push the *decision* into a thin pure function (as above) so it
@@ -287,7 +287,7 @@ kubectl apply -f config/samples/ # Try out sample CRs
 ### Sentinel Reconcile Stalled ~146s on Blackholing Dead Pod IPs (2026-07-28, LR-017)
 **Symptom:** On a managed cloud, the single-survivor leaderless-recovery e2e failed as "data lost" — `status.master.podName` stayed `redis-0` (the killed master, restarted empty). Rule L itself is correct (the local control run promoted the survivor); the operator simply never got to run it in time. Operator logs show one reconcile blocked **~146s** (the whole recovery window) dialing the killed Sentinels' stale IPs, which **blackholed** (`i/o timeout` / `no route to host`) one after another. Did **not** reproduce on local kubeadm, where killed IPs RST fast (`connection refused`) and the same paths return in ~2s.
 
-**Root cause:** Missing per-probe deadline in two sentinel-mode paths that cluster mode already bounds (LR-012). (1) `GatherClusterState` probed every Redis/Sentinel pod **sequentially** (cluster's `gatherNodeIdentities` was made concurrent in LR-012; the sentinel loop never was). (2) The status/master-resolution path (`getMasterPodName` → `SentinelClient.GetMaster`/`GetMasterState`) loops `c.addresses` sequentially with `DefaultTimeout` (5s) + go-redis retries and **no per-address context deadline**. Informer-cache lag keeps killed sentinels listed `Ready`, so their stale IPs enter the list; each blackholing address burns ~`5s × retries`. The stall froze status at its stale bootstrap value and starved Rule L.
+**Root cause:** Missing per-probe deadline in two sentinel-mode paths that cluster mode already bounds (LR-012). (1) `GatherClusterState` (since renamed `GatherReplicationState`) probed every Redis/Sentinel pod **sequentially** (cluster's `gatherNodeIdentities` was made concurrent in LR-012; the sentinel loop never was). (2) The status/master-resolution path (`getMasterPodName` → `SentinelClient.GetMaster`/`GetMasterState`) loops `c.addresses` sequentially with `DefaultTimeout` (5s) + go-redis retries and **no per-address context deadline**. Informer-cache lag keeps killed sentinels listed `Ready`, so their stale IPs enter the list; each blackholing address burns ~`5s × retries`. The stall froze status at its stale bootstrap value and starved Rule L.
 
 **Fix (LR-017):** Made `GatherClusterState` probe concurrently; renamed `ClusterProbeTimeout` → mode-neutral `ProbeTimeout` (3s) and wrapped the gatherer's `GetRedisState` and every `SentinelClient` read-path address loop in `context.WithTimeout(ctx, ProbeTimeout)`, so a dead address fails in ≤3s regardless of retries. The sentinel-mode completion of LR-012; the worked example for the cross-mode-parity rule (§7). See changelog LR-017.
 

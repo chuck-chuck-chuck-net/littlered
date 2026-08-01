@@ -67,8 +67,12 @@ type SentinelNodeState struct {
 	NumSlaves         int
 }
 
-// SentinelClusterState represents the combined "Ground Truth" of the entire cluster
-type SentinelClusterState struct {
+// ReplicationState represents the combined "Ground Truth" of a replication-based
+// instance — every data pod's replication view plus (in sentinel mode) every
+// Sentinel's monitoring view. It is the shared state container for the
+// sentinel- and failover-mode reconciliation paths; the Sentinel-specific
+// predicates on it are no-ops when SentinelNodes is empty.
+type ReplicationState struct {
 	RedisNodes    map[string]*RedisNodeState
 	SentinelNodes map[string]*SentinelNodeState
 	ValidIPs      map[string]bool
@@ -78,9 +82,9 @@ type SentinelClusterState struct {
 	FailoverActive bool
 }
 
-// NewSentinelClusterState initializes a new cluster state
-func NewSentinelClusterState() *SentinelClusterState {
-	return &SentinelClusterState{
+// NewReplicationState initializes an empty ReplicationState
+func NewReplicationState() *ReplicationState {
+	return &ReplicationState{
 		RedisNodes:    make(map[string]*RedisNodeState),
 		SentinelNodes: make(map[string]*SentinelNodeState),
 		ValidIPs:      make(map[string]bool),
@@ -88,7 +92,7 @@ func NewSentinelClusterState() *SentinelClusterState {
 }
 
 // DetermineRealMaster uses the gathered information to decide who the authoritative master is.
-func (s *SentinelClusterState) DetermineRealMaster() {
+func (s *ReplicationState) DetermineRealMaster() {
 	// 1. Check for active failover
 	for _, sn := range s.SentinelNodes {
 		if sn.Reachable && sn.Monitoring && sn.FailoverStatus != "" &&
@@ -145,7 +149,7 @@ func (s *SentinelClusterState) DetermineRealMaster() {
 // bootstrap deadlock (as opposed to a recent master death, where the Sentinels
 // still monitor the now-dead master and know its replicas). It returns the count
 // of reachable Sentinels so callers can gate on quorum.
-func (s *SentinelClusterState) AllSentinelsBare() (bare bool, reachable int) {
+func (s *ReplicationState) AllSentinelsBare() (bare bool, reachable int) {
 	monitoring := 0
 	for _, sn := range s.SentinelNodes {
 		if !sn.Reachable {
@@ -160,7 +164,7 @@ func (s *SentinelClusterState) AllSentinelsBare() (bare bool, reachable int) {
 }
 
 // DataHolders returns the reachable Redis nodes that currently hold keys.
-func (s *SentinelClusterState) DataHolders() []*RedisNodeState {
+func (s *ReplicationState) DataHolders() []*RedisNodeState {
 	var holders []*RedisNodeState
 	for _, rn := range s.RedisNodes {
 		if rn.Reachable && rn.Keys > 0 {
@@ -188,7 +192,7 @@ func (s *SentinelClusterState) DataHolders() []*RedisNodeState {
 // a promotion chain as divergent and wrongly refuse a safe election.
 //
 // Returns (nil, false) when no node holds data.
-func (s *SentinelClusterState) BestDataHolder() (best *RedisNodeState, diverged bool) {
+func (s *ReplicationState) BestDataHolder() (best *RedisNodeState, diverged bool) {
 	holders := s.DataHolders()
 	if len(holders) == 0 {
 		return nil, false
@@ -277,7 +281,7 @@ func holdersDiverged(holders []*RedisNodeState) bool {
 }
 
 // IsGhost returns true if the given IP is not in the set of valid pod IPs
-func (s *SentinelClusterState) IsGhost(ip string) bool {
+func (s *ReplicationState) IsGhost(ip string) bool {
 	if ip == "" {
 		return false
 	}
@@ -287,7 +291,7 @@ func (s *SentinelClusterState) IsGhost(ip string) bool {
 // HasHealthyKnownReplica reports whether at least one monitoring sentinel knows a
 // replica that is neither a ghost nor s_down — i.e. a candidate Sentinel could
 // promote during a failover.
-func (s *SentinelClusterState) HasHealthyKnownReplica() bool {
+func (s *ReplicationState) HasHealthyKnownReplica() bool {
 	for _, sn := range s.SentinelNodes {
 		if !sn.Reachable || !sn.Monitoring {
 			continue
@@ -302,7 +306,7 @@ func (s *SentinelClusterState) HasHealthyKnownReplica() bool {
 }
 
 // ReachableSentinels returns the number of reachable Sentinel pods.
-func (s *SentinelClusterState) ReachableSentinels() int {
+func (s *ReplicationState) ReachableSentinels() int {
 	n := 0
 	for _, sn := range s.SentinelNodes {
 		if sn.Reachable {
@@ -316,7 +320,7 @@ func (s *SentinelClusterState) ReachableSentinels() int {
 // monitoring a master IP that is a ghost (no live pod). This is the signature of the
 // ghost-master failover deadlock — Sentinel is pinned to a dead master it cannot fail
 // over off — as distinct from the bare-Sentinel leaderless state (AllSentinelsBare).
-func (s *SentinelClusterState) SentinelsMonitorGhostMaster() bool {
+func (s *ReplicationState) SentinelsMonitorGhostMaster() bool {
 	reachable, ghost := 0, 0
 	for _, sn := range s.SentinelNodes {
 		if !sn.Reachable {
@@ -351,7 +355,7 @@ func (s *SentinelClusterState) SentinelsMonitorGhostMaster() bool {
 // When not whole we simply defer: the ghost entry is harmless and will be pruned on a
 // later reconcile once the cluster is whole again. Deferring a RESET never causes a
 // deadlock; issuing one at the wrong moment does.
-func (s *SentinelClusterState) GhostReplicaResetSafe(ghostFound, clusterWhole bool) bool {
+func (s *ReplicationState) GhostReplicaResetSafe(ghostFound, clusterWhole bool) bool {
 	if !ghostFound || !clusterWhole {
 		return false
 	}
@@ -364,8 +368,9 @@ func (s *SentinelClusterState) GhostReplicaResetSafe(ghostFound, clusterWhole bo
 	return s.HasHealthyKnownReplica()
 }
 
-// GetHealActions returns a list of recommended actions to fix the cluster state
-func (s *SentinelClusterState) GetHealActions(masterName string) []string {
+// GetHealActions returns a list of recommended actions to fix the instance's
+// topology (sentinel mode: MONITOR/SLAVEOF/RESET suggestions).
+func (s *ReplicationState) GetHealActions(masterName string) []string {
 	var actions []string
 	if s.RealMasterIP == "" {
 		return actions

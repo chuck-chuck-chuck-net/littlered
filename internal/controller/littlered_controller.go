@@ -93,15 +93,15 @@ type LittleRedReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
 
-	// Background fast-detection monitors. sentinelEvents is the mode-agnostic
+	// Background fast-detection monitors. monitorEvents is the mode-agnostic
 	// GenericEvent channel wired into SetupWithManager (both the sentinel
 	// +switch-master subscriber and the failover-mode master watcher push onto
-	// it; the name predates failover mode). monitors holds the sentinel
+	// it). monitors holds the sentinel
 	// subscribers, failoverMonitors the failover-mode watchers — separate maps
 	// because the mode-mismatch stop branches in Reconcile are per-kind (a
 	// shared map could not tell WHICH monitor runs under a key across a mode
 	// switch). Both share monitorsMu (bookkeeping only, no contention).
-	sentinelEvents   chan event.GenericEvent
+	monitorEvents    chan event.GenericEvent
 	monitors         map[types.NamespacedName]func()
 	failoverMonitors map[types.NamespacedName]func()
 	monitorsMu       sync.Mutex
@@ -765,7 +765,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 
 	// 2. Gather Cluster State (Ground Truth)
 	g := &operatorGatherer{password: password, tlsEnabled: littleRed.Spec.TLS.Enabled}
-	state := redisclient.GatherClusterState(ctx, g, redisMap, sentinelMap)
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap)
 
 	// 3. Healing
 
@@ -1464,7 +1464,7 @@ func (r *LittleRedReconciler) setFailedStatus(ctx context.Context, lr *littlered
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LittleRedReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	r.sentinelEvents = make(chan event.GenericEvent)
+	r.monitorEvents = make(chan event.GenericEvent)
 	r.monitors = make(map[types.NamespacedName]func())
 	r.failoverMonitors = make(map[types.NamespacedName]func())
 
@@ -1474,7 +1474,7 @@ func (r *LittleRedReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.Service{}).
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&policyv1.PodDisruptionBudget{}).
-		WatchesRawSource(source.Channel(r.sentinelEvents, &handler.EnqueueRequestForObject{})).
+		WatchesRawSource(source.Channel(r.monitorEvents, &handler.EnqueueRequestForObject{})).
 		Named("littlered").
 		Complete(r)
 }
@@ -1706,7 +1706,7 @@ const leaderlessRecoveryCooldown = 30 * time.Second
 func (r *LittleRedReconciler) recoverLeaderlessDeadlock(
 	ctx context.Context,
 	lr *littleredv1alpha1.LittleRed,
-	state *redisclient.SentinelClusterState,
+	state *redisclient.ReplicationState,
 	redisMap map[string]string,
 	password string,
 ) error {
@@ -1800,7 +1800,7 @@ func (r *LittleRedReconciler) recoverLeaderlessDeadlock(
 // alone would not promote it, and Rule R skips the elected master, so nothing else
 // would. An unreachable / wait-looping elect (the no-data reseed) starts fresh as
 // master via its own startup script, so no promotion is issued.
-func (r *LittleRedReconciler) electMaster(ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.SentinelClusterState, masterIP, password string, quorum int) error {
+func (r *LittleRedReconciler) electMaster(ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState, masterIP, password string, quorum int) error {
 	if needsPromotion(state, masterIP) {
 		auditLog := r.getLogger(ctx, lr, LogCategoryAudit)
 		auditLog.Info("Promoting elected pod to master (REPLICAOF NO ONE)", "master", masterIP, "wasRole", state.RedisNodes[masterIP].Role)

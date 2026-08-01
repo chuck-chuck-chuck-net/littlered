@@ -332,7 +332,7 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 	// deliberately ignored — in failover mode the operator's intent is the
 	// sole master authority (determineFailoverLiveMaster).
 	g := &operatorGatherer{password: password, tlsEnabled: lr.Spec.TLS.Enabled}
-	state := redisclient.GatherClusterState(ctx, g, redisMap, map[string]string{})
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, map[string]string{})
 
 	// 3. Re-derive the intent and the live master from live state.
 	views := buildFailoverPodViews(podList, state)
@@ -488,7 +488,7 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 func (r *LittleRedReconciler) executeFailoverPlan(
 	ctx context.Context,
 	lr *littleredv1alpha1.LittleRed,
-	state *redisclient.SentinelClusterState,
+	state *redisclient.ReplicationState,
 	podList *corev1.PodList,
 	intent failoverIntent,
 	plan failoverPlan,
@@ -577,7 +577,7 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 // primitive of sentinel-mode electMaster WITHOUT its Sentinel half
 // (seedSentinelsWithMaster) — in failover mode there is nothing to point at the
 // new master; the stamped annotations and the label flip carry the intent.
-func (r *LittleRedReconciler) promoteFailoverMaster(ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.SentinelClusterState, masterIP, password string) error {
+func (r *LittleRedReconciler) promoteFailoverMaster(ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState, masterIP, password string) error {
 	if !needsPromotion(state, masterIP) {
 		return nil
 	}
@@ -651,7 +651,7 @@ func (r *LittleRedReconciler) stampFailoverPod(ctx context.Context, lr *littlere
 
 // buildFailoverPodViews resolves the pure per-pod inputs from the K8s pod list
 // and (optionally) the gathered ground truth.
-func buildFailoverPodViews(podList *corev1.PodList, state *redisclient.SentinelClusterState) []failoverPodView {
+func buildFailoverPodViews(podList *corev1.PodList, state *redisclient.ReplicationState) []failoverPodView {
 	views := make([]failoverPodView, 0, len(podList.Items))
 	for i := range podList.Items {
 		p := &podList.Items[i]

@@ -761,9 +761,9 @@ littlered/
 │   ├── redis/
 │   │   ├── client.go                  # Sentinel client wrapper
 │   │   ├── cluster_client.go          # Cluster client wrapper
-│   │   ├── sentinel_state.go          # SentinelClusterState + DetermineRealMaster
+│   │   ├── replication_state.go       # ReplicationState + DetermineRealMaster
 │   │   ├── cluster_state.go           # ClusterGroundTruth + health checks
-│   │   └── gather.go                  # GatherClusterState / GatherClusterGroundTruth
+│   │   └── gather.go                  # GatherReplicationState / GatherClusterGroundTruth
 │   └── cli/
 │       ├── discovery/                 # Resource discovery for lrctl
 │       ├── k8s/                       # K8s exec-based Gatherer for lrctl

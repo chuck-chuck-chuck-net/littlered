@@ -40,6 +40,16 @@ func (r *LittleRedReconciler) ensureSentinelMonitor(ctx context.Context, littleR
 		return
 	}
 
+	// No event channel means the reconciler was constructed without
+	// SetupWithManager (unit/envtest): the monitor's only output does not
+	// exist, so there is nothing to accelerate — reconcile-cadence detection
+	// still works. This also keeps envtest reconciles from leaking
+	// subscription goroutines. (Parity with ensureFailoverMonitor.)
+	if r.monitorEvents == nil {
+		log.V(1).Info("No event channel wired (reconciler built without SetupWithManager), skipping Sentinel monitor")
+		return
+	}
+
 	r.monitorsMu.Lock()
 	defer r.monitorsMu.Unlock()
 
@@ -132,15 +142,24 @@ func (r *LittleRedReconciler) monitorSentinel(ctx context.Context, littleRed *li
 			for msg := range msgChan {
 				stateLog.Info("Received Sentinel event", "channel", msg.Channel, "payload", msg.Payload)
 
-				// Trigger reconciliation
+				// Trigger reconciliation. Cancel-guarded like the failover
+				// watcher's send: if the consumer is gone (manager shut down),
+				// a bare send would block this goroutine forever.
 				log.Info("Triggering reconciliation via Sentinel event")
-				r.sentinelEvents <- event.GenericEvent{
+				select {
+				case r.monitorEvents <- event.GenericEvent{
 					Object: &littleredv1alpha1.LittleRed{
 						ObjectMeta: ctrl.ObjectMeta{
 							Name:      littleRed.Name,
 							Namespace: littleRed.Namespace,
 						},
 					},
+				}:
+				case <-ctx.Done():
+					cleanup()
+					cancelSub()
+					log.Info("Stopping Sentinel monitor")
+					return
 				}
 			}
 

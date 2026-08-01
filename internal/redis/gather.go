@@ -33,7 +33,7 @@ type Gatherer interface {
 	GetClusterNodes(ctx context.Context, podName, ip string) ([]ClusterNodeInfo, error)
 }
 
-// GatherClusterState uses a Gatherer to populate a SentinelClusterState.
+// GatherReplicationState uses a Gatherer to populate a ReplicationState.
 //
 // Every Redis and Sentinel pod is probed concurrently: a single unreachable IP —
 // e.g. a stale pod IP the K8s cache hands us during pod churn — must not
@@ -42,8 +42,8 @@ type Gatherer interface {
 // concurrent gather (see gatherNodeIdentities / LR-012); it was previously a plain
 // sequential loop, and the same blackhole-dial stall then bit sentinel mode on a
 // managed cloud. See the cross-mode-parity rule in CLAUDE.md.
-func GatherClusterState(ctx context.Context, g Gatherer, redisPods, sentinelPods map[string]string) *SentinelClusterState {
-	state := NewSentinelClusterState()
+func GatherReplicationState(ctx context.Context, g Gatherer, redisPods, sentinelPods map[string]string) *ReplicationState {
+	state := NewReplicationState()
 
 	type redisResult struct {
 		ip string

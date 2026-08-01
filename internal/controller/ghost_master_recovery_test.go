@@ -35,10 +35,10 @@ type ghostSnSpec struct {
 
 const ghostMasterIP = "10.9.9.9" // never added to ValidIPs -> a ghost
 
-// buildGhostState builds a SentinelClusterState. Redis node IPs are marked valid (live
+// buildGhostState builds a ReplicationState. Redis node IPs are marked valid (live
 // pods); the ghost master IP is deliberately NOT, so IsGhost(masterIP) holds.
-func buildGhostState(sentinels []ghostSnSpec, redis []rnSpec) *redisclient.SentinelClusterState {
-	s := redisclient.NewSentinelClusterState()
+func buildGhostState(sentinels []ghostSnSpec, redis []rnSpec) *redisclient.ReplicationState {
+	s := redisclient.NewReplicationState()
 	for i, sn := range sentinels {
 		ip := "10.0.3." + string(rune('0'+i))
 		s.SentinelNodes[ip] = &redisclient.SentinelNodeState{

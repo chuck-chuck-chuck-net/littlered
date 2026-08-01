@@ -230,21 +230,21 @@ func TestGatherClusterGroundTruth_ProbesRunConcurrently(t *testing.T) {
 	}
 }
 
-// TestGatherClusterState_ProbesRunConcurrently is the sentinel-mode analogue of the
+// TestGatherReplicationState_ProbesRunConcurrently is the sentinel-mode analogue of the
 // cluster-mode concurrency guard above. It is a red-first regression test for the
 // leaderless-recovery stall observed on a managed cloud (op-logs: a single reconcile
 // blocked ~146s dialing freshly-killed Sentinel/Redis pod IPs that blackholed —
 // i/o timeout / no route to host — one after another). The stall froze status at
 // stale bootstrap values, so Rule L never ran inside the test window.
 //
-// The defect is that GatherClusterState probes every Redis pod and then every
+// The defect is that GatherReplicationState probes every Redis pod and then every
 // Sentinel pod sequentially, so N unreachable endpoints cost N × (dial timeout ×
 // retries) instead of ~one. A blocking fakeGatherer makes that serial cost
 // observable: against the current sequential implementation this test is RED
 // (elapsed ≈ total-pods × delay, max in-flight = 1); a concurrent gather turns it
 // green. Locally/on kubeadm the real bug hides because dead IPs RST fast (~0 delay);
 // the delay here stands in for the cloud's blackhole timeout.
-func TestGatherClusterState_ProbesRunConcurrently(t *testing.T) {
+func TestGatherReplicationState_ProbesRunConcurrently(t *testing.T) {
 	const delay = 120 * time.Millisecond
 
 	redisPods := map[string]string{
@@ -264,7 +264,7 @@ func TestGatherClusterState_ProbesRunConcurrently(t *testing.T) {
 	g := &fakeGatherer{nodeID: map[string]string{}, dead: map[string]bool{}, probeDelay: delay}
 
 	start := time.Now()
-	GatherClusterState(context.Background(), g, redisPods, sentinelPods)
+	GatherReplicationState(context.Background(), g, redisPods, sentinelPods)
 	elapsed := time.Since(start)
 
 	// Serial would be >= totalPods*delay (720ms). Concurrent should be a small

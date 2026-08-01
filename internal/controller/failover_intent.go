@@ -109,7 +109,7 @@ func resolveFailoverIntent(pods []failoverPodView) failoverIntent {
 // still up during a transition, or a bare restarted pod) is a straggler for
 // Rule R to repoint, never the live master. Returns "" when there is no intent
 // or the intended master is not observably mastering.
-func determineFailoverLiveMaster(state *redisclient.SentinelClusterState, intendedMasterIP string) string {
+func determineFailoverLiveMaster(state *redisclient.ReplicationState, intendedMasterIP string) string {
 	if intendedMasterIP == "" {
 		return ""
 	}
@@ -124,7 +124,7 @@ func determineFailoverLiveMaster(state *redisclient.SentinelClusterState, intend
 // observed converged (ADR-011 §6): the intended master pod reports role:master
 // AND carries the role=master K8s label. No intent at all is settled (there is
 // nothing to converge). roleLabels maps pod name -> current LabelRole value.
-func failoverTransitionSettled(intent failoverIntent, state *redisclient.SentinelClusterState, roleLabels map[string]string) bool {
+func failoverTransitionSettled(intent failoverIntent, state *redisclient.ReplicationState, roleLabels map[string]string) bool {
 	if intent.masterName == "" {
 		return true
 	}
@@ -145,7 +145,7 @@ func failoverTransitionSettled(intent failoverIntent, state *redisclient.Sentine
 // recoveries this mode exists for (the dead master can never again "report
 // role:master"). Cascade serialization for that case is the time-based
 // post-transition cooldown, not this gate.
-func failoverPromotionUnsettled(intent failoverIntent, state *redisclient.SentinelClusterState, roleLabels map[string]string) bool {
+func failoverPromotionUnsettled(intent failoverIntent, state *redisclient.ReplicationState, roleLabels map[string]string) bool {
 	if intent.masterName == "" {
 		return false
 	}
@@ -214,7 +214,7 @@ func planFailoverReauth(pods []failoverPodView, intent failoverIntent, liveMaste
 // handshake state, and re-issuing SLAVEOF would interrupt it (Rule R parity).
 // Sorted for determinism. The caller gates execution (settled transition, no
 // terminating pods — ADR-011 §6 secondary healing keeps the conservative gate).
-func planFailoverRepoints(state *redisclient.SentinelClusterState, liveMasterIP string) []string {
+func planFailoverRepoints(state *redisclient.ReplicationState, liveMasterIP string) []string {
 	var ips []string
 	for ip, rn := range state.RedisNodes {
 		if !rn.Reachable || ip == liveMasterIP {
