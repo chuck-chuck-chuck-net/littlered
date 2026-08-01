@@ -8,6 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	clifailover "github.com/littlered-operator/littlered-operator/internal/cli/failover"
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
@@ -73,6 +74,7 @@ type statusJSON struct {
 	Sentinels          *littleredv1alpha1.SentinelStatus    `json:"sentinels,omitempty"`
 	Replicas           *littleredv1alpha1.ReplicaStatus     `json:"replicas,omitempty"`
 	Cluster            *littleredv1alpha1.ClusterStatusInfo `json:"cluster,omitempty"`
+	Failover           *littleredv1alpha1.FailoverStatus    `json:"failover,omitempty"`
 	Conditions         []metav1.Condition                   `json:"conditions,omitempty"`
 }
 
@@ -89,6 +91,7 @@ func lrToStatusJSON(lr *littleredv1alpha1.LittleRed) statusJSON {
 		Sentinels:          lr.Status.Sentinels,
 		Replicas:           lr.Status.Replicas,
 		Cluster:            lr.Status.Cluster,
+		Failover:           lr.Status.Failover,
 		Conditions:         lr.Status.Conditions,
 	}
 }
@@ -127,8 +130,12 @@ type redisPodJSON struct {
 	Replication  map[string]string        `json:"replication,omitempty"`
 	ClusterNodes []clusterNodeInspectJSON `json:"clusterNodes,omitempty"`
 	ClusterInfo  map[string]string        `json:"clusterInfo,omitempty"`
-	Error        string                   `json:"error,omitempty"`
-	raw          string
+	// Assignment holds the operator-stamped assignment annotations plus the
+	// role label (failover mode only): assigned-role, assigned-master-ip,
+	// assignment-epoch, role-label.
+	Assignment map[string]string `json:"assignment,omitempty"`
+	Error      string            `json:"error,omitempty"`
+	raw        string
 }
 
 type inspectJSON struct {
@@ -304,6 +311,106 @@ func buildSentinelVerifyJSON(
 	}
 
 	result.Healthy = state.RealMasterIP != "" && len(result.HealActions) == 0 && !state.FailoverActive
+	return result
+}
+
+// failoverPodVerifyJSON merges the K8s-side view (assignment annotations,
+// role label, readiness) with the gathered replication state for one data pod.
+type failoverPodVerifyJSON struct {
+	PodName          string `json:"podName"`
+	IP               string `json:"ip"`
+	Phase            string `json:"phase,omitempty"`
+	Ready            bool   `json:"ready"`
+	Restarted        bool   `json:"restarted"`
+	Terminating      bool   `json:"terminating,omitempty"`
+	RoleLabel        string `json:"roleLabel,omitempty"`
+	HasAssignment    bool   `json:"hasAssignment"`
+	AssignedRole     string `json:"assignedRole,omitempty"`
+	AssignedMasterIP string `json:"assignedMasterIP,omitempty"`
+	AssignmentEpoch  int64  `json:"assignmentEpoch,omitempty"`
+	Parked           bool   `json:"parked,omitempty"`
+	Role             string `json:"role,omitempty"`
+	MasterHost       string `json:"masterHost,omitempty"`
+	LinkStatus       string `json:"linkStatus,omitempty"`
+	Offset           int64  `json:"offset,omitempty"`
+	Keys             int64  `json:"keys,omitempty"`
+	Replid           string `json:"replid,omitempty"`
+	Replid2          string `json:"replid2,omitempty"`
+	Reachable        bool   `json:"reachable"`
+}
+
+type failoverVerifyJSON struct {
+	Name                  string                  `json:"name"`
+	Namespace             string                  `json:"namespace"`
+	Mode                  string                  `json:"mode"`
+	IntendedMasterPod     string                  `json:"intendedMasterPod,omitempty"`
+	IntendedMasterIP      string                  `json:"intendedMasterIP,omitempty"`
+	MasterAssignmentEpoch int64                   `json:"masterAssignmentEpoch,omitempty"`
+	MaxAssignmentEpoch    int64                   `json:"maxAssignmentEpoch,omitempty"`
+	AuthorityMasterPod    string                  `json:"authorityMasterPod,omitempty"`
+	AuthorityMasterIP     string                  `json:"authorityMasterIP,omitempty"`
+	Pods                  []failoverPodVerifyJSON `json:"pods"`
+	Findings              []clifailover.Finding   `json:"findings"`
+	Healthy               bool                    `json:"healthy"`
+	Degraded              bool                    `json:"degraded"`
+}
+
+func buildFailoverVerifyJSON(
+	name, namespace string, views []clifailover.PodView,
+	state *redisclient.ReplicationState, analysis clifailover.Analysis,
+) failoverVerifyJSON {
+	findings := analysis.Findings
+	if findings == nil {
+		findings = []clifailover.Finding{}
+	}
+	result := failoverVerifyJSON{
+		Name:                  name,
+		Namespace:             namespace,
+		Mode:                  modeFailover,
+		IntendedMasterPod:     analysis.Intent.MasterName,
+		IntendedMasterIP:      analysis.Intent.MasterIP,
+		MasterAssignmentEpoch: analysis.Intent.MasterEpoch,
+		MaxAssignmentEpoch:    analysis.Intent.MaxEpoch,
+		AuthorityMasterPod:    analysis.AuthorityPod,
+		AuthorityMasterIP:     analysis.AuthorityIP,
+		Pods:                  []failoverPodVerifyJSON{},
+		Findings:              findings,
+		Healthy:               analysis.Healthy(),
+		Degraded:              analysis.Degraded(),
+	}
+
+	parked := make(map[string]bool, len(analysis.Parked))
+	for _, p := range analysis.Parked {
+		parked[p] = true
+	}
+
+	for _, v := range views {
+		entry := failoverPodVerifyJSON{
+			PodName:          v.Name,
+			IP:               v.IP,
+			Phase:            v.Phase,
+			Ready:            v.Ready,
+			Restarted:        v.Restarted,
+			Terminating:      v.Terminating,
+			RoleLabel:        v.RoleLabel,
+			HasAssignment:    v.HasAssignment,
+			AssignedRole:     v.AssignedRole,
+			AssignedMasterIP: v.AssignedMasterIP,
+			AssignmentEpoch:  v.Epoch,
+			Parked:           parked[v.Name],
+		}
+		if rn := state.RedisNodes[v.IP]; rn != nil {
+			entry.Role = rn.Role
+			entry.MasterHost = rn.MasterHost
+			entry.LinkStatus = rn.LinkStatus
+			entry.Offset = rn.Offset
+			entry.Keys = rn.Keys
+			entry.Replid = rn.Replid
+			entry.Replid2 = rn.Replid2
+			entry.Reachable = rn.Reachable
+		}
+		result.Pods = append(result.Pods, entry)
+	}
 	return result
 }
 

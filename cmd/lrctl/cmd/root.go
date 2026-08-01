@@ -16,11 +16,13 @@ const (
 	modeStandalone    = "standalone"
 	modeCluster       = "cluster"
 	modeSentinel      = "sentinel"
+	modeFailover      = "failover"
 	roleMaster        = "master"
 	roleSlave         = "slave" // Redis wire term, as reported by INFO / SENTINEL replies
 	redisCliBin       = "redis-cli"
 	infoSubcommand    = "info"
 	clusterSubcommand = "cluster"
+	statusUnreachable = "unreachable"
 )
 
 var (

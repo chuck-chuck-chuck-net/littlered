@@ -70,6 +70,24 @@ Master: <none>
 Redis Nodes: 6/6 Ready
 ```
 
+**Example Output (Failover Mode):**
+```text
+Cluster: store-failover
+Namespace: default
+Phase: Running
+Mode: failover
+Master: store-failover-redis-0 (IP: 10.233.66.112)
+Replicas: 2/2 Ready
+Redis Nodes: 3/3 Ready
+Assignment Epoch: 1
+Last Transition: 2026-08-01T12:38:36+02:00
+```
+
+Failover mode additionally surfaces the ADR-011 monitoring fields from `status.failover`: the
+assignment epoch mirrored from the pod annotations, `Master Down Since` while a detection window
+is running, `Last Transition` (the last master-intent stamp), and — when set — the
+`FailoverRecovery` condition (the refuse-and-wait state on diverged data holders).
+
 ---
 
 ### 2. inspect
@@ -83,6 +101,15 @@ lrctl inspect <name>
 **What it does:**
 - **Sentinel Mode**: Runs `SENTINEL master` on every sentinel pod and `INFO replication` on every redis pod.
 - **Cluster Mode**: Runs `CLUSTER NODES` and `CLUSTER INFO` on every node.
+- **Failover Mode**: Runs `INFO replication` on every redis pod and prints each pod's
+  operator-stamped assignment (the ADR-011 intent record) above the raw output:
+  ```text
+  Redis Pod: store-failover-redis-1 (IP: 10.233.65.205)
+    Assignment: role=replica, master-ip=10.233.66.112, epoch=1 (label: replica)
+    # Replication
+    role:slave
+    ...
+  ```
 - **Result**: Aggregates all raw output into a single report, allowing you to see exactly what every individual process believes the state to be.
 
 ---
@@ -151,6 +178,46 @@ The cluster summary has three verdicts: `[OK]` (healthy and shards colocated), `
 replica's replication link is down — reduced redundancy; often a transient resync, exit 0), and `[FAIL]` (a
 health/topology problem — missing slots, empty masters, or a **shard-colocation violation**: a replica whose master is
 in a different shard StatefulSet, which breaks per-shard failure-domain placement; see ADR-007).
+
+**Example Output (Failover Mode):**
+```text
+Verifying Cluster: default/store-failover (Mode: failover)
+Gathering Replication Ground Truth...
+
+Assignment Intent:
+  Intended Master: store-failover-redis-0 (10.233.66.112, epoch 1)
+  Max Assignment Epoch: 1
+
+Redis Status:
+  - Redis store-failover-redis-0: role:master, offset:25508, keys:0, assigned:master@1, label:master
+  - Redis store-failover-redis-1: role:slave, following:10.233.66.112, link:up, offset:25508, keys:0, assigned:replica@1, label:replica
+  - Redis store-failover-redis-2: role:slave, following:10.233.66.112, link:up, offset:25508, keys:0, assigned:replica@1, label:replica
+
+Ground Truth Summary:
+  [OK] Authority Master: store-failover-redis-0 (10.233.66.112)
+
+[OK] Instance configuration is consistent.
+```
+
+Failover mode (ADR-011) has no Sentinels: the operator's assignment annotations on the data pods
+are the intent record, and verification is the comparison **intent ∩ observation**:
+
+- **Assignment Intent** — the *intended* master is the pod with an `assigned-role: master`
+  annotation at the highest `assignment-epoch` (the operator's semantics). Each per-pod line shows
+  the observed role next to the assignment (`assigned:<role>@<epoch>`) and the routing label
+  (`label:`); a pod in the epoch-yield park state is marked `[PARKED]`, and terminating/not-ready
+  pods are marked too.
+- **Authority Master** — the intended master *iff* it is reachable and observed `role:master`
+  (mirrors the operator's `determineFailoverLiveMaster`). No authority master is a `[FAIL]`.
+- **Findings** — classified `[FAIL]` (verification fails, non-zero exit) or `[WARN]` (functional
+  but degraded, exit 0): label-vs-authority disagreement, a straggler (unintended `role:master`),
+  a replica following the wrong master IP, missing or duplicated master assignments, and **lineage
+  divergence** across data holders (`master_replid`/`master_replid2` disjoint — electing any one
+  node would discard writes) all FAIL; a parked pod, a fresh pod awaiting authorization, an
+  unreachable replica, and `link:down` toward the authority master (transient resync) WARN.
+
+The failover summary uses the same three verdicts as cluster mode: `[OK]`, `[DEGRADED]` (warnings
+only), `[FAIL]` (any FAIL finding, non-zero exit).
 
 **Advanced Checks:**
 - **Consensus**: Do all Sentinels agree on the master?

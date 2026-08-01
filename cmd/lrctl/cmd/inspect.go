@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/littlered-operator/littlered-operator/internal/cli/discovery"
+	clifailover "github.com/littlered-operator/littlered-operator/internal/cli/failover"
 	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
 	"github.com/spf13/cobra"
 )
@@ -76,6 +77,16 @@ var inspectCmd = &cobra.Command{
 			// ── collect redis pods ──────────────────────────────────────────
 			for _, pod := range cCtx.RedisPods {
 				entry := redisPodJSON{Pod: pod.Name, IP: pod.Status.PodIP}
+				if cCtx.Mode == modeFailover {
+					// The assignment annotations ARE the operator's intent
+					// record (ADR-011) — surface them alongside the live view.
+					entry.Assignment = map[string]string{
+						"assigned-role":      pod.Annotations[clifailover.AnnotationAssignedRole],
+						"assigned-master-ip": pod.Annotations[clifailover.AnnotationAssignedMasterIP],
+						"assignment-epoch":   pod.Annotations[clifailover.AnnotationAssignmentEpoch],
+						"role-label":         pod.Labels[clifailover.LabelRole],
+					}
+				}
 				var cmdArgs []string
 				if cCtx.Mode == modeCluster {
 					cmdArgs = []string{"sh", "-c", "redis-cli cluster nodes && echo --- && redis-cli cluster info"}
@@ -124,6 +135,13 @@ var inspectCmd = &cobra.Command{
 			}
 			for _, r := range res.Redis {
 				fmt.Printf("Redis Pod: %s (IP: %s)\n", r.Pod, r.IP)
+				if r.Assignment != nil {
+					fmt.Printf("  Assignment: role=%s, master-ip=%s, epoch=%s (label: %s)\n",
+						valueOrNone(r.Assignment["assigned-role"]),
+						valueOrNone(r.Assignment["assigned-master-ip"]),
+						valueOrNone(r.Assignment["assignment-epoch"]),
+						valueOrNone(r.Assignment["role-label"]))
+				}
 				if r.Error != "" {
 					fmt.Printf("  [!] Error: %s\n", r.Error)
 				} else {
@@ -143,6 +161,14 @@ var inspectCmd = &cobra.Command{
 		}
 		return nil
 	},
+}
+
+// valueOrNone renders an empty annotation/label value as <none>.
+func valueOrNone(v string) string {
+	if v == "" {
+		return "<none>"
+	}
+	return v
 }
 
 func printLines(stdout string) {

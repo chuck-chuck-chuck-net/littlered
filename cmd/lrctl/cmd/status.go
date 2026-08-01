@@ -90,6 +90,9 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 	if lr.Status.Sentinels != nil {
 		fmt.Printf("Sentinels: %d/%d Ready\n", lr.Status.Sentinels.Ready, lr.Status.Sentinels.Total)
 	}
+	if lr.Spec.Mode == modeFailover && lr.Status.Replicas != nil {
+		fmt.Printf("Replicas: %d/%d Ready\n", lr.Status.Replicas.Ready, lr.Status.Replicas.Total)
+	}
 	fmt.Printf("Redis Nodes: %d/%d Ready\n", lr.Status.Redis.Ready, lr.Status.Redis.Total)
 
 	// Surface an in-progress in-place legacy→per-shard cluster migration (ADR-013).
@@ -97,6 +100,28 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 	// output is unchanged).
 	if banner := migrationBanner(clusterMigration(lr)); banner != "" {
 		fmt.Println(banner)
+	}
+
+	// Failover-mode monitoring surfaces (ADR-011): assignment epoch, plus the
+	// detection-window and post-transition markers when set.
+	if fo := lr.Status.Failover; fo != nil {
+		fmt.Printf("Assignment Epoch: %d\n", fo.AssignmentEpoch)
+		if fo.MasterDownSince != nil {
+			fmt.Printf("Master Down Since: [!] %s (detection window running)\n",
+				fo.MasterDownSince.Format(timeFormat))
+		}
+		if fo.TransitionSince != nil {
+			fmt.Printf("Last Transition: %s\n", fo.TransitionSince.Format(timeFormat))
+		}
+	}
+
+	// Surface the failover-mode refuse-and-wait condition (ADR-011).
+	if c := apimeta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionFailoverRecovery); c != nil {
+		marker := "[recovered]"
+		if c.Status == "True" {
+			marker = "[!] ACTION MAY BE REQUIRED"
+		}
+		fmt.Printf("Failover Recovery: %s %s: %s\n", marker, c.Reason, c.Message)
 	}
 
 	// Surface the leaderless bootstrap-deadlock condition (ADR-005 / LR-015).
@@ -107,10 +132,13 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 		}
 		fmt.Printf("Leaderless Recovery: %s %s: %s\n", marker, c.Reason, c.Message)
 	} else if lr.Status.LeaderlessSince != nil {
-		since := lr.Status.LeaderlessSince.Format("2006-01-02T15:04:05Z07:00")
+		since := lr.Status.LeaderlessSince.Format(timeFormat)
 		fmt.Printf("Leaderless Recovery: [!] bare-Sentinel deadlock since %s\n", since)
 	}
 }
+
+// timeFormat is the timestamp layout used by printStatus (RFC3339).
+const timeFormat = "2006-01-02T15:04:05Z07:00"
 
 func init() {
 	rootCmd.AddCommand(statusCmd)

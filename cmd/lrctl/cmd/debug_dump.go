@@ -37,6 +37,8 @@ Collected artifacts:
   - Pod logs (all containers, current + previous for crash loops)
   - Redis state (INFO replication, SENTINEL MASTER/REPLICAS, CLUSTER NODES/INFO)
   - Kubernetes resources (pods, statefulsets, services, PDBs, events)
+  - Failover-mode assignment annotations (assigned-role / assigned-master-ip /
+    assignment-epoch per data pod, failover mode only)
 
 Secrets are never collected.`,
 	Args: cobra.ExactArgs(1),
@@ -79,6 +81,9 @@ func runDebugDump(_ *cobra.Command, args []string) error {
 	collectPodLogsForCR(ctx, k8sClient, dir, name, targetNS)
 	collectRedisState(ctx, coreClient, config, k8sClient, dir, lr)
 	collectK8sResources(dir, name, targetNS)
+	if lr.Spec.Mode == modeFailover {
+		collectFailoverAssignments(dir, name, targetNS)
+	}
 
 	fmt.Printf("Done. Artifacts written to %s/\n", dir)
 	return nil
@@ -210,6 +215,26 @@ func collectRedisState(
 			writeFile(dir, fmt.Sprintf("sentinel-%s-state.txt", pod.Name), out)
 		}
 	}
+}
+
+// --- Failover-Mode Assignment Annotations ---
+
+// collectFailoverAssignments dumps the operator-stamped assignment annotations
+// (the failover-mode intent record, ADR-011) plus the role label per data pod.
+func collectFailoverAssignments(dir, name, ns string) {
+	fmt.Println("  Collecting failover assignment annotations...")
+
+	const jsonpath = `{range .items[*]}{.metadata.name}` +
+		`{"\tlabel-role="}{.metadata.labels.redis\.chuck-chuck-chuck\.net/role}` +
+		`{"\tassigned-role="}{.metadata.annotations.redis\.chuck-chuck-chuck\.net/assigned-role}` +
+		`{"\tassigned-master-ip="}{.metadata.annotations.redis\.chuck-chuck-chuck\.net/assigned-master-ip}` +
+		`{"\tassignment-epoch="}{.metadata.annotations.redis\.chuck-chuck-chuck\.net/assignment-epoch}` +
+		`{"\n"}{end}`
+
+	out := kubectl("get", "pods", "-n", ns,
+		"-l", "app.kubernetes.io/instance="+name,
+		"-o", "jsonpath="+jsonpath)
+	writeFile(dir, "failover-assignments.txt", out)
 }
 
 // --- Kubernetes Resources ---

@@ -57,6 +57,16 @@ instances in the namespace.
   ghost-master case); `NONE` means split-brain or uninitialized. `[!] failover in
   progress` and the `Recommended Healing Actions` list tell you what the operator
   would do next.
+- **Failover mode:** two layers — *Assignment Intent* (what the operator stamped:
+  intended master + max assignment epoch, from the pod annotations) and
+  `Authority Master` (intent ∩ observation: the intended pod, reachable and
+  `role:master`). Per-pod lines show `assigned:<role>@<epoch>` next to the observed
+  role/label, so intent-vs-reality disagreement is visible at a glance. Findings:
+  `straggler` (unintended `role:master` — Rule-R repoint pending), `PARKED`
+  (not-Ready + restarted + consumed epoch — the kill-9 yield, waiting for an operator
+  epoch bump), label↔authority disagreement, lineage divergence across data holders.
+  Mid-transition captures legitimately show `[FAIL]` for a few seconds (epoch already
+  bumped, promotion not settled) — re-run before concluding it's stuck.
 - **Cluster mode:** `Cluster State`, `Total Slots Assigned: N / 16384` (anything <16384
   = gaps), `Ghost Nodes` (in cluster but not in K8s → expect `CLUSTER FORGET`),
   `Network Partitions`, and the per-master topology tree with replica link status.
