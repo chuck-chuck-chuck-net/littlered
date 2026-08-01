@@ -134,6 +134,15 @@ func getPodRoleLabel(namespace, pod string) string {
 	return strings.TrimSpace(out)
 }
 
+// podContainerLogContains reports whether the CURRENT container log of
+// pod/container contains substr (false on any kubectl error). Used for
+// mechanism OBSERVATIONS (e.g. the kill-9 epoch-gate park log, a
+// timing-dependent transient) — never for assertions.
+func podContainerLogContains(namespace, pod, container, substr string) bool {
+	out, err := utils.Run(exec.Command("kubectl", "logs", pod, "-n", namespace, "-c", container))
+	return err == nil && strings.Contains(out, substr)
+}
+
 // replicationView is the parsed `INFO replication` of one data pod.
 type replicationView struct {
 	role       string // role:master|slave

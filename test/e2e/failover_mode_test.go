@@ -458,9 +458,12 @@ var _ = Describe("Failover Mode", Label("failover-mode"), func() {
 
 	// -------------------------------------------------------------------------
 	// KILL-9 in-place: the ADR-001 same-IP hazard, re-owned by the epoch gate
-	// (ADR-011 §3). The pod is NOT replaced; the restarted container must PARK
-	// on its consumed epoch ("already consumed" log), the operator must promote
-	// a replica, and the old master must be re-authorized as a replica.
+	// (ADR-011 §3). The pod is NOT replaced. Asserted is the INVARIANT the ADR
+	// guarantees: the ex-master never re-enters service as master on its stale
+	// authorization; the operator promotes a replica; the ex-master rejoins as
+	// a replica at a strictly greater epoch. Whether the restarted container
+	// visibly PARKS ("already consumed" log) is a kubelet-timing race with two
+	// equally correct outcomes — recorded as an observation, never asserted.
 	// -------------------------------------------------------------------------
 	Context("Kill-9 In-Place Master Crash", Ordered, func() {
 		It("should yield mastership via the epoch gate and recover without data loss", func() {
@@ -511,16 +514,16 @@ var _ = Describe("Failover Mode", Label("failover-mode"), func() {
 			masterUID := podUID(testNamespace, masterPod)
 			Expect(masterUID).NotTo(BeEmpty())
 
+			By("capturing the pre-kill assignment epoch (the stale authorization)")
+			preKillEpoch, err := strconv.ParseInt(
+				getPodAnnotation(testNamespace, masterPod, failoverAnnEpoch), 10, 64)
+			Expect(err).NotTo(HaveOccurred(),
+				"master pod must carry a parsable assignment-epoch before the kill")
+
 			By(fmt.Sprintf("kill -9 on master pod %s (in-pod process crash, pod and IP stay)", masterPod))
 			killPodProcess(testNamespace, masterPod)
 
-			By("verifying the pod UID is UNCHANGED — only the container restarted")
-			Consistently(func(g Gomega) {
-				g.Expect(podUID(testNamespace, masterPod)).To(Equal(masterUID),
-					"pod UID changed — this is a pod replacement, not an in-pod crash")
-			}, 15*time.Second, 3*time.Second).Should(Succeed())
-
-			By("waiting for the redis container to restart (restart count > 0)")
+			By("waiting for the redis container restart to become visible (invariant-window start)")
 			Eventually(func(g Gomega) {
 				out, err := utils.Run(exec.Command("kubectl", "get", "pod", masterPod,
 					"-n", testNamespace,
@@ -529,35 +532,83 @@ var _ = Describe("Failover Mode", Label("failover-mode"), func() {
 				var count int
 				_, _ = fmt.Sscan(strings.TrimSpace(out), &count)
 				g.Expect(count).To(BeNumerically(">", 0))
+			}, 30*time.Second, 1*time.Second).Should(Succeed())
+
+			// THE INVARIANT (ADR-011 §3): after the in-place restart, the
+			// ex-master must never again SERVE as master on its stale
+			// authorization — i.e. never simultaneously (a) carry the
+			// role=master label (traffic routing) and (b) report role:master
+			// via INFO (actually serving). HOW it gets there is a
+			// kubelet-timing race with two equally correct outcomes: either
+			// its first annotation read precedes the downward-API sync of the
+			// operator's bumped epoch and it PARKS ("already consumed" log),
+			// or the fresh epoch is already visible and it starts directly as
+			// a replica (no park log). So the mechanism is only observed
+			// (parkLogSeen, reported below), never asserted.
+			//
+			// The window starts strictly AFTER the restart is visible: before
+			// it, label==master && role:master was the legitimate pre-kill
+			// state. The pod-UID check rides along for the whole window — an
+			// unchanged UID proves this stayed an in-pod crash, not a pod
+			// replacement.
+			parkLogSeen := false
+			By("verifying the ex-master never re-enters service as master on the stale epoch")
+			Consistently(func(g Gomega) {
+				g.Expect(podUID(testNamespace, masterPod)).To(Equal(masterUID),
+					"pod UID changed — this is a pod replacement, not an in-pod crash")
+
+				label := getPodRoleLabel(testNamespace, masterPod)
+				v, infoErr := getReplicationView(testNamespace, masterPod)
+				// While parked, INFO is unreachable — a legal (yielding) state;
+				// only label-routed AND serving as master violates the yield.
+				servesAsMaster := infoErr == nil && v.role == "master"
+				g.Expect(label == "master" && servesAsMaster).To(BeFalse(),
+					"the restarted ex-master serves as labeled master again on its stale epoch — the kill-9 yield (ADR-011 §3) is broken")
+
+				if !parkLogSeen {
+					parkLogSeen = podContainerLogContains(testNamespace, masterPod, "redis", "already consumed")
+				}
 			}, 30*time.Second, 2*time.Second).Should(Succeed())
 
-			// The restarted container replays its stale assigned-role:master
-			// annotation, but the EmptyDir run-marker holds the consumed epoch —
-			// the startup script must PARK (that parking IS the kill-9 yield).
-			By("verifying the epoch gate parked the restarted container ('already consumed' in its log)")
-			Eventually(func(g Gomega) {
-				out, err := utils.Run(exec.Command("kubectl", "logs", masterPod,
-					"-n", testNamespace, "-c", "redis"))
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(out).To(ContainSubstring("already consumed"),
-					"the restarted ex-master must park on its consumed assignment epoch (ADR-011 §3)")
-			}, 90*time.Second, 3*time.Second).Should(Succeed())
-
 			By("waiting for the operator to promote a replica (new master, different pod)")
+			var newMaster string
 			Eventually(func(g Gomega) {
-				newMaster := getMasterPod(crName)
+				newMaster = getMasterPod(crName)
 				g.Expect(newMaster).NotTo(BeEmpty())
 				g.Expect(newMaster).NotTo(Equal(masterPod),
 					"a data-holding replica must be promoted; the empty restarted ex-master must not reclaim mastership")
+				// Label-agreement guard (a26efa4 convention): only a labeled
+				// master is a completed promotion (and a safe IP source below).
+				g.Expect(getPodRoleLabel(testNamespace, newMaster)).To(Equal("master"),
+					"status.master must agree with the role label")
 			}, 2*time.Minute, 3*time.Second).Should(Succeed())
 
-			By("verifying the old master pod was re-authorized as a replica (label + INFO)")
+			newMasterIPRaw, err := utils.Run(exec.Command("kubectl", "get", "pod", newMaster,
+				"-n", testNamespace, "-o", "jsonpath={.status.podIP}"))
+			Expect(err).NotTo(HaveOccurred())
+			newMasterIP := strings.TrimSpace(newMasterIPRaw)
+			Expect(newMasterIP).NotTo(BeEmpty())
+
+			By("verifying the ex-master rejoins as a replica of the NEW master at a strictly greater epoch")
 			Eventually(func(g Gomega) {
+				// The operator's re-authorization: a replica assignment whose
+				// epoch strictly exceeds the consumed pre-kill epoch — the only
+				// thing that may release the yielded pod (ADR-011 §3).
+				g.Expect(getPodAnnotation(testNamespace, masterPod, failoverAnnRole)).To(Equal("replica"),
+					"old master must be re-assigned as replica")
+				epoch, err := strconv.ParseInt(
+					getPodAnnotation(testNamespace, masterPod, failoverAnnEpoch), 10, 64)
+				g.Expect(err).NotTo(HaveOccurred(), "old master must carry a parsable assignment-epoch")
+				g.Expect(epoch).To(BeNumerically(">", preKillEpoch),
+					"the re-authorization must carry a STRICTLY greater epoch than the consumed pre-kill one")
+
 				g.Expect(getPodRoleLabel(testNamespace, masterPod)).To(Equal("replica"),
 					"old master must be re-labeled replica")
 				v, err := getReplicationView(testNamespace, masterPod)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(v.role).To(Equal("slave"), "old master must be running as a replica")
+				g.Expect(v.masterHost).To(Equal(newMasterIP),
+					"old master must follow the NEW master's IP")
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("verifying the run-id changed (a fresh Redis process is running)")
@@ -566,6 +617,14 @@ var _ = Describe("Failover Mode", Label("failover-mode"), func() {
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(newRunID).NotTo(Equal(oldRunID))
 			}, 1*time.Minute, 5*time.Second).Should(Succeed())
+
+			// Race-frequency observation only (see the invariant comment above):
+			// did the epoch gate visibly PARK this run? The container survives
+			// its exec, so the park lines — if any — are still in its log.
+			if !parkLogSeen {
+				parkLogSeen = podContainerLogContains(testNamespace, masterPod, "redis", "already consumed")
+			}
+			GinkgoWriter.Printf("Epoch-gate park log ('already consumed') observed this run: %v\n", parkLogSeen)
 
 			By("verifying full topology consistency")
 			verifyFailoverTopologySync(testNamespace, crName, 2)
