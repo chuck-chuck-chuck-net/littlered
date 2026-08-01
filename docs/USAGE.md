@@ -474,6 +474,134 @@ store.<namespace>.svc.cluster.local:6379
 
 ---
 
+## Failover Mode (Experimental)
+
+Operator-managed high availability **without Sentinel**: 1 master +
+`spec.failover.replicas` replicas (default 2), and the operator itself performs
+failure detection and failover (ADR-011). It is the same logical topology as
+sentinel mode minus the 3 Sentinel pods.
+
+**Status: experimental.** The mode is under active validation — the operator
+emits a warning event (`ExperimentalMode`) on the first reconcile of a
+failover-mode instance, and its e2e/chaos validation (the graduation gate
+written in `docs/FAILOVER_MODE_DESIGN.md` §4) is still in progress. `sentinel`
+mode remains fully supported; choose for yourself based on the trade-off below.
+
+**The trade-off, honestly:** failover mode couples HA to **operator liveness**.
+If the operator is down when a master dies, failover waits until the operator
+is back (mitigations: operator leader election with multiple replicas, fast
+restart, and a background watcher that keeps detection in the seconds range).
+In exchange there is only **one** failure detector — the class of
+operator-vs-Sentinel races that produced the hardest sentinel-mode deadlocks
+(see the LR-007/LR-008 and LR-024 entries in
+`docs/RECONCILIATION_ALGORITHM_CHANGELOG.md`) does not exist, and clients are
+routed by a single authority (the operator's `role: master` label, which is
+what routes sentinel-mode traffic anyway).
+
+### Deploy
+
+```yaml
+# failover.yaml
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: store
+spec:
+  mode: failover
+
+  # Optional: customize failover settings (defaults shown)
+  failover:
+    replicas: 2                  # data pods = 1 + replicas
+    downAfterMilliseconds: 5000  # sustained-failure window before the operator declares the master dead
+    minReplicasToWrite: 0        # 0 = off; >0 bounds write loss at the cost of write availability
+```
+
+```bash
+kubectl apply -f failover.yaml
+```
+
+### Verify
+
+```bash
+# Check status
+kubectl get littlered store
+
+# Expected output:
+# NAME       MODE       PHASE     READY   AGE
+# store   failover   Running   3       1m
+
+# Check pods (1 master + 2 replicas, NO sentinel pods)
+kubectl get pods -l app.kubernetes.io/instance=store
+
+# Expected:
+# store-redis-0      2/2     Running
+# store-redis-1      2/2     Running
+# store-redis-2      2/2     Running
+
+# Check services
+kubectl get svc -l app.kubernetes.io/instance=store
+
+# Expected:
+# store            ClusterIP   ...   6379/TCP,9121/TCP   (routes to current master)
+# store-replicas   ClusterIP   ...   6379/TCP,9121/TCP   (all data pods, headless)
+
+# The operator's role assignments live on the pods as annotations:
+kubectl get pods -l app.kubernetes.io/instance=store \
+  -o custom-columns='NAME:.metadata.name,ROLE:.metadata.annotations.redis\.chuck-chuck-chuck\.net/assigned-role,EPOCH:.metadata.annotations.redis\.chuck-chuck-chuck\.net/assignment-epoch'
+```
+
+### Test failover
+
+```bash
+# Find current master
+kubectl get littlered store -o jsonpath='{.status.master.podName}'
+
+# Kill the master pod
+kubectl delete pod store-redis-0 --grace-period=0 --force
+
+# Watch the operator promote a replica (detection is immediate on pod loss;
+# probe-evidenced failures wait downAfterMilliseconds)
+kubectl get littlered store -w
+
+# Inspect the failover monitoring surfaces
+kubectl get littlered store -o jsonpath='{.status.failover}'
+```
+
+### Connect from your application
+
+There are no Sentinel endpoints; use a plain (non-sentinel-aware) client
+against the master service — the operator keeps it pointed at the current
+master via the `role: master` label:
+
+```
+store.<namespace>.svc.cluster.local:6379
+```
+
+### Data-safety opt-in: allowUnsafeRebootstrapOnDeadlock
+
+If the instance ever reaches a no-master state, the operator resolves it
+data-aware, gated on replication **lineage** (not a raw holder count):
+
+- **No pod holds data** → it reseeds `redis-0`. Automatic, nothing to lose.
+- **Survivors hold data on a single replication lineage** (this includes the
+  normal promotion chain left behind by earlier failovers) → it promotes the
+  most-complete survivor. Automatic and safe — the other survivors resync from
+  the winner, no independent writes are discarded. **No opt-in needed.**
+- **Survivors span two or more independent lineages** → electing any one would
+  discard the writes unique to the others, so the operator **refuses**: it
+  raises the `FailoverRecovery` condition with reason `RefusedDataPresent` and
+  waits for a human. Setting `spec.failover.allowUnsafeRebootstrapOnDeadlock: true`
+  authorizes it to force-elect the most-complete pod instead — the divergent
+  data on the other lineages is discarded via full resync. Enable only where
+  data loss is acceptable (e.g. caches).
+
+Note the difference from the sentinel-mode field of the same name: the sentinel
+gate refuses on **≥2 data holders**; the failover gate refuses only on **≥2
+divergent lineages**, so a plain multi-replica survivor set recovers
+automatically.
+
+---
+
 ## Cluster Mode
 
 Horizontally scaled setup with automatic sharding across multiple master nodes. Data is distributed using hash slots (16384 total). No PersistentVolumes required - cluster state is stored in the CR status.
@@ -1026,6 +1154,7 @@ The `minReadySeconds` setting ensures:
 |------|------------------------|--------|
 | Cluster with replicas | 30s | Allows automatic failover (cluster-node-timeout + promotion + buffer) |
 | Sentinel mode | 35s | Allows sentinel-managed failover (down-after-milliseconds + promotion) |
+| Failover mode | 15s | Operator-led handover is faster than Sentinel's (default 5s detection window + promote/repoint); 15s lets a transition settle before the next pod rolls |
 | Standalone or 0-replica | 0s | No failover mechanism, immediate restart is safe |
 
 ### Performing a Rolling Restart

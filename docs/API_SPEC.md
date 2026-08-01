@@ -3,7 +3,7 @@
 > Detailed Custom Resource Definition schema for LittleRed.
 
 **Document Status**: Active
-**Last Updated**: 2026-02-24
+**Last Updated**: 2026-08-01
 **API Version**: `redis.chuck-chuck-chuck.net/v1alpha1`
 
 ---
@@ -29,7 +29,7 @@ status:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `mode` | `string` | No | `standalone` | Deployment mode: `standalone`, `sentinel`, or `cluster` |
+| `mode` | `string` | No | `standalone` | Deployment mode: `standalone`, `sentinel`, `cluster`, or `failover` (**experimental** — operator-managed HA without Sentinel, see §2.12) |
 
 ### 2.2 Image Configuration
 
@@ -398,7 +398,41 @@ label-routed `{name}` Service are unaffected), and there is no rolling cutover �
 master under two names runs two independent failover state machines that can promote different
 replicas.
 
-### 2.12 Cluster-Specific Configuration
+### 2.12 Failover-Specific Configuration (Experimental)
+
+Only applicable when `mode: failover` (enforced by a CEL rule on the CRD).
+
+> **Experimental**: mode `failover` is operator-managed HA without Sentinel,
+> under active validation — see `docs/RECONCILIATION_LOOP_FAILOVER.md` and
+> ADR-011 for current status and trade-offs vs `sentinel`. The operator emits a
+> warning event (`ExperimentalMode`) on the first reconcile of a failover-mode
+> instance. Trade-off: failover orchestration is coupled to operator liveness.
+
+```yaml
+spec:
+  failover:
+    replicas: 2                   # Redis replicas; total data pods = 1 + replicas
+    downAfterMilliseconds: 5000   # Sustained-failure window before the operator declares the master down
+    minReplicasToWrite: 0         # Rendered as min-replicas-to-write (0 = off)
+    allowUnsafeRebootstrapOnDeadlock: false  # Break a diverged-lineage no-master deadlock (destructive)
+```
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `failover.replicas` | `int32` | No | `2` | Number of Redis replicas (min: 1); total data pods = `1 + replicas`. The first mode with a configurable replica count — no quorum math depends on it. |
+| `failover.downAfterMilliseconds` | `int` | No | `5000` | Sustained-failure window before the operator declares the master dead on probe evidence and initiates a failover. Kubernetes-authoritative evidence (pod deleted/replaced, redis container not-Ready per kubelet, pod terminating) is acted on immediately, without this window. |
+| `failover.minReplicasToWrite` | `int` | No | `0` | Rendered into `redis.conf` as `min-replicas-to-write` (only when > 0): the master stops accepting writes when fewer than this many replicas are connected. Off by default (parity with sentinel mode); setting it trades write availability for a bound on data lost in a failover. |
+| `failover.allowUnsafeRebootstrapOnDeadlock` | `bool` | No | `false` | Permit the operator to break a no-master deadlock when the surviving data holders span **divergent replication lineages** (electing any one discards the independent writes on the others). A deadlock with no data, or with all survivors on a single lineage — including a normal post-failover promotion chain — is always broken automatically and safely regardless of this flag (the most-complete holder is promoted, discarding nothing). Enable only for instances where data loss is acceptable (e.g. caches). Note the gate differs from the sentinel-mode field of the same name, which is keyed on the data-holder *count*; this one is keyed on lineage. |
+
+There are no Sentinel-only knobs (`quorum`, `failoverTimeout`, `parallelSyncs`,
+sentinel container resources) — the mode has no Sentinel processes.
+
+**Failover mode creates**:
+- StatefulSet `{name}-redis` (`1 + replicas` pods; **no** Sentinel StatefulSet, no `sentinel.conf`, no sentinel Service)
+- Service `{name}` (ClusterIP, selector `role=master` — routes to the current master) and Service `{name}-replicas` (headless, all data pods)
+- A PDB over the data pods (always ≥ 2 pods, so the PDB redundancy rule holds)
+
+### 2.13 Cluster-Specific Configuration
 
 Only applicable when `mode: cluster`:
 
@@ -428,10 +462,10 @@ spec:
 - Data durability through replication, not disk persistence
 - Minimum 3 shards required by Redis Cluster protocol
 
-### 2.13 Placement (Cluster Mode)
+### 2.14 Placement (Cluster Mode)
 
-Only applicable when `mode: cluster`; rejected by validation in standalone and
-sentinel mode. Configures per-shard failure-domain isolation. The operator
+Only applicable when `mode: cluster`; rejected by validation in every other mode
+(standalone, sentinel, failover). Configures per-shard failure-domain isolation. The operator
 translates `shardAntiAffinity` into a per-shard `topologySpreadConstraint`
 (`maxSkew: 1`, `labelSelector` scoped to that shard's pods via the operator-owned
 `redis.chuck-chuck-chuck.net/shard` label) injected into each shard StatefulSet,
@@ -455,7 +489,7 @@ spec:
 > and too few domains, unschedulable pods surface as standard `Pending` pods
 > (visible through readiness: `status.redis.ready < total`, phase `Initializing`).
 
-### 2.14 Requeue Intervals
+### 2.15 Requeue Intervals
 
 For tuning large-scale installations to reduce API server pressure:
 
@@ -471,7 +505,7 @@ spec:
 | `requeueIntervals.fast` | `Duration` | No | `2s` | Interval during init/recovery |
 | `requeueIntervals.steadyState` | `Duration` | No | `30s` | Interval when stable |
 
-### 2.15 PodDisruptionBudget
+### 2.16 PodDisruptionBudget
 
 A [PodDisruptionBudget](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/) (PDB)
 protects the Redis pods from voluntary disruptions (node drains, rolling node
@@ -487,6 +521,7 @@ regardless of `create`:
 |------|------|
 | `standalone` (1 pod) | ❌ never |
 | `sentinel` (1 master + 2 replicas, 3 sentinels) | ✅ |
+| `failover` (1 master + ≥1 replicas) | ✅ (always ≥ 2 data pods) |
 | `cluster`, `replicasPerShard ≥ 1` | ✅ |
 | `cluster`, `replicasPerShard = 0` (single pod per shard) | ❌ never |
 
@@ -536,18 +571,27 @@ status:
     ready: 1                    # Ready Redis pods
     total: 1                    # Total Redis pods
 
-  # Sentinel mode only
+  # Sentinel + failover modes
   bootstrapRequired: true       # True on creation, cleared after first master elected
-  leaderlessSince: "2026-07-09T13:10:37Z"  # Set when a bootstrap deadlock is observed; cleared once a master is known
   master:
     podName: store-redis-0   # Current master pod
     ip: 10.0.0.5                # Current master IP
   replicas:
     ready: 2
     total: 2
+
+  # Sentinel mode only
+  leaderlessSince: "2026-07-09T13:10:37Z"  # Set when a bootstrap deadlock is observed; cleared once a master is known
   sentinels:
     ready: 3
     total: 3
+
+  # Failover mode only — monitoring surfaces: every value is re-derived from
+  # live state on each reconcile; nothing load-bearing is persisted here
+  failover:
+    masterDownSince: "2026-08-01T09:00:00Z"  # First observation of the master as unreachable (detection window anchor)
+    assignmentEpoch: 4                        # Mirror of the epoch stamped on the pods (authority lives on the pods)
+    transitionSince: "2026-08-01T09:00:05Z"   # Last master-intent stamp; anchors the post-transition cooldown
 
   # Cluster mode only
   cluster:
@@ -573,18 +617,21 @@ status:
 |-------|------|-------------|
 | `phase` | `string` | `Pending`, `Initializing`, `Running`, `Failed`, `Terminating` |
 | `status` | `string` | Human-readable summary: master pod name when Running, phase otherwise. Shown in `kubectl get littlered` output. |
-| `bootstrapRequired` | `bool` | True on creation, cleared after first master is elected (sentinel mode) |
+| `bootstrapRequired` | `bool` | True on creation, cleared after the first master is elected (sentinel + failover modes) |
 | `leaderlessSince` | `Time` | Set when the operator first observes a leaderless, all-Sentinels-bare bootstrap deadlock; cleared once a master is known. Gates the leaderless-recovery cooldown (sentinel mode). |
 | `observedGeneration` | `int64` | Last processed `.metadata.generation` |
 | `conditions` | `[]Condition` | Detailed status conditions |
 | `redis.ready` | `int32` | Ready Redis pod count |
 | `redis.total` | `int32` | Total Redis pod count |
-| `master.podName` | `string` | Current master pod name (sentinel mode) |
-| `master.ip` | `string` | Current master pod IP (sentinel mode) |
-| `replicas.ready` | `int32` | Ready replica count (sentinel mode) |
-| `replicas.total` | `int32` | Total replica count (sentinel mode) |
+| `master.podName` | `string` | Current master pod name (sentinel + failover modes; in failover mode this is the operator's intent once *observed* live, empty during transitions) |
+| `master.ip` | `string` | Current master pod IP (sentinel + failover modes) |
+| `replicas.ready` | `int32` | Ready replica count (sentinel + failover modes) |
+| `replicas.total` | `int32` | Total replica count (sentinel + failover modes) |
 | `sentinels.ready` | `int32` | Ready sentinel count (sentinel mode) |
 | `sentinels.total` | `int32` | Total sentinel count (sentinel mode) |
+| `failover.masterDownSince` | `Time` | When the operator first observed the current master as unreachable — the `downAfterMilliseconds` detection-window anchor. Cleared once the master is reachable again or a failover completes. **Monitoring surface only** (failover mode). |
+| `failover.assignmentEpoch` | `int64` | Mirror of the monotonic assignment epoch stamped on the data pods' annotations. The authoritative epoch lives on the pods and is re-derived from live state, never read back from status. **Monitoring surface only** (failover mode). |
+| `failover.transitionSince` | `Time` | When the operator last stamped a new master intent (bootstrap seed, failover promotion, or unsafe elect). Anchors the short post-transition cooldown that serializes cascading failovers; if lost, at worst one cooldown window is skipped. **Monitoring surface only** (failover mode). |
 | `cluster.state` | `string` | Cluster state: `ok`, `fail`, `initializing` (cluster mode) |
 | `cluster.lastBootstrap` | `Time` | Timestamp of last full cluster bootstrap (cluster mode) |
 | `cluster.nodes` | `[]ClusterNodeState` | Per-node topology for operator-managed recovery (cluster mode) |
@@ -606,7 +653,8 @@ status:
 | `Ready` | ✅ | All components are ready and operational |
 | `Initialized` | ✅ | Initial setup complete |
 | `ConfigValid` | ✅ | Configuration is valid (set `False` on validation failure) |
-| `SentinelReady` | ✅ | Sentinel quorum established (sentinel mode) |
+| `SentinelReady` | ✅ | Sentinel quorum established (sentinel mode; never set in failover mode) |
+| `FailoverRecovery` | ✅ | Failover mode only: `True` means the instance needs attention — most importantly the refuse-and-wait state, where the surviving data holders span divergent replication lineages and electing any one would discard independent writes (set `failover.allowUnsafeRebootstrapOnDeadlock` to authorize); `False` records a completed recovery |
 | `TLSReady` | — | Reserved for future use (defined but not currently set) |
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |
 | `ClusterReady` | — | Reserved for future use (defined but not currently set) |
@@ -896,7 +944,21 @@ spec:
             topologyKey: kubernetes.io/hostname
 ```
 
-### 4.10 Minimal Cluster
+### 4.10 Minimal Failover (Experimental)
+
+```yaml
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: store-failover
+spec:
+  mode: failover   # experimental: operator-managed HA without Sentinel
+```
+
+Creates 3 data pods (1 master + 2 replicas by default), no Sentinel pods. See
+§2.12 for the knobs and `config/samples/littlered_v1alpha1_littlered_failover.yaml`.
+
+### 4.11 Minimal Cluster
 
 ```yaml
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
@@ -909,7 +971,7 @@ spec:
 
 Deploys: 3 masters + 3 replicas (6 pods total) with default settings.
 
-### 4.11 Cluster with Custom Shards
+### 4.12 Cluster with Custom Shards
 
 ```yaml
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
@@ -968,7 +1030,7 @@ labels:
   app.kubernetes.io/component: redis | sentinel | exporter
   app.kubernetes.io/managed-by: littlered-operator
   app.kubernetes.io/version: "8.0"
-  redis.chuck-chuck-chuck.net/mode: standalone | sentinel | cluster
+  redis.chuck-chuck-chuck.net/mode: standalone | sentinel | cluster | failover
 ```
 
 ### 5.2 Sentinel Mode Labels
@@ -979,6 +1041,21 @@ labels:
   redis.chuck-chuck-chuck.net/role: master | replica
 ```
 
+### 5.3 Failover Mode Labels and Annotations
+
+The dynamic `role` label works exactly as in sentinel mode (the `{name}` Service
+routes on it). In addition, the operator stamps its **assignment channel** onto
+each data pod as annotations (ADR-011); the pod reads them back through a
+downward-API volume. These are operator-owned — do not set them by hand:
+
+```yaml
+# On Redis pods (operator-stamped; the intent record)
+annotations:
+  redis.chuck-chuck-chuck.net/assigned-role: master | replica
+  redis.chuck-chuck-chuck.net/assigned-master-ip: "10.0.0.5"   # empty on the master's stamp
+  redis.chuck-chuck-chuck.net/assignment-epoch: "3"            # monotonic per instance
+```
+
 ---
 
 ## 6. Go Types (Reference)
@@ -986,8 +1063,8 @@ labels:
 ```go
 // LittleRedSpec defines the desired state of LittleRed
 type LittleRedSpec struct {
-    // Mode is the deployment mode: standalone, sentinel, or cluster
-    // +kubebuilder:validation:Enum=standalone;sentinel;cluster
+    // Mode is the deployment mode: standalone, sentinel, cluster, or failover (experimental)
+    // +kubebuilder:validation:Enum=standalone;sentinel;cluster;failover
     // +kubebuilder:default=standalone
     Mode string `json:"mode,omitempty"`
 
@@ -1024,8 +1101,36 @@ type LittleRedSpec struct {
     // Cluster defines cluster-specific settings (cluster mode only)
     Cluster *ClusterSpec `json:"cluster,omitempty"`
 
+    // Failover defines failover-specific settings (failover mode only, experimental)
+    Failover *FailoverSpec `json:"failover,omitempty"`
+
     // RequeueIntervals for tuning reconciliation frequency
     RequeueIntervals *RequeueIntervals `json:"requeueIntervals,omitempty"`
+}
+
+// FailoverSpec defines failover-specific settings. Mode failover is
+// experimental: operator-managed HA without Sentinel.
+type FailoverSpec struct {
+    // Replicas is the number of Redis replicas; total data pods = 1 + replicas.
+    // +kubebuilder:validation:Minimum=1
+    // +kubebuilder:default=2
+    Replicas *int32 `json:"replicas,omitempty"`
+
+    // DownAfterMilliseconds is the sustained-failure window before the operator
+    // declares the master down on probe evidence and initiates a failover.
+    // +kubebuilder:default=5000
+    DownAfterMilliseconds int `json:"downAfterMilliseconds,omitempty"`
+
+    // MinReplicasToWrite is rendered into redis.conf as min-replicas-to-write
+    // (0 = disabled).
+    // +kubebuilder:validation:Minimum=0
+    // +kubebuilder:default=0
+    MinReplicasToWrite int `json:"minReplicasToWrite,omitempty"`
+
+    // AllowUnsafeRebootstrapOnDeadlock permits breaking a no-master deadlock
+    // when surviving data holders have DIVERGED replication lineages.
+    // +kubebuilder:default=false
+    AllowUnsafeRebootstrapOnDeadlock bool `json:"allowUnsafeRebootstrapOnDeadlock,omitempty"`
 }
 
 type ImageSpec struct {
@@ -1087,11 +1192,14 @@ type ConfigSpec struct {
 
 | Rule | Error Condition |
 |------|-----------------|
-| `mode` must be `standalone`, `sentinel`, or `cluster` | Invalid mode value |
+| `mode` must be `standalone`, `sentinel`, `cluster`, or `failover` | Invalid mode value |
 | If `auth.enabled`, must have `existingSecret` | Missing authentication secret |
 | If `tls.enabled`, must have `existingSecret` | Missing TLS certificate |
 | If `tls.clientAuth`, must have `caCertSecret` | Missing CA certificate |
 | `sentinel` config ignored if `mode=standalone` | Warning in status |
+| `spec.failover` only allowed with `mode: failover` (CEL rule on the CRD; `spec.sentinel`/`spec.cluster` are gated to their modes the same way) | Rejected at admission |
+| `failover.replicas` must be ≥ 1; `failover.minReplicasToWrite` must be ≥ 0 | Enforced by the CRD schema, mirrored in controller validation |
+| `spec.placement.shardAntiAffinity` rejected unless `mode: cluster` (failover included) | Validation failure |
 | `cluster.shards` must be exactly `3` | Currently only 3-shard clusters are supported (CRD schema allows ≥3, controller enforces exactly 3 until slot migration is implemented) |
 | `cluster.replicasPerShard` must be `0` or `1` | Currently only 0 or 1 replica per shard supported |
 | `maxmemory` must parse as quantity | Invalid memory format |

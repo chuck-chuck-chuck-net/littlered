@@ -3,7 +3,7 @@
 > Technical architecture for the LittleRed Kubernetes operator.
 
 **Document Status**: Active
-**Last Updated**: 2026-02-24
+**Last Updated**: 2026-08-01
 
 ---
 
@@ -17,6 +17,7 @@
 | **standalone** | A single Redis pod (`mode: standalone`) |
 | **sentinel** | The HA mode: 3 Redis pods (1 master + 2 replicas) monitored by 3 sentinel processes (`mode: sentinel`) |
 | **sentinels** | The 3 monitoring processes within a sentinel instance specifically |
+| **failover** | The operator-managed HA mode: 1 Redis master + N replicas, no Sentinel processes (`mode: failover`, experimental) |
 | **Redis Cluster** | The gossip-based sharding mode (`mode: cluster`) |
 
 "Cluster" on its own always refers to Redis Cluster mode. "Sentinel cluster" is avoided throughout because it is ambiguous — it could mean the whole sentinel setup or the sentinel processes themselves. "Instance" is the generic term for any LittleRed deployment.
@@ -33,8 +34,9 @@
 │  │                  LittleRed Operator                       │   │
 │  │  ┌─────────────────┐  ┌─────────────────────────────┐    │   │
 │  │  │ Controller      │  │ Sentinel Event Monitor      │    │   │
-│  │  │ Manager         │  │ (background goroutine       │    │   │
-│  │  │                 │  │  per sentinel CR)            │    │   │
+│  │  │ Manager         │  │ (per sentinel CR) /         │    │   │
+│  │  │                 │  │ Failover Master Watcher     │    │   │
+│  │  │                 │  │ (per failover CR)           │    │   │
 │  │  └────────┬────────┘  └─────────────────────────────┘    │   │
 │  │           │                                               │   │
 │  │           ▼                                               │   │
@@ -44,10 +46,11 @@
 │  │  │  │ Standalone    │  │ Sentinel              │   │     │   │
 │  │  │  │ Reconciler    │  │ Reconciler            │   │     │   │
 │  │  │  └───────────────┘  └───────────────────────┘   │     │   │
-│  │  │                      ┌───────────────────────┐   │     │   │
-│  │  │                      │ Cluster               │   │     │   │
-│  │  │                      │ Reconciler            │   │     │   │
-│  │  │                      └───────────────────────┘   │     │   │
+│  │  │  ┌───────────────┐  ┌───────────────────────┐   │     │   │
+│  │  │  │ Failover      │  │ Cluster               │   │     │   │
+│  │  │  │ Reconciler    │  │ Reconciler            │   │     │   │
+│  │  │  │ (experimental)│  │                       │   │     │   │
+│  │  │  └───────────────┘  └───────────────────────┘   │     │   │
 │  │  └─────────────────────────────────────────────────┘     │   │
 │  └──────────────────────────────────────────────────────────┘   │
 │                              │                                   │
@@ -87,7 +90,7 @@ metadata:
   namespace: default
 spec:
   # Mode selection
-  mode: standalone | sentinel | cluster  # Required, default: standalone
+  mode: standalone | sentinel | cluster | failover  # default: standalone; failover is experimental
 
   # Image configuration
   image:
@@ -159,6 +162,13 @@ spec:
     failoverTimeout: 60000
     parallelSyncs: 1
 
+  # Failover mode settings (experimental, ADR-011)
+  failover:
+    replicas: 2                  # Data pods = 1 + replicas
+    downAfterMilliseconds: 5000  # Probe-evidence window before declaring the master dead
+    minReplicasToWrite: 0        # min-replicas-to-write (0 = off)
+    allowUnsafeRebootstrapOnDeadlock: false
+
   # Cluster mode settings
   cluster:
     shards: 3                    # Minimum 3
@@ -169,10 +179,10 @@ spec:
 status:
   phase: Pending | Initializing | Running | Failed | Terminating
   status: ""                     # Human-readable summary (master pod name or phase)
-  bootstrapRequired: true        # Sentinel mode only
+  bootstrapRequired: true        # Sentinel + failover modes
   observedGeneration: 0
   conditions:
-    - type: Ready | ConfigValid | Initialized | SentinelReady
+    - type: Ready | ConfigValid | Initialized | SentinelReady | FailoverRecovery
       status: "True" | "False"
       reason: ""
       message: ""
@@ -180,15 +190,19 @@ status:
   redis:
     ready: 0
     total: 0
-  master:                        # Sentinel mode only
+  master:                        # Sentinel + failover modes
     podName: ""
     ip: ""
-  replicas:                      # Sentinel mode only
+  replicas:                      # Sentinel + failover modes
     ready: 0
     total: 0
   sentinels:                     # Sentinel mode only
     ready: 0
     total: 0
+  failover:                      # Failover mode only (monitoring surfaces)
+    masterDownSince: ""
+    assignmentEpoch: 0
+    transitionSince: ""
   cluster:                       # Cluster mode only
     state: ok | fail | unknown
     nodes:
@@ -295,7 +309,61 @@ status:
 - ConfigMap: `{name}-config` (redis.conf + startup script)
 - ConfigMap: `{name}-sentinel-config` (sentinel.conf + startup script)
 
-### 3.3 Cluster Mode
+### 3.3 Failover Mode (Experimental)
+
+Same logical topology as sentinel mode minus the Sentinel processes — the
+operator itself performs bootstrap, failure detection, failover, and repair
+(ADR-011).
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Namespace: user-ns                            │
+│                                                                      │
+│  ┌────────────────────────────────────────────────────────────────┐ │
+│  │      StatefulSet: {name}-redis (replicas: 1 + N, default 3)     │ │
+│  │  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │ │
+│  │  │ Pod: -0      │  │ Pod: -1      │  │ Pod: -2      │          │ │
+│  │  │ (master)     │  │ (replica)    │  │ (replica)    │          │ │
+│  │  │ redis:6379   │  │ redis:6379   │  │ redis:6379   │          │ │
+│  │  │ export:9121  │  │ export:9121  │  │ export:9121  │          │ │
+│  │  └──────────────┘  └──────────────┘  └──────────────┘          │ │
+│  │  Labels: redis.chuck-chuck-chuck.net/role = master | replica          │ │
+│  │  Annotations (operator-stamped assignment channel):             │ │
+│  │    assigned-role / assigned-master-ip / assignment-epoch        │ │
+│  │  Each pod mounts its own annotations via a downward-API volume  │ │
+│  └────────────────────────────────────────────────────────────────┘ │
+│                                                                      │
+│  ┌─────────────────────┐  ┌─────────────────────┐                   │
+│  │ Service: {name}     │  │ Service:            │                   │
+│  │ (ClusterIP,         │  │ {name}-replicas     │                   │
+│  │  selector:          │  │ (headless, all      │                   │
+│  │  role=master)       │  │  Redis pods)        │                   │
+│  └─────────────────────┘  └─────────────────────┘                   │
+│                                                                      │
+│  ┌─────────────────────────────────────────────────────────────┐    │
+│  │ ConfigMap: {name}-config (redis.conf, no sentinel.conf)     │    │
+│  └─────────────────────────────────────────────────────────────┘    │
+│                                                                      │
+│  NO Sentinel StatefulSet, NO sentinel Service, NO sentinel PDB       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+**Failover Mode Resources**:
+- StatefulSet: `{name}-redis` (`1 + spec.failover.replicas` pods, default 1 master + 2 replicas; parallel pod management)
+- Service: `{name}` (ClusterIP, selector `role=master` — the label being the sole writer-selector authority is the point of the mode)
+- Service: `{name}-replicas` (headless, all Redis pods)
+- ConfigMap: `{name}-config` (redis.conf + startup script; no Sentinel sibling)
+- PodDisruptionBudget over the data pods (always ≥ 2 pods)
+
+The **assignment channel**: instead of the sentinel-mode startup wait-loop that
+queries Sentinel, the operator stamps `assigned-role` / `assigned-master-ip` /
+`assignment-epoch` annotations on each data pod; the pod reads its own
+annotations back through a **downward-API volume** and only then starts
+`redis-server`. An EmptyDir run-marker records the consumed epoch, so a
+kill-9'd ex-master parks instead of reclaiming mastership (the ADR-001 hazard,
+epoch-fenced). See [RECONCILIATION_LOOP_FAILOVER.md](RECONCILIATION_LOOP_FAILOVER.md).
+
+### 3.4 Cluster Mode
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -369,11 +437,12 @@ The operator uses a single `LittleRedReconciler` that dispatches based on `spec.
 
 **Resource management**: All resources use Server-Side Apply (SSA) with `client.Apply` and `client.ForceOwnership`, which only manages fields the operator explicitly sets. This preserves external labels/annotations (e.g. `kubectl rollout restart`).
 
-**Watch configuration**: The controller watches the LittleRed CR with `GenerationChangedPredicate` (ignoring status-only updates) and owns ConfigMaps, Services, and StatefulSets. Sentinel mode additionally watches a channel fed by the background Sentinel event monitor.
+**Watch configuration**: The controller watches the LittleRed CR with `GenerationChangedPredicate` (ignoring status-only updates) and owns ConfigMaps, Services, and StatefulSets. Sentinel and failover modes additionally watch a shared channel fed by their background fast-detection goroutines (the Sentinel event monitor / the failover master watcher).
 
 For detailed reconciliation logic per mode, see:
 - [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md) — high-level flow
 - [RECONCILIATION_LOOP_SENTINEL.md](RECONCILIATION_LOOP_SENTINEL.md) — sentinel healing rules, DetermineRealMaster, kill-9 protection
+- [RECONCILIATION_LOOP_FAILOVER.md](RECONCILIATION_LOOP_FAILOVER.md) — failover-mode intent model, death detection, decision table (experimental)
 - [RECONCILIATION_LOOP_CLUSTER.md](RECONCILIATION_LOOP_CLUSTER.md) — repair loop, quorum recovery, kill-9 protection
 
 ### 4.1 Reconciliation Triggers
@@ -383,9 +452,10 @@ For detailed reconciliation logic per mode, see:
 | CR spec change (generation bump) | Full reconciliation |
 | Owned resource change (STS, SVC, CM) | Reconciliation via ownership watch |
 | Sentinel `+switch-master` event | Reconciliation via channel (sentinel mode) |
+| Failover master watcher fires (master unreachable past `downAfterMilliseconds`) | Reconciliation via the same channel (failover mode) |
 | Fast requeue timer (2s) | While not Running |
 | Steady requeue timer (10s) | While Running |
-| CR deleted | Cleanup: remove finalizer, stop sentinel monitor |
+| CR deleted | Cleanup: remove finalizer, stop sentinel monitor / failover watcher |
 
 ---
 
@@ -482,9 +552,74 @@ The cluster startup script detects container restarts via a surviving `nodes.con
 
 ---
 
-## 7. Authentication & TLS
+## 7. Failover Mode: Key Mechanisms (Experimental)
 
-### 7.1 Authentication
+Failover mode (ADR-011) is operator-managed HA without Sentinel: one decider
+instead of two, eliminating the operator-vs-Sentinel race class (LR-007/008,
+LR-013, LR-024) at the accepted cost of coupling failover orchestration to
+operator liveness. The full algorithm lives in
+[RECONCILIATION_LOOP_FAILOVER.md](RECONCILIATION_LOOP_FAILOVER.md); the load-bearing
+mechanisms:
+
+### 7.1 Operator Assignment via Downward API
+
+Pillar 3.6 (a Redis pod does not start `redis-server` until the operator
+assigns it a role) is kept, but the Sentinel query loop is replaced: the
+operator patches `assigned-role` / `assigned-master-ip` / `assignment-epoch`
+annotations onto each data pod, and the pod polls its own annotations through a
+downward-API volume. No API-server access from data pods; the kubelet rewrites
+the projected file on every annotation change.
+
+### 7.2 Epoch Fencing (Kill-9 / Crash Protection)
+
+Before `exec`, the startup script writes the consumed epoch to an EmptyDir
+run-marker (survives a container restart, not a pod replacement). An assignment
+is honored only with no marker or a strictly greater epoch — so a kill-9'd
+ex-master replays its stale `assigned-role: master` annotation and **parks**
+until the operator (with its global view) either fails over to a data-holding
+replica or re-authorizes it as master when no data exists anywhere. This
+re-owns sentinel mode's run-id yield with the operator as the authority.
+
+### 7.3 Failure Detection (Corroborated)
+
+The reconcile loop is the sole decider (pure predicate `planMasterDeath`):
+Kubernetes-authoritative evidence (pod gone/replaced, redis container not-Ready
+per kubelet, pod terminating) is acted on immediately; probe evidence requires
+operator-unreachability sustained past `downAfterMilliseconds` **and** every
+reachable replica reporting `master_link_status:down` — the operator's own dial
+alone is never sufficient (a blackholed operator-side route must not kill a
+serving master).
+
+### 7.4 The Failover Decision
+
+One pure decision table (`planFailover`) covers bootstrap seeding, normal
+failover, and the no-master deadlock matrix: 0 data holders → seed `redis-0`;
+holders on one replication lineage → promote the most-complete one (no opt-in);
+divergent lineages → refuse unless `failover.allowUnsafeRebootstrapOnDeadlock`.
+Execution (stamp intent → promote → flip label → repoint) is idempotent and
+resumable from live state.
+
+### 7.5 Failover Master Watcher
+
+A background goroutine per failover-mode CR probes the current master with a
+bounded `INFO` every ~1s and injects a `GenericEvent` when a failure streak
+crosses `downAfterMilliseconds` — the fast path replacing the sentinel-mode
+`+switch-master` subscription. It accelerates reconciliation only; it never
+declares death itself.
+
+### 7.6 Master Service Routing
+
+Identical to sentinel mode (§5.4): the `{name}` Service selects on the
+operator-managed `role: master` label. In failover mode this label is the
+*only* writer-selector authority — there is no second (Sentinel) view to
+conflict with it. The label flips only after the promoted pod is observed
+reporting `role:master`.
+
+---
+
+## 8. Authentication & TLS
+
+### 8.1 Authentication
 
 - User provides a Secret containing a `password` key
 - `spec.auth.existingSecret` references the Secret
@@ -492,7 +627,7 @@ The cluster startup script detects container restarts via a surviving `nodes.con
 - Redis is configured with `requirepass` and `masterauth`
 - Sentinel is configured with `auth-pass` via `SENTINEL SET`
 
-### 7.2 TLS
+### 8.2 TLS
 
 - User provides a Secret containing `tls.crt`, `tls.key`, and `ca.crt`
 - `spec.tls.existingSecret` references the Secret
@@ -500,15 +635,15 @@ The cluster startup script detects container restarts via a surviving `nodes.con
 - Redis/Sentinel are configured with `tls-port`, `tls-cert-file`, `tls-key-file`, `tls-ca-cert-file`
 - The non-TLS port is disabled (`port 0`)
 
-### 7.3 Operator-to-Pod Connections
+### 8.3 Operator-to-Pod Connections
 
 The operator connects to Redis/Sentinel pods using `InsecureSkipVerify` for TLS. This provides encryption in transit while relying on the Kubernetes API (not PKI) for identity verification. See [ADR-004](adr/004-tls-insecure-skip-verify.md) for the full rationale.
 
 ---
 
-## 8. Configuration Management
+## 9. Configuration Management
 
-### 8.1 Config Layering
+### 9.1 Config Layering
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -536,38 +671,40 @@ The operator connects to Redis/Sentinel pods using `InsecureSkipVerify` for TLS.
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 8.2 Startup Scripts
+### 9.2 Startup Scripts
 
 Each mode uses a Go `text/template` (with `[[` `]]` delimiters) to generate a startup script injected as the container command. The script handles:
 - Sentinel mode: wait-loop for Sentinel authorization, kill-9 detection, master/replica branching
+- Failover mode: wait-loop polling the downward-API annotation file for an operator assignment, epoch gate (run-marker) for kill-9 yield, master/replica branching
 - Cluster mode: crash detection, yield loop, deadlock breaker, fresh identity guarantee
 
 Pre-stop hooks handle graceful shutdown:
 - Sentinel mode: triggers `SENTINEL FAILOVER` if master, waits for handoff
+- Failover mode: only sleeps to hold the grace window — the handover itself is operator-led (the reconcile sees the `deletionTimestamp` and promotes; pods make no topology decisions, LR-016)
 - Cluster mode: triggers `CLUSTER FAILOVER` to replica if master with slots
 
 ---
 
-## 9. Security
+## 10. Security
 
-### 9.1 Pod Security
+### 10.1 Pod Security
 - Runs as non-root (uid 999)
 - Read-only root filesystem (writable `/data` emptyDir)
 - All capabilities dropped
 
-### 9.2 Network Security
+### 10.2 Network Security
 - Services are ClusterIP by default (no external exposure)
 - TLS available for transport encryption (ADR-004)
 - No NetworkPolicies created by operator (user responsibility)
 
-### 9.3 Secret Handling
+### 10.3 Secret Handling
 - Passwords and TLS certs stored in user-managed Secrets, not in the CR
 - Operator uses RBAC to read Secrets in the target namespace
 - Secrets validated during spec validation (existence + required keys)
 
 ---
 
-## 10. Operator Deployment
+## 11. Operator Deployment
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -591,7 +728,7 @@ Pre-stop hooks handle graceful shutdown:
 
 ---
 
-## 11. Project Structure
+## 12. Project Structure
 
 ```
 littlered/
@@ -613,7 +750,12 @@ littlered/
 │   ├── controller/
 │   │   ├── littlered_controller.go    # Main reconciler + sentinel healing
 │   │   ├── cluster_reconcile.go       # Cluster mode reconciliation
+│   │   ├── failover_reconcile.go      # Failover mode reconciliation (ADR-011)
+│   │   ├── failover_plan.go           # Pure seams: planMasterDeath + planFailover
+│   │   ├── failover_intent.go         # Intent model (annotations → intent, settledness, re-auth)
+│   │   ├── failover_monitor.go        # Background failover-mode master watcher
 │   │   ├── resources.go               # Resource builders (CMs, SVCs, STSs, startup scripts)
+│   │   ├── resources_failover.go      # Failover-mode builders (STS, config, startup script)
 │   │   ├── gatherer.go                # Operator-side Gatherer implementation
 │   │   └── sentinel_monitor.go        # Background +switch-master subscriber
 │   ├── redis/
@@ -638,6 +780,7 @@ littlered/
 │   ├── SCOPE.md
 │   ├── RECONCILIATION_LOOP.md         # High-level reconciliation diagram
 │   ├── RECONCILIATION_LOOP_SENTINEL.md
+│   ├── RECONCILIATION_LOOP_FAILOVER.md
 │   ├── RECONCILIATION_LOOP_CLUSTER.md
 │   ├── RECONCILIATION_ALGORITHM_CHANGELOG.md
 │   ├── USAGE.md
@@ -648,7 +791,9 @@ littlered/
 │       ├── 002-remove-startup-ping-check.md
 │       ├── 003-low-interference-sentinel-reconciliation.md
 │       ├── 003a-deferred-improvements.md
-│       └── 004-tls-insecure-skip-verify.md
+│       ├── 004-tls-insecure-skip-verify.md
+│       ├── ...                        # 005-009: recovery rules, per-shard STSs
+│       └── 011-failover-mode.md       # Operator-managed HA without Sentinel
 ├── Makefile
 ├── go.mod
 └── CLAUDE.md
@@ -656,7 +801,7 @@ littlered/
 
 ---
 
-## 12. Dependencies
+## 13. Dependencies
 
 | Dependency | Purpose | Version |
 |------------|---------|---------|
@@ -667,7 +812,7 @@ littlered/
 
 ---
 
-## 13. Design Decisions
+## 14. Design Decisions
 
 | Question | Decision | Rationale |
 |----------|----------|-----------|
@@ -681,10 +826,11 @@ littlered/
 
 ---
 
-## 14. References
+## 15. References
 
 - [ADR-001: Strict IP-Only Identity](adr/001-strict-ip-identity.md)
 - [ADR-003: Low-Interference Sentinel Reconciliation](adr/003-low-interference-sentinel-reconciliation.md)
 - [ADR-004: TLS InsecureSkipVerify](adr/004-tls-insecure-skip-verify.md)
+- [ADR-011: `failover` Mode — Operator-Managed HA without Sentinel](adr/011-failover-mode.md)
 - [Reconciliation Algorithm Changelog](RECONCILIATION_ALGORITHM_CHANGELOG.md)
 - [CLAUDE.md](../CLAUDE.md) — condensed project overview for LLM onboarding

@@ -24,6 +24,7 @@ Welcome! This document provides a high-level, condensed overview of the LittleRe
 | **standalone** | A single Redis pod (`mode: standalone`) |
 | **sentinel** | The HA mode: 3 Redis pods (1 master + 2 replicas) monitored by 3 sentinel processes (`mode: sentinel`) |
 | **sentinels** | The 3 monitoring processes within a sentinel instance specifically |
+| **failover** | The operator-managed HA mode: 1 Redis master + N replicas, **no Sentinel processes** — the operator is the failure detector and failover decider (`mode: failover`, experimental) |
 | **Redis Cluster** | The gossip-based sharding mode (`mode: cluster`) |
 
 **Rules:**
@@ -112,6 +113,16 @@ Welcome! This document provides a high-level, condensed overview of the LittleRe
 - **Fix — operator-owned, not script-owned**: `recoverClusterWipeDeadlock` (pure `planClusterWipeRecovery`) runs in the not-all-Ready branch and **recycles** (deletes) exactly the stuck pods so their StatefulSets reschedule them fresh (clean EmptyDir → new node ID); the pod-delete self-heal path then re-bootstraps. The startup script is unchanged (keeps its conservative yield/park — a parked pod can't distinguish a total wipe from a temporarily-unreachable live replica; that needs the global view, echoing LR-016).
 - **Data safety by construction**: recyclable = redis container **not-Ready + crash-looping (restarted) + not OOMKilled**, gated by a 120s `status.cluster.wipeDeadlockSince` cooldown (mirrors `LeaderlessSince`). The safety gate is the **kubelet's local readiness probe** (authoritative, blackhole-proof — *not* the operator's remote dial, which LR-017 showed a blackhole can fool): in a pure in-memory cluster a not-Ready redis holds no data, so deleting it loses nothing. A **Ready** pod (a possible data holder) is **never** recycled, so a partial wipe with a surviving replica keeps it (Step 0/1 promotes it). No `allowUnsafeRebootstrap` analog is needed (a total wipe has zero data holders: cluster data ⟺ slot ownership).
 
+### 3.14 Operator-Managed Failover (Failover Mode)
+- **Decision** (ADR-011, ships **experimental**): a fourth mode, `failover` — 1 master + `spec.failover.replicas` replicas (default 2, the first configurable replica count), **no Sentinel processes**. The operator is the sole failure detector and failover decider, removing the "two cooks" problem class (operator and Sentinel as independent failure-detectors fighting over the same state — the LR-007/LR-008 saga, the LR-024 self-inflicted deadlock, the whole ADR-010 ghost-replica subject). The label-routed master Service is unchanged: the operator's `role: master` label was already the effective writer-routing authority; Sentinel was a second, sometimes-conflicting one. Accepted trade-off: **HA is coupled to operator liveness** (sentinel mode's *hard* failures already depended on the operator). `sentinel` stays fully supported on feature-completeness grounds; `failover` is offered neutrally as validated-by-our-own-use added value, not pushed.
+- **Intent from annotations** (pillar 3.6 kept, Sentinel replaced): the operator stamps `redis.chuck-chuck-chuck.net/assigned-role` / `assigned-master-ip` / `assignment-epoch` annotations on each data pod; the pod reads its own annotations back through a **downward-API volume** and only then `exec`s `redis-server` (no API-server access from data pods). The annotations ARE the intent record — re-derived from the pod list every pass (`resolveFailoverIntent`: master = highest-epoch master assignment), never read back from status (ADR-006). `status.failover.*` (`masterDownSince`, `assignmentEpoch`, `transitionSince`) is monitoring surface only; nothing load-bearing is persisted.
+- **Epoch-fenced kill-9 yield** (the ADR-001 same-IP hazard, re-owned): before `exec` the startup script writes the consumed epoch to an EmptyDir run-marker; a container restart (same pod, same IP, wiped dataset) replays the same annotations, but the marker marks them consumed, so the pod **parks in the wait-loop — parking IS the yield**. Only an operator epoch bump (its global view failing over to a data holder, or re-authorizing when nothing holds data) releases it. No reachability check before starting as replica (ADR-002's deadlock constraint).
+- **Corroborated death detection** (pure `planMasterDeath`): (a) **K8s-authoritative** — master pod gone/replaced, redis container not-Ready per kubelet, or terminating (graceful handover: the operator promotes proactively during the grace window; the preStop hook only sleeps) → dead **immediately** (kubelet readiness is the blackhole-proof signal, ADR-008); (b) **probe-evidenced, corroborated** — operator-unreachable ≥ `downAfterMilliseconds` AND every reachable replica reports `link:down` (LR-017 lesson: the operator's own dial is never sufficient evidence). A replica still seeing `link:up`, or no reachable replica to corroborate → HOLD: the marker is kept (the timer never resets on a veto) but nothing is declared.
+- **One decision table** (pure `planFailover`) replaces the three sentinel-mode rules (bootstrap, Rule L, LR-024): no live master + **0 data holders** → seed `redis-0`; **≥1 holders, one lineage** (`holdersDiverged` union-find over `{master_replid, master_replid2}`) → promote `BestDataHolder`, **no opt-in** (a post-failover promotion chain is one lineage — LR-024 lesson); **≥2 lineages** → refuse (`FailoverRecovery` condition, `RefusedDataPresent` event) unless `failover.allowUnsafeRebootstrapOnDeadlock`. Execution order: stamp the new intent (epoch bump) → `REPLICAOF NO ONE` → label flip → repoint stragglers; every step idempotent and **resumable from live state** (a half-applied promotion is re-derived and re-issued, no persisted cursor).
+- **Guards, redefined** (no Rule A): a promotion is **never blocked by the dead master's own termination** — `failoverPromotionUnsettled` blocks a NEW mastership decision only while the intended master is still *alive and converging*; a dead/unreachable target never blocks its own replacement (gating on bare unsettledness would deadlock exactly the crash recovery this mode exists for). Cascades serialize via a 10s post-transition cooldown keyed on `transitionSince`. Secondary healing keeps the conservative gate: straggler repoint (Rule R reused) requires a settled transition and no terminating pods; re-authorization of parked/fresh pods requires a settled transition (annotation stamps are inert metadata). Probes make no topology decisions (LR-016) — the failover probes *delegate to the sentinel builders* (local-PING liveness, `link:up` readiness) so the modes cannot drift (§7 parity).
+- **Watcher accelerates, reconcile decides**: a per-instance background goroutine (`failover_monitor.go`, the `+switch-master` subscriber's replacement as the fast path) INFO-probes `status.master.ip` on a ~1s cadence and pushes one `GenericEvent` per failure streak crossing `downAfterMilliseconds` — it only makes a reconcile look sooner, never declares death itself.
+- **Verification status**: unit/envtest green; **e2e-verified 16/16 on a real 3-node cluster (scm-s2, 2026-08-01)** — functional, graceful/crash failover (UID+RunID+label-agreement asserted), event path 4.96s (<15s bar), polling-only tier, the **hybrid double-failover graduation scenario** (promotion chain redis-0→1→2, the LR-007/LR-008/LR-024 class does not reproduce), kill-9 epoch-yield park (chaos: corruptions 0, write availability 96.5%), all three deadlock tiers (multi-holder same-lineage promotes with **no refuse** — the deliberate contrast to Rule L), rolling update with data intact. The ADR-011 **graduation gate remainder**: chaos/soak run + managed-cloud dogfooding evidence, then the drop/coexist/replace-sentinel decision.
+
 ---
 
 ## 4. Deployment Modes
@@ -120,10 +131,12 @@ Welcome! This document provides a high-level, condensed overview of the LittleRe
 | :--- | :--- | :--- |
 | **Standalone** | 1 Redis Pod | Dev / Simple caching |
 | **Sentinel** | 3 Redis (1M+2R) + 3 Sentinels | High Availability (HA) |
+| **Failover** | `1 + replicas` Redis pods (default 1M+2R), **no Sentinels** — *experimental* | HA without Sentinel processes (operator-led, ADR-011) |
 | **Cluster** | `shards × (1 + replicasPerShard)` Pods, as **one StatefulSet per shard** (`{name}-shard-K`) | Horizontal Scaling / Large Data |
 
 ### Key Logic:
 - **Sentinel Mode**: The operator manages a `redis.chuck-chuck-chuck.net/role: master` label on Pods. The `{name}` Service uses this label as a selector to always route traffic to the current master. `spec.sentinel.masterName` is **required** and must be unique among Sentinel deployments sharing a pod network (pillar 3.7, LR-039); Sentinel-aware clients carry that value, clients using the `{name}` Service do not.
+- **Failover Mode** (experimental): same label routing as sentinel mode (`{name}` Service → `role: master`), but the operator itself is the failure detector and failover decider. Roles are assigned by stamping `assigned-role` / `assigned-master-ip` / `assignment-epoch` annotations on the data pods, read back through a downward-API volume; a background master watcher accelerates detection. See pillar 3.14 and ADR-011.
 - **Cluster Mode**: N per-shard StatefulSets (`{name}-shard-K`, pod `-K-0` = shard K master; stable `redis.chuck-chuck-chuck.net/shard` label — pillar 3.12), fronted by one shared headless Service `{name}-cluster`. Sophisticated repair loop handles:
     1. Quorum loss (via `CLUSTER FAILOVER TAKEOVER`).
     2. Partition healing (via `CLUSTER MEET`).
@@ -153,9 +166,14 @@ config/                     # Kustomize manifests (CRDs, RBAC, Samples)
 internal/controller/        # Core Reconciliation Logic
   ├── littlered_controller.go # Entrypoint reconciler + sentinel healing rules
   ├── cluster_reconcile.go    # Cluster-specific reconciliation
+  ├── failover_reconcile.go   # Failover-mode reconciliation (ADR-011)
+  ├── failover_plan.go        # Pure seams: planMasterDeath + planFailover
+  ├── failover_intent.go      # Intent model: annotations→intent, settledness, re-auth
+  ├── failover_monitor.go     # Background failover-mode master watcher
   ├── gatherer.go             # Operator-side ground truth gatherer
   ├── sentinel_monitor.go     # Background +switch-master subscriber
-  └── resources.go            # K8s resource builders (STS, SVC, CM, startup scripts)
+  ├── resources.go            # K8s resource builders (STS, SVC, CM, startup scripts)
+  └── resources_failover.go   # Failover-mode builders (STS, config, startup script)
 internal/redis/             # Redis/Cluster API clients
   ├── client.go               # Sentinel client wrapper
   ├── cluster_client.go       # Cluster client wrapper

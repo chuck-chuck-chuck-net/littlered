@@ -37,14 +37,14 @@ kind: LittleRed
 metadata:
   name: my-store
 spec:
-  mode: sentinel   # standalone | sentinel | cluster
+  mode: sentinel   # standalone | sentinel | cluster | failover (experimental)
 ```
 
 ```bash
 kubectl apply -f my-store.yaml
 ```
 
-`standalone` runs a single Redis pod. `sentinel` runs 3 Redis pods (1 master + 2 replicas) monitored by 3 sentinels for automatic failover. `cluster` runs a sharded Redis Cluster across multiple pods for horizontal scaling.
+`standalone` runs a single Redis pod. `sentinel` runs 3 Redis pods (1 master + 2 replicas) monitored by 3 sentinels for automatic failover. `cluster` runs a sharded Redis Cluster across multiple pods for horizontal scaling. `failover` (**experimental**) runs 1 master + N replicas with no Sentinel processes — the operator itself performs failure detection and failover; it is under active validation, see [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md) for status and trade-offs vs `sentinel`.
 
 ### 3. Verify Health
 
@@ -58,7 +58,7 @@ kubectl lr verify my-store
 
 ## Key Features
 
-- **Three deployment modes**: `standalone` (single pod), `sentinel` (1 master + 2 replicas monitored by 3 sentinels for automatic failover), and `cluster` (sharded Redis Cluster for horizontal scaling).
+- **Three deployment modes**: `standalone` (single pod), `sentinel` (1 master + 2 replicas monitored by 3 sentinels for automatic failover), and `cluster` (sharded Redis Cluster for horizontal scaling) — plus an **experimental** fourth, `failover` (operator-managed HA without Sentinel).
 - **Redis 8.4.2 by default**, compatible with Redis 7.2+.
 - **Burstable QoS by default**: memory limit equals request (preventing OOM surprises); a CPU *request* but no CPU *limit*. Redis's CPU use is bounded by its thread count, so a limit can only throttle it under load — size the request to the thread budget instead. Set an explicit CPU limit only if you need Guaranteed QoS.
 - **`noeviction` by default**: memory exhaustion returns an error rather than silently dropping data. Explicitly configure a different policy if you need eviction semantics.
@@ -77,7 +77,7 @@ kind: LittleRed
 metadata:
   name: my-store
 spec:
-  mode: standalone          # standalone | sentinel | cluster
+  mode: standalone          # standalone | sentinel | cluster | failover (experimental)
 
   image:
     registry: docker.io
@@ -103,6 +103,10 @@ spec:
   cluster:                  # For mode: cluster
     shards: 3
     replicasPerShard: 1
+
+  failover:                 # For mode: failover (experimental)
+    replicas: 2
+    downAfterMilliseconds: 5000
 
   # Security
   auth:
@@ -140,7 +144,7 @@ The core principle is **minimal interference**: trust Sentinel and Cluster Gossi
 
 ## Documentation
 
-- [Usage Guide](docs/USAGE.md) — deployment examples for all three modes
+- [Usage Guide](docs/USAGE.md) — deployment examples for all modes
 - [API Reference](docs/API_SPEC.md) — full spec field documentation
 - [Architecture](docs/ARCHITECTURE.md) — reconciliation design, ADRs, and [terminology conventions](docs/ARCHITECTURE.md#terminology)
 - [E2E Testing](docs/E2E_TESTING.md) — running the test suite and manual chaos testing

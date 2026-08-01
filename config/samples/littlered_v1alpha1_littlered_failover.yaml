@@ -1,0 +1,19 @@
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  labels:
+    app.kubernetes.io/name: littlered-operator
+    app.kubernetes.io/managed-by: kustomize
+  name: store-failover
+spec:
+  # Experimental: operator-managed HA without Sentinel (ADR-011).
+  # 1 master + N replicas, no Sentinel pods; the operator is the failure
+  # detector and failover decider. See docs/RECONCILIATION_LOOP_FAILOVER.md.
+  mode: failover
+
+  # Optional: customize failover settings (defaults shown)
+  failover:
+    replicas: 2
+    downAfterMilliseconds: 5000
+    minReplicasToWrite: 0
+    allowUnsafeRebootstrapOnDeadlock: false

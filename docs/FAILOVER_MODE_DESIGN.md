@@ -1,8 +1,14 @@
 # Design Note: `failover` Mode (Operator-Managed HA without Sentinel)
 
-> **Status:** Exploratory design — not yet committed, not yet implemented.
-> **Created:** 2026-06-24 (design discussion). This note captures the reasoning so a
-> future session can pick up without re-deriving it.
+> **Status:** **Implemented (experimental)** on `feat/failover-mode` — the concrete design
+> is recorded in [ADR-011](adr/011-failover-mode.md), the algorithm in
+> [RECONCILIATION_LOOP_FAILOVER.md](RECONCILIATION_LOOP_FAILOVER.md). The HA e2e suite is
+> **green 16/16 on a real 3-node cluster (2026-08-01)** — including the §4 hybrid
+> double-failover scenario, which sentinel mode kept deadlocking on (LR-007/LR-008/LR-024).
+> The **§4 graduation-gate remainder is pending** (chaos/soak run, dogfooding evidence),
+> and the §3.4 drop/coexist/replace decision stays deferred until that gate.
+> **Created:** 2026-06-24 (design discussion) as an exploratory note. The sections below are
+> kept as written — they are the historical reasoning; per-item resolution notes are inline.
 > **Decision owners:** the littlered authors (spare-time OSS); also dogfooded on the
 > managed-cloud hosted service, which is the intended proving ground.
 
@@ -120,33 +126,53 @@ If `failover` clears the exact scenarios where `sentinel` keeps deadlocking, tha
 consider replacing. If it can't, we learned that cheaply. Use the current failing sentinel e2e (being
 fixed in a parallel session as of this writing) as a candidate graduation scenario.
 
-## 5. Design sketch (TODO — not yet worked out)
+## 5. Design sketch (historical TODO — all pieces now decided in ADR-011)
 
-To be fleshed out in a future session. Open pieces:
+Kept as written for the reasoning trail; each item carries its resolution.
 
-- **Failure detection loop.** Background goroutine doing fast health probes + K8s readiness/pod events
+- ✅ **Failure detection loop.** Background goroutine doing fast health probes + K8s readiness/pod events
   → signal reconcile. Needs flapping suppression and "slow vs dead" discrimination — the hardening
   Sentinel encodes for free and that we'd now own. Consider `min-replicas-to-write` to bound write loss.
-- **Failover state machine.** On master loss: pick the replica with the highest `master_repl_offset`,
+  *Resolved (ADR-011 §4): the reconcile loop is the sole decider (pure `planMasterDeath`:
+  kubelet-authoritative immediate + corroborated probe evidence over `downAfterMilliseconds`);
+  a per-instance watcher (`failover_monitor.go`) only accelerates reconcile. `min-replicas-to-write`
+  became `spec.failover.minReplicasToWrite`, off by default (§1).*
+- ✅ **Failover state machine.** On master loss: pick the replica with the highest `master_repl_offset`,
   `REPLICAOF NO ONE` on it, repoint the others, flip the master label. Define the states/guards
   explicitly (analogous to ADR-003's Rule A guards: no terminating pods, no in-flight transition).
-- **Bootstrap.** Reuse `status.bootstrapRequired` + operator-led registration; the pods' start-up
+  *Resolved (ADR-011 §5/§6): one pure decision table `planFailover` (seed / promote-one-lineage /
+  refuse-on-divergence), lineage-gated via `holdersDiverged`. The guards deliberately DIFFER from the
+  Rule A sketch here: there is no terminating-pods gate on promotion — the dead master's own
+  termination must never block its replacement; serialization is the promotion-unsettled gate + a
+  post-transition cooldown.*
+- ✅ **Bootstrap.** Reuse `status.bootstrapRequired` + operator-led registration; the pods' start-up
   wait-loop currently queries Sentinel — needs a Sentinel-free equivalent (wait for the operator to
   assign a master). See ADR-002 (removed startup PING check) for the deadlock-avoidance constraints.
-- **Reuse inventory.** `gatherer.go`, `internal/redis/sentinel_state.go`'s offset logic (the
+  *Resolved (ADR-011 §3): operator-stamped assignment annotations read back through a downward-API
+  volume, epoch-fenced by an EmptyDir run-marker (the ADR-001 kill-9 yield, re-owned). ADR-002's
+  no-PING constraint is kept.*
+- ✅ **Reuse inventory.** `gatherer.go`, `internal/redis/sentinel_state.go`'s offset logic (the
   offset-based promotion removed from sentinel mode per ADR-003 *is* the right primitive here, since
   there is no Sentinel consensus to wait for), `updateMasterLabel`, `resources.go` STS/SVC/CM builders
   (drop the Sentinel StatefulSet + sentinel.conf; reuse the master-label Service unchanged).
-- **What gets deleted vs sentinel mode:** the Sentinel StatefulSet/config, `sentinel_monitor.go`'s
+  *Resolved as sketched: the gather, `BestDataHolder`/`holdersDiverged`, the label mechanics
+  (`applyRoleLabels`), master/replicas Services, and the PDB/probe builders are reused; failover-specific
+  builders live in `resources_failover.go`.*
+- ✅ **What gets deleted vs sentinel mode:** the Sentinel StatefulSet/config, `sentinel_monitor.go`'s
   subscriber, and the `SENTINEL RESET` / `REMOVE` + `MONITOR` healing — replaced by direct
   `REPLICAOF` orchestration the operator fully owns.
+  *Resolved as sketched (ADR-011 §2 and Consequences): no Sentinel resources of any kind; the
+  subscriber's role is taken by the failover master watcher.*
 
-## 6. Next-session entry points
+## 6. Next-session entry points (historical — both done)
 
 Pick one:
 1. **Sketch the `failover` design** (Section 5) — detection loop, failover state machine, reuse map.
+   *Done: ADR-011.*
 2. **Read the failing sentinel e2e** (parallel session) to confirm it is the same "two cooks" race
    class and lock it in as a graduation scenario.
+   *Done: confirmed as LR-024 (the ghost-replica RESET → crash deadlock); the graceful+crash sequence
+   is a graduation scenario per §4.*
 
 ## 7. Pointers
 

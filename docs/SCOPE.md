@@ -2,7 +2,7 @@
 
 > Quick reference for what's in and out of scope.
 
-**Last Updated**: 2026-02-24
+**Last Updated**: 2026-08-01
 
 ---
 
@@ -71,6 +71,22 @@
 - [x] Graceful pre-stop hooks (failover before shutdown)
 - [x] Operator passivity during active transitions (Rule A guardrails)
 
+### Failover Mode (Experimental) 🚧
+
+Operator-managed HA without Sentinel (`mode: failover`, ADR-011): 1 master +
+N replicas (configurable, default 2), the operator as the sole failure detector
+and failover decider. Coexists with sentinel mode — sentinel stays fully
+supported; failover is offered as an alternative with an explicit trade-off
+(HA coupled to operator liveness).
+
+- [x] `mode: failover` + `spec.failover` API (replicas, downAfterMilliseconds, minReplicasToWrite, allowUnsafeRebootstrapOnDeadlock)
+- [x] Operator-assignment startup protocol (downward-API annotations + epoch-fenced kill-9 yield)
+- [x] Pure decision seams (`planMasterDeath`, `planFailover`) with unit tables
+- [x] Reconcile flow: bootstrap, assignment engine, straggler repoint, re-authorization, status
+- [x] Fast-detection master watcher (background goroutine, reconcile-accelerating only)
+- [x] Full HA e2e suite — **16/16 green on a real 3-node cluster (2026-08-01)**: graceful, crash, hybrid double-failover (the graduation scenario), kill-9, chaos (corruptions 0, write availability 96.5%), deadlock tiers, rolling update
+- [ ] **Open: the graduation gate remainder** (`FAILOVER_MODE_DESIGN.md` §4) — chaos/soak run and dogfooding evidence from a managed cloud. Only after that gate is the drop/coexist/replace-sentinel decision due.
+
 ### Tooling ✅
 
 - [x] lrctl CLI tool (kubectl plugin, JSON output, shell completion)
@@ -104,7 +120,7 @@
 | OLM distribution | Helm sufficient | Maybe |
 | Multi-cluster replication | Out of scope | Unlikely |
 | Admission webhooks | Validate in controller instead | Maybe later |
-| Configurable sentinel/replica counts | Fixed 1+2+3 topology | Yes |
+| Configurable sentinel/replica counts | Fixed 1+2+3 topology in sentinel mode (failover mode already has a configurable replica count) | Yes |
 | TLS certificate verification (operator→pod) | Identity via K8s API, not PKI (ADR-004) | Service mesh recommended |
 
 ### Will Not Do
@@ -211,4 +227,14 @@ Phase 4 ✅
 ├── Structured JSON logging with categories
 ├── lrctl CLI tool
 └── Reconciliation algorithm changelog
+
+Failover Mode (experimental) 🚧
+├── ADR-011 + design note (FAILOVER_MODE_DESIGN.md) ✅
+├── API surface (mode enum, FailoverSpec, status, CEL) ✅
+├── Pure decision seams (planMasterDeath, planFailover) ✅
+├── Resource builders + assignment startup protocol ✅
+├── Reconcile flow (bootstrap, engine, status) ✅
+├── Fast-detection master watcher ✅
+├── e2e suite ✅ (16/16 on a real 3-node cluster)
+└── Graduation gate: chaos/soak + dogfooding → decide drop/coexist/replace (open)
 ```
