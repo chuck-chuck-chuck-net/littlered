@@ -244,7 +244,23 @@ over it.
 
 ---
 
-## 8. Useful Commands
+## 8. Git & Release Engineering Model (Split-by-Altitude)
+
+**Rebase *inside* a branch; merge `--no-ff` *at integration*; read the trunk with `git log --first-parent`.** The two operations live at different altitudes — don't apply one's rule at the other.
+
+- **Inside a branch** (`feature/*`, `fix/*` WIP): rebase/squash freely — each branch reads as one tidy story. (Long-standing habit; unchanged.)
+- **At integration** (`feature/fix → e2e-* → release/* → main`): merge `--no-ff`. The merge commit *is* the provenance record — it names the branch, pins its tip SHA, and records how inter-feature conflicts were actually resolved. Rebase-flattening loses all of that.
+
+Key invariants:
+- Base `feature/*`/`fix/*` on **`main`** (stable base, independently mergeable). `e2e-*` = disposable superset (merge *everything*, "latest & greatest" for e2e). `release/<ver>` = cut **from `main`** — or from the **prior release** when releases stack ahead of a lagging `main` — then merge only the *curated subset* agreed to ship.
+- **Clean-apply onto the base is structural, not observed**: because `release/*` is cut from its base and only ever *adds*, the base stays an ancestor ⇒ it lands by construction. Verify with `git merge-base --is-ancestor <base> release/<ver>`. (This replaces the old rebase-clean confirmation — and it's stronger, since it doesn't go stale when the base moves.)
+- `main` carries merge bubbles by design; `--first-parent` hides them so the trunk still *reads* linear. Experimental work stays local/private — push only `main` and tags to the public repo.
+
+**Full model, rationale, and command cheat sheet (provenance queries, release cut/land, whole-feature revert, `rerere`, bisect): `docs/RELEASE_ENGINEERING.md`.**
+
+---
+
+## 9. Useful Commands
 
 ```bash
 make manifests generate # Update CRDs and DeepCopy code
@@ -257,7 +273,7 @@ kubectl apply -f config/samples/ # Try out sample CRs
 
 ---
 
-## 9. Key Resolved Investigations
+## 10. Key Resolved Investigations
 
 ### Sentinel Ghost Master Split-Brain (2026-02-20, LR-007/LR-008)
 **Test:** `Sentinel Advanced Failover Hybrid (Production) Mode > should recover correctly with both mechanisms active (crash)`
