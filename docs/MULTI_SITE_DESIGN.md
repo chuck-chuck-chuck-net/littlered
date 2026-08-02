@@ -122,12 +122,18 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   Cluster elect and move masters as it sees fit. The operator observes; it does not
   pin a "master site" per shard. Consequently there is no "master STS" — any of a
   shard's per-site StatefulSets may hold the master at a given time.
-- Masters are *initially* distributed evenly across sites. No active master balancing
-  in the first iteration; a gentle rebalance (graceful `CLUSTER FAILOVER` on a
-  replica, no data loss) is a planned follow-up (§10) — without it, repeated failovers
-  can concentrate masters in one site, degrading that site's loss from "native
-  failover" to "operator takeover" (§6). Acceptable interim: takeover covers the
-  drifted case.
+- Masters are *initially* distributed as evenly across sites as the arithmetic
+  allows — an odd number of masters over two sites always leaves one site holding the
+  majority (`shards: 3`, the standard mental model, is a 2+1 split). No active master
+  balancing in the first iteration; a gentle rebalance (graceful `CLUSTER FAILOVER`
+  on a replica, no data loss) is a planned follow-up (§10) — without it, repeated
+  failovers can concentrate masters further. Consequence for site loss (§6, ADR-012):
+  losing a minority-master site heals natively; losing a majority-master site is
+  automatically recoverable only when the site's death is Kubernetes-confirmed —
+  under an unobservable witness it lands in the **drift-refusal** (the fence argument
+  is unavailable), surfacing a condition and waiting for the opt-in or a human. That
+  refusal is an expected, common dual-site outcome, not a rare corner: uneven spreads
+  exist by construction (odd shards) and by drift (even shards).
 - The shard-aware reattach (LR-020 `chooseReattachTarget`) keeps its rule "attach an
   empty pod to the under-replicated master of *its own shard*" — membership is per
   shard across sites; `cluster-allow-replica-migration no` stays.
@@ -156,7 +162,7 @@ fact shapes the dual-site rows below.
 |---|---|---|
 | Pod / node loss | any | Native Redis failover to a replica (same or other site). Existing repair loop unchanged. |
 | Full site loss | ≥3 | **Native**: survivors keep a master majority, FAIL-mark the dead masters, elect cross-site replicas. Operator cleans up ghosts (FORGET) afterwards. |
-| Full site loss | 2 | **Operator takeover**: survivors hold exactly half the masters — below quorum — so native failover cannot trigger. The operator (which survives if the hub does) detects the site loss via the site's Kubernetes API and pods, then issues `CLUSTER FAILOVER TAKEOVER` on the surviving replicas and FORGETs the dead nodes — the existing quorum-loss machinery with a new trigger. |
+| Full site loss | 2 | **Operator takeover** (fence-gated, ADR-012): with an even master split, survivors hold exactly half the masters — below quorum — so native failover cannot trigger. The operator (which survives if the hub does) detects the site loss via the site's Kubernetes API and pods, then issues `CLUSTER FAILOVER TAKEOVER` on the surviving replicas and FORGETs the dead nodes — the existing quorum-loss machinery with a new trigger. If the *lost* site held the master majority (odd shards, or drift), the fence argument is unavailable: under an unobservable witness the operator **refuses** (drift-refusal) and waits for Kubernetes-confirmed death, the opt-in, or a human. |
 | Cross-site link cut | 2 | Both halves are minority ⇒ both fail-stop until the link heals; recovery is automatic on heal (rejoin delay applies). **Descoped**: no operator action; a runbook documents it. Link redundancy is the real mitigation. |
 | Cross-site link cut | ≥3 | Only the isolated site fail-stops; majority side continues, fails over the isolated site's shards. Rejoining site's demoted ex-masters resync. |
 | Multi-site / total failure | any | **Descoped**: manual re-bootstrap (the instance is a pure in-memory store; total loss is a documented, accepted outcome — cf. ADR-008 for the single-site analog). |
@@ -171,6 +177,17 @@ Safety notes:
   the site still serves would create two masters per shard; the gate must make this
   practically impossible, and the losing side is demoted on heal (async-replication
   write-loss semantics, same class Redis failover always has).
+- **The fence-safe automated path is *exactly* the even-split case.** "Survivors
+  below quorum" (takeover needed) and "lost side below quorum" (fence holds) can hold
+  together only when the slot-serving masters split exactly in half. Any odd master
+  count makes a dual-site loss either native (survivors hold quorum) or a
+  drift-refusal (the lost side could hold it). See ADR-012 condition 4.
+- **Dual-site takeover presumes the hub survives the lost site.** A hub co-located in
+  one of the two sites cannot recover that site's loss — the operator dies with it.
+  Automated dual-site recovery therefore effectively requires the hub in a third
+  failure domain (or stretched across sites): a third domain holding **no data and no
+  quorum participant**, which is exactly why the takeover still beats the witness
+  shard (§6.1).
 - **Ghost handling stays Kubernetes-informed and becomes multi-site aware** (pillar
   3.4): a node is only FORGOTTEN when *its* site's Kubernetes API confirms the pod is
   gone — never merely because it is unreachable from the hub.

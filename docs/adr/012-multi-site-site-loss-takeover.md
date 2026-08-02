@@ -54,13 +54,27 @@ The gate — **all** conditions must hold:
    survivors hold a majority, Redis will elect on its own — the operator waits
    (pillar 3.5). This condition also makes the rule mode-general: it fires for
    dual-site symmetric loss *and* for drift-created minority states, and stays
-   silent whenever Redis can self-heal.
+   silent whenever Redis can self-heal. **Vantage point:** evaluated from the
+   *survivors' own view*, never the hub's dial (LR-017; ADR-011's corroboration
+   principle). The direct signal is the surviving pods' `CLUSTER INFO` reporting
+   `cluster_state:fail` — the minority fail-stop observed first-hand — corroborated
+   by the FAIL/PFAIL flags in their `CLUSTER NODES` tables. The hub's own
+   reachability is transport, not evidence; the same vantage applies to
+   conditions 1 and 4.
 3. **Site witness is not contradictory.** Per affected site, the hub's Kubernetes
    view yields one of three states:
-   - `ConfirmedDown` — site API reachable, the site's redis pods gone or not-Ready.
+   - `ConfirmedDown` — site API reachable, and per redis pod either the pod is
+     **gone**, or it is not-Ready while its **Node is Ready** (kubelet-attested).
      Kubelet readiness is the authority (the ADR-008 argument: in a pure in-memory
      instance a not-Ready redis serves nothing and holds nothing; and unlike the
-     hub's remote dial it cannot be fooled by a blackhole — LR-017).
+     hub's remote dial it cannot be fooled by a blackhole — LR-017). A pod shown
+     not-Ready while its Node is NotReady/Unknown does **not** qualify: that flag
+     is set by the node controller (kube-controller-manager's node-lifecycle
+     controller) inferring from missed heartbeats — a remote inference, not the
+     kubelet's verdict — and the pod may in fact still be running, holding data,
+     serving intra-site clients (the LR-017 trap in Kubernetes clothing). Such
+     pods downgrade the witness to `Unobservable` grade: fence required
+     (condition 4).
    - `Unobservable` — site API unreachable. Ambiguous: true site death also kills
      the API; so does a mere hub↔site management-path cut.
    - `Contradiction` — site API reachable and pods Ready. The site is alive; the
@@ -78,6 +92,15 @@ The gate — **all** conditions must hold:
    *could* hold a majority (drift), an isolated site may still be serving:
    **refuse**, surface a condition, and require either
    `multiSite.allowUnsafeSiteTakeover` or manual action.
+   **Arithmetic identity:** condition 2 (reachable ≤ size/2) and this fence
+   (unreachable ≤ size/2) can hold together *only when the slot-serving masters
+   split exactly in half* — the fence-safe automated path IS the even-split case.
+   Any odd master count makes a site loss either native (condition 2 fails) or
+   this refusal (the lost side could hold the majority). Since `shards: 3` over
+   two sites is the standard deployment shape, and drift recreates uneven spreads
+   in even-shard instances, this refusal is an **expected, common dual-site
+   outcome** — a first-class documented state with the opt-in as its escape
+   hatch, not a rare corner.
 5. **Cooldown.** First observation arms `status.multiSite.takeoverPendingSince`
    (mirrors `LeaderlessSince` / `wipeDeadlockSince`); the plan fires only if the
    state persists past `max(60s, 2 × cluster-node-timeout)` — comfortably after the
@@ -97,10 +120,16 @@ Actions, in order:
 2. `CLUSTER FORGET` the lost site's node IDs on every reachable node (ghost
    hygiene; pillar 3.4 extended: a node is forgotten only when *its own* site's
    witness supports it — never merely because the hub cannot reach it).
-3. Nothing else. Site rejoin is the ordinary empty-pod path: fresh pods (EmptyDir,
-   new node IDs — no epoch conflict by construction) are MEET-ed and reattached
-   shard-aware, staggered per the LR-021 serialization pattern to bound the WAN
-   full-sync burst.
+3. Site rejoin. Fresh pods take the ordinary empty-pod path: (EmptyDir, new node
+   IDs — no epoch conflict by construction) MEET-ed and reattached shard-aware,
+   staggered per the LR-021 serialization pattern to bound the WAN full-sync
+   burst. Pods that return **without a restart** — the fence-safe branch
+   explicitly admits an alive, fail-stopped site that later heals — carry
+   forgotten node IDs and stale epochs and cannot gossip themselves back in
+   (survivors drop packets from unknown senders; re-admission needs MEET). The
+   operator **recycles** them (pod delete, the ADR-008 machinery) so they too
+   return through the fresh-pod path, rather than re-MEETing stale ex-masters
+   mid-recovery.
 
 ## Rationale
 - **Why the operator, not the pods or a script.** Same conclusion as LR-016 and
@@ -117,10 +146,14 @@ Actions, in order:
   loss class.
 - **Why refuse on drift instead of trusting the witness.** When the unreachable
   side could hold a serving majority, a wrong takeover creates a *live* dual
-  writer — the one outcome worse than an outage. The refusal is expected to be
-  rare (the master-rebalance follow-up keeps spreads even) and has an explicit
-  opt-in escape hatch, following the `allowUnsafeRebootstrapOnDeadlock` precedent:
-  the operator never takes a data-losing gamble silently.
+  writer — the one outcome worse than an outage. The refusal is **not** rare in
+  dual-site: an odd shard count (3 is the standard shape) gives one site the
+  master majority by construction, and drift recreates uneven spreads in
+  even-shard instances — the master-rebalance follow-up narrows only the drift
+  half. It is therefore documented as an expected outcome with an explicit
+  opt-in escape hatch (`allowUnsafeSiteTakeover`, following the
+  `allowUnsafeRebootstrapOnDeadlock` precedent) and its own runbook entry: the
+  operator never takes a data-losing gamble silently.
 - **Why not act on `Contradiction`.** Evidence of an alive site makes this a link
   partition, which the design descopes deliberately: taking over would trade the
   isolated site's fence-window writes and a full post-heal resync for availability
@@ -132,8 +165,11 @@ Actions, in order:
 
 ## Consequences
 - A dual-site site loss recovers in roughly cooldown + one reconcile, with zero
-  loss of replicated data; ≥3-site losses stay fully native and this rule stays
-  silent.
+  loss of replicated data — **when the gate passes** (Kubernetes-confirmed death,
+  or an even master split under an unobservable witness). The loss of a
+  majority-master site under an unobservable witness refuses (drift-refusal) and
+  waits for the opt-in or a human — an expected, documented dual-site outcome
+  (see condition 4). ≥3-site losses stay fully native and this rule stays silent.
 - A dual-site inter-site **link cut** remains a full outage until the link heals —
   by design, inherited from the design doc's descope. Link redundancy is the
   mitigation; the fence keeps it split-brain-free.
@@ -143,14 +179,33 @@ Actions, in order:
 - The gate depends on per-site Kubernetes API access — already a multi-site
   prerequisite — and on bounded probes (LR-017 `ProbeTimeout`) so a dead site
   cannot stall the reconcile that must repair it.
+- Automated dual-site recovery presumes the hub survives the lost site: a hub
+  co-located in one of the two sites cannot recover that site's loss. The
+  effective deployment requirement is the hub in a third failure domain (or
+  stretched) — one holding no data and no quorum participant (design doc §6).
+- **TAKEOVER→FORGET ordering is required, not just preferred**: a shard's other
+  surviving replica still points at the dead master until it follows the slot
+  claim, and `CLUSTER FORGET` refuses ("Can't forget my master") on such a node.
+  FORGET therefore trails idempotently across reconciles; a partial FORGET pass
+  is normal, not an error.
+- A multi-shard takeover issues several no-consensus epoch bumps close together;
+  convergence relies on Redis's config-epoch collision resolution — named here
+  so the reliance is explicit, and asserted in the multi-orphaned-shard e2e.
+- The ≥3-site link-cut *rejoin* is a resync storm the LR-021 staggering does not
+  bound (the isolated site's pods never restarted, so there is no StatefulSet
+  recreation to stagger) — accepted for now; revisit if it bites.
 - Test plan (red-first): planner table tests for every branch — safe takeover
   (`ConfirmedDown`, `Unobservable`+fence-safe), refusal on drift-majority without
-  opt-in, hold on `Contradiction`, cooldown arming/clearing, Rule-A quieting.
-  e2e: dual-site site kill → takeover + serve; hub↔site management-path cut with
-  the site alive → must **not** fire; site rejoin → staggered resync, no epoch
-  conflict. Also verify e2e that `CLUSTER FAILOVER TAKEOVER` executes on a replica
-  whose local `cluster_state` is `fail` (expected — it performs no agreement — but
-  load-bearing, so proven, not assumed).
+  opt-in, hold on `Contradiction`, downgrade of node-controller-inferred
+  not-Ready (Node NotReady/Unknown) to `Unobservable` grade, cooldown
+  arming/clearing, Rule-A quieting. e2e: dual-site site kill → takeover + serve;
+  hub↔site management-path cut with the site alive → must **not** fire; site
+  rejoin (fresh pods) → staggered resync, no epoch conflict; fenced-alive site
+  heals → pre-takeover pods are recycled, never re-MEET-ed stale;
+  multi-orphaned-shard takeover → concurrent epoch bumps converge (collision
+  resolution). Also verify e2e that `CLUSTER FAILOVER TAKEOVER` executes on a
+  replica whose local `cluster_state` is `fail` (expected — it performs no
+  agreement — but load-bearing, so proven, not assumed).
 
 ## Alternatives considered
 - **Witness shard** (a 1-slot master in a third failure domain to make the master
