@@ -107,6 +107,12 @@ type LittleRedReconciler struct {
 	monitors         map[types.NamespacedName]func()
 	failoverMonitors map[types.NamespacedName]func()
 	monitorsMu       sync.Mutex
+
+	// sites is the per-CR/per-site SiteClient registry for multi-site cluster
+	// mode (docs/MULTI_SITE_DESIGN.md §8). Constructed in SetupWithManager; nil
+	// when the reconciler is built without a manager (unit/envtest) — the
+	// multi-site helpers tolerate that (single-site behavior is unaffected).
+	sites *siteClientRegistry
 }
 
 // event emits a Kubernetes Event for lr, tolerating a nil Recorder (e.g. in unit
@@ -170,6 +176,15 @@ func (r *LittleRedReconciler) Reconcile(ctx context.Context, req ctrl.Request) (
 		if err := r.Update(ctx, littleRed); err != nil {
 			return ctrl.Result{}, err
 		}
+		return ctrl.Result{Requeue: true}, nil
+	}
+
+	// Multi-site instances additionally carry a spoke-teardown finalizer: their
+	// spoke-side children have no cross-cluster owner references, so a finalizer
+	// sweep is their only garbage collection (see docs/MULTI_SITE_DESIGN.md §8).
+	if updated, err := r.ensureMultiSiteFinalizer(ctx, littleRed); err != nil {
+		return ctrl.Result{}, err
+	} else if updated {
 		return ctrl.Result{Requeue: true}, nil
 	}
 
@@ -261,6 +276,17 @@ func (r *LittleRedReconciler) reconcileDelete(ctx context.Context, littleRed *li
 		if !apierrors.IsConflict(err) {
 			return ctrl.Result{}, err
 		}
+	}
+
+	// Multi-site: sweep the spoke-side children (no cross-cluster owner refs to
+	// GC them) before releasing the standard finalizer. A site unreachable at
+	// deletion time keeps the teardown finalizer and requeues; the documented
+	// escape hatch is manual finalizer removal.
+	if done, err := r.handleMultiSiteDeletion(ctx, littleRed); err != nil {
+		return ctrl.Result{}, err
+	} else if !done {
+		fast, _ := littleRed.GetRequeueIntervals()
+		return ctrl.Result{RequeueAfter: fast}, nil
 	}
 
 	// Remove finalizer (owned resources will be garbage collected)
@@ -1457,6 +1483,7 @@ func (r *LittleRedReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.monitorEvents = make(chan event.GenericEvent)
 	r.monitors = make(map[types.NamespacedName]func())
 	r.failoverMonitors = make(map[types.NamespacedName]func())
+	r.sites = newSiteClientRegistry(r.Client, r.Scheme, r.monitorEvents)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&littleredv1alpha1.LittleRed{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

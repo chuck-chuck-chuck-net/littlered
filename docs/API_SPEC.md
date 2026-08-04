@@ -461,6 +461,77 @@ spec:
 > and too few domains, unschedulable pods surface as standard `Pending` pods
 > (visible through readiness: `status.redis.ready < total`, phase `Initializing`).
 
+### 2.14a Multi-Site (Cluster Mode)
+
+> **Status:** experimental; API surface and per-site plumbing only in this
+> release. See `docs/MULTI_SITE_DESIGN.md` and ADR-012.
+
+Only applicable when `mode: cluster`; rejected by validation in every other
+mode. Stretches one Redis Cluster across multiple workload Kubernetes clusters
+("sites"), managed by a single operator running in a designated management
+Kubernetes cluster (the "hub"). Absent `multiSite` means single-site behavior,
+unchanged.
+
+```yaml
+spec:
+  mode: cluster
+  cluster:
+    shards: 3
+    replicasPerShard: 1       # per-site shard StatefulSet size = replicasPerShard + 1
+  multiSite:
+    sites:
+      - name: alpha
+        kubeconfigSecretRef:
+          name: site-alpha-kubeconfig   # omitted => hub-local site
+      - name: beta
+        kubeconfigSecretRef:
+          name: site-beta-kubeconfig
+    sitesPerShard: 2          # default: number of sites
+    network:
+      mode: pod-routed        # only supported value (nodeport | multus are future)
+    allowUnsafeSiteTakeover: false
+```
+
+Each `kubeconfigSecretRef` names a Secret **in the operator namespace** holding
+a kubeconfig under the `kubeconfig` data key, whose credentials are bound to a
+**namespaced Role** in the target site (workload CRUD + pod read in the instance
+namespace — not cluster-admin). Generating that ServiceAccount/Role/RoleBinding/
+token and Secret is an operator setup step (no helper tooling ships in this
+milestone). A site with `kubeconfigSecretRef` omitted is **hub-local**: its
+workloads live in the same Kubernetes cluster as the operator.
+
+**Total members per shard = `sitesPerShard × (replicasPerShard + 1)`** — note the
+reading trap: `replicasPerShard: 1` in a dual-site instance yields 4 members per
+shard (1 master + 3 replicas), not 2.
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `multiSite` | `MultiSite` | No | `nil` | Stretch the cluster across sites. Cluster mode only. Absent = single-site. |
+| `multiSite.sites` | `[]Site` | Yes (if `multiSite` set) | — | The sites hosting this instance's Redis pods. Minimum 2; names unique; at most one hub-local. |
+| `multiSite.sites[].name` | `string` | Yes | — | Unique site name within the instance. |
+| `multiSite.sites[].kubeconfigSecretRef.name` | `string` | No | — | Name of a Secret in the operator namespace holding the site kubeconfig (`kubeconfig` key). Omit entirely for a hub-local site. |
+| `multiSite.sitesPerShard` | `int` | No | number of sites | How many sites host each shard (round-robin over the ordered site list). Must be `2 ≤ sitesPerShard ≤ len(sites)`. `sitesPerShard = N+1` tolerates N site losses without data loss. |
+| `multiSite.network.mode` | `string` (enum: `pod-routed`) | No | `pod-routed` | Cross-site replication transport. Only `pod-routed` (routed pod CIDRs between all sites) is supported; `nodeport` and `multus` are future transports and are rejected. |
+| `multiSite.allowUnsafeSiteTakeover` | `bool` | No | `false` | Permit an operator-led site-loss takeover when the fence argument is unavailable (the lost side could hold a serving master majority). With it unset the operator refuses (drift-refusal) and waits for Kubernetes-confirmed death or a human. See ADR-012. |
+
+**Validation** (CEL at admission + controller-side `Validate()`):
+- `multiSite` only with `mode: cluster`.
+- At least 2 sites; site names unique and non-empty; a present
+  `kubeconfigSecretRef` must name a non-empty Secret.
+- At most one hub-local site (a second local site is meaningless).
+- `2 ≤ sitesPerShard ≤ len(sites)` (the `≥ 2` floor is what lets the design
+  descope single-site-loss data repair — `docs/MULTI_SITE_DESIGN.md` §4).
+- `network.mode` must be `pod-routed`.
+
+**Spoke-side garbage collection:** owner references do not work across Kubernetes
+clusters, so spoke-side children are created **without** owner references
+(hub-local children keep the ordinary controller owner reference). Instead a
+multi-site CR carries the `redis.chuck-chuck-chuck.net/multisite-teardown`
+finalizer, whose delete path sweeps the instance-labeled workload objects
+through each site before the CR is released. A site unreachable at deletion time
+keeps the finalizer (bounded retries) and surfaces the `MultiSiteTeardown`
+condition; the documented escape hatch is removing the finalizer manually.
+
 ### 2.15 Requeue Intervals
 
 For tuning large-scale installations to reduce API server pressure:
@@ -585,6 +656,19 @@ status:
         masterNodeId: abc123def456...
         detectedAt: "2026-02-03T12:01:00Z"
     wipeDeadlockSince: "2026-07-31T08:00:00Z"  # Set when the total-/partial-wipe deadlock signature is observed; cleared once it no longer holds
+
+  # Multi-site cluster mode only (spec.multiSite set) — monitoring surface;
+  # per-site observed state is re-derived from live probes each pass
+  multiSite:
+    sites:
+      - name: alpha
+        reachable: true
+        pods: {ready: 4, total: 4}
+        lastProbeTime: "2026-08-02T09:00:00Z"
+      - name: beta
+        reachable: false               # site unreachable = unmanaged, not broken
+        lastProbeTime: "2026-08-02T08:59:30Z"
+    takeoverPendingSince: "2026-08-02T09:00:10Z"  # Armed when a site loss native failover cannot resolve is observed; cleared when it clears (ADR-012)
 ```
 
 | Field | Type | Description |
@@ -621,6 +705,12 @@ status:
 | `cluster.orphanedReplicas[].masterNodeId` | `string` | Node ID of the (now gone) master |
 | `cluster.orphanedReplicas[].detectedAt` | `Time` | When the orphan was first detected |
 | `cluster.wipeDeadlockSince` | `Time` | Set when the operator first observes the total-/partial-wipe deadlock signature: cluster pods stuck not-Ready and crash-looping (redis down, so — pure in-memory — holding no data) while the instance cannot reach a healthy topology. Arms the cooldown before the operator recycles the stuck pods; cleared as soon as the signature no longer holds (cluster mode). |
+| `multiSite.sites` | `[]SiteStatus` | Per-site observed state (multi-site cluster mode). Monitoring surface — re-derived from live probes each pass. |
+| `multiSite.sites[].name` | `string` | Site name from `spec.multiSite.sites`. |
+| `multiSite.sites[].reachable` | `bool` | Whether the site's Kubernetes API was reachable at the last probe. An unreachable site is unmanaged, not broken (its Redis keeps serving and failing over natively). |
+| `multiSite.sites[].pods` | `RedisStatus` | Count of this instance's Redis pods observed in the site (`ready`/`total`). |
+| `multiSite.sites[].lastProbeTime` | `Time` | When the operator last probed the site. |
+| `multiSite.takeoverPendingSince` | `Time` | Armed when the operator first observes a site loss that native Redis failover cannot resolve; gates the takeover cooldown (ADR-012). Cleared when the state clears (multi-site cluster mode). |
 
 ### 3.1 Condition Types
 
@@ -633,6 +723,7 @@ status:
 | `LeaderlessRecovery` | ✅ | Sentinel mode only: reflects a leaderless bootstrap deadlock (every Sentinel bare, no master) and the operator's response — `True` means the instance is deadlocked and needs attention (in cooldown, or refusing because data is present); `False` records a completed recovery |
 | `GhostMasterRecovery` | ✅ | Sentinel mode only: reflects a ghost-master failover deadlock — a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so failover aborts `no-good-slave` while living survivors hold the data — and the operator's recovery of it. `True` means deadlocked/needs attention (in cooldown, or refusing because divergent data is present); `False` records a completed recovery |
 | `FailoverRecovery` | ✅ | Failover mode only: `True` means the instance needs attention — most importantly the refuse-and-wait state, where the surviving data holders span divergent replication lineages and electing any one would discard independent writes (set `failover.allowUnsafeRebootstrapOnDeadlock` to authorize); `False` records a completed recovery |
+| `MultiSiteTeardown` | ✅ | Multi-site cluster mode only: `True` while the deletion sweep is blocked — a site was unreachable or its sweep failed — so the `redis.chuck-chuck-chuck.net/multisite-teardown` finalizer is retained and the operator retries. Escape hatch: remove the finalizer manually |
 | `TLSReady` | — | Reserved for future use (defined but not currently set) |
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |
 | `ClusterReady` | — | Reserved for future use (defined but not currently set) |
@@ -1171,6 +1262,10 @@ type ConfigSpec struct {
 | `spec.failover` only allowed with `mode: failover` (CEL rule on the CRD; `spec.sentinel`/`spec.cluster` are gated to their modes the same way) | Rejected at admission |
 | `failover.replicas` must be ≥ 1; `failover.minReplicasToWrite` must be ≥ 0 | Enforced by the CRD schema, mirrored in controller validation |
 | `spec.placement.shardAntiAffinity` rejected unless `mode: cluster` (failover included) | Validation failure |
+| `spec.multiSite` only allowed with `mode: cluster` (CEL rule on the CRD, mirrored in controller validation) | Rejected at admission |
+| `spec.multiSite.sites` must have ≥ 2 entries; names unique and non-empty; a present `kubeconfigSecretRef` must name a non-empty Secret; at most one hub-local site | Enforced by the CRD schema (MinItems, listType=map, MinLength, CEL) and mirrored in controller validation |
+| `spec.multiSite.sitesPerShard` must be `2 ≤ sitesPerShard ≤ len(sites)` | CRD Minimum=2 + CEL upper bound, mirrored in controller validation |
+| `spec.multiSite.network.mode` must be `pod-routed` | CRD enum (nodeport/multus rejected), mirrored in controller validation |
 | `cluster.shards` must be ≥ `3` | Enforced by the CRD schema (minimum 3, default 3) and mirrored in controller validation (`cluster mode requires at least 3 shards`) |
 | `cluster.replicasPerShard` must be `0` or `1` | Currently only 0 or 1 replica per shard supported |
 | `maxmemory` must parse as quantity | Invalid memory format |

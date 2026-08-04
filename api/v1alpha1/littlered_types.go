@@ -30,6 +30,7 @@ import (
 // +kubebuilder:validation:XValidation:rule="self.mode == 'cluster' || !has(self.cluster)",message="spec.cluster may only be set when spec.mode is 'cluster'"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'sentinel' || !has(self.sentinel)",message="spec.sentinel may only be set when spec.mode is 'sentinel'"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'failover' || !has(self.failover)",message="spec.failover may only be set when spec.mode is 'failover'"
+// +kubebuilder:validation:XValidation:rule="self.mode == 'cluster' || !has(self.multiSite)",message="spec.multiSite may only be set when spec.mode is 'cluster'"
 type LittleRedSpec struct {
 	// Mode is the deployment mode: standalone, sentinel, cluster, or failover (experimental)
 	// +kubebuilder:validation:Enum=standalone;sentinel;cluster;failover
@@ -100,6 +101,12 @@ type LittleRedSpec struct {
 	// Placement defines topology/failure-domain placement rules (cluster mode only)
 	// +optional
 	Placement *PlacementSpec `json:"placement,omitempty"`
+
+	// MultiSite stretches a Redis Cluster across multiple workload Kubernetes
+	// clusters ("sites") managed by this (hub) operator. Cluster mode only.
+	// Absent means single-site behavior, unchanged. See docs/MULTI_SITE_DESIGN.md.
+	// +optional
+	MultiSite *MultiSiteSpec `json:"multiSite,omitempty"`
 }
 
 // PodDisruptionBudgetSpec defines whether a PodDisruptionBudget should be created
@@ -568,6 +575,81 @@ type ClusterSpec struct {
 	ReshardMigrateTimeoutMillis int `json:"reshardMigrateTimeoutMillis,omitempty"`
 }
 
+// MultiSiteSpec configures a stretched Redis Cluster across multiple sites
+// (workload Kubernetes clusters), managed hub-and-spokes by one operator.
+// Cluster mode only. See docs/MULTI_SITE_DESIGN.md and ADR-012.
+// +kubebuilder:validation:XValidation:rule="!has(self.sitesPerShard) || self.sitesPerShard <= self.sites.size()",message="spec.multiSite.sitesPerShard cannot exceed the number of sites"
+// +kubebuilder:validation:XValidation:rule="self.sites.filter(s, !has(s.kubeconfigSecretRef)).size() <= 1",message="at most one site may be hub-local (kubeconfigSecretRef omitted)"
+type MultiSiteSpec struct {
+	// Sites lists the workload Kubernetes clusters hosting Redis pods of this
+	// instance. At least 2 sites are required (sitesPerShard >= 2 is what lets
+	// the design descope single-site-loss data repair); site names must be
+	// unique. At most one site may be hub-local (kubeconfigSecretRef omitted).
+	// +kubebuilder:validation:MinItems=2
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=map
+	// +listMapKey=name
+	Sites []SiteSpec `json:"sites"`
+
+	// SitesPerShard is how many sites host each shard. Defaults to the number
+	// of sites (every site hosts every shard); pinning it at 2 or 3 with many
+	// sites scales out capacity instead of multiplying copies. Must be between
+	// 2 and the number of sites. Total members per shard =
+	// sitesPerShard x (replicasPerShard + 1).
+	// +kubebuilder:validation:Minimum=2
+	// +optional
+	SitesPerShard int `json:"sitesPerShard,omitempty"`
+
+	// Network selects the cross-site replication transport.
+	// +optional
+	Network MultiSiteNetworkSpec `json:"network,omitempty"`
+
+	// AllowUnsafeSiteTakeover permits the operator to take over a lost site's
+	// shards (CLUSTER FAILOVER TAKEOVER on surviving replicas) even when the
+	// fence argument is unavailable — the unreachable side could hold a serving
+	// master majority, so a wrong takeover creates a live dual writer. With it
+	// unset the operator refuses (drift-refusal), surfaces a condition and
+	// waits for Kubernetes-confirmed site death or a human. See ADR-012.
+	// +optional
+	AllowUnsafeSiteTakeover bool `json:"allowUnsafeSiteTakeover,omitempty"`
+}
+
+// SiteSpec identifies one site (workload Kubernetes cluster) of a multi-site
+// instance.
+type SiteSpec struct {
+	// Name is the site's unique name within this instance.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+
+	// KubeconfigSecretRef names a Secret in the operator namespace holding a
+	// kubeconfig whose credentials are bound to a namespaced Role in the target
+	// site (workload CRUD + pod read in the instance namespace — not
+	// cluster-admin). Omitted means the site is hub-local: its workloads live
+	// in the same Kubernetes cluster as the operator.
+	// +optional
+	KubeconfigSecretRef *KubeconfigSecretRef `json:"kubeconfigSecretRef,omitempty"`
+}
+
+// KubeconfigSecretRef names a Secret in the operator namespace that holds a
+// site kubeconfig under the "kubeconfig" data key.
+type KubeconfigSecretRef struct {
+	// Name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// MultiSiteNetworkSpec selects the cross-site replication transport.
+type MultiSiteNetworkSpec struct {
+	// Mode is the transport for cross-site pod reachability. Only "pod-routed"
+	// is supported: pod CIDRs are routed between all sites (and the hub), so
+	// Redis nodes announce and reach plain pod IPs across sites. Future
+	// transports (nodeport, multus) are not yet accepted.
+	// +kubebuilder:validation:Enum=pod-routed
+	// +kubebuilder:default=pod-routed
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
 // PlacementSpec defines topology/failure-domain placement rules. Cluster mode only.
 type PlacementSpec struct {
 	// ShardAntiAffinity spreads each shard's pods (its master and replicas) across a
@@ -651,6 +733,16 @@ const (
 	// bare-Sentinel deadlock) keeps the sentinel-vs-failover graduation-gate
 	// comparison honest.
 	ConditionFailoverRecovery = "FailoverRecovery"
+	// ConditionMultiSiteTeardown reflects the multi-site deletion sweep (cluster
+	// mode with spec.multiSite). Spoke-side children carry no owner references
+	// (owner references do not work across Kubernetes clusters), so on CR
+	// deletion the operator sweeps the instance-labeled workload objects
+	// through every site before releasing the CR. True means the sweep is
+	// blocked — a site was unreachable or its sweep failed — and the finalizer
+	// is retained while the operator retries with bounded per-site attempts;
+	// the documented escape hatch is manually removing the
+	// redis.chuck-chuck-chuck.net/multisite-teardown finalizer.
+	ConditionMultiSiteTeardown = "MultiSiteTeardown"
 )
 
 // LittleRedStatus defines the observed state of LittleRed
@@ -718,6 +810,49 @@ type LittleRedStatus struct {
 	// Failover contains failover-mode state (failover mode only)
 	// +optional
 	Failover *FailoverStatus `json:"failover,omitempty"`
+
+	// MultiSite contains multi-site observed state (cluster mode with
+	// spec.multiSite only)
+	// +optional
+	MultiSite *MultiSiteStatus `json:"multiSite,omitempty"`
+}
+
+// MultiSiteStatus contains multi-site observed state (cluster mode with
+// spec.multiSite only). Monitoring surface: per-site observed state is
+// re-derived from live probes; the takeover marker mirrors the
+// leaderlessSince/wipeDeadlockSince cooldown-anchor pattern.
+type MultiSiteStatus struct {
+	// Sites is the per-site observed state.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Sites []SiteStatus `json:"sites,omitempty"`
+
+	// TakeoverPendingSince records when the operator first observed a site-loss
+	// state that native Redis failover cannot resolve, arming the cooldown
+	// before an operator-led CLUSTER FAILOVER TAKEOVER (ADR-012). Cleared when
+	// the state clears.
+	// +optional
+	TakeoverPendingSince *metav1.Time `json:"takeoverPendingSince,omitempty"`
+}
+
+// SiteStatus is the observed state of one site.
+type SiteStatus struct {
+	// Name is the site name from spec.multiSite.sites.
+	Name string `json:"name"`
+
+	// Reachable reports whether the site's Kubernetes API was reachable at the
+	// last probe.
+	// +optional
+	Reachable bool `json:"reachable,omitempty"`
+
+	// Pods counts this instance's Redis pods observed in the site.
+	// +optional
+	Pods *RedisStatus `json:"pods,omitempty"`
+
+	// LastProbeTime is when the operator last probed the site.
+	// +optional
+	LastProbeTime *metav1.Time `json:"lastProbeTime,omitempty"`
 }
 
 // FailoverStatus contains failover-mode state. Both fields are monitoring
@@ -912,7 +1047,57 @@ func (r *LittleRed) Validate() error {
 		}
 	}
 
-	return nil
+	return r.validateMultiSite()
+}
+
+// validateMultiSite validates spec.multiSite. Defense-in-depth mirror of the
+// CRD structural rules (CEL, MinItems, listType=map, enum) plus the relational
+// rules the schema cannot express against the dynamically defaulted
+// sitesPerShard. Expects SetDefaults to have run.
+func (r *LittleRed) validateMultiSite() error {
+	ms := r.Spec.MultiSite
+	if ms == nil {
+		return nil
+	}
+
+	if r.Spec.Mode != ModeCluster {
+		return fmt.Errorf("spec.multiSite is only supported in cluster mode (mode is %q)", r.Spec.Mode)
+	}
+
+	if len(ms.Sites) < 2 {
+		return fmt.Errorf("spec.multiSite requires at least 2 sites (found %d); a single-site instance simply omits multiSite", len(ms.Sites))
+	}
+
+	seen := make(map[string]bool, len(ms.Sites))
+	hubLocal := 0
+	for _, s := range ms.Sites {
+		if s.Name == "" {
+			return fmt.Errorf("spec.multiSite.sites[].name must not be empty")
+		}
+		if seen[s.Name] {
+			return fmt.Errorf("duplicate site name %q in spec.multiSite.sites", s.Name)
+		}
+		seen[s.Name] = true
+		if s.KubeconfigSecretRef == nil {
+			hubLocal++
+		} else if s.KubeconfigSecretRef.Name == "" {
+			return fmt.Errorf("site %q: kubeconfigSecretRef.name must not be empty (omit kubeconfigSecretRef entirely for a hub-local site)", s.Name)
+		}
+	}
+	if hubLocal > 1 {
+		return fmt.Errorf("at most one site may be hub-local (kubeconfigSecretRef omitted); found %d", hubLocal)
+	}
+
+	if ms.SitesPerShard != 0 && (ms.SitesPerShard < 2 || ms.SitesPerShard > len(ms.Sites)) {
+		return fmt.Errorf("spec.multiSite.sitesPerShard must be between 2 and the number of sites (%d), got %d", len(ms.Sites), ms.SitesPerShard)
+	}
+
+	switch ms.Network.Mode {
+	case "", MultiSiteNetworkModePodRouted:
+		return nil
+	default:
+		return fmt.Errorf("spec.multiSite.network.mode %q is not supported (only %q; nodeport and multus are future transports)", ms.Network.Mode, MultiSiteNetworkModePodRouted)
+	}
 }
 
 // +kubebuilder:object:root=true

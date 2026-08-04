@@ -86,6 +86,12 @@ const (
 	// Placement defaults (cluster-mode shard anti-affinity)
 	DefaultShardTopologyKey       = "kubernetes.io/hostname"
 	DefaultShardWhenUnsatisfiable = corev1.ScheduleAnyway
+
+	// Multi-site (cluster mode; see docs/MULTI_SITE_DESIGN.md).
+	// MultiSiteNetworkModePodRouted is the only supported cross-site transport:
+	// pod CIDRs routed between all sites. sitesPerShard has no static default —
+	// it defaults dynamically to the number of sites (MultiSiteSpec.SetDefaults).
+	MultiSiteNetworkModePodRouted = "pod-routed"
 )
 
 // redis-exporter.Dockerfile is the single source of truth for the default
@@ -201,6 +207,23 @@ func (r *LittleRed) SetDefaults() {
 	// Placement defaults (only when the block is present; not mode-gated / never auto-created)
 	if spec.Placement != nil {
 		spec.Placement.SetDefaults()
+	}
+
+	// Multi-site defaults (only when the block is present; never auto-created)
+	if spec.MultiSite != nil {
+		spec.MultiSite.SetDefaults()
+	}
+}
+
+// SetDefaults applies default values to MultiSiteSpec. sitesPerShard defaults
+// dynamically to the number of sites (every site hosts every shard), so it
+// cannot be a static CRD default marker.
+func (m *MultiSiteSpec) SetDefaults() {
+	if m.SitesPerShard == 0 {
+		m.SitesPerShard = len(m.Sites)
+	}
+	if m.Network.Mode == "" {
+		m.Network.Mode = MultiSiteNetworkModePodRouted
 	}
 }
 

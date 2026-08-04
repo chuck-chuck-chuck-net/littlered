@@ -257,6 +257,7 @@ Remaining field-shape details are settled in the ADR, not here.
   both explicitly.
 - **RBAC blast radius:** the hub operator can modify workloads in every site — the
   accepted cost of flat control, bounded by namespaced Roles per site.
+- **Spoke-side garbage collection:** owner references do not work across Kubernetes clusters — a spoke-side object referencing the hub-resident `LittleRed` UID dangles, and the spoke's GC controller would treat the owner as absent and delete the object out from under us. Spoke-side children are therefore created **without** owner references (hub-local children keep `SetControllerReference` unchanged); instead the CR carries a finalizer whose delete path sweeps the instance-labeled workload objects through each `SiteClient` before the CR is released. A site unreachable at deletion time keeps the finalizer with bounded retries and a surfaced condition; the documented escape hatch is manual finalizer removal.
 
 ## 9. Deferred transports
 

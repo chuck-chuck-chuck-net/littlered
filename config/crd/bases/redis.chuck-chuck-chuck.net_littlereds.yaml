@@ -395,6 +395,95 @@ spec:
                 - cluster
                 - failover
                 type: string
+              multiSite:
+                description: |-
+                  MultiSite stretches a Redis Cluster across multiple workload Kubernetes
+                  clusters ("sites") managed by this (hub) operator. Cluster mode only.
+                  Absent means single-site behavior, unchanged. See docs/MULTI_SITE_DESIGN.md.
+                properties:
+                  allowUnsafeSiteTakeover:
+                    description: |-
+                      AllowUnsafeSiteTakeover permits the operator to take over a lost site's
+                      shards (CLUSTER FAILOVER TAKEOVER on surviving replicas) even when the
+                      fence argument is unavailable — the unreachable side could hold a serving
+                      master majority, so a wrong takeover creates a live dual writer. With it
+                      unset the operator refuses (drift-refusal), surfaces a condition and
+                      waits for Kubernetes-confirmed site death or a human. See ADR-012.
+                    type: boolean
+                  network:
+                    description: Network selects the cross-site replication transport.
+                    properties:
+                      mode:
+                        default: pod-routed
+                        description: |-
+                          Mode is the transport for cross-site pod reachability. Only "pod-routed"
+                          is supported: pod CIDRs are routed between all sites (and the hub), so
+                          Redis nodes announce and reach plain pod IPs across sites. Future
+                          transports (nodeport, multus) are not yet accepted.
+                        enum:
+                        - pod-routed
+                        type: string
+                    type: object
+                  sites:
+                    description: |-
+                      Sites lists the workload Kubernetes clusters hosting Redis pods of this
+                      instance. At least 2 sites are required (sitesPerShard >= 2 is what lets
+                      the design descope single-site-loss data repair); site names must be
+                      unique. At most one site may be hub-local (kubeconfigSecretRef omitted).
+                    items:
+                      description: |-
+                        SiteSpec identifies one site (workload Kubernetes cluster) of a multi-site
+                        instance.
+                      properties:
+                        kubeconfigSecretRef:
+                          description: |-
+                            KubeconfigSecretRef names a Secret in the operator namespace holding a
+                            kubeconfig whose credentials are bound to a namespaced Role in the target
+                            site (workload CRUD + pod read in the instance namespace — not
+                            cluster-admin). Omitted means the site is hub-local: its workloads live
+                            in the same Kubernetes cluster as the operator.
+                          properties:
+                            name:
+                              description: Name of the Secret.
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        name:
+                          description: Name is the site's unique name within this
+                            instance.
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 16
+                    minItems: 2
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  sitesPerShard:
+                    description: |-
+                      SitesPerShard is how many sites host each shard. Defaults to the number
+                      of sites (every site hosts every shard); pinning it at 2 or 3 with many
+                      sites scales out capacity instead of multiplying copies. Must be between
+                      2 and the number of sites. Total members per shard =
+                      sitesPerShard x (replicasPerShard + 1).
+                    minimum: 2
+                    type: integer
+                required:
+                - sites
+                type: object
+                x-kubernetes-validations:
+                - message: spec.multiSite.sitesPerShard cannot exceed the number of
+                    sites
+                  rule: '!has(self.sitesPerShard) || self.sitesPerShard <= self.sites.size()'
+                - message: at most one site may be hub-local (kubeconfigSecretRef
+                    omitted)
+                  rule: self.sites.filter(s, !has(s.kubeconfigSecretRef)).size() <=
+                    1
               placement:
                 description: Placement defines topology/failure-domain placement rules
                   (cluster mode only)
@@ -2083,6 +2172,8 @@ spec:
               rule: self.mode == 'sentinel' || !has(self.sentinel)
             - message: spec.failover may only be set when spec.mode is 'failover'
               rule: self.mode == 'failover' || !has(self.failover)
+            - message: spec.multiSite may only be set when spec.mode is 'cluster'
+              rule: self.mode == 'cluster' || !has(self.multiSite)
           status:
             description: LittleRedStatus defines the observed state of LittleRed
             properties:
@@ -2313,6 +2404,61 @@ spec:
                     type: string
                   podName:
                     description: PodName is the current master pod name
+                    type: string
+                type: object
+              multiSite:
+                description: |-
+                  MultiSite contains multi-site observed state (cluster mode with
+                  spec.multiSite only)
+                properties:
+                  sites:
+                    description: Sites is the per-site observed state.
+                    items:
+                      description: SiteStatus is the observed state of one site.
+                      properties:
+                        lastProbeTime:
+                          description: LastProbeTime is when the operator last probed
+                            the site.
+                          format: date-time
+                          type: string
+                        name:
+                          description: Name is the site name from spec.multiSite.sites.
+                          type: string
+                        pods:
+                          description: Pods counts this instance's Redis pods observed
+                            in the site.
+                          properties:
+                            ready:
+                              description: Ready is the number of ready Redis pods
+                              format: int32
+                              type: integer
+                            total:
+                              description: Total is the total number of Redis pods
+                              format: int32
+                              type: integer
+                          required:
+                          - ready
+                          - total
+                          type: object
+                        reachable:
+                          description: |-
+                            Reachable reports whether the site's Kubernetes API was reachable at the
+                            last probe.
+                          type: boolean
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  takeoverPendingSince:
+                    description: |-
+                      TakeoverPendingSince records when the operator first observed a site-loss
+                      state that native Redis failover cannot resolve, arming the cooldown
+                      before an operator-led CLUSTER FAILOVER TAKEOVER (ADR-012). Cleared when
+                      the state clears.
+                    format: date-time
                     type: string
                 type: object
               observedGeneration:
