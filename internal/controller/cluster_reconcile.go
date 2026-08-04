@@ -48,6 +48,13 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 		littleRed.Status.Phase = littleredv1alpha1.PhasePending
 	}
 
+	// Multi-site cluster mode (docs/MULTI_SITE_DESIGN.md): resources, gather, gating and
+	// bootstrap fan out across every site's SiteClient. Single-site (no spec.multiSite)
+	// falls through to the unchanged path below.
+	if isMultiSite(littleRed) {
+		return r.reconcileMultiSiteCluster(ctx, littleRed)
+	}
+
 	// Legacy single-STS migration (ADR-013). When a pre-0.3.0 single {name}-cluster
 	// StatefulSet is present, the operator drives an in-place, online, data-safe migration
 	// into the per-shard layout (drain slots old→new, then delete the emptied legacy
@@ -434,8 +441,11 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		// already-consolidated cluster.
 		intendedMasters := make(map[int]*redisclient.ClusterNodeState) // shardIdx -> Node
 		for i := range shards {
-			podName := shardMasterPodName(littleRed.Name, i)
-			if node, ok := gt.Nodes[podName]; ok && redisclient.SafeMissingShardTarget(node) {
+			// The intended master's ground-truth key differs by mode: single-site keys by
+			// the {name}-shard-K-0 pod name; multi-site keys by the site-qualified initial
+			// master (its primary hosting site), since pod names collide across sites.
+			key := r.intendedShardMasterKey(littleRed, i)
+			if node, ok := gt.Nodes[key]; ok && redisclient.SafeMissingShardTarget(node) {
 				intendedMasters[i] = node
 			}
 		}
@@ -446,7 +456,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			if targetNode == nil {
 				log.Info("Intended master for shard not available, waiting",
 					"shardIdx", shardIdx,
-					"expectedPod", shardMasterPodName(littleRed.Name, shardIdx))
+					"expectedPod", r.intendedShardMasterKey(littleRed, shardIdx))
 				continue
 			}
 
@@ -563,6 +573,9 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 
 // gatherGroundTruth queries all pods to build a view of the cluster
 func (r *LittleRedReconciler) gatherGroundTruth(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) *redisclient.ClusterGroundTruth {
+	if isMultiSite(littleRed) {
+		return r.gatherMultiSiteGroundTruth(ctx, littleRed)
+	}
 	cluster := littleRed.Spec.Cluster
 	password := r.getRedisPassword(ctx, littleRed)
 
@@ -580,6 +593,9 @@ func (r *LittleRedReconciler) gatherGroundTruth(ctx context.Context, littleRed *
 
 // bootstrapCluster initializes a new Redis Cluster
 func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
+	if isMultiSite(littleRed) {
+		return r.bootstrapMultiSiteCluster(ctx, littleRed)
+	}
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
 	auditLog.Info("Bootstrapping/Healing cluster")
@@ -719,6 +735,9 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 // updateClusterStatus updates the LittleRed status for cluster mode.
 // gt may be passed in from the caller to avoid a redundant gather; pass nil to gather fresh.
 func (r *LittleRedReconciler) updateClusterStatus(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth) (ctrl.Result, error) {
+	if isMultiSite(littleRed) {
+		return r.updateMultiSiteClusterStatus(ctx, littleRed, gt, nil)
+	}
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	oldStatus := littleRed.Status.DeepCopy()
 

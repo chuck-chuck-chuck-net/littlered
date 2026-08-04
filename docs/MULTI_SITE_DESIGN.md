@@ -277,12 +277,29 @@ Remaining field-shape details are settled in the ADR, not here.
    failover path armed against master drift.
 3. Witness-shard exploration (§6.1) — separate design + e2e.
 4. Rollout serialization across sites (LR-021 currently serializes shards within one
-   site; define the cross-site ordering).
+   site; define the cross-site ordering). *Implemented in the initial multi-site work
+   as "at most one shard StatefulSet rolling across the whole instance at a time" —
+   stronger than the minimum "never restart a shard's masters in >1 site at once".*
 5. e2e substrate: two Kubernetes clusters with mutually routed pod CIDRs; red-first
    scenarios: dual-site takeover on site kill, minority fail-stop reproduction,
    rejoin staggering, hub↔site partition must-not-takeover.
 6. `lrctl` multi-site support: site-aware `status`/`verify` (authority view must
    aggregate all sites), connectivity preflight.
+7. **Multi-site scale-down / topology-shrink guards (pre-graduation).** The
+   single-site path refuses (surfaces a condition and waits, never deletes) when
+   `shards` is reduced or a legacy topology is detected — the "never delete data by
+   default" pillar. The initial multi-site reconcile does *not* yet carry per-site
+   equivalents: reducing `shards`, lowering `sitesPerShard`, or removing a site from
+   the list leaves the now-orphaned per-site StatefulSets **un-managed (drift), not
+   deleted** — no active data loss, but no refusal either. Per-site orphan detection
+   + refusal must land before multi-site graduates from design-draft. (The legacy
+   single-STS guard is correctly moot: a multi-site instance is post-0.3.0 by
+   construction.)
+8. **Operator self-namespace for out-of-cluster runs.** The site-kubeconfig Secret
+   lookup needs the operator's own namespace; in-cluster the ServiceAccount namespace
+   file resolves it, but an out-of-cluster hub (e.g. during development before the
+   management cluster exists) needs a downward-API `POD_NAMESPACE`/`OPERATOR_NAMESPACE`
+   env on the manager Deployment. Deploy-wiring follow-up, due with the e2e substrate.
 
 ## 11. Pointers
 

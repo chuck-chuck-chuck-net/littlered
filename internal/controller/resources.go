@@ -1835,6 +1835,13 @@ func buildClusterRedisConfig(lr *littleredv1alpha1.LittleRed) string {
 	// and silently break that invariant, so we disable it — "a more stable cluster
 	// topology when it is managed externally" (Redis cluster spec).
 	sb.WriteString("cluster-allow-replica-migration no\n")
+	// Multi-site (docs/MULTI_SITE_DESIGN.md §5): while a site's shards are failing over,
+	// the surviving shards must keep serving their slots instead of the whole keyspace
+	// going down. Single-site keeps Redis's default (yes) — this is gated on multiSite so
+	// single-site behavior is unchanged.
+	if isMultiSite(lr) {
+		sb.WriteString("cluster-require-full-coverage no\n")
+	}
 
 	// Replication settings
 	sb.WriteString("\n# Replication settings\n")
