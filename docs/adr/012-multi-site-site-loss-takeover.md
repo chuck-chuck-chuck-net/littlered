@@ -1,8 +1,11 @@
 # ADR-012: Multi-Site Site-Loss Takeover (Operator-Led, Fence-Gated)
 
 ## Status
-Proposed (design-stage; multi-site cluster mode not yet implemented — see
-`docs/MULTI_SITE_DESIGN.md`)
+Accepted — implemented, unit/envtest-verified (Milestone 3 of multi-site cluster
+mode, `feat/multi-site`; the pure `planSiteTakeover` + witness + gather + executor
+land here). e2e on a real two-site substrate is Milestone 4 and still pending, so
+the executor's dial paths and the end-to-end takeover are not yet field-verified —
+see `docs/MULTI_SITE_DESIGN.md` and changelog LR-025.
 
 ## Context
 Multi-site cluster mode runs one stretched Redis Cluster across several sites
@@ -179,6 +182,28 @@ Actions, in order:
 - The gate depends on per-site Kubernetes API access — already a multi-site
   prerequisite — and on bounded probes (LR-017 `ProbeTimeout`) so a dead site
   cannot stall the reconcile that must repair it.
+- **RBAC expansion (a real deviation from the M1 namespaced-Role prerequisite).**
+  The witness's condition-3 grading must distinguish a kubelet-attested pod death
+  (Node Ready) from a node-controller inference (Node NotReady/Unknown), which
+  requires reading each pod's **Node** `Ready` condition — a **cluster-scoped**
+  resource the M1 namespace-scoped per-site cache does not serve. The `SiteClient`
+  therefore gains one narrow method (`NodeReady`) implemented as a bounded,
+  **uncached** direct API read, and **each site's credentials now need
+  cluster-scoped `nodes` get/list** on top of the namespaced workload/pod Role of
+  the design doc (§7/§8). This is the one place multi-site reaches outside a single
+  namespace; the site-kubeconfig helper (`lrctl`, M5) must grant it, and it is
+  called out prominently as a deviation because it widens the per-site blast
+  radius beyond "namespaced Role". A failed or absent node read is treated
+  conservatively (as the node-controller-inferred downgrade → fence required), so
+  it can only make the witness more cautious, never authorise an unfenced takeover.
+- **Fenced-alive rejoin recycle is gated on a serving majority.** The recycle
+  (action 3) fires only once the survivors already hold a master majority and no
+  shard is orphaned, and only for pods isolated from that majority that never
+  restarted — so it never churns a pod mid-bootstrap or mid-takeover. Recycling an
+  isolated, data-empty (EmptyDir) pod is data-safe either way (a genuine returnee
+  gets its clean rejoin; a briefly-isolated fresh pod is only re-created). Robustly
+  distinguishing the two without gossip-visibility/epoch tracking is left to the M4
+  substrate.
 - Automated dual-site recovery presumes the hub survives the lost site: a hub
   co-located in one of the two sites cannot recover that site's loss. The
   effective deployment requirement is the hub in a third failure domain (or

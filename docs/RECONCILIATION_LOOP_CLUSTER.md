@@ -313,6 +313,57 @@ The cluster pre-stop hook handles graceful shutdown:
 
 ---
 
+## Multi-Site Site-Loss Takeover (ADR-012)
+
+Single-site clusters run the loop above. A **multi-site** cluster (`spec.multiSite`)
+adds one branch that runs in `reconcileMultiSiteCluster` **before** the readiness gate
+and before `repairCluster`, so it — not the generic Step-0 quorum-loss takeover — owns
+the takeover decision when a whole site is lost. This matters because Step-0 would
+force-promote orphan replicas on any quorum loss, which across an alive-but-partitioned
+site (a link-cut) would create a **live split-brain** (two serving masters per shard).
+
+`recoverSiteLoss` gathers the survivors' own view + classifies each site's Kubernetes
+witness, then the pure `planSiteTakeover` decides behind a 6-condition gate (all must
+hold to fire):
+
+1. **Orphaned shard with a survivor** — a shard has no reachable master and a reachable
+   replica to promote. (No survivor anywhere ⇒ total loss ⇒ descoped.)
+2. **Native path exhausted, survivor vantage** — `reachableMasters < (size/2)+1`
+   (`size` = slot-serving masters = shard count) AND ≥1 survivor reports its own
+   `cluster_state:fail`. If survivors keep a majority, Redis elects on its own — wait.
+3. **Witness not `Contradiction`** — per affected site: `ConfirmedDown` (API reachable
+   + pods gone / not-Ready on a Ready Node), `Unobservable` (API unreachable, OR a
+   not-Ready pod on a **NotReady/Unknown** Node — node-controller inference, the
+   downgrade), or `Contradiction` (API reachable + a pod Ready ⇒ alive ⇒ **never take
+   over**, the descoped link-cut).
+4. **Fence** — required under an `Unobservable` witness: holds iff the unreachable
+   masters are themselves `< (size/2)+1` (an isolated minority-master site has
+   fail-stopped). Else **refuse** (surface `MultiSiteTakeover` condition +
+   `RefusedSiteTakeover` event) unless `multiSite.allowUnsafeSiteTakeover`. A
+   `ConfirmedDown` witness authorises without the fence.
+5. **Cooldown** — `max(60s, 2 × cluster-node-timeout)` on `status.multiSite.takeoverPendingSince`.
+6. **Quiet cluster** — no terminating survivor / in-flight op.
+
+Actions (in order): **TAKEOVER** the most-complete surviving replica of each orphaned
+shard (highest offset within one lineage, `{master_replid, master_replid2}`) →
+**FORGET** the lost site's node IDs on every reachable node (TAKEOVER→FORGET ordering is
+required; FORGET trails idempotently, "Can't forget my master" is expected) → **recycle**
+fenced-alive returnee pods so they rejoin fresh instead of re-MEETing a stale ex-master.
+
+```mermaid
+flowchart TD
+    Obs["observeSites + gather survivors + classify witness"] --> Gate{"planSiteTakeover<br/>(6-condition gate)"}
+    Gate -- "None / WaitNative" --> Repair["fall through to readiness gate + repairCluster"]
+    Gate -- "Contradiction / not-quiet" --> Hold["Hold (never take over a link-cut)"]
+    Gate -- "first obs" --> Arm["arm takeoverPendingSince"]
+    Gate -- "Unobservable + drift, no opt-in" --> Refuse["Refuse + condition"]
+    Gate -- "ConfirmedDown, or fence-safe, past cooldown" --> Fire["TAKEOVER → FORGET → recycle"]
+```
+
+See ADR-012, `docs/MULTI_SITE_DESIGN.md` §6, and changelog LR-025.
+
+---
+
 ## Status Determination
 
 The operator reports `Phase: Running` when:

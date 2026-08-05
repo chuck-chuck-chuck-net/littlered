@@ -19,9 +19,11 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -32,6 +34,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/apiutil"
+	ctrlconfig "sigs.k8s.io/controller-runtime/pkg/client/config"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	logf "sigs.k8s.io/controller-runtime/pkg/log"
@@ -96,6 +99,16 @@ type SiteClient interface {
 	// Delete deletes an object in the site.
 	Delete(ctx context.Context, obj client.Object) error
 
+	// NodeReady reports whether the site node nodeName has a Ready condition of True.
+	// found is false when the node object does not exist. This is the ONE
+	// cluster-scoped read multi-site needs: the site-loss witness (ADR-012 condition 3)
+	// must distinguish a kubelet-attested pod death (Node Ready) from a node-controller
+	// inference (Node NotReady/Unknown). Nodes are cluster-scoped, which the M1
+	// namespace-scoped remote cache does not serve, so this is a bounded, UNCACHED direct
+	// API read. A site's credentials therefore need cluster-scoped nodes get/list — a real
+	// expansion beyond the M1 namespaced Role (see docs/MULTI_SITE_DESIGN.md §7/§8).
+	NodeReady(ctx context.Context, nodeName string) (ready bool, found bool, err error)
+
 	// Gatherer returns the Redis dial seam for this site's pods. With the
 	// pod-routed transport the hub dials pod IPs directly, so all sites share
 	// the direct-TCP gatherer; a future transport (nodeport/multus) would
@@ -151,6 +164,18 @@ func ssaApply(ctx context.Context, c client.Client, scheme *runtime.Scheme, obj 
 	return c.Apply(ctx, client.ApplyConfigurationFromUnstructured(u), client.FieldOwner(fieldManager), client.ForceOwnership)
 }
 
+// nodeReadyFromConditions reports whether a node's Ready condition is True. A node with no
+// Ready condition (or Unknown) is treated as not Ready — the safe default for the witness,
+// which only ever uses "node Ready" to UPGRADE a not-Ready pod to a kubelet-attested death.
+func nodeReadyFromConditions(node *corev1.Node) bool {
+	for _, c := range node.Status.Conditions {
+		if c.Type == corev1.NodeReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
+}
+
 // hubSiteClient is the degenerate SiteClient: the site is the hub's own
 // Kubernetes cluster, so it wraps the manager's client/cache — zero new
 // connections, and children keep the ordinary controller owner reference.
@@ -158,11 +183,49 @@ type hubSiteClient struct {
 	name   string
 	client client.Client
 	scheme *runtime.Scheme
+
+	// nodeReader is a lazily-built, UNCACHED reader for the hub's own cluster-scoped
+	// Nodes (friction B). It is separate from the cache-backed client so a Node read
+	// never starts a cluster-wide Node informer (which would also need watch RBAC). Built
+	// from the operator's own rest config, which — for the hub-local site — IS this site.
+	nodeReaderOnce sync.Once
+	nodeReader     client.Reader
+	nodeReaderErr  error
 }
 
 func (h *hubSiteClient) Name() string     { return h.name }
 func (h *hubSiteClient) IsHubLocal() bool { return true }
 func (h *hubSiteClient) Stop()            {}
+
+func (h *hubSiteClient) NodeReady(ctx context.Context, nodeName string) (bool, bool, error) {
+	h.nodeReaderOnce.Do(func() {
+		cfg, err := ctrlconfig.GetConfig()
+		if err != nil {
+			h.nodeReaderErr = err
+			return
+		}
+		cfg.Timeout = siteAPICallTimeout
+		rd, err := client.New(cfg, client.Options{Scheme: h.scheme})
+		if err != nil {
+			h.nodeReaderErr = err
+			return
+		}
+		h.nodeReader = rd
+	})
+	if h.nodeReaderErr != nil {
+		return false, false, h.nodeReaderErr
+	}
+	ctx, cancel := context.WithTimeout(ctx, siteAPICallTimeout)
+	defer cancel()
+	node := &corev1.Node{}
+	if err := h.nodeReader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	return nodeReadyFromConditions(node), true, nil
+}
 
 func (h *hubSiteClient) Apply(ctx context.Context, owner *littleredv1alpha1.LittleRed, obj client.Object) error {
 	stampInstanceLabels(owner, obj)
@@ -201,6 +264,10 @@ type remoteSiteClient struct {
 	cache     cache.Cache
 	scheme    *runtime.Scheme
 	cancel    context.CancelFunc
+	// apiReader is an UNCACHED direct reader for cluster-scoped Nodes (friction B). The
+	// namespace-scoped cache above does not serve cluster-scoped resources, so the witness
+	// node read goes direct to the site API (bounded by cfg.Timeout).
+	apiReader client.Reader
 }
 
 // newRemoteSiteClient constructs a SiteClient for a remote site from kubeconfig
@@ -237,6 +304,13 @@ func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, o
 		return nil, fmt.Errorf("site %q: building client: %w", siteName, err)
 	}
 
+	// Uncached direct reader for cluster-scoped Nodes (friction B): no cache, so it never
+	// starts a Node informer and needs only get on nodes, not watch.
+	apiReader, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, fmt.Errorf("site %q: building node reader: %w", siteName, err)
+	}
+
 	bctx, cancel := context.WithCancel(context.Background())
 	c := &remoteSiteClient{
 		name:      siteName,
@@ -246,6 +320,7 @@ func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, o
 		cache:     ca,
 		scheme:    scheme,
 		cancel:    cancel,
+		apiReader: apiReader,
 	}
 	go c.run(bctx, events)
 	return c, nil
@@ -369,6 +444,19 @@ func (c *remoteSiteClient) Delete(ctx context.Context, obj client.Object) error 
 	ctx, cancel := bounded(ctx)
 	defer cancel()
 	return c.client.Delete(ctx, obj)
+}
+
+func (c *remoteSiteClient) NodeReady(ctx context.Context, nodeName string) (bool, bool, error) {
+	ctx, cancel := bounded(ctx)
+	defer cancel()
+	node := &corev1.Node{}
+	if err := c.apiReader.Get(ctx, client.ObjectKey{Name: nodeName}, node); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, false, nil
+		}
+		return false, false, err
+	}
+	return nodeReadyFromConditions(node), true, nil
 }
 
 func (c *remoteSiteClient) Gatherer(password string, tlsEnabled bool) redisclient.Gatherer {

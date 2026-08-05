@@ -170,6 +170,12 @@ func gatherNodeIdentities(ctx context.Context, g Gatherer, clusterPods map[strin
 			// Replication state is only queried for reachable nodes, so it never hits a dead IP.
 			if rs, err := g.GetRedisState(ctx, p.name, p.ip); err == nil {
 				ns.LinkStatus = rs.LinkStatus
+				// Survivor-vantage lineage fields (ADR-012): kept so the takeover planner can
+				// pick the most-complete surviving replica within one lineage. §7-parity —
+				// single-site gather gets them too, but no single-site decision reads them.
+				ns.MasterReplid = rs.Replid
+				ns.MasterReplid2 = rs.Replid2
+				ns.ReplOffset = rs.Offset
 			}
 			states[i] = ns
 		}(i)
@@ -258,6 +264,10 @@ func probeNodeTopology(ctx context.Context, g Gatherer, n *ClusterNodeState) *to
 		v.state = info.State
 		v.slotsAssigned = info.SlotsAssigned
 		v.asm = info.AtomicSlotMigration
+		// This node's OWN cluster_state — the survivors' first-hand quorum verdict
+		// (ADR-012 condition 2). Distinct from the merged gt.ClusterState, which is
+		// "ok if ANY node says ok".
+		n.ClusterState = info.State
 	}
 
 	nodes, err := g.GetClusterNodes(ctx, n.PodName, n.PodIP)
@@ -273,6 +283,15 @@ func probeNodeTopology(ctx context.Context, g Gatherer, n *ClusterNodeState) *to
 		for _, f := range knownNode.Flags {
 			if f == flagFail || f == "noaddr" || f == "handshake" {
 				isFailed = true
+			}
+			// Record this vantage's FAIL/PFAIL verdict on the peer (ADR-012 survivor
+			// corroboration). PFAIL ("fail?") is checked before FAIL ("fail") because
+			// strings.Contains-style matching is avoided — exact flag compare only.
+			switch f {
+			case flagPFail:
+				n.PFailFlagged = append(n.PFailFlagged, knownNode.NodeID)
+			case flagFail:
+				n.FailFlagged = append(n.FailFlagged, knownNode.NodeID)
 			}
 		}
 		if !isFailed {

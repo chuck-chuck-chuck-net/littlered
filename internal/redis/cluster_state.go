@@ -22,8 +22,17 @@ const (
 	roleMaster  = "master"
 	roleReplica = "replica"
 
-	// flagFail is the CLUSTER NODES gossip flag marking a node as failed.
+	// flagFail is the CLUSTER NODES gossip flag marking a node objectively down (FAIL).
 	flagFail = "fail"
+	// flagPFail is the CLUSTER NODES gossip flag marking a node subjectively down
+	// (PFAIL) — a single node's suspicion, not yet the cluster-wide FAIL verdict.
+	flagPFail = "fail?"
+
+	// ClusterStateFail is the cluster_state a node reports when it has fail-stopped in the
+	// unconditional minority check (fewer than (size/2)+1 reachable slot-serving masters).
+	// It is the first-hand, survivor-vantage signal a multi-site site loss has exhausted
+	// native failover (ADR-012 condition 2).
+	ClusterStateFail = "fail"
 )
 
 // ClusterNodeState represents the state of a single node in the Redis Cluster
@@ -36,6 +45,32 @@ type ClusterNodeState struct {
 	MasterNodeID string // "-" if master
 	LinkStatus   string // "up" or "down"
 	Reachable    bool
+
+	// --- Survivor-vantage fields (multi-site site-loss takeover, ADR-012) ---
+	// These carry data already on the wire in the gather (this node's own CLUSTER INFO
+	// and CLUSTER NODES, its replication INFO) that was previously discarded. They give
+	// the operator the SURVIVORS' OWN view of the cluster — the vantage ADR-012 requires,
+	// because the hub's dial reachability is transport, not evidence (LR-017). They are a
+	// §7-parity gather addition: single-site gather populates them too, but no single-site
+	// decision reads them.
+
+	// ClusterState is this node's own cluster_state (from its CLUSTER INFO): "ok" when it
+	// can reach a slot-serving-master majority, "fail" when it has fail-stopped in the
+	// unconditional minority check (the direct, first-hand signal of a quorum loss —
+	// ADR-012 condition 2). Empty when its CLUSTER INFO was not gathered.
+	ClusterState string
+	// FailFlagged is the set of NodeIDs this node's CLUSTER NODES view marks objectively
+	// down (FAIL). PFailFlagged is the set it marks subjectively down (PFAIL). Together
+	// they are the survivors' corroboration of which peers they have given up on.
+	FailFlagged  []string
+	PFailFlagged []string
+	// MasterReplid / MasterReplid2 / ReplOffset are this node's replication lineage
+	// identity and progress (INFO replication). Used to pick the most-complete surviving
+	// replica of an orphaned shard WITHIN one lineage (LR-024: union-find over
+	// {replid, replid2}, never keyed on replid alone), mirroring BestDataHolder.
+	MasterReplid  string
+	MasterReplid2 string
+	ReplOffset    int64
 }
 
 // ClusterGroundTruth represents the combined view of the Redis Cluster topology

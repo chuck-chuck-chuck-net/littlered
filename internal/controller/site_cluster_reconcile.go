@@ -120,6 +120,16 @@ type sitePodObservation struct {
 	ready     bool
 	restarted bool
 	oomKilled bool
+	// nodeName is the pod's scheduled node (empty if unscheduled). The site-loss witness
+	// (ADR-012) reads this node's Ready condition to tell a kubelet-attested pod death from
+	// a node-controller inference.
+	nodeName string
+	// terminating is whether the pod is being deleted (DeletionTimestamp set) — the
+	// site-loss quiet-cluster gate excludes a terminating survivor (ADR-012 condition 6).
+	terminating bool
+	// restartCount is the redis container's restart count (0 = never restarted); the
+	// fenced-alive rejoin recycle only recycles pods that returned WITHOUT a restart.
+	restartCount int32
 }
 
 // siteObservation is one site's observed state this pass.
@@ -152,9 +162,11 @@ func (r *LittleRedReconciler) observeSites(ctx context.Context, lr *littleredv1a
 		for i := range list.Items {
 			pod := &list.Items[i]
 			obsPod := sitePodObservation{
-				objName: pod.Name,
-				key:     siteQualifiedKey(s.name, pod.Name),
-				ip:      pod.Status.PodIP,
+				objName:     pod.Name,
+				key:         siteQualifiedKey(s.name, pod.Name),
+				ip:          pod.Status.PodIP,
+				nodeName:    pod.Spec.NodeName,
+				terminating: pod.DeletionTimestamp != nil,
 			}
 			for j := range pod.Status.ContainerStatuses {
 				cs := &pod.Status.ContainerStatuses[j]
@@ -163,6 +175,7 @@ func (r *LittleRedReconciler) observeSites(ctx context.Context, lr *littleredv1a
 				}
 				obsPod.ready = cs.Ready
 				obsPod.restarted = cs.RestartCount >= 1
+				obsPod.restartCount = cs.RestartCount
 				if cs.LastTerminationState.Terminated != nil &&
 					cs.LastTerminationState.Terminated.Reason == containerReasonOOMKilled {
 					obsPod.oomKilled = true
@@ -224,8 +237,23 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 		return ctrl.Result{}, err
 	}
 
-	// 2. Observe every site and gate on per-site readiness.
+	// 2. Observe every site.
 	obs := r.observeSites(ctx, lr, sites)
+
+	// 2a. Site-loss takeover (ADR-012). This OWNS the quorum-loss decision in multi-site,
+	// ahead of the readiness gate and repair: a whole-site loss the survivors cannot fail
+	// over natively is fence-gated here, so the generic repairCluster Step-0 TAKEOVER never
+	// fires unguarded across a site that might be alive-but-partitioned (a live split-brain).
+	// It runs before the readiness gate because a Kubernetes-confirmed dead site also FAILS
+	// that gate. When it acts (arm/hold/wait/refuse/fire/recycle) we requeue without running
+	// repair; only "nothing to do" / "survivors keep quorum" fall through.
+	if acted, err := r.recoverSiteLoss(ctx, lr, obs); err != nil {
+		return ctrl.Result{}, err
+	} else if acted {
+		return ctrl.Result{RequeueAfter: fast}, nil
+	}
+
+	// 2b. Gate on per-site readiness.
 	ready, anyReachable := multiSiteReady(readinessFromObs(lr, obs))
 
 	if !ready {

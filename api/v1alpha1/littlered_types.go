@@ -743,6 +743,15 @@ const (
 	// the documented escape hatch is manually removing the
 	// redis.chuck-chuck-chuck.net/multisite-teardown finalizer.
 	ConditionMultiSiteTeardown = "MultiSiteTeardown"
+	// ConditionMultiSiteTakeover reflects the multi-site site-loss takeover (cluster mode
+	// with spec.multiSite; ADR-012). It is the operator-owned recovery of a whole site's
+	// loss that native Redis failover cannot resolve (survivors below the master
+	// majority). True means the instance needs attention — the cooldown is armed, or the
+	// operator is refusing because the fence is unavailable (the unreachable side could
+	// hold a serving master majority, so an automatic takeover risks a live split-brain;
+	// set multiSite.allowUnsafeSiteTakeover to authorise, or act manually). False records
+	// a completed takeover or that no site-loss recovery is needed.
+	ConditionMultiSiteTakeover = "MultiSiteTakeover"
 )
 
 // LittleRedStatus defines the observed state of LittleRed

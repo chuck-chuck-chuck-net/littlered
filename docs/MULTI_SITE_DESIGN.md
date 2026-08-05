@@ -229,8 +229,20 @@ spec:
 - Absent `multiSite` ⇒ existing single-site behavior, unchanged.
 - `kubeconfigSecretRef` names a Secret in the operator namespace holding a kubeconfig
   whose credentials are bound to a **namespaced Role** in the target site (workload
-  CRUD + pod read in the instance namespace — not cluster-admin). A helper (`lrctl` or
-  a script) generates the ServiceAccount/Role/RoleBinding/token and the Secret.
+  CRUD + pod read in the instance namespace — not cluster-admin) **plus one
+  cluster-scoped read: `nodes` get/list**. A helper (`lrctl` or a script) generates
+  the ServiceAccount/Role/RoleBinding + a ClusterRole/ClusterRoleBinding for the node
+  read, the token, and the Secret.
+  - **Why the cluster-scoped node read (ADR-012, a real widening beyond a namespaced
+    Role).** The site-loss witness must tell a kubelet-attested pod death (the pod's
+    Node is Ready) from a node-controller inference (the Node is NotReady/Unknown — a
+    remote guess from missed heartbeats, the LR-017 trap). That needs each pod's Node
+    `Ready` condition, and Nodes are cluster-scoped, so the per-site cache (namespaced)
+    cannot serve them; the operator does a bounded, **uncached** direct read via
+    `SiteClient.NodeReady`. This is the only place per-site access reaches outside the
+    instance namespace. A failed/absent node read is treated conservatively (as the
+    node-controller downgrade → the takeover fence is required), so the widened read
+    can only make the witness more cautious.
 - Validation: `multiSite` only with `mode: cluster`; site names unique; ≥2 sites;
   `2 ≤ sitesPerShard ≤ len(sites)`.
 - Status gains per-site observed state (reachable, pods, discovered addresses) and
@@ -256,7 +268,11 @@ Remaining field-shape details are settled in the ADR, not here.
   different network paths and must both be verified at setup; `lrctl` should check
   both explicitly.
 - **RBAC blast radius:** the hub operator can modify workloads in every site — the
-  accepted cost of flat control, bounded by namespaced Roles per site.
+  accepted cost of flat control, bounded by namespaced Roles per site — **plus one
+  cluster-scoped read per site (`nodes` get/list), required by the site-loss witness
+  (ADR-012 condition 3, §7).** That node read is the only per-site permission outside
+  the instance namespace; everything else stays namespaced. The operator's own
+  (hub-side) RBAC likewise gains `nodes` get/list.
 - **Spoke-side garbage collection:** owner references do not work across Kubernetes clusters — a spoke-side object referencing the hub-resident `LittleRed` UID dangles, and the spoke's GC controller would treat the owner as absent and delete the object out from under us. Spoke-side children are therefore created **without** owner references (hub-local children keep `SetControllerReference` unchanged); instead the CR carries a finalizer whose delete path sweeps the instance-labeled workload objects through each `SiteClient` before the CR is released. A site unreachable at deletion time keeps the finalizer with bounded retries and a surfaced condition; the documented escape hatch is manual finalizer removal.
 
 ## 9. Deferred transports
@@ -271,8 +287,12 @@ Remaining field-shape details are settled in the ADR, not here.
 
 ## 10. Open items
 
-1. Takeover trigger: designed in **ADR-012** (fence-gated site-loss takeover) —
-   remaining work is implementation + the red-first planner/e2e suite listed there.
+1. Takeover trigger: designed in **ADR-012** (fence-gated site-loss takeover) and
+   **implemented (Milestone 3)** — the pure `planSiteTakeover` + `classifySiteWitness`
+   planner, the survivor-vantage gather fields, the `SiteClient.NodeReady` witness read,
+   and the TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-025).
+   Remaining: the two-site e2e suite (Milestone 4) and the `lrctl` site-kubeconfig helper's
+   cluster-scoped `nodes` grant (Milestone 5).
 2. Master rebalance follow-up (graceful `CLUSTER FAILOVER`), keeping the native
    failover path armed against master drift.
 3. Witness-shard exploration (§6.1) — separate design + e2e.

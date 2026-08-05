@@ -136,6 +136,7 @@ func (r *LittleRedReconciler) event(lr *littleredv1alpha1.LittleRed, eventType, 
 // +kubebuilder:rbac:groups=core,resources=services,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=core,resources=secrets,verbs=get;list;watch
 // +kubebuilder:rbac:groups=core,resources=pods,verbs=get;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=core,resources=nodes,verbs=get;list
 // +kubebuilder:rbac:groups=core,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 // +kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
@@ -1852,6 +1853,11 @@ const (
 	reasonReseededFromSurvivor = "ReseededFromSurvivor"
 	reasonUnsafeRebootstrap    = "UnsafeRebootstrap"
 	reasonRecovered            = "Recovered"
+
+	// Multi-site site-loss takeover reasons (ADR-012).
+	reasonSiteLossDetected     = "SiteLossDetected"
+	reasonSiteTakeoverExecuted = "SiteTakeoverExecuted"
+	reasonRefusedSiteTakeover  = "RefusedSiteTakeover"
 )
 
 // setLeaderlessSince stamps Status.LeaderlessSince and sets the LeaderlessRecovery
