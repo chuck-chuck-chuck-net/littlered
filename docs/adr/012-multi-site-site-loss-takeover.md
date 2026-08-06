@@ -6,10 +6,15 @@ mode, `feat/multi-site`; the pure `planSiteTakeover` + witness + gather + execut
 land here). **M4a (first live bringup on the real hub+3-spoke lab, 2026-08-06)**
 verified the steady state — a stretched cluster forms healthy across sites and the
 planner correctly stays quiet — and surfaced one correction: **condition 0
-(`clusterFormed`)** below, without which initial bringup deadlocks. The *disruption*
-paths — the executor's dial paths under a real site loss, live witness grading, and
-fenced-alive recycle — remain deferred to **M4b**. See `docs/MULTI_SITE_DESIGN.md`
-and changelog LR-025 (+ its M4a correction) / LR-026.
+(`clusterFormed`)** below, without which initial bringup deadlocks. **M4b (live
+disruption on the same lab, 2026-08-07)** then proved the disruption paths: a real
+dual-site loss drives the fence-gated takeover end-to-end (survivor serves all
+16384 slots, replicated data intact across the kill and the rejoin), and a
+data-plane partition with the site kept alive (Contradiction witness) is correctly
+HELD — no takeover, no split-brain. M4b also hardened the **takeover-authority
+model** (see Consequences): `recoverSiteLoss` is now the *sole* quorum-loss takeover
+and ghost-FORGET authority in multi-site. See `docs/MULTI_SITE_DESIGN.md` and
+changelog LR-025 (+ its M4a/M4b addenda) / LR-026.
 
 ## Context
 Multi-site cluster mode runs one stretched Redis Cluster across several sites
@@ -184,6 +189,24 @@ Actions, in order:
   cleanup and can safely trail.
 
 ## Consequences
+- **`recoverSiteLoss` is the sole quorum-loss takeover AND ghost-FORGET authority in
+  multi-site (hardened in M4b).** The generic repair loop (`repairCluster`) is reused
+  across sites, but its Step-0 quorum-recovery and Step-1 stuck-orphan promotion —
+  both cooldown-free and witness-blind — are gated off in multi-site
+  (`repairMayForceTakeover(lr) == !isMultiSite(lr)`), because otherwise, whenever
+  `recoverSiteLoss` returned None/WaitNative, repair could still fire an unguarded
+  `CLUSTER FAILOVER TAKEOVER` ahead of the fence/cooldown (observed on a sub-cooldown
+  real reboot in M4b). Likewise, repair's Step-2 FORGET and `recoverSiteLoss`'s own
+  action-2 FORGET are gated on **`allSitesObservable`**: a gossip-known node with no
+  backing pod is indistinguishable by NodeID from a node on a merely-unreachable site,
+  so FORGET is deferred entirely while any hosting site is unobservable — the actual
+  realization of "forgotten only when its own site's witness supports it" (the M3
+  claim was aspirational until M4b). FORGET trails idempotently until every site is
+  observable again; routine reachable-site ghost cleanup is unaffected. Cost: a
+  genuine fast site loss now waits the cooldown rather than being resolved
+  immediately by the unguarded Step-0 — an accepted trade (correctness over ~60s on a
+  site loss). Left active in multi-site: Step-1's partition-heal `CLUSTER MEET`
+  (benign, non-takeover).
 - A dual-site site loss recovers in roughly cooldown + one reconcile, with zero
   loss of replicated data — **when the gate passes** (Kubernetes-confirmed death,
   or an even master split under an unobservable witness). The loss of a
