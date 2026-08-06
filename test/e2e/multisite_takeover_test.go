@@ -181,15 +181,32 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			msRebootSite(reg.site(victim))
 			msWaitSiteUnreachable(reg.site(victim), 3*time.Minute)
 
-			By("asserting the operator fires CLUSTER FAILOVER TAKEOVER after the cooldown")
+			By("asserting the FENCE/WITNESS-GATED recoverSiteLoss fires the takeover after the cooldown")
+			// Evidence priority: the operator log's gated-path audit line and the
+			// MultiSiteTakeover=SiteTakeoverExecuted condition — NOT Kubernetes Events, which
+			// some clusters do not retain (M4b Finding #3). The event is checked best-effort only.
 			Eventually(func(g Gomega) {
-				g.Expect(msHasEvent(reg, ns, crName, "SiteTakeoverExecuted")).To(BeTrue(),
-					"a SiteTakeoverExecuted event must be emitted")
+				gated, _ := msOperatorLogSince(reg, startedAt, "promoting surviving replica via CLUSTER FAILOVER TAKEOVER")
+				_, reason := msTakeoverCondition(reg, ns, crName)
+				g.Expect(gated != "" || reason == "SiteTakeoverExecuted").To(BeTrue(),
+					"the gated recoverSiteLoss takeover must fire (log 'promoting surviving replica…' or condition SiteTakeoverExecuted)")
 			}, "4m", "10s").Should(Succeed())
 
-			logLines, _ := msOperatorLogSince(reg, startedAt, "CLUSTER FAILOVER TAKEOVER")
-			_, _ = fmt.Fprintf(GinkgoWriter, "operator TAKEOVER log lines:\n%s\n", logLines)
-			Expect(logLines).To(ContainSubstring("TAKEOVER"))
+			logLines, _ := msOperatorLogSince(reg, startedAt, "promoting surviving replica via CLUSTER FAILOVER TAKEOVER")
+			_, _ = fmt.Fprintf(GinkgoWriter, "operator gated-takeover log lines:\n%s\n", logLines)
+			Expect(logLines).To(ContainSubstring("CLUSTER FAILOVER TAKEOVER"))
+
+			By("asserting the generic repair Step-0 did NOT preempt the gated path (multi-site suppresses it)")
+			step0, _ := msOperatorLogSince(reg, startedAt, "Promoting orphan replica during quorum loss")
+			Expect(step0).To(BeEmpty(),
+				"repair Step-0's unguarded quorum-loss takeover must never fire in multi-site")
+
+			// Best-effort: the event, if this cluster retains Events.
+			if msHasEvent(reg, ns, crName, "SiteTakeoverExecuted") {
+				_, _ = fmt.Fprintf(GinkgoWriter, "SiteTakeoverExecuted event present\n")
+			} else {
+				_, _ = fmt.Fprintf(GinkgoWriter, "note: no SiteTakeoverExecuted event (cluster may not retain Events); relying on log+condition\n")
+			}
 
 			By("asserting the surviving site serves ALL 16384 slots (cluster_state:ok from a survivor)")
 			Eventually(func(g Gomega) {

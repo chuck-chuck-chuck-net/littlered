@@ -240,13 +240,17 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 	// 2. Observe every site.
 	obs := r.observeSites(ctx, lr, sites)
 
-	// 2a. Site-loss takeover (ADR-012). This OWNS the quorum-loss decision in multi-site,
-	// ahead of the readiness gate and repair: a whole-site loss the survivors cannot fail
-	// over natively is fence-gated here, so the generic repairCluster Step-0 TAKEOVER never
-	// fires unguarded across a site that might be alive-but-partitioned (a live split-brain).
-	// It runs before the readiness gate because a Kubernetes-confirmed dead site also FAILS
-	// that gate. When it acts (arm/hold/wait/refuse/fire/recycle) we requeue without running
-	// repair; only "nothing to do" / "survivors keep quorum" fall through.
+	// 2a. Site-loss takeover (ADR-012). This is the SOLE fence/witness-gated authority for a
+	// quorum-loss TAKEOVER in multi-site. It runs ahead of the readiness gate and repair, and
+	// — as a belt-and-braces guarantee — the generic repairCluster is itself made INCAPABLE of
+	// the unguarded acts here: repairMayForceTakeover is false in multi-site (so repair's Step-0
+	// quorum recovery and Step-1 stuck-orphan promotion never issue CLUSTER FAILOVER TAKEOVER),
+	// and ghost FORGET is passed forgetSafe=allSitesObservable(obs) (so a node on an unreachable
+	// site is never forgotten — pillar 3.4). Safety therefore no longer rests on recoverSiteLoss
+	// merely *acting* to bypass repair; repair simply cannot take over or forget-on-unreachability.
+	// It runs before the readiness gate because a Kubernetes-confirmed dead site also FAILS that
+	// gate. When it acts (arm/hold/wait/refuse/fire/recycle) we requeue without running repair;
+	// only "nothing to do" / "survivors keep quorum" fall through.
 	if acted, err := r.recoverSiteLoss(ctx, lr, obs); err != nil {
 		return ctrl.Result{}, err
 	} else if acted {
@@ -284,7 +288,9 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 			"partitions", len(gt.Partitions), "ghosts", len(gt.GhostNodes),
 			"orphanedSlots", gt.HasOrphanedSlots(), "emptyMasters", gt.HasEmptyMasters(),
 			"masters", gt.CountMasters(), "allNodesView", len(gt.AllNodeIDs))
-		return r.repairCluster(ctx, lr, gt)
+		// forgetSafe only when every hosting site answered this pass; otherwise an unreachable
+		// site's nodes are "unknown, not gone" and repair must not FORGET them (pillar 3.4).
+		return r.repairCluster(ctx, lr, gt, allSitesObservable(obs))
 	}
 
 	// 4. Healthy — update status (also refreshes per-site observed state).
@@ -412,6 +418,23 @@ func (r *LittleRedReconciler) reconcileMultiSiteClusterStatefulSets(ctx context.
 // hostsShard reports whether site si hosts shard k under the computed placement.
 func hostsShard(shardsBySite map[int][]int, si, k int) bool {
 	return slices.Contains(shardsBySite[si], k)
+}
+
+// allSitesObservable reports whether every observed site's Kubernetes API answered this pass.
+// It is the multi-site FORGET-safety signal (ghostForgetPlan): only when every hosting site is
+// observable can a gossip-known node with no backing pod be treated as confirmed gone; if any
+// site is unobservable, its nodes are "unknown, not gone" (pillar 3.4) and no ghost is
+// forgotten this pass. Empty obs (no sites) is not observable.
+func allSitesObservable(obs []siteObservation) bool {
+	if len(obs) == 0 {
+		return false
+	}
+	for _, o := range obs {
+		if !o.reachable {
+			return false
+		}
+	}
+	return true
 }
 
 // gatherMultiSiteGroundTruth builds the union IP->qualified-key map across every reachable

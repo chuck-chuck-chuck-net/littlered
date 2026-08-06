@@ -147,17 +147,24 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 			"emptyMasters", gt.HasEmptyMasters(),
 			"masters", gt.CountMasters(),
 			"allNodesView", len(gt.AllNodeIDs))
-		return r.repairCluster(ctx, littleRed, gt)
+		// Single-site: one implicit always-observable "site", so ghost FORGET is always safe.
+		return r.repairCluster(ctx, littleRed, gt, true)
 	}
 
 	// 5. Cluster is healthy and stable — pass gt through to avoid a second gather
 	return r.updateClusterStatus(ctx, littleRed, gt)
 }
 
-// repairCluster handles healing: partitions, ghost nodes, slot restoration, and replication topology
+// repairCluster handles healing: partitions, ghost nodes, slot restoration, and replication topology.
+//
+// forgetSafe gates CLUSTER FORGET: true in single-site (and multi-site with every hosting site
+// observable) so routine ghost cleanup runs; false in multi-site when a hosting site is
+// unobservable, so a gossip-known node on an unreachable site is never forgotten (pillar 3.4).
+// Quorum-loss/orphan TAKEOVER is additionally gated on repairMayForceTakeover(littleRed): in
+// multi-site the fence/witness-gated recoverSiteLoss is the sole takeover authority (ADR-012).
 //
 //nolint:gocyclo
-func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth) (ctrl.Result, error) {
+func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, forgetSafe bool) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	fast, _ := littleRed.GetRequeueIntervals()
 
@@ -173,8 +180,12 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 	shards := littleRed.Spec.Cluster.Shards
 	votingMasters := gt.CountMasters()
 
-	// Quorum is lost if available voting masters are <= shards / 2
-	if votingMasters <= shards/2 {
+	// Quorum is lost if available voting masters are <= shards / 2.
+	// In MULTI-SITE the fence/witness-gated recoverSiteLoss (ADR-012) is the sole takeover
+	// authority — it runs ahead of repair and either acts (blocking repair) or defers to
+	// native failover — so repair must never fire this cooldown-free, witness-blind takeover
+	// across a site that may be alive-but-unreachable. repairMayForceTakeover is false there.
+	if repairMayForceTakeover(littleRed) && votingMasters <= shards/2 {
 		stateLog.Info("Quorum loss detected", "votingMasters", votingMasters, "targetShards", shards)
 
 		// Build set of live node IDs for fast lookup
@@ -270,8 +281,9 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			}
 
 			age := now.Sub(orphanInfo.DetectedAt.Time)
-			if age >= orphanTimeout {
-				// Timeout exceeded — force-promote
+			if age >= orphanTimeout && repairMayForceTakeover(littleRed) {
+				// Timeout exceeded — force-promote. Suppressed in multi-site: the same
+				// cooldown-free, witness-blind takeover hazard as Step-0; recoverSiteLoss owns it.
 				auditLog.Info("Force-promoting stuck orphan replica",
 					"pod", node.PodName, "orphanAge", age, "timeout", orphanTimeout)
 				addr := fmt.Sprintf("%s:%d", node.PodIP, littleredv1alpha1.RedisPort)
@@ -356,6 +368,12 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			}
 			ghostsToRemove = append(ghostsToRemove, ghostID)
 		}
+
+		// Site-aware FORGET gate (pillar 3.4): in multi-site with a site unobservable this pass,
+		// a no-backing-pod ghost cannot be told apart from a node on the unreachable site, so it
+		// is "unknown, not gone" and must not be forgotten. ghostForgetPlan drops the whole set
+		// then (FORGET trails to a later pass); with every site observable it passes them through.
+		ghostsToRemove = ghostForgetPlan(ghostsToRemove, forgetSafe)
 
 		if len(ghostsToRemove) > 0 {
 			stateLog.Info("Removing ghost nodes", "count", len(ghostsToRemove))

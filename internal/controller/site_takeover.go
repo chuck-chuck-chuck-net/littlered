@@ -138,8 +138,15 @@ type siteTakeoverInput struct {
 	// equals the shard count. It is the denominator of the unconditional minority check
 	// (ADR-012: "size counts only masters serving at least one slot").
 	size int
-	// reachableMasters is how many of those slot-serving masters the survivors can reach
-	// and see serving (the hub gather's CountMasters). unreachableMasters := size - this.
+	// reachableMasters is the number of slot-serving masters PRESENT IN THE GATHERED VIEW
+	// (gt.CountMasters()). NOTE the name is a slight misnomer: CountMasters counts every
+	// gossip-known slot-serving master in gt.Nodes, not strictly the ones the hub could dial.
+	// This is nonetheless the correct quantity for the ADR-012 arithmetic, because gt.Nodes is
+	// built from the OBSERVED pods across REACHABLE sites only (unionClusterPods): a genuinely
+	// lost site's pods are never observed, so its masters are absent from gt.Nodes and NOT
+	// counted here — exactly what condition 2 needs. (An artificial partition where the hub can
+	// still observe/reach the "lost" site keeps its masters in gt.Nodes and correctly makes the
+	// planner see no loss — see M4b Finding #2.) unreachableMasters := size - this.
 	reachableMasters int
 
 	// orphanTargets is one entry per orphaned shard (no reachable master) that HAS a
@@ -545,7 +552,7 @@ func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littlered
 		return true, r.setTakeoverCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedSiteTakeover, msg)
 
 	case siteTakeover, siteTakeoverUnsafe:
-		r.executeSiteTakeover(ctx, lr, gt, plan, auditLog)
+		r.executeSiteTakeover(ctx, lr, gt, plan, allSitesObservable(obs), auditLog)
 		msg := fmt.Sprintf("Site-loss takeover executed: promoted %d surviving replica(s) via CLUSTER FAILOVER TAKEOVER "+
 			"(%d/%d masters were unreachable)", len(plan.targets), plan.unreachableMasters, plan.size)
 		if plan.action == siteTakeoverUnsafe {
@@ -566,7 +573,10 @@ func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littlered
 // replica of each shard with no reachable master.
 func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, obs []siteObservation, witness map[string]siteWitnessGrade, shards int) siteTakeoverInput {
 	in := siteTakeoverInput{
-		size:             shards,
+		size: shards,
+		// CountMasters counts gossip-known slot-serving masters in gt.Nodes; since gt.Nodes only
+		// holds pods observed across reachable sites, a lost site's masters are absent and not
+		// counted (see the field doc — the name is a mild misnomer, the value is correct here).
 		reachableMasters: gt.CountMasters(),
 		allowUnsafe:      lr.Spec.MultiSite != nil && lr.Spec.MultiSite.AllowUnsafeSiteTakeover,
 	}
@@ -719,7 +729,7 @@ func multiSiteExpectedPodNamesBySite(lr *littleredv1alpha1.LittleRed) map[string
 // node — so FORGET trails idempotently across reconciles and a partial pass is NORMAL, not
 // an error. Concurrent no-consensus epoch bumps across shards converge via Redis's
 // config-epoch collision resolution (named in ADR-012; asserted in the multi-shard e2e).
-func (r *LittleRedReconciler) executeSiteTakeover(ctx context.Context, lr *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, plan siteTakeoverPlan, auditLog logr.Logger) {
+func (r *LittleRedReconciler) executeSiteTakeover(ctx context.Context, lr *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, plan siteTakeoverPlan, forgetSafe bool, auditLog logr.Logger) {
 	password := r.getRedisPassword(ctx, lr)
 	cc := redisclient.NewClusterClient(password, lr.Spec.TLS.Enabled)
 
@@ -735,8 +745,18 @@ func (r *LittleRedReconciler) executeSiteTakeover(ctx context.Context, lr *littl
 		}
 	}
 
-	// Action 2: FORGET the lost site's node IDs (the ghosts) on every reachable node. Trails
-	// idempotently — "Can't forget my master" until the sibling replica follows the slot
+	// Action 2: FORGET the lost site's node IDs (the ghosts) on every reachable node — but only
+	// when the lost site's witness SUPPORTS it, i.e. its Kubernetes API answered this pass
+	// (allSitesObservable). Under an Unobservable witness (the fence-safe fire path, site API
+	// unreachable) the node is "unknown, not gone" (pillar 3.4 / ADR-012: "forgotten only when
+	// its own site's witness supports it, never merely because the hub cannot reach it"), so
+	// FORGET is deferred — it trails idempotently to a later pass once the site is observable
+	// (its returnee pods are then recycled and their stale IDs become confirmed-gone ghosts).
+	if !forgetSafe {
+		auditLog.Info("Site-loss takeover: deferring CLUSTER FORGET — a hosting site is unobservable, so its nodes are unknown-not-gone (pillar 3.4); FORGET will trail once observable")
+		return
+	}
+	// Trails idempotently — "Can't forget my master" until the sibling replica follows the slot
 	// claim is expected, not an error.
 	for _, ghostID := range gt.GhostNodes {
 		for _, n := range gt.Nodes {
