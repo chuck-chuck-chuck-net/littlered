@@ -20,8 +20,75 @@ import (
 	"reflect"
 	"testing"
 
+	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
+
+// TestClusterRepairExpectedReplicas is the red-first guard for LR-026: the Step-4
+// replication-repair per-shard replica count must reflect the cross-site placement in
+// multi-site mode, where replicas exist even when spec.cluster.replicasPerShard is 0.
+func TestClusterRepairExpectedReplicas(t *testing.T) {
+	rps := func(n int) *int { return &n }
+	sites := func(n int) []littleredv1alpha1.SiteSpec {
+		out := make([]littleredv1alpha1.SiteSpec, n)
+		for i := range out {
+			out[i] = littleredv1alpha1.SiteSpec{Name: string(rune('a' + i))}
+		}
+		return out
+	}
+	cases := []struct {
+		name string
+		lr   *littleredv1alpha1.LittleRed
+		want int
+	}{
+		{
+			name: "single-site nil replicasPerShard defaults to 1",
+			lr:   &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3}}},
+			want: 1,
+		},
+		{
+			name: "single-site replicasPerShard 0 disables (0)",
+			lr:   &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3, ReplicasPerShard: rps(0)}}},
+			want: 0,
+		},
+		{
+			name: "single-site replicasPerShard 2",
+			lr:   &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3, ReplicasPerShard: rps(2)}}},
+			want: 2,
+		},
+		{
+			name: "multi-site sitesPerShard 2, replicasPerShard 0 => 1 cross-site replica",
+			lr: &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{
+				Cluster:   &littleredv1alpha1.ClusterSpec{Shards: 3, ReplicasPerShard: rps(0)},
+				MultiSite: &littleredv1alpha1.MultiSiteSpec{Sites: sites(3), SitesPerShard: 2},
+			}},
+			want: 1,
+		},
+		{
+			name: "multi-site sitesPerShard 3, replicasPerShard 1 => 5 replicas per shard",
+			lr: &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{
+				Cluster:   &littleredv1alpha1.ClusterSpec{Shards: 2, ReplicasPerShard: rps(1)},
+				MultiSite: &littleredv1alpha1.MultiSiteSpec{Sites: sites(3), SitesPerShard: 3},
+			}},
+			want: 5,
+		},
+		{
+			name: "multi-site default sitesPerShard (= len sites) with replicasPerShard 0",
+			lr: &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{
+				Cluster:   &littleredv1alpha1.ClusterSpec{Shards: 3, ReplicasPerShard: rps(0)},
+				MultiSite: &littleredv1alpha1.MultiSiteSpec{Sites: sites(2)},
+			}},
+			want: 1, // sps defaults to 2, 2*(0+1)-1 = 1
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := clusterRepairExpectedReplicas(tc.lr); got != tc.want {
+				t.Fatalf("clusterRepairExpectedReplicas = %d, want %d", got, tc.want)
+			}
+		})
+	}
+}
 
 func TestClusterPodRefs(t *testing.T) {
 	tests := []struct {

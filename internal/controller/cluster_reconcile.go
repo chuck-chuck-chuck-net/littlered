@@ -492,20 +492,18 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		return res, nil
 	}
 
-	// 4. Replication Repair (Non-Zero Replica Mode)
-	isZeroReplicaMode := littleRed.Spec.Cluster.ReplicasPerShard != nil && *littleRed.Spec.Cluster.ReplicasPerShard == 0
+	// 4. Replication Repair. expectedReplicas is the per-shard replica count the repair
+	// reattaches empty masters up to; 0 disables the step. In multi-site the cross-site
+	// members ARE replicas even when spec.cluster.replicasPerShard is 0, so this is derived
+	// per mode (clusterRepairExpectedReplicas — LR-026), not keyed on replicasPerShard alone.
+	expectedReplicas := clusterRepairExpectedReplicas(littleRed)
 
-	if !isZeroReplicaMode {
+	if expectedReplicas > 0 {
 		emptyMasters := gt.GetEmptyMasters()
 		shardsWithReplicas := gt.GetMastersWithReplicas()
 
 		if len(emptyMasters) > 0 {
 			stateLog.Info("Detected masters with no slots in replication mode, attempting to assign as replicas")
-
-			expectedReplicas := 1
-			if littleRed.Spec.Cluster.ReplicasPerShard != nil {
-				expectedReplicas = *littleRed.Spec.Cluster.ReplicasPerShard
-			}
 
 			// Candidate masters, snapshotted once for a deterministic, shard-aware choice.
 			candidates := make([]*redisclient.ClusterNodeState, 0, len(gt.Nodes))
