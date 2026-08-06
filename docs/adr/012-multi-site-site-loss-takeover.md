@@ -3,9 +3,13 @@
 ## Status
 Accepted — implemented, unit/envtest-verified (Milestone 3 of multi-site cluster
 mode, `feat/multi-site`; the pure `planSiteTakeover` + witness + gather + executor
-land here). e2e on a real two-site substrate is Milestone 4 and still pending, so
-the executor's dial paths and the end-to-end takeover are not yet field-verified —
-see `docs/MULTI_SITE_DESIGN.md` and changelog LR-025.
+land here). **M4a (first live bringup on the real hub+3-spoke lab, 2026-08-06)**
+verified the steady state — a stretched cluster forms healthy across sites and the
+planner correctly stays quiet — and surfaced one correction: **condition 0
+(`clusterFormed`)** below, without which initial bringup deadlocks. The *disruption*
+paths — the executor's dial paths under a real site loss, live witness grading, and
+fenced-alive recycle — remain deferred to **M4b**. See `docs/MULTI_SITE_DESIGN.md`
+and changelog LR-025 (+ its M4a correction) / LR-026.
 
 ## Context
 Multi-site cluster mode runs one stretched Redis Cluster across several sites
@@ -49,6 +53,19 @@ Add an operator-owned recovery, decided by a pure, unit-tested planner
 surviving replica of every orphaned shard, then FORGETs the lost site's nodes.
 
 The gate — **all** conditions must hold:
+
+0. **Cluster is formed** (added in M4a; the planner's precondition, made explicit).
+   At least one node in the gathered view — a reachable survivor OR a gossip-known
+   dead master — owns ≥1 slot. This distinguishes a genuine site loss from a cluster
+   that has simply not bootstrapped yet: a formed cluster that lost every master
+   still shows its dead masters owning slots in the survivors' gossip (ownership is
+   retained until FORGET/TAKEOVER), whereas a never-bootstrapped cluster has zero
+   slots anywhere and presents the *same* surface as "all masters lost" (fresh nodes
+   = `role:master`, 0 slots, own `cluster_state:fail`). Without this veto, initial
+   bringup arms and fires a takeover across pods that never joined a cluster,
+   preempting bootstrap — a hard deadlock. `!clusterFormed ⇒` do nothing (let
+   bootstrap run). This is *not* the total-wipe case (a formed cluster whose gossip
+   memory is gone), which the wipe-recovery/bootstrap path owns.
 
 1. **Orphaned shards with survivors.** At least one shard has no reachable master,
    and a reachable replica of it exists in a surviving site. (No survivors anywhere

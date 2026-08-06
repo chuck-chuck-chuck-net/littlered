@@ -136,7 +136,14 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   exist by construction (odd shards) and by drift (even shards).
 - The shard-aware reattach (LR-020 `chooseReattachTarget`) keeps its rule "attach an
   empty pod to the under-replicated master of *its own shard*" — membership is per
-  shard across sites; `cluster-allow-replica-migration no` stays.
+  shard across sites; `cluster-allow-replica-migration no` stays. **A shard always
+  has replicas in multi-site, regardless of `replicasPerShard`** — it spans
+  `sitesPerShard ≥ 2` per-site StatefulSets, each sized `replicasPerShard + 1`, so
+  its replica count is `sitesPerShard × (replicasPerShard + 1) − 1` (e.g.
+  `replicasPerShard: 0` still yields one cross-site replica per shard). The repair
+  loop's expected-replica count is therefore this formula in multi-site, not
+  `replicasPerShard` — the single-site "`replicasPerShard == 0` ⇒ no replicas"
+  short-circuit must not disable cross-site reattach (LR-026).
 - Identity stays announced **pod IPs** (native Redis Cluster behavior); with routed
   pod CIDRs nothing needs `cluster-announce-*` overrides. Clients are ordinary
   cluster-aware clients reaching pod IPs from any site; replica reads can be kept
