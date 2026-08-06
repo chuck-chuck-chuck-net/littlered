@@ -28,7 +28,7 @@ package e2e
 //	  native recovery to healthy.
 //
 //	Scenario A (crown jewel, MUST fire): a whole-site kill (talosctl reboot) of one site of a
-//	  dedicated 2-site instance with an even 1+1 master split ⇒ witness Unobservable +
+//	  dedicated 2-site instance with an even 2+2 master split (shards:4) ⇒ witness Unobservable +
 //	  survivors below quorum + fence-safe ⇒ the operator fires CLUSTER FAILOVER TAKEOVER on
 //	  the surviving site, which then serves all 16384 slots with the replicated data intact.
 //	  Then restore ⇒ the site rejoins back to a healthy cross-site topology.
@@ -75,9 +75,9 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 		})
 
 		It("classifies the affected site Contradiction and HOLDs — no takeover, no split-brain", func() {
-			By("standing up a 2-site cluster instance [s1,s2] shards:2 sitesPerShard:2")
+			By("standing up a 2-site cluster instance [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
-			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 2, 0, 2, 15000), "apply", "-f", "-")
+			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
 			Expect(err).NotTo(HaveOccurred())
 
 			By("waiting for the stretched cluster to become Ready")
@@ -134,13 +134,13 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 	})
 
 	// --- Scenario A: the crown jewel — dual-site kill → takeover ----------------------------
-	Context("Scenario A: whole-site kill of an even 1+1 split (MUST take over)", Label("multisite-takeover"), func() {
+	Context("Scenario A: whole-site kill of an even 2+2 split (MUST take over)", Label("multisite-takeover"), func() {
 		const (
 			ns     = "ms-e2e-a"
 			crName = "ms-a"
 		)
 		siteNames := []string{"scm-s1", "scm-s2"}
-		victim := "scm-s2" // the site we kill (hosts shard-1's master)
+		victim := "scm-s2" // the site we kill (hosts shard-1 and shard-3 masters)
 
 		AfterEach(func() {
 			// Best-effort: ensure the victim site is back before tearing down (teardown must be
@@ -150,9 +150,9 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 		})
 
 		It("detects the loss, waits the cooldown, fires TAKEOVER, serves all slots, keeps data, and rejoins", func() {
-			By("standing up a dedicated 2-site cluster [s1,s2] shards:2 sitesPerShard:2 (even 1+1 master split)")
+			By("standing up a dedicated 2-site cluster [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
-			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 2, 0, 2, 15000), "apply", "-f", "-")
+			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
 			Expect(err).NotTo(HaveOccurred())
 
 			Eventually(func(g Gomega) {
