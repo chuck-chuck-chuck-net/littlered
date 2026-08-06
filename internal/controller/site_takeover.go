@@ -120,6 +120,18 @@ type orphanTarget struct {
 // siteTakeoverInput is the pure, I/O-free view the planner decides on. The executor
 // (recoverSiteLoss) builds it from the gather + the per-site witness.
 type siteTakeoverInput struct {
+	// clusterFormed reports whether the stretched cluster has ever been bootstrapped —
+	// i.e. ANY node in the gathered view (reachable survivor OR a gossip-known dead master)
+	// owns at least one slot. It is the discriminator between a genuine site loss and a
+	// cluster that has simply not bootstrapped yet: a formed cluster that lost every master
+	// still shows its dead masters owning slots in the survivors' gossip (ownership is kept
+	// until FORGET/TAKEOVER), whereas a never-bootstrapped cluster has ZERO slots assigned
+	// anywhere. Without this, initial bringup — fresh nodes reporting role:master, 0 slots,
+	// cluster_state:fail (uncovered) — is indistinguishable from "all masters lost" and the
+	// planner would arm/fire a takeover across pods that never formed a cluster, preempting
+	// bootstrap (a hard bringup deadlock — LR-025). false ⇒ siteTakeoverNone unconditionally.
+	clusterFormed bool
+
 	// size is the total number of slot-serving masters in the stretched cluster. Every
 	// shard's slots are owned by exactly one master (owned even while that master is dead
 	// and not-yet-failed-over — gossip keeps the ownership until FORGET/TAKEOVER), so this
@@ -195,6 +207,18 @@ func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, coo
 		fenceSafe:          fenceSafe,
 	}
 	plan := func(a siteTakeoverAction) siteTakeoverPlan { p := base; p.action = a; return p }
+
+	// Condition 0 (LR-025): the cluster must have been bootstrapped for a site-loss takeover
+	// to be meaningful. A never-formed cluster (no slot owned anywhere) presents the SAME
+	// surface as "all masters lost" — zero slot-serving masters, fresh nodes classifiable as
+	// promotable survivors, survivors reporting their own cluster_state:fail (uncovered) — so
+	// without this veto initial bringup would arm and eventually FIRE a takeover across pods
+	// that never joined a cluster, and (because recoverSiteLoss short-circuits repair whenever
+	// it acts) bootstrap would never run. This is not the total-wipe case (a formed cluster
+	// whose gossip memory is gone) — that is owned by the wipe-recovery/bootstrap path.
+	if !in.clusterFormed {
+		return plan(siteTakeoverNone)
+	}
 
 	// Condition 1: orphaned shards WITH a surviving replica. None ⇒ healthy cluster, or a
 	// total loss with nothing to promote (descoped). Nothing to do — clear the marker.
@@ -545,6 +569,18 @@ func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.Littl
 		size:             shards,
 		reachableMasters: gt.CountMasters(),
 		allowUnsafe:      lr.Spec.MultiSite != nil && lr.Spec.MultiSite.AllowUnsafeSiteTakeover,
+	}
+
+	// clusterFormed (LR-025): has the cluster ever been bootstrapped? ANY node in the gathered
+	// view owning a slot proves it — including a gossip-known DEAD master (Reachable=false)
+	// whose slot ownership the survivors still carry until FORGET/TAKEOVER. Zero slots anywhere
+	// means the cluster has not formed yet (initial bringup), so the site-loss takeover must
+	// stay quiet and let bootstrap run.
+	for _, n := range gt.Nodes {
+		if len(n.Slots) > 0 {
+			in.clusterFormed = true
+			break
+		}
 	}
 
 	// Survivor corroboration: any reachable node reporting its OWN cluster_state:fail.
