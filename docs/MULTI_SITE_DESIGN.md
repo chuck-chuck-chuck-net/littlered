@@ -313,15 +313,33 @@ Remaining field-shape details are settled in the ADR, not here.
 6. `lrctl` multi-site support: site-aware `status`/`verify`/`inspect`/`debug-dump`
    (authority view aggregates all sites), a connectivity preflight, and a
    site-kubeconfig-Secret generator (`lrctl multisite setup-site`, Milestone 5). **Implemented**
-   — see `docs/LRCTL.md` "Multi-Site Clusters". The read verbs auto-detect `spec.multiSite`,
-   read the CR on the hub, and gather each site through the user's own kube-contexts (NOT the
-   operator's repl-net Secrets, which are hub-pod-only — §8); the union of per-site pods runs
-   through the existing `GatherClusterGroundTruth` + checks, plus a cross-site placement check
-   (a shard's master and replica must live in different sites). The preflight validates the two
-   §8 network prerequisites honestly (Secret well-formedness + workstation-path site-API
-   reachability tested; the operator's repl-net site-API and the hub-pod→pod-IP data path
-   reported as requiring in-cluster verification, never claimed). The generator provisions the
-   §7 RBAC including the cluster-scoped `nodes get;list` witness grant.
+   — see `docs/LRCTL.md` "Multi-Site Clusters". The read verbs auto-detect `spec.multiSite` and
+   read the CR on the hub; the union of per-site pods runs through the existing
+   `GatherClusterGroundTruth` + checks, plus a cross-site placement check (a shard's master and
+   replica must live in different sites). The preflight validates the two §8 network
+   prerequisites honestly; the generator provisions the §7 RBAC including the cluster-scoped
+   `nodes get;list` witness grant.
+
+   **Three gather tiers (M6)** — lrctl no longer requires direct site access or per-site
+   kube-contexts. **Tier 1 (read-only hub):** the operator publishes a compact, site-attributed
+   cross-site view to `status.multiSite` (overall `clusterState`/`slotsAssigned`/`crossSiteOK`,
+   per-shard master/replica sites + link-down, `lastReconcileTime`), computed each reconcile
+   from the union ground truth; `status` and `verify --from-status` render it with only
+   `get littlered`. **Tier 2 (exec/run on hub, the DEFAULT for verify/inspect/debug-dump):** the
+   operator binary gains `--gather <ns>/<name> -o json`, which builds the SAME per-site
+   `SiteClient`s and runs the SAME gather, printing the site-attributed ground truth as JSON;
+   `lrctl` runs it as a **throwaway hub Job** (operator SA + image discovered from the operator
+   Deployment, `ttlSecondsAfterFinished` for server-side GC, resource-isolated and operator-pod
+   independent), reads the Job pod log, and renders. The gather runs *on the hub* — only the
+   *result* returns over the K8s API control path, so no hub↔site data mesh is added. **Tier 3
+   (direct site access):** the former default, demoted to an explicit `--direct`/`--site-context`
+   fallback; the site-name==context-name convention now applies only *within* tier 3. RBAC:
+   tier 1 = `get littlered`; tier 2 = lrctl user `create jobs` + `pods/log` in the operator
+   namespace (the Job runs as the operator SA, no new operator-SA grant); tier 3 = per-site
+   contexts. Pure decision seams are unit-tested red-first (`SelectTier`, `BuildGatherJob`,
+   `ExtractOperatorInfo`, `StatusVerdict`, `ExtractResultJSON`, `buildCrossSiteView`, wire
+   round-trip). **Live lab verification pending** (the hub-only tier-1/tier-2 proof + Job-GC
+   proof) — the lab was unreachable during implementation.
 7. **Multi-site scale-down / topology-shrink guards (pre-graduation).** The
    single-site path refuses (surfaces a condition and waits, never deletes) when
    `shards` is reduced or a legacy topology is detected — the "never delete data by

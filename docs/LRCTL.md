@@ -33,7 +33,10 @@ kubectl lr status <name>
 - `-A, --all-namespaces`: List or verify resources across all namespaces.
 - `--kubeconfig`: Path to a specific kubeconfig file.
 - `--context`: Kube-context to use. For a multi-site instance this is the **hub** context (where the `LittleRed` CR lives). Defaults to the kubeconfig's current context.
-- `--site-context`: Multi-site only. Map site names to kube-contexts, e.g. `--site-context alpha=ctxA,beta=ctxB`. When omitted, each site resolves to a context of the **same name** (convention). See [Multi-Site Clusters](#multi-site-clusters).
+- `--site-context`: Multi-site **tier 3** (direct) only. Map site names to kube-contexts, e.g. `--site-context alpha=ctxA,beta=ctxB` (implies `--direct`). Within tier 3 an unmapped site falls back to the site-name==context-name convention. See [Multi-Site Clusters](#multi-site-clusters).
+- `--from-status`: Multi-site **tier 1**. Render the cross-site view the operator published to `status.multiSite` (needs only `get littlered` on the hub; no site access).
+- `--direct`: Multi-site **tier 3**. Gather each site directly through your own per-site kube-contexts, bypassing the operator.
+- `--operator-namespace` / `--operator-deployment`: Multi-site **tier 2**. Where the operator lives on the hub (default `littlered-system` / `littlered`), used to discover the SA + image for the gather Job.
 - `--json`: Output results in pure JSON for automation/scripting.
 - `--unmanaged`: Treat the target as a raw set of pods rather than a LittleRed CR.
 - `--kind [sentinel|cluster]`: Used with `--unmanaged` to hint at the cluster type.
@@ -238,30 +241,62 @@ For a **stretched (multi-site) cluster** (`spec.multiSite`, managed hub-and-spok
 operator — see `docs/MULTI_SITE_DESIGN.md`), the read verbs (`status`, `verify`, `inspect`,
 `debug-dump`) are **site-aware automatically**: they detect `spec.multiSite` on the CR and
 aggregate across **all** sites. Point `lrctl` at the **hub** (`--context <hub>`), where the
-CR lives; it discovers the ordered site list and the instance namespace from the CR, then
-gathers each site.
+CR lives; it discovers the ordered site list and the instance namespace from the CR.
 
-### The two-network wrinkle (why you pass contexts, not the operator's Secrets)
+### Three ways to get ground truth (privilege tiers)
+
+The pods of a stretched cluster live in the **sites**, not on the hub — so ground truth has
+to come from the sites. `lrctl` offers three transports matched to the access you have, and
+**announces the one in use** (`Transport: …`) in every command's output:
+
+| Tier | Access needed | How | Selected by |
+|------|---------------|-----|-------------|
+| **1** | read-only **hub** (`get littlered`) | render the cross-site view the **operator publishes** to `status.multiSite` each reconcile | `status` always; `verify --from-status` |
+| **2** | exec/run on the **hub** (`create jobs`, `pods/log`) | run the operator's own gather as a **throwaway hub Job**; it gathers every site and returns JSON over the K8s API control path | **default** for `verify`/`inspect`/`debug-dump` |
+| **3** | **direct site** kube-contexts | gather each site from the workstation through your own per-site contexts, bypassing the operator | `--direct`, or any `--site-context` |
+
+Why this shape: the operator already has working site access (it is its job); tier 2 borrows
+it rather than duplicating site connectivity on the workstation, and — crucially — needs **no
+direct site access and no per-site kube-contexts** on the workstation. The gather runs *on the
+hub* and only the *result* travels back over the Kubernetes API (the Job's pod logs); the
+hub↔site data path is never proxied. Tier 2 is a **Job**, not a `kubectl exec` into the
+operator, so it is resource-isolated and works even when the operator pod is unhealthy or
+crash-looping (a prime debug case).
+
+Tier-2 discovery: the Job runs under the **operator's own ServiceAccount and image**,
+discovered from the operator Deployment on the hub (default `littlered-system/littlered`,
+override with `--operator-namespace` / `--operator-deployment`). It carries
+`ttlSecondsAfterFinished` so the API server GCs it even if `lrctl` dies; `lrctl` also deletes
+it proactively on the happy path.
+
+**RBAC.** Tier 1 needs only `get littlered` on the hub. Tier 2 needs the **lrctl user** to
+have `create` on `jobs` and `get` on `pods/log` in the operator namespace; the **Job** runs
+as the operator SA and inherits its existing Secret + site access (no new operator-SA grant
+is required — it does exactly what the operator already does each reconcile). Tier 3 needs a
+kube-context per site with pod read in the instance namespace.
+
+### The two-network wrinkle (tier 3: why you pass contexts, not the operator's Secrets)
 
 The operator reaches sites over the **replication-net** endpoint embedded in its per-site
 kubeconfig Secrets — an address reachable **only from hub pods**. A workstation cannot use
-those Secrets. So `lrctl` gathers each site through **your own kube-contexts** (the
-admin/site-net path). Site name → context resolution:
+those Secrets. So the tier-3 (`--direct`) path gathers each site through **your own
+kube-contexts** (the admin/site-net path). Site name → context resolution (tier 3 only):
 
 - an explicit `--site-context <site>=<context>` mapping wins;
 - otherwise the **convention** applies: a site is reached through a context of the **same
-  name**;
+  name** (this convention is a tier-3 resolution rule, **not** a default gather mode);
 - a site with neither is reported unresolved (and `verify` FAILs — the gather is incomplete).
 
 `docs/MULTI_SITE_DESIGN.md §8` describes the **two distinct** network prerequisites the
 operator needs: (a) hub-pod → spoke **pod-IP** data path (Redis dials) and (b) hub → site
 **Kubernetes API**. They are different paths; the `preflight` verb checks each honestly.
 
-### Site-aware verify
+### Site-aware verify (tier 3, `--direct`)
 
 ```text
 Verifying Multi-Site Cluster: ms-smoke/ms-smoke (Mode: cluster, 3 sites)
-Gathering Cluster Ground Truth across sites...
+Transport: gathered via direct site contexts
+Gathering Cluster Ground Truth across sites (direct contexts)...
 
 Sites:
   - scm-s1 (context scm-s1): reachable, 2 pod(s)
@@ -312,13 +347,22 @@ on top of the shared cluster checks (state, slot coverage, ghosts, partitions):
 An unreachable/unresolved site is reported and makes the verdict `[FAIL]` ("verification is
 incomplete") — its nodes then appear as ghosts in the survivors' gossip view and its shards
 show as placement violations. Verdicts and exit codes match cluster mode (`[OK]`/`[DEGRADED]`
-exit 0, `[FAIL]` non-zero). `--json` adds `multiSite`, `sites[]`, site-attributed `nodes[]`,
-`siteSpreadViolations`, and `unreachableSites`.
+exit 0, `[FAIL]` non-zero). `--json` adds `tier`, `asOf`, `multiSite`, `sites[]`,
+site-attributed `nodes[]`, `siteSpreadViolations`, and `unreachableSites`.
 
-### Site-aware status
+The **default** `verify` transport is now tier 2 (live via a hub Job): the same checks over
+the same ground truth, but gathered on the hub and returned over the control path — so it
+works from a **hub-only kubeconfig** with no `scm-s*` contexts. The output prepends
+`Transport: gathered live via hub Job` and a `Running gather Job …` line; the Sites section
+shows reachability + pod counts (no context column, since none is used). `verify --from-status`
+(tier 1) renders the same verdict shape from the operator's published cross-site view, with an
+`(as of last reconcile N ago)` freshness line and no gather at all.
 
-`status` reads the operator's **aggregated** per-site observed state from the CR
-(`status.multiSite`) — no cross-site gather needed:
+### Site-aware status (tier 1)
+
+`status` reads the operator's **aggregated** per-site observed state and **published
+cross-site view** from the CR (`status.multiSite`) — a pure tier-1 render, no gather, hub-only
+access:
 
 ```text
 Cluster: ms-smoke
@@ -332,14 +376,27 @@ Sites:
   - scm-s1: reachable, pods 2/2 Ready
   - scm-s2: reachable, pods 2/2 Ready
   - scm-s3: reachable, pods 2/2 Ready
+Slots Assigned: 16384 / 16384
+Cross-Site Placement: [OK] every shard spans >= 2 sites
+  - shard 0: master@scm-s1, replicas@[scm-s2] (cross-site)
+  - shard 1: master@scm-s3, replicas@[scm-s2] (cross-site)
+  - shard 2: master@scm-s3, replicas@[scm-s1] (cross-site)
+View freshness: as of last reconcile 3s ago (at 2026-08-07T…)
 Site-Loss Takeover: [recovered] Recovered: No site-loss takeover needed.
 Redis Nodes: 6/6 Ready
 ```
 
-`inspect` and `debug-dump` are likewise site-aware: `inspect` execs the cluster diagnostics
-in every site's pods (output grouped by site, pods keyed `<site>/<pod>`); `debug-dump` writes
-per-site subdirectories `site-<name>/` (pod logs, live cluster state, K8s resources) via each
-site's context, keeping the hub-only CR and operator logs at the top level.
+The `Slots Assigned` / `Cross-Site Placement` / per-shard / `View freshness` block is the
+operator's published tier-1 surface (`status.multiSite.{clusterState,slotsAssigned,crossSiteOK,
+shards,lastReconcileTime}`), computed each reconcile from the union ground truth.
+
+`inspect` and `debug-dump` also follow the tier model. By default (tier 2) `inspect` renders
+the site-attributed topology from the hub gather Job (for full per-pod raw `redis-cli` output,
+use `--direct`), and `debug-dump` saves the operator's hub gather as `multisite-gather.json`;
+`--direct` (tier 3) restores the full per-site collection — `inspect` execs the cluster
+diagnostics in every site's pods, `debug-dump` writes per-site `site-<name>/` subdirectories
+(pod logs, live cluster state, K8s resources) via each site's context — keeping the hub-only
+CR and operator logs at the top level.
 
 ### Connectivity preflight
 
