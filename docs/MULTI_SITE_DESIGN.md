@@ -298,8 +298,8 @@ Remaining field-shape details are settled in the ADR, not here.
    **implemented (Milestone 3)** — the pure `planSiteTakeover` + `classifySiteWitness`
    planner, the survivor-vantage gather fields, the `SiteClient.NodeReady` witness read,
    and the TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-025).
-   Remaining: the two-site e2e suite (Milestone 4) and the `lrctl` site-kubeconfig helper's
-   cluster-scoped `nodes` grant (Milestone 5).
+   Remaining: the two-site e2e suite (Milestone 4). The `lrctl` site-kubeconfig helper's
+   cluster-scoped `nodes` grant (Milestone 5) is implemented (item 6).
 2. Master rebalance follow-up (graceful `CLUSTER FAILOVER`), keeping the native
    failover path armed against master drift.
 3. Witness-shard exploration (§6.1) — separate design + e2e.
@@ -310,8 +310,18 @@ Remaining field-shape details are settled in the ADR, not here.
 5. e2e substrate: two Kubernetes clusters with mutually routed pod CIDRs; red-first
    scenarios: dual-site takeover on site kill, minority fail-stop reproduction,
    rejoin staggering, hub↔site partition must-not-takeover.
-6. `lrctl` multi-site support: site-aware `status`/`verify` (authority view must
-   aggregate all sites), connectivity preflight.
+6. `lrctl` multi-site support: site-aware `status`/`verify`/`inspect`/`debug-dump`
+   (authority view aggregates all sites), a connectivity preflight, and a
+   site-kubeconfig-Secret generator (`lrctl multisite setup-site`, Milestone 5). **Implemented**
+   — see `docs/LRCTL.md` "Multi-Site Clusters". The read verbs auto-detect `spec.multiSite`,
+   read the CR on the hub, and gather each site through the user's own kube-contexts (NOT the
+   operator's repl-net Secrets, which are hub-pod-only — §8); the union of per-site pods runs
+   through the existing `GatherClusterGroundTruth` + checks, plus a cross-site placement check
+   (a shard's master and replica must live in different sites). The preflight validates the two
+   §8 network prerequisites honestly (Secret well-formedness + workstation-path site-API
+   reachability tested; the operator's repl-net site-API and the hub-pod→pod-IP data path
+   reported as requiring in-cluster verification, never claimed). The generator provisions the
+   §7 RBAC including the cluster-scoped `nodes get;list` witness grant.
 7. **Multi-site scale-down / topology-shrink guards (pre-graduation).** The
    single-site path refuses (surfaces a condition and waits, never deletes) when
    `shards` is reduced or a legacy topology is detected — the "never delete data by

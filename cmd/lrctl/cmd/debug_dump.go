@@ -46,7 +46,7 @@ Secrets are never collected.`,
 }
 
 func runDebugDump(_ *cobra.Command, args []string) error {
-	k8sClient, coreClient, config, defaultNS, err := k8s.NewClient(kubeconfig)
+	k8sClient, coreClient, config, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return err
 	}
@@ -76,13 +76,22 @@ func runDebugDump(_ *cobra.Command, args []string) error {
 	fmt.Printf("Collecting debug artifacts for %s/%s into %s/\n", targetNS, name, dir)
 
 	// Collect everything. Errors are logged but don't stop collection.
+	// CR and operator logs always live on the hub.
 	collectCR(ctx, dir, name, targetNS)
 	collectOperatorLogsForCR(dir, name, targetNS)
-	collectPodLogsForCR(ctx, k8sClient, dir, name, targetNS)
-	collectRedisState(ctx, coreClient, config, k8sClient, dir, lr)
-	collectK8sResources(dir, name, targetNS)
-	if lr.Spec.Mode == modeFailover {
-		collectFailoverAssignments(dir, name, targetNS)
+
+	if isMultiSite(lr) {
+		// A stretched cluster's pods/resources live in the sites, not on the hub —
+		// collecting from the hub context would capture nothing (the same
+		// zero-pods-on-hub trap verify hit). Fan out per site (design §8).
+		collectMultiSiteArtifacts(ctx, dir, lr)
+	} else {
+		collectPodLogsForCR(ctx, k8sClient, dir, name, targetNS)
+		collectRedisState(ctx, coreClient, config, k8sClient, dir, lr)
+		collectK8sResources(dir, name, targetNS)
+		if lr.Spec.Mode == modeFailover {
+			collectFailoverAssignments(dir, name, targetNS)
+		}
 	}
 
 	fmt.Printf("Done. Artifacts written to %s/\n", dir)
@@ -273,10 +282,22 @@ func collectK8sResources(dir, name, ns string) {
 
 // --- Helpers ---
 
-// kubectl runs a kubectl command and returns stdout. Errors are silently swallowed
-// (the output will contain the error text if kubectl prints to stdout).
+// kubectl runs a kubectl command against the hub context (--context, if set) and
+// returns stdout. Errors are silently swallowed (the output will contain the
+// error text if kubectl prints to stdout).
 func kubectl(args ...string) string {
-	cmd := exec.Command("kubectl", args...)
+	return kubectlContext(kubeContext, args...)
+}
+
+// kubectlContext runs a kubectl command against an explicit kube-context (empty
+// ⇒ the kubeconfig current context). Multi-site collection targets each site's
+// own context.
+func kubectlContext(ctxName string, args ...string) string {
+	full := args
+	if ctxName != "" {
+		full = append([]string{"--context", ctxName}, args...)
+	}
+	cmd := exec.Command("kubectl", full...)
 	out, _ := cmd.CombinedOutput()
 	return string(out)
 }
@@ -290,6 +311,8 @@ func writeFile(dir, name, content string) {
 		content = redactSecrets(content)
 	}
 	path := filepath.Join(dir, name)
+	// Ensure the (possibly nested, e.g. per-site) parent directory exists.
+	_ = os.MkdirAll(filepath.Dir(path), 0o755)
 	_ = os.WriteFile(path, []byte(content), 0o644)
 }
 

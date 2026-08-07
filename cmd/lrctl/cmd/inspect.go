@@ -17,7 +17,7 @@ var inspectCmd = &cobra.Command{
 	Short: "Perform a deep-dive diagnostic of a Redis instance (omit name to inspect all in namespace)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		k8sClient, coreClient, config, defaultNS, err := k8s.NewClient(kubeconfig)
+		k8sClient, coreClient, config, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 		if err != nil {
 			return err
 		}
@@ -51,6 +51,25 @@ var inspectCmd = &cobra.Command{
 		textIdx := 0
 
 		for _, key := range targets {
+			// Multi-site: exec into every site's pods through their own contexts.
+			if !unmanaged {
+				if lr, lerr := getLittleRed(ctx, k8sClient, key); lerr == nil && isMultiSite(lr) {
+					res, ierr := inspectMultiSite(ctx, lr)
+					if ierr != nil {
+						fmt.Fprintf(os.Stderr, "error: %s/%s: %v\n", key.Namespace, key.Name, ierr)
+						errCount++
+						continue
+					}
+					if jsonOutput {
+						jsonResults = append(jsonResults, res)
+					} else if textIdx > 0 {
+						fmt.Println(strings.Repeat("=", 40))
+					}
+					textIdx++
+					continue
+				}
+			}
+
 			cCtx, err := discovery.GetContext(ctx, k8sClient, key.Namespace, key.Name, kind, unmanaged)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %s/%s: %v\n", key.Namespace, key.Name, err)

@@ -32,6 +32,8 @@ kubectl lr status <name>
 - `-n, --namespace`: Specify the namespace (defaults to your current context).
 - `-A, --all-namespaces`: List or verify resources across all namespaces.
 - `--kubeconfig`: Path to a specific kubeconfig file.
+- `--context`: Kube-context to use. For a multi-site instance this is the **hub** context (where the `LittleRed` CR lives). Defaults to the kubeconfig's current context.
+- `--site-context`: Multi-site only. Map site names to kube-contexts, e.g. `--site-context alpha=ctxA,beta=ctxB`. When omitted, each site resolves to a context of the **same name** (convention). See [Multi-Site Clusters](#multi-site-clusters).
 - `--json`: Output results in pure JSON for automation/scripting.
 - `--unmanaged`: Treat the target as a raw set of pods rather than a LittleRed CR.
 - `--kind [sentinel|cluster]`: Used with `--unmanaged` to hint at the cluster type.
@@ -229,6 +231,169 @@ only), `[FAIL]` (any FAIL finding, non-zero exit).
 - **Partition Detection**: Identifies if nodes see different versions of the cluster topology.
 
 ---
+
+## Multi-Site Clusters
+
+For a **stretched (multi-site) cluster** (`spec.multiSite`, managed hub-and-spokes by one
+operator — see `docs/MULTI_SITE_DESIGN.md`), the read verbs (`status`, `verify`, `inspect`,
+`debug-dump`) are **site-aware automatically**: they detect `spec.multiSite` on the CR and
+aggregate across **all** sites. Point `lrctl` at the **hub** (`--context <hub>`), where the
+CR lives; it discovers the ordered site list and the instance namespace from the CR, then
+gathers each site.
+
+### The two-network wrinkle (why you pass contexts, not the operator's Secrets)
+
+The operator reaches sites over the **replication-net** endpoint embedded in its per-site
+kubeconfig Secrets — an address reachable **only from hub pods**. A workstation cannot use
+those Secrets. So `lrctl` gathers each site through **your own kube-contexts** (the
+admin/site-net path). Site name → context resolution:
+
+- an explicit `--site-context <site>=<context>` mapping wins;
+- otherwise the **convention** applies: a site is reached through a context of the **same
+  name**;
+- a site with neither is reported unresolved (and `verify` FAILs — the gather is incomplete).
+
+`docs/MULTI_SITE_DESIGN.md §8` describes the **two distinct** network prerequisites the
+operator needs: (a) hub-pod → spoke **pod-IP** data path (Redis dials) and (b) hub → site
+**Kubernetes API**. They are different paths; the `preflight` verb checks each honestly.
+
+### Site-aware verify
+
+```text
+Verifying Multi-Site Cluster: ms-smoke/ms-smoke (Mode: cluster, 3 sites)
+Gathering Cluster Ground Truth across sites...
+
+Sites:
+  - scm-s1 (context scm-s1): reachable, 2 pod(s)
+  - scm-s2 (context scm-s2): reachable, 2 pod(s)
+  - scm-s3 (context scm-s3): reachable, 2 pod(s)
+
+Cluster State: ok
+Total Slots Assigned: 16384 / 16384
+
+Node Status:
+  - Pod scm-s1/ms-smoke-shard-0-0 [site scm-s1]: role:master, id:25fa735f…, slots:0-5461
+  - Pod scm-s1/ms-smoke-shard-2-0 [site scm-s1]: role:replica, id:72ac630d…, following:4a84fb37…, link:up
+  - Pod scm-s2/ms-smoke-shard-0-0 [site scm-s2]: role:replica, id:14d1b9e7…, following:25fa735f…, link:up
+  - Pod scm-s2/ms-smoke-shard-1-0 [site scm-s2]: role:replica, id:05f09cc6…, following:10c76ca0…, link:up
+  - Pod scm-s3/ms-smoke-shard-1-0 [site scm-s3]: role:master, id:10c76ca0…, slots:5462-10922
+  - Pod scm-s3/ms-smoke-shard-2-0 [site scm-s3]: role:master, id:4a84fb37…, slots:10923-16383
+
+Cluster Topology (site-attributed):
+  Master: scm-s1/ms-smoke-shard-0-0 [site scm-s1] (25fa735f…)
+    Slots: 0-5461
+    └── Replica: scm-s2/ms-smoke-shard-0-0 [site scm-s2] (14d1b9e7…, link:up, cross-site)
+  Master: scm-s3/ms-smoke-shard-1-0 [site scm-s3] (10c76ca0…)
+    Slots: 5462-10922
+    └── Replica: scm-s2/ms-smoke-shard-1-0 [site scm-s2] (05f09cc6…, link:up, cross-site)
+  Master: scm-s3/ms-smoke-shard-2-0 [site scm-s3] (4a84fb37…)
+    Slots: 10923-16383
+    └── Replica: scm-s1/ms-smoke-shard-2-0 [site scm-s1] (72ac630d…, link:up, cross-site)
+
+Cross-Site Placement:
+  [OK] every shard spans >= 2 sites (a shard's master and replica live in different sites)
+
+Summary:
+  [OK] Stretched cluster is healthy and consistent across all sites.
+```
+
+Nodes are keyed by a **site-qualified key** (`<site>/<pod>`) because pod names collide
+across sites (each site has its own `{name}-shard-K-*`). Two multi-site-specific checks run
+on top of the shared cluster checks (state, slot coverage, ghosts, partitions):
+
+- **Cross-Site Placement** — the multi-site **inversion** of the single-site shard-colocation
+  invariant. Single-site wants a shard's master and replica in one shard StatefulSet;
+  multi-site wants them in **different sites** so a whole-site loss keeps a copy. A shard
+  whose members all live in one site is a `[FAIL]` (no cross-site copy). Each replica line is
+  tagged `cross-site` or `SAME-SITE`.
+- **Shard colocation** (reused unchanged, LR-020) — a replica must still follow a master in
+  its **own shard K**; a cross-shard pairing FAILs.
+
+An unreachable/unresolved site is reported and makes the verdict `[FAIL]` ("verification is
+incomplete") — its nodes then appear as ghosts in the survivors' gossip view and its shards
+show as placement violations. Verdicts and exit codes match cluster mode (`[OK]`/`[DEGRADED]`
+exit 0, `[FAIL]` non-zero). `--json` adds `multiSite`, `sites[]`, site-attributed `nodes[]`,
+`siteSpreadViolations`, and `unreachableSites`.
+
+### Site-aware status
+
+`status` reads the operator's **aggregated** per-site observed state from the CR
+(`status.multiSite`) — no cross-site gather needed:
+
+```text
+Cluster: ms-smoke
+Namespace: ms-smoke
+Phase: Running
+Mode: cluster
+Master: <none>
+Multi-Site: 3 sites, sitesPerShard=2, network=pod-routed
+Cluster State: ok
+Sites:
+  - scm-s1: reachable, pods 2/2 Ready
+  - scm-s2: reachable, pods 2/2 Ready
+  - scm-s3: reachable, pods 2/2 Ready
+Site-Loss Takeover: [recovered] Recovered: No site-loss takeover needed.
+Redis Nodes: 6/6 Ready
+```
+
+`inspect` and `debug-dump` are likewise site-aware: `inspect` execs the cluster diagnostics
+in every site's pods (output grouped by site, pods keyed `<site>/<pod>`); `debug-dump` writes
+per-site subdirectories `site-<name>/` (pod logs, live cluster state, K8s resources) via each
+site's context, keeping the hub-only CR and operator logs at the top level.
+
+### Connectivity preflight
+
+`lrctl multisite preflight <name>` validates the operator's setup, honestly reporting which
+network path each check used:
+
+```text
+Multi-Site Preflight: ms-smoke/ms-smoke (3 sites, operator namespace "littlered-system")
+
+Site "scm-s1":
+  [OK] kubeconfig Secret littlered-system/site-scm-s1 exists and is well-formed
+  [INFO] operator path (hub-pod -> site-API): https://10.2.1.10:6443 — NOT tested (reachable only from hub pods)
+  [OK] workstation path: site Kubernetes API reachable via context "scm-s1"
+…
+[INFO] hub-pod -> spoke-pod-IP DATA path (Redis dials over the routed pod network):
+       REQUIRES an in-cluster probe (a pod on the hub dialing a spoke pod IP); NOT verified here.
+       This is a DIFFERENT network path from the site-API checks above (design §8).
+
+Summary:
+  [OK] Secrets well-formed and every site's Kubernetes API reachable over the workstation path.
+```
+
+It checks (a) each site's `kubeconfigSecretRef` Secret exists on the hub and is well-formed
+(parses, has the `kubeconfig` key, names an endpoint); (b) each site's Kubernetes API is
+reachable over the **workstation** path. It **reports but does not test** the operator's
+repl-net site-API endpoint (hub-pod-only), and reports the hub-pod → spoke-pod-IP **data
+path** as requiring an in-cluster probe — it never claims a pass it did not observe.
+
+### Site-Secret setup helper
+
+`lrctl multisite setup-site` automates onboarding a site (the manual `docs/MULTI_SITE_DESIGN.md
+§7` steps). In the **site** it creates (in the instance namespace) a ServiceAccount, a
+namespaced Role (the operator's workload CRUD), a ClusterRole + ClusterRoleBinding granting
+cluster-scoped **`nodes get;list`** (the ADR-012 site-loss witness), and a long-lived token;
+it then assembles a kubeconfig and creates it as a Secret (data key `kubeconfig`) in the
+operator namespace on the **hub**.
+
+```bash
+lrctl multisite setup-site \
+  --site scm-s1 \                       # site name (also the generated context name)
+  --site-admin-context scm-s1 \         # workstation context for the site (default: --site)
+  --hub-context scm-cp \                # hub context (default: --context)
+  -n ms-smoke \                         # instance namespace
+  --repl-endpoint https://10.2.1.10:6443 \   # REQUIRED — see below
+  --operator-namespace littlered-system \    # where the hub Secret is created
+  --secret-name site-scm-s1             # default: site-<site>
+```
+
+`--repl-endpoint` is **required** and is the crux of the two-network wrinkle: the generated
+kubeconfig's server must be the site's **replication-net** endpoint (what hub pods use), which
+**cannot** be derived from your workstation kubeconfig (that holds the admin endpoint). Pass
+`--dry-run` to print the objects without applying. The command is idempotent (re-running
+updates in place). The cluster-scoped ClusterRole/ClusterRoleBinding are namespace-suffixed
+(`littlered-site-nodes-<namespace>`) so multiple instances never clobber one another.
 
 ## Advanced Usage
 

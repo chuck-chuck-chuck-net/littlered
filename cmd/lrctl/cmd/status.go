@@ -9,6 +9,7 @@ import (
 	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
 	"github.com/spf13/cobra"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 var statusCmd = &cobra.Command{
@@ -16,7 +17,7 @@ var statusCmd = &cobra.Command{
 	Short: "Show status of a LittleRed instance (omit name to list all in namespace)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		k8sClient, _, _, defaultNS, err := k8s.NewClient(kubeconfig)
+		k8sClient, _, _, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 		if err != nil {
 			return err
 		}
@@ -87,6 +88,14 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 		fmt.Printf("Master: <none>\n")
 	}
 
+	// Multi-site: the operator aggregates per-site observed state into
+	// status.multiSite (docs/MULTI_SITE_DESIGN.md §8). Surface it here — the
+	// single "Master" line is meaningless for a stretched cluster (roles are
+	// fluid per shard, pillar 3.5).
+	if lr.Spec.MultiSite != nil {
+		printMultiSiteStatus(lr)
+	}
+
 	if lr.Status.Sentinels != nil {
 		fmt.Printf("Sentinels: %d/%d Ready\n", lr.Status.Sentinels.Ready, lr.Status.Sentinels.Total)
 	}
@@ -117,25 +126,74 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 
 	// Surface the failover-mode refuse-and-wait condition (ADR-011).
 	if c := apimeta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionFailoverRecovery); c != nil {
-		marker := "[recovered]"
-		if c.Status == "True" {
-			marker = "[!] ACTION MAY BE REQUIRED"
-		}
-		fmt.Printf("Failover Recovery: %s %s: %s\n", marker, c.Reason, c.Message)
+		printRecoveryCondition("Failover Recovery", c)
 	}
 
 	// Surface the leaderless bootstrap-deadlock condition (ADR-005 / LR-015).
 	if c := apimeta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionLeaderlessRecovery); c != nil {
-		marker := "[recovered]"
-		if c.Status == "True" {
-			marker = "[!] ACTION MAY BE REQUIRED"
-		}
-		fmt.Printf("Leaderless Recovery: %s %s: %s\n", marker, c.Reason, c.Message)
+		printRecoveryCondition("Leaderless Recovery", c)
 	} else if lr.Status.LeaderlessSince != nil {
 		since := lr.Status.LeaderlessSince.Format(timeFormat)
 		fmt.Printf("Leaderless Recovery: [!] bare-Sentinel deadlock since %s\n", since)
 	}
 }
+
+// printMultiSiteStatus renders the multi-site observed state from the CR status
+// (the operator's aggregated per-site view) plus the site-loss takeover marker.
+func printMultiSiteStatus(lr *littleredv1alpha1.LittleRed) {
+	ms := lr.Spec.MultiSite
+	sitesPerShard := len(ms.Sites)
+	if ms.SitesPerShard > 0 {
+		sitesPerShard = ms.SitesPerShard
+	}
+	fmt.Printf("Multi-Site: %d sites, sitesPerShard=%d, network=%s\n",
+		len(ms.Sites), sitesPerShard, valueOrNone(ms.Network.Mode))
+	if lr.Status.Cluster != nil && lr.Status.Cluster.State != "" {
+		fmt.Printf("Cluster State: %s\n", lr.Status.Cluster.State)
+	}
+
+	fmt.Println("Sites:")
+	if lr.Status.MultiSite != nil {
+		for _, s := range lr.Status.MultiSite.Sites {
+			reach := "unreachable"
+			if s.Reachable {
+				reach = "reachable"
+			}
+			pods := ""
+			if s.Pods != nil {
+				pods = fmt.Sprintf(", pods %d/%d Ready", s.Pods.Ready, s.Pods.Total)
+			}
+			fmt.Printf("  - %s: %s%s\n", s.Name, reach, pods)
+		}
+	} else {
+		for _, s := range ms.Sites {
+			fmt.Printf("  - %s: (no observed state yet)\n", s.Name)
+		}
+	}
+
+	if lr.Status.MultiSite != nil && lr.Status.MultiSite.TakeoverPendingSince != nil {
+		fmt.Printf("Site-Loss Takeover: [!] pending since %s (cooldown armed)\n",
+			lr.Status.MultiSite.TakeoverPendingSince.Format(timeFormat))
+	}
+	if c := apimeta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionMultiSiteTakeover); c != nil {
+		printRecoveryCondition("Site-Loss Takeover", c)
+	}
+}
+
+// printRecoveryCondition renders a recovery/takeover condition with a consistent
+// marker: [recovered] when it has cleared, an action-required marker while True.
+func printRecoveryCondition(label string, c *metav1.Condition) {
+	marker := markerRecovered
+	if c.Status == metav1.ConditionTrue {
+		marker = markerActionRequired
+	}
+	fmt.Printf("%s: %s %s: %s\n", label, marker, c.Reason, c.Message)
+}
+
+const (
+	markerRecovered      = "[recovered]"
+	markerActionRequired = "[!] ACTION MAY BE REQUIRED"
+)
 
 // timeFormat is the timestamp layout used by printStatus (RFC3339).
 const timeFormat = "2006-01-02T15:04:05Z07:00"

@@ -18,6 +18,7 @@ const (
 	modeSentinel       = "sentinel"
 	modeFailover       = "failover"
 	roleMaster         = "master"
+	roleReplica        = "replica"
 	redisCliBin        = "redis-cli"
 	infoSubcommand     = "info"
 	clusterSubcommand  = "cluster"
@@ -28,6 +29,8 @@ const (
 var (
 	namespace     string
 	kubeconfig    string
+	kubeContext   string
+	siteContext   string
 	unmanaged     bool
 	kind          string
 	allNamespaces bool
@@ -92,7 +95,7 @@ func completeLittleRedNames(_ *cobra.Command, args []string, _ string) ([]string
 		// Already have a name — suppress all further completions.
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	k8sClient, _, _, defaultNS, err := k8s.NewClient(kubeconfig)
+	k8sClient, _, _, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
@@ -113,7 +116,7 @@ func completeLittleRedNames(_ *cobra.Command, args []string, _ string) ([]string
 
 // completeNamespaces is used as the completion function for the --namespace / -n flag.
 func completeNamespaces(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-	k8sClient, _, _, _, err := k8s.NewClient(kubeconfig)
+	k8sClient, _, _, _, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
@@ -133,6 +136,12 @@ func init() {
 		&namespace, "namespace", "n", "", "If present, the namespace scope for this CLI request")
 	rootCmd.PersistentFlags().StringVar(
 		&kubeconfig, "kubeconfig", "", "Path to the kubeconfig file to use for CLI requests")
+	rootCmd.PersistentFlags().StringVar(
+		&kubeContext, "context", "", "Kube-context to use (the hub context for multi-site); defaults to the current context")
+	rootCmd.PersistentFlags().StringVar(
+		&siteContext, "site-context", "",
+		"Multi-site only: map site names to kube-contexts, e.g. --site-context alpha=ctxA,beta=ctxB "+
+			"(default convention: site name == context name)")
 	rootCmd.PersistentFlags().BoolVar(
 		&unmanaged, "unmanaged", false, "If true, skip looking for a LittleRed CR and use heuristics to find pods")
 	rootCmd.PersistentFlags().StringVar(
