@@ -338,8 +338,11 @@ Remaining field-shape details are settled in the ADR, not here.
    namespace (the Job runs as the operator SA, no new operator-SA grant); tier 3 = per-site
    contexts. Pure decision seams are unit-tested red-first (`SelectTier`, `BuildGatherJob`,
    `ExtractOperatorInfo`, `StatusVerdict`, `ExtractResultJSON`, `buildCrossSiteView`, wire
-   round-trip). **Live lab verification pending** (the hub-only tier-1/tier-2 proof + Job-GC
-   proof) — the lab was unreachable during implementation.
+   round-trip). **Live-verified on the lab (M5.1):** from a hub-only kubeconfig (site
+   contexts stripped), tier-1 `status` renders the published cross-site view and tier-2
+   `verify` gathers live via a throwaway hub Job that is then GC'd — and tier-2 still
+   gathers with the operator scaled to zero (the operator-pod-independence payoff of the
+   Job over exec). Independently re-verified by the orchestrator.
 7. **Multi-site scale-down / topology-shrink guards (pre-graduation).** The
    single-site path refuses (surfaces a condition and waits, never deletes) when
    `shards` is reduced or a legacy topology is detected — the "never delete data by

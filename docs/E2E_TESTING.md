@@ -119,6 +119,48 @@ Convention: when adding a tier that is slow, needs a non-default image, or is ot
 opt-in, tag it `Label("extended")` — it then runs under `make test-e2e-all`/CI-all and is
 skipped by the fast default, with no new flag to remember.
 
+### Cross-Topology Cluster Matrix (single-site + multi-site)
+
+A stretched **multi-site** cluster (`spec.multiSite`, experimental — ADR-012,
+`docs/MULTI_SITE_DESIGN.md`) *is* just a Redis Cluster: bring-up, basic ops, and
+pod-failure recovery must all hold whether the cluster lives in one Kubernetes cluster or
+is stretched across sites. So the topology-agnostic cluster behaviours live in **one shared
+spec body** (`cluster_behaviour_test.go`, `clusterBehaviourSpecs`) driven through the
+`clusterHarness` interface (`cluster_harness_test.go`); the only difference between
+topologies is which kube-context a given pod lives in. These specs assert **outcomes** (data
+intact, all 16384 slots served, converges healthy), not the recovery mechanism — multi-site
+pod failure may recover via native cross-site failover or (below quorum) the operator, and
+the shared body must not care which.
+
+The `E2E_TOPOLOGY` env knob selects which topology registers its behaviour Describe (both are
+labelled `cluster-behaviour`):
+
+```bash
+make test-e2e E2E_TOPOLOGY=single   # only single-site (DEFAULT — the suite's historical behaviour)
+make test-e2e E2E_TOPOLOGY=multi    # only multi-site
+make test-e2e E2E_TOPOLOGY=both     # both topologies
+make test-e2e LABEL_FILTER='cluster-behaviour' E2E_TOPOLOGY=both   # just the matrix, both ways
+```
+
+**The multi-site topology needs a real hub+sites substrate** — it is not runnable on the
+single Kind cluster of a default run. It requires a hub kube-context and per-site contexts
+over Kubernetes clusters with **mutually routed pod CIDRs**, wired via `MS_HUB_CONTEXT` /
+`MS_SITE_CONTEXTS` / `MS_OPERATOR_NS` / `MS_SITE_ENDPOINTS` (see the env table); the multi-site
+Describe provisions each site's namespace/RBAC/Secrets in a `BeforeAll`. The default
+`E2E_TOPOLOGY=single` keeps CI on Kind unchanged.
+
+**Shared vs single-site-only.** Shared through the matrix (both topologies): cluster
+bring-up + basic operations, and master-pod-failure recovery under chaos. Deliberately
+**single-site-only** (they do not generalise to the site dimension, and stay in their own
+files): the kill-9-all total-wipe semantics (`cluster_totalwipe_test.go` — `nodes.conf`-on-
+EmptyDir is per-site; the multi-site analogue is the per-site ADR-008 wipe recovery), the
+per-shard `topologySpreadConstraint` node-spread (`cluster_placement_test.go` — the multi-site
+analogue is the *site* dimension, asserted by the takeover suite), and the 0-replica
+self-heal / custom-config / debug-no-slots / rolling-update / multipod specs in
+`cluster_functional_test.go` + `cluster_chaos_test.go`. The inherently-multi-site disruption
+scenarios (whole-site kill, data-plane partition) live in `multisite_takeover_test.go`, not the
+shared body.
+
 ### Additional Flags
 
 Pass extra arguments to `go test` via `ARGS`:
@@ -142,6 +184,12 @@ make test-e2e ARGS="-timeout 90m"
 | `KUBECONTEXT` | (none) | Pin to a specific named context (implies pinning) |
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |
 | `CLUSTER_REPLICAS_PER_SHARD` | `1` | Replicas per shard for cluster tests that use replicas |
+| `E2E_TOPOLOGY` | `single` | Which topologies the shared **cluster-behaviour** matrix runs under: `single` (default), `multi`, or `both`. See "Cross-Topology Cluster Matrix" below. |
+| `MS_HUB_CONTEXT` | (lab default) | Multi-site only: the hub kube-context (where the CR + operator live). Required for `E2E_TOPOLOGY=multi`/`both` and the takeover suite. |
+| `MS_OPERATOR_NS` | `littlered-system` | Multi-site only: the operator namespace on the hub (where per-site kubeconfig Secrets are created). |
+| `MS_SITE_CONTEXTS` | (lab default) | Multi-site only: comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. |
+| `MS_SITE_ENDPOINTS` | (lab default) | Multi-site only: comma list of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). |
+| `MS_TALOS_ENDPOINTS` | (lab default) | Multi-site takeover suite only: per-site node endpoints for the whole-site-kill (reboot) disruption mechanism. |
 | `NON_GRACEFUL_RESTART` | (none) | Advanced: when `true`, pod-restart helpers use a hard/non-graceful kill instead of a graceful delete |
 | `FOCUS` | (none) | Ginkgo focus filter (regex) |
 | `ARGS` | (none) | Extra arguments passed to `go test` |
@@ -161,6 +209,9 @@ make test-e2e ARGS="-timeout 90m"
 | `sentinel_standalone_chaos_test.go` | Sentinel and Standalone Chaos Testing | Sentinel rapid double failover under load (graceful + crash), standalone pod restart |
 | `security_test.go` | LittleRed Security Features | Password authentication enforcement, TLS encryption enforcement |
 | `failover_mode_test.go` | Failover Mode / Failover Mode Deadlock Recovery | `mode: failover` (ADR-011): functional (resources, assignment annotations, experimental event), graceful+crash failover (UID-asserted), event-path (<15s) and polling-only tiers, hybrid double-failover (the graduation scenario), kill-9 epoch-gate yield under chaos load, deadlock tiers (total-loss / single-survivor / multi-holder same-lineage), rolling update. Label: `failover-mode` |
+| `cluster_behaviour_test.go` | Cluster Behaviour Matrix [single-site] / [multi-site] | The ONE shared body of topology-agnostic cluster behaviours (bring-up to healthy serving 16384 slots, cross-shard ops, master-pod-failure recovery under chaos with data intact), run under single-site and/or multi-site via the `clusterHarness` abstraction. Gated by `E2E_TOPOLOGY`. Labels: `cluster-behaviour` (both); `multisite` (the multi-site Describe). |
+| `cluster_harness_test.go` + `cluster_harness_single_test.go` / `cluster_harness_multi_test.go` | (support) | The `clusterHarness` interface + `topologyEnabled` gating, and its single-site (ambient-context) and multi-site (hub + per-site contexts, per-pod site) implementations. Not specs themselves. |
+| `multisite_takeover_test.go` | Multi-Site Site-Loss Takeover (ADR-012) | `spec.multiSite` disruption: Scenario A whole-site kill of an even 2+2 split (`shards: 4`) MUST take over (survivor serves all slots, data intact); Scenario B data-plane-only partition with the site kept alive MUST NOT take over (no split-brain). Needs the hub+sites substrate + node-reboot / partition mechanisms. Labels: `multisite`, `multisite-takeover`, `multisite-hold`. |
 
 > Naming caveat: `sentinel_advanced_failover_test.go` (Describe: *Sentinel Advanced
 > Failover*, formerly `failover_test.go`) tests **sentinel-mode** label mechanics and

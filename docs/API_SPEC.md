@@ -463,8 +463,12 @@ spec:
 
 ### 2.14a Multi-Site (Cluster Mode)
 
-> **Status:** experimental; API surface and per-site plumbing only in this
-> release. See `docs/MULTI_SITE_DESIGN.md` and ADR-012.
+> **Status:** experimental. The full mode ships (API, per-site plumbing,
+> operator-owned site-loss takeover, and `lrctl` multi-site support) and is
+> e2e-verified on a real multi-cluster lab, but pre-1.0 with known deferred items
+> (per-site scale-down / topology-shrink refusal guards; NodePort/Multus
+> transports; witness shard; master rebalance). See `docs/MULTI_SITE_DESIGN.md`
+> §10 and ADR-012.
 
 Only applicable when `mode: cluster`; rejected by validation in every other
 mode. Stretches one Redis Cluster across multiple workload Kubernetes clusters
@@ -495,10 +499,13 @@ spec:
 Each `kubeconfigSecretRef` names a Secret **in the operator namespace** holding
 a kubeconfig under the `kubeconfig` data key, whose credentials are bound to a
 **namespaced Role** in the target site (workload CRUD + pod read in the instance
-namespace — not cluster-admin). Generating that ServiceAccount/Role/RoleBinding/
-token and Secret is an operator setup step (no helper tooling ships in this
-milestone). A site with `kubeconfigSecretRef` omitted is **hub-local**: its
-workloads live in the same Kubernetes cluster as the operator.
+namespace — not cluster-admin) **plus one cluster-scoped read (`nodes` get/list)**,
+required by the ADR-012 site-loss witness (it must tell a kubelet-attested pod
+death from a node-controller inference). `lrctl multisite setup-site` generates
+that ServiceAccount/Role/RoleBinding + the ClusterRole/ClusterRoleBinding for the
+node read, the token, and the Secret (see `docs/LRCTL.md`). A site with
+`kubeconfigSecretRef` omitted is **hub-local**: its workloads live in the same
+Kubernetes cluster as the operator.
 
 **Total members per shard = `sitesPerShard × (replicasPerShard + 1)`** — note the
 reading trap: `replicasPerShard: 1` in a dual-site instance yields 4 members per
@@ -669,6 +676,25 @@ status:
         reachable: false               # site unreachable = unmanaged, not broken
         lastProbeTime: "2026-08-02T08:59:30Z"
     takeoverPendingSince: "2026-08-02T09:00:10Z"  # Armed when a site loss native failover cannot resolve is observed; cleared when it clears (ADR-012)
+    # Published cross-site view (tier-1 surface): the operator gathers every site
+    # each reconcile and stamps this compact site-attributed summary so a
+    # read-only-hub client (lrctl status / verify --from-status) can render
+    # cross-site health with only `get littlered`. Freshness = the reconcile interval.
+    clusterState: ok               # overall stretched-cluster cluster_state (ok/fail/unknown)
+    slotsAssigned: 16384           # assigned hash slots across the stretched cluster (16384 = whole)
+    crossSiteOK: true              # every shard's members span >= 2 sites (the failure-domain guarantee)
+    shards:
+      - shard: 0
+        masterSite: alpha
+        replicaSites: [beta]
+        crossSite: true
+        linkDown: false
+      - shard: 1
+        masterSite: beta
+        replicaSites: [alpha]
+        crossSite: true
+        linkDown: false
+    lastReconcileTime: "2026-08-02T09:00:15Z"  # when this cross-site view was last published (freshness anchor)
 ```
 
 | Field | Type | Description |
@@ -711,6 +737,16 @@ status:
 | `multiSite.sites[].pods` | `RedisStatus` | Count of this instance's Redis pods observed in the site (`ready`/`total`). |
 | `multiSite.sites[].lastProbeTime` | `Time` | When the operator last probed the site. |
 | `multiSite.takeoverPendingSince` | `Time` | Armed when the operator first observes a site loss that native Redis failover cannot resolve; gates the takeover cooldown (ADR-012). Cleared when the state clears (multi-site cluster mode). |
+| `multiSite.clusterState` | `string` | The stretched cluster's overall `cluster_state` from the last gather (`ok`/`fail`/`unknown`) — the tier-1 published equivalent of the live gather's cluster state. Part of the operator's published cross-site view. |
+| `multiSite.slotsAssigned` | `int32` | How many of the 16384 hash slots are assigned across the stretched cluster (16384 when whole). Published cross-site view. |
+| `multiSite.crossSiteOK` | `bool` | True when every shard's members span at least two sites (a master and a replica in different sites) — the multi-site failure-domain guarantee. False means at least one shard would be lost with a single site. Published cross-site view. |
+| `multiSite.shards` | `[]ShardSiteView` | Per-shard site-attributed topology summary. Published cross-site view. |
+| `multiSite.shards[].shard` | `int` | Shard index. |
+| `multiSite.shards[].masterSite` | `string` | Site hosting this shard's current master (empty if no reachable master was observed). |
+| `multiSite.shards[].replicaSites` | `[]string` | Sites hosting this shard's replicas, sorted. |
+| `multiSite.shards[].crossSite` | `bool` | True when this shard's master and at least one replica live in different sites. |
+| `multiSite.shards[].linkDown` | `bool` | True when any of this shard's replicas reported its replication link down at the last gather (reduced redundancy). |
+| `multiSite.lastReconcileTime` | `Time` | When the operator last published this cross-site view; a tier-1 reader reports it as the data's freshness ("as of last reconcile N ago"). |
 
 ### 3.1 Condition Types
 
@@ -724,6 +760,7 @@ status:
 | `GhostMasterRecovery` | ✅ | Sentinel mode only: reflects a ghost-master failover deadlock — a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so failover aborts `no-good-slave` while living survivors hold the data — and the operator's recovery of it. `True` means deadlocked/needs attention (in cooldown, or refusing because divergent data is present); `False` records a completed recovery |
 | `FailoverRecovery` | ✅ | Failover mode only: `True` means the instance needs attention — most importantly the refuse-and-wait state, where the surviving data holders span divergent replication lineages and electing any one would discard independent writes (set `failover.allowUnsafeRebootstrapOnDeadlock` to authorize); `False` records a completed recovery |
 | `MultiSiteTeardown` | ✅ | Multi-site cluster mode only: `True` while the deletion sweep is blocked — a site was unreachable or its sweep failed — so the `redis.chuck-chuck-chuck.net/multisite-teardown` finalizer is retained and the operator retries. Escape hatch: remove the finalizer manually |
+| `MultiSiteTakeover` | ✅ | Multi-site cluster mode only (ADR-012): the operator-owned recovery of a whole site's loss that native Redis failover cannot resolve. `True` means the instance needs attention — the takeover cooldown is armed, or the operator is **refusing** because the fence is unavailable (the unreachable side could hold a serving master majority, so an automatic takeover risks a live split-brain; set `multiSite.allowUnsafeSiteTakeover` to authorize, or act manually). `False` records a completed takeover or that no site-loss recovery is needed. Event reasons: `SiteLossDetected` / `SiteTakeoverExecuted` / `RefusedSiteTakeover` |
 | `TLSReady` | — | Reserved for future use (defined but not currently set) |
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |
 | `ClusterReady` | — | Reserved for future use (defined but not currently set) |

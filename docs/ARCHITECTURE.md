@@ -19,8 +19,10 @@
 | **sentinels** | The 3 monitoring processes within a sentinel instance specifically |
 | **failover** | The operator-managed HA mode: 1 Redis master + N replicas, no Sentinel processes (`mode: failover`, experimental) |
 | **Redis Cluster** | The gossip-based sharding mode (`mode: cluster`) |
+| **site** / **hub** / **spoke** | A site is one workload Kubernetes cluster hosting Redis pods of a multi-site instance; the hub is the Kubernetes cluster hosting the CR and the operator; a spoke is a site viewed from the hub (`spec.multiSite`, experimental) |
+| **stretched Redis Cluster** | One Redis Cluster whose nodes span multiple sites (`mode: cluster` + `spec.multiSite`) |
 
-"Cluster" on its own always refers to Redis Cluster mode. "Sentinel cluster" is avoided throughout because it is ambiguous — it could mean the whole sentinel setup or the sentinel processes themselves. "Instance" is the generic term for any LittleRed deployment.
+A **Kubernetes cluster** in the multi-site context is always called *site*, *hub*, or spelled out — never bare "cluster". "Cluster" on its own always refers to Redis Cluster mode. "Sentinel cluster" is avoided throughout because it is ambiguous — it could mean the whole sentinel setup or the sentinel processes themselves. "Instance" is the generic term for any LittleRed deployment.
 
 ---
 
@@ -424,6 +426,79 @@ and appended to any user-supplied `spec.podTemplate.topologySpreadConstraints`.
 This is the ergonomic completion of the per-shard-StatefulSet design (ADR-007,
 pillar 3.12); users cannot write the constraint themselves because the shard label
 is operator-owned. See `docs/USAGE.md` and `docs/API_SPEC.md` for the field.
+
+### 3.5 Multi-Site Cluster Mode (Experimental)
+
+Cluster mode with `spec.multiSite`: **one stretched Redis Cluster across several
+workload Kubernetes clusters ("sites")**, managed hub-and-spokes by a single
+operator on a designated management cluster (the "hub"). The data plane stays plain
+OSS Redis/Valkey Cluster — multi-site lives in *placement* and *operator plumbing*,
+not a new replication mechanism. This section is an architectural overview; the full
+design is in `docs/MULTI_SITE_DESIGN.md` and ADR-012.
+
+```
+                 ┌──────────────────────────────┐
+                 │  HUB Kubernetes cluster       │
+                 │  ┌────────────────────────┐   │
+                 │  │ LittleRed CR (one)      │   │
+                 │  │ operator (leader-elected)│  │
+                 │  │  one SiteClient/site ───┼───┼──── kubeconfig Secrets
+                 │  └────────────────────────┘   │      (per-site, hub ns)
+                 └───────┬───────────────┬───────┘
+      routed pod network │  K8s API +    │  (both paths required, design §8)
+       (Redis dials)     │  pod IPs      │
+             ┌───────────▼──┐        ┌───▼──────────┐
+             │  SITE alpha  │        │  SITE beta   │   … (≥2 sites)
+             │  {name}-shard-K per shard, each site │
+             │  shard 0: master@alpha  replica@beta │
+             │  shard 1: master@beta   replica@alpha│
+             └──────────────┘        └──────────────┘
+```
+
+**Flat control, one authority.** The CR lives on the hub. The operator holds one
+Kubernetes client + informer cache **per site**, built at admission time from the
+per-site kubeconfig Secrets (controller-runtime has no mature multi-cluster layer,
+so this is explicit plumbing — the cluster-api "remote cluster client" pattern),
+all behind one narrow **`SiteClient`** seam (workload CRUD, pod list/watch, Redis
+dial, and a cluster-scoped `NodeReady` read). All Redis-level orchestration is
+issued by the hub dialing pod IPs directly over the routed pod network — the same
+as single-site, across sites. A subordinate/tiered per-site operator was declined
+(a reduced local operator has almost nothing safe to do alone; design §3.1).
+
+**Placement** (extends the per-shard-StatefulSet model with a site dimension): for
+each shard K, **one StatefulSet per hosting site** (`{name}-shard-K` in each site;
+names collide harmlessly across Kubernetes clusters), all carrying the same
+`redis.chuck-chuck-chuck.net/shard` label. Deterministic round-robin over the
+ordered site list (shard K → sites `(K+j) mod S`, `j < sitesPerShard`). Uniform
+sizing: every per-site shard StatefulSet has `replicasPerShard + 1` pods, so total
+members per shard = `sitesPerShard × (replicasPerShard + 1)` — a shard always has a
+cross-site replica regardless of `replicasPerShard`. Roles stay fluid (the operator
+wires initial cross-site replication, then lets Redis elect/move masters); there is
+no "master site". One shared headless Service `{name}-cluster` per site governs peer
+discovery. `cluster-require-full-coverage no` is mandatory.
+
+**Gather / gating / GC.** Gather is unchanged in shape — concurrent, per-probe
+`ProbeTimeout`-bounded dials (LR-017) tolerate unreachable sites; pod↔node
+correlation uses the union of all sites' pod lists. `allPodsReady`-style gates and
+wipe recovery (ADR-008) are evaluated **per site**, so one unreachable site does not
+blind repair of the rest. Owner references do not cross Kubernetes clusters, so
+spoke-side children are created **without** owner references and are swept on
+deletion through each `SiteClient` via a `multisite-teardown` finalizer (hub-local
+children keep the ordinary owner reference).
+
+**Site-loss takeover authority.** The one failure the operator must own is the loss
+of a whole site whose masters the survivors cannot fail over natively (a dual-site
+even master split leaves survivors below Redis's unconditional `(size/2)+1` minority
+quorum, so everything fail-stops). `recoverSiteLoss` (pure `planSiteTakeover` +
+`classifySiteWitness`) issues `CLUSTER FAILOVER TAKEOVER` on the best surviving
+replica of each orphaned shard, then trails `CLUSTER FORGET`, behind a strict
+fence-gate that refuses whenever an alive-but-partitioned site could still be serving
+(the split-brain guard). In multi-site this is the **sole** quorum-loss
+takeover/FORGET authority — the generic repair loop's unguarded Step-0/Step-1
+force-promote is gated off and FORGET is deferred while any site is unobservable. The
+full 6-condition gate, the witness classifier, and the executor are documented in
+[RECONCILIATION_LOOP_CLUSTER.md](RECONCILIATION_LOOP_CLUSTER.md#multi-site-site-loss-takeover-adr-012)
+and ADR-012.
 
 ---
 

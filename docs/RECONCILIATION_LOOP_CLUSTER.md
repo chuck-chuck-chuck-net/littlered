@@ -350,6 +350,25 @@ shard (highest offset within one lineage, `{master_replid, master_replid2}`) →
 required; FORGET trails idempotently, "Can't forget my master" is expected) → **recycle**
 fenced-alive returnee pods so they rejoin fresh instead of re-MEETing a stale ex-master.
 
+**Sole-authority hardening (M4b).** So that `recoverSiteLoss` is genuinely the *only*
+quorum-loss takeover and ghost-FORGET authority in multi-site — and the generic
+`repairCluster` (reused across sites) cannot fire an unguarded takeover ahead of the
+fence/cooldown when `recoverSiteLoss` returns `None`/`WaitNative` — two pure guards
+(`repair_guards.go`) apply in multi-site only:
+- `repairMayForceTakeover(lr) == !isMultiSite(lr)` gates **off** repair's Step-0
+  quorum-recovery force-promote **and** Step-1's stuck-orphan force-promote (both
+  cooldown-free and witness-blind). Step-1's benign partition-heal `CLUSTER MEET`
+  stays active.
+- `ghostForgetPlan(candidates, forgetSafe)` with `forgetSafe = allSitesObservable(obs)`
+  gates both repair's Step-2 FORGET **and** the takeover's own action-2 FORGET: a
+  gossip-known node with no backing pod is indistinguishable by NodeID from a node on a
+  merely-unreachable site, so FORGET is deferred entirely while any hosting site is
+  unobservable (this is the actual realization of pillar 3.4's "forgotten only when its
+  own site's witness supports it"). Single-site passes `forgetSafe = true` — unchanged.
+
+Accepted cost: a genuine fast site loss now waits the cooldown rather than being
+resolved immediately by the unguarded Step-0.
+
 ```mermaid
 flowchart TD
     Obs["observeSites + gather survivors + classify witness"] --> Gate{"planSiteTakeover<br/>(6-condition gate)"}
