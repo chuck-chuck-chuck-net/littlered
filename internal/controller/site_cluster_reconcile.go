@@ -443,15 +443,24 @@ func allSitesObservable(obs []siteObservation) bool {
 // contributes nothing and never stalls the gather (the shared gather already bounds every
 // dial with ProbeTimeout — LR-017).
 func (r *LittleRedReconciler) gatherMultiSiteGroundTruth(ctx context.Context, lr *littleredv1alpha1.LittleRed) *redisclient.ClusterGroundTruth {
+	gt, _ := r.gatherMultiSiteWithObs(ctx, lr)
+	return gt
+}
+
+// gatherMultiSiteWithObs is gatherMultiSiteGroundTruth plus the per-site
+// observations it derived (reachability + observed pods). The one-shot
+// `--gather` mode (tier 2) needs both: the union ground truth and the per-site
+// summary, so lrctl can tell "site unreachable" from "site hosts no pods".
+func (r *LittleRedReconciler) gatherMultiSiteWithObs(ctx context.Context, lr *littleredv1alpha1.LittleRed) (*redisclient.ClusterGroundTruth, []siteObservation) {
 	if r.sites == nil {
-		return redisclient.NewClusterGroundTruth()
+		return redisclient.NewClusterGroundTruth(), nil
 	}
 	sites := r.resolveSites(ctx, lr)
 	obs := r.observeSites(ctx, lr, sites)
 	clusterPods := unionClusterPods(obs)
 	password := r.getRedisPassword(ctx, lr)
 	g := &operatorGatherer{password: password, tlsEnabled: lr.Spec.TLS.Enabled}
-	return redisclient.GatherClusterGroundTruth(ctx, g, clusterPods)
+	return redisclient.GatherClusterGroundTruth(ctx, g, clusterPods), obs
 }
 
 // unionClusterPods builds the gather's IP->qualified-key map from the union of every
@@ -765,6 +774,17 @@ func (r *LittleRedReconciler) updateMultiSiteClusterStatus(ctx context.Context, 
 			}
 		}
 		lr.Status.Cluster.Nodes = nodeStates
+
+		// Publish the compact, site-attributed cross-site view for tier-1
+		// (read-only-hub) consumers (lrctl status / verify --from-status): they
+		// render this without any site access. Freshness = reconcile interval.
+		state, slots, crossSiteOK, shardViews := buildCrossSiteView(gt)
+		lr.Status.MultiSite.ClusterState = state
+		lr.Status.MultiSite.SlotsAssigned = slots
+		lr.Status.MultiSite.CrossSiteOK = crossSiteOK
+		lr.Status.MultiSite.Shards = shardViews
+		reconTime := metav1.Now()
+		lr.Status.MultiSite.LastReconcileTime = &reconTime
 	}
 
 	if lr.Status.Redis.Ready == lr.Status.Redis.Total && clusterOK {

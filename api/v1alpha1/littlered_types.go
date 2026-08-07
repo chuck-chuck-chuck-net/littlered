@@ -830,6 +830,14 @@ type LittleRedStatus struct {
 // spec.multiSite only). Monitoring surface: per-site observed state is
 // re-derived from live probes; the takeover marker mirrors the
 // leaderlessSince/wipeDeadlockSince cooldown-anchor pattern.
+//
+// The cross-site view fields (ClusterState/SlotsAssigned/CrossSiteOK/Shards)
+// are the operator's published tier-1 surface: the operator gathers every site
+// each reconcile and stamps a compact, site-attributed topology summary here, so
+// a read-only-hub client (lrctl status / verify --from-status) can render the
+// cross-site health with only `get littlered` — no site access. Kept small (a
+// handful of shards) to stay within status size limits; freshness is the
+// reconcile interval, anchored by LastReconcileTime.
 type MultiSiteStatus struct {
 	// Sites is the per-site observed state.
 	// +listType=map
@@ -843,6 +851,62 @@ type MultiSiteStatus struct {
 	// the state clears.
 	// +optional
 	TakeoverPendingSince *metav1.Time `json:"takeoverPendingSince,omitempty"`
+
+	// ClusterState is the stretched cluster's overall cluster_state from the last
+	// gather ("ok"/"fail"/"unknown") — the tier-1 published equivalent of the
+	// live gather's ClusterState.
+	// +optional
+	ClusterState string `json:"clusterState,omitempty"`
+
+	// SlotsAssigned is how many of the 16384 hash slots are assigned across the
+	// stretched cluster (16384 when whole).
+	// +optional
+	SlotsAssigned int32 `json:"slotsAssigned,omitempty"`
+
+	// CrossSiteOK is true when every shard's members span at least two sites (a
+	// master and a replica in different sites) — the multi-site failure-domain
+	// guarantee. False means at least one shard would be lost with a single site.
+	// +optional
+	CrossSiteOK bool `json:"crossSiteOK,omitempty"`
+
+	// Shards is the per-shard site-attributed topology summary (which site holds
+	// the master, which sites hold replicas, and whether the shard is cross-site).
+	// +listType=map
+	// +listMapKey=shard
+	// +optional
+	Shards []ShardSiteView `json:"shards,omitempty"`
+
+	// LastReconcileTime is when the operator last published this cross-site view.
+	// A tier-1 reader reports it as the data's freshness ("as of last reconcile
+	// N ago").
+	// +optional
+	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
+}
+
+// ShardSiteView is one shard's site-attributed placement in the published
+// cross-site view (tier 1). Derived from the union ground truth each reconcile.
+type ShardSiteView struct {
+	// Shard is the shard index.
+	Shard int `json:"shard"`
+
+	// MasterSite is the site hosting this shard's current master (empty if no
+	// reachable master was observed).
+	// +optional
+	MasterSite string `json:"masterSite,omitempty"`
+
+	// ReplicaSites are the sites hosting this shard's replicas, sorted.
+	// +optional
+	ReplicaSites []string `json:"replicaSites,omitempty"`
+
+	// CrossSite is true when the shard's master and at least one replica live in
+	// different sites.
+	// +optional
+	CrossSite bool `json:"crossSite,omitempty"`
+
+	// LinkDown is true when any of this shard's replicas reported its replication
+	// link down at the last gather (reduced redundancy).
+	// +optional
+	LinkDown bool `json:"linkDown,omitempty"`
 }
 
 // SiteStatus is the observed state of one site.
