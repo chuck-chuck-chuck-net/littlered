@@ -39,8 +39,25 @@ func getChaosClientImage() string {
 	return "ghcr.io/littlered-operator/littlered-chaos-client:latest"
 }
 
-// deployChaosClient deploys a chaos test client pod and returns the pod name
+// kubectlCtx runs kubectl against the given kube-context, omitting the --context flag
+// entirely when ctx is "" so the ambient (single-site) call is byte-for-byte what it was
+// before the multi-site harness existed. Multi-site callers pass a per-pod site context.
+func kubectlCtx(ctx string, args ...string) (string, error) {
+	if ctx != "" {
+		args = append([]string{"--context", ctx}, args...)
+	}
+	return utils.Run(exec.Command("kubectl", args...))
+}
+
+// deployChaosClient deploys a chaos test client pod and returns the pod name (ambient context).
 func deployChaosClient(namespace, name, addresses, keyPrefix string, clusterMode bool, duration time.Duration) (string, error) {
+	return deployChaosClientCtx("", namespace, name, addresses, keyPrefix, clusterMode, duration)
+}
+
+// deployChaosClientCtx deploys a chaos test client pod in the given kube-context (""=ambient)
+// and returns the pod name. Multi-site runs deploy the client into a site that can reach the
+// stretched cluster's routed pod IPs.
+func deployChaosClientCtx(ctx, namespace, name, addresses, keyPrefix string, clusterMode bool, duration time.Duration) (string, error) {
 	podName := fmt.Sprintf("chaos-client-%s", name)
 
 	image := getChaosClientImage()
@@ -74,19 +91,30 @@ spec:
     - "-timeout=500ms"%s
 `, podName, namespace, name, image, addresses, keyPrefix, duration.String(), clusterArg)
 
+	if ctx != "" {
+		full := []string{"--context", ctx, "apply", "-f", "-"}
+		cmd := exec.Command("kubectl", full...)
+		cmd.Stdin = strings.NewReader(pod)
+		_, err := utils.Run(cmd)
+		return podName, err
+	}
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(pod)
 	_, err := utils.Run(cmd)
 	return podName, err
 }
 
-// waitForChaosClientComplete waits for the chaos client pod to complete
+// waitForChaosClientComplete waits for the chaos client pod to complete (ambient context).
 func waitForChaosClientComplete(namespace, podName string, timeout time.Duration) error {
+	return waitForChaosClientCompleteCtx("", namespace, podName, timeout)
+}
+
+// waitForChaosClientCompleteCtx waits for the chaos client pod to complete in the given context.
+func waitForChaosClientCompleteCtx(ctx, namespace, podName string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		cmd := exec.Command("kubectl", "get", "pod", podName,
+		output, err := kubectlCtx(ctx, "get", "pod", podName,
 			"-n", namespace, "-o", "jsonpath={.status.phase}")
-		output, err := utils.Run(cmd)
 		if err != nil {
 			return err
 		}
@@ -98,10 +126,14 @@ func waitForChaosClientComplete(namespace, podName string, timeout time.Duration
 	return fmt.Errorf("timeout waiting for pod %s to complete", podName)
 }
 
-// getChaosClientMetrics retrieves metrics from a completed chaos client pod
+// getChaosClientMetrics retrieves metrics from a completed chaos client pod (ambient context).
 func getChaosClientMetrics(namespace, podName string) (*chaos.MetricsSnapshot, error) {
-	cmd := exec.Command("kubectl", "logs", podName, "-n", namespace)
-	output, err := utils.Run(cmd)
+	return getChaosClientMetricsCtx("", namespace, podName)
+}
+
+// getChaosClientMetricsCtx retrieves metrics from a completed chaos client pod in the given context.
+func getChaosClientMetricsCtx(ctx, namespace, podName string) (*chaos.MetricsSnapshot, error) {
+	output, err := kubectlCtx(ctx, "logs", podName, "-n", namespace)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get logs: %w", err)
 	}
@@ -119,8 +151,12 @@ func getChaosClientMetrics(namespace, podName string) (*chaos.MetricsSnapshot, e
 	return nil, fmt.Errorf("METRICS_JSON not found in pod logs")
 }
 
-// deleteChaosClient deletes the chaos client pod
+// deleteChaosClient deletes the chaos client pod (ambient context).
 func deleteChaosClient(namespace, podName string) {
-	cmd := exec.Command("kubectl", "delete", "pod", podName, "-n", namespace, "--ignore-not-found")
-	_, _ = utils.Run(cmd)
+	deleteChaosClientCtx("", namespace, podName)
+}
+
+// deleteChaosClientCtx deletes the chaos client pod in the given context.
+func deleteChaosClientCtx(ctx, namespace, podName string) {
+	_, _ = kubectlCtx(ctx, "delete", "pod", podName, "-n", namespace, "--ignore-not-found")
 }
