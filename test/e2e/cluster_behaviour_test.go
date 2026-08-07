@@ -119,16 +119,10 @@ func clusterBehaviourSpecs(h clusterHarness) {
 
 				By(fmt.Sprintf("[%s] applying a redundant cluster CR %q", topo, crName))
 				Expect(h.applyRedundantCR(crName)).To(Succeed())
-
-				By("deploying the chaos client")
-				chaos, err := h.deployChaos(crName, topo+"-chaos-"+mode.Name, testDuration)
-				Expect(err).NotTo(HaveOccurred())
-				AddReportEntry("chaos:" + chaos.pod)
 				defer func() {
 					if debugOnFailure && suiteOrSpecFailed() {
 						return
 					}
-					h.deleteChaos(chaos)
 					h.deleteCR(crName)
 				}()
 
@@ -139,6 +133,22 @@ func clusterBehaviourSpecs(h clusterHarness) {
 					g.Expect(err).NotTo(HaveOccurred())
 					g.Expect(out).To(ContainSubstring("cluster_state:ok"))
 				}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+				// Deploy the chaos client only AFTER the cluster is Running: the multi-site
+				// harness seeds the client with the stretched cluster's routed POD IPs, which
+				// do not exist until the pods are scheduled (a pre-Running deploy would seed an
+				// empty address list). Single-site seeds a Service name and tolerates either
+				// order, so post-Running is correct for both.
+				By("deploying the chaos client against the live cluster")
+				chaos, err := h.deployChaos(crName, topo+"-chaos-"+mode.Name, testDuration)
+				Expect(err).NotTo(HaveOccurred())
+				AddReportEntry("chaos:" + chaos.pod)
+				defer func() {
+					if debugOnFailure && suiteOrSpecFailed() {
+						return
+					}
+					h.deleteChaos(chaos)
+				}()
 
 				By("waiting 10s for baseline traffic")
 				time.Sleep(10 * time.Second)
@@ -229,7 +239,7 @@ var _ = Describe("Cluster Behaviour Matrix [single-site]", func() {
 	clusterBehaviourSpecs(newSingleSiteHarness())
 })
 
-var _ = Describe("Cluster Behaviour Matrix [multi-site]", Ordered, Label("multisite", "cluster-behaviour"), func() {
+var _ = Describe("Cluster Behaviour Matrix [multi-site]", Ordered, ContinueOnFailure, Label("multisite", "cluster-behaviour"), func() {
 	if !topologyEnabled("multi") {
 		return
 	}
