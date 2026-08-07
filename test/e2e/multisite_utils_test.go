@@ -361,7 +361,7 @@ func msSiteOfPodByIP(reg *msRegistry, ns string) map[string]string {
 	ipSite := map[string]string{}
 	for _, s := range reg.orderedSites {
 		out, err := kctl(s.context, "-n", ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
-			"-o", "jsonpath={range .items[*]}{.status.podIP}={.metadata.name}\\n{end}")
+			"-o", "jsonpath={range .items[*]}{.status.podIP}={.metadata.name}{\"\\n\"}{end}")
 		if err != nil {
 			continue
 		}
@@ -530,7 +530,7 @@ func msHealDataPlane(siteCtx, ns string) {
 // peers to deny so the cut is surgical (only this instance's cross-site redis, nothing else).
 func msPodCIDRsForSite(reg *msRegistry, siteCtx, ns string) []string {
 	out, err := kctl(siteCtx, "-n", ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
-		"-o", "jsonpath={range .items[*]}{.status.podIP}\\n{end}")
+		"-o", "jsonpath={range .items[*]}{.status.podIP}{\"\\n\"}{end}")
 	Expect(err).NotTo(HaveOccurred())
 	var cidrs []string
 	for _, ip := range strings.Split(strings.TrimSpace(out), "\n") {
@@ -578,7 +578,7 @@ func msWaitSiteReady(site msSite, timeout time.Duration) {
 	By(fmt.Sprintf("Scenario A: waiting for site %s nodes to be Ready again", site.name))
 	Eventually(func(g Gomega) {
 		out, err := kctl(site.context, "get", "nodes", "--request-timeout=8s",
-			"-o", "jsonpath={range .items[*]}{.status.conditions[?(@.type==\"Ready\")].status}\\n{end}")
+			"-o", "jsonpath={range .items[*]}{.status.conditions[?(@.type==\"Ready\")].status}{\"\\n\"}{end}")
 		g.Expect(err).NotTo(HaveOccurred())
 		lines := strings.Split(strings.TrimSpace(out), "\n")
 		g.Expect(lines).NotTo(BeEmpty())

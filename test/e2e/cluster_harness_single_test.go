@@ -104,7 +104,7 @@ func (h *singleSiteHarness) resolveMasterForSlot(crName string, slot int) (podHa
 	}
 	out, err := kubectlCtx("", "-n", testNamespace, "get", "pods",
 		"-l", "app.kubernetes.io/component=cluster",
-		"-o", "jsonpath={range .items[*]}{.status.podIP}={.metadata.name}\\n{end}")
+		"-o", "jsonpath={range .items[*]}{.status.podIP}={.metadata.name}{\"\\n\"}{end}")
 	if err != nil {
 		return podHandle{}, err
 	}

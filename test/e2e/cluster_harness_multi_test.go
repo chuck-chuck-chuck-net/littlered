@@ -120,7 +120,7 @@ func (h *multiSiteHarness) ipToHandle() map[string]podHandle {
 	out := map[string]podHandle{}
 	for _, s := range h.reg.orderedSites {
 		res, err := kctl(s.context, "-n", h.ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
-			"-o", "jsonpath={range .items[*]}{.status.podIP}={.metadata.name}\\n{end}")
+			"-o", "jsonpath={range .items[*]}{.status.podIP}={.metadata.name}{\"\\n\"}{end}")
 		if err != nil {
 			continue
 		}

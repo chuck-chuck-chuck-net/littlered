@@ -262,7 +262,7 @@ func msPodIPAddrs(reg *msRegistry, ns string) string {
 	var addrs []string
 	for _, s := range reg.orderedSites {
 		out, err := kctl(s.context, "-n", ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
-			"-o", "jsonpath={range .items[*]}{.status.podIP}\\n{end}")
+			"-o", "jsonpath={range .items[*]}{.status.podIP}{\"\\n\"}{end}")
 		if err != nil {
 			continue
 		}
