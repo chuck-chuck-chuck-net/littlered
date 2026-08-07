@@ -54,7 +54,7 @@ var inspectCmd = &cobra.Command{
 			// Multi-site: exec into every site's pods through their own contexts.
 			if !unmanaged {
 				if lr, lerr := getLittleRed(ctx, k8sClient, key); lerr == nil && isMultiSite(lr) {
-					res, ierr := inspectMultiSite(ctx, lr)
+					res, ierr := inspectMultiSiteTiered(ctx, k8sClient, coreClient, lr)
 					if ierr != nil {
 						fmt.Fprintf(os.Stderr, "error: %s/%s: %v\n", key.Namespace, key.Name, ierr)
 						errCount++

@@ -21,28 +21,53 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
+
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	"github.com/littlered-operator/littlered-operator/internal/cli/multisite"
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
-// verifyMultiSiteCluster aggregates ground truth across ALL sites of a stretched
-// cluster and runs the shared checks over the union — fixing the single-context
-// false-FAIL (the hub, where the CR lives, hosts zero data pods). It gathers each
-// site through the user's own kube-contexts (design §8), unions the per-site pods
-// into one IP->site-qualified-key map, and reuses GatherClusterGroundTruth +
-// IsHealthy + CheckShardColocation, adding the cross-site placement (failure
-// domain) check that is the whole point of multi-site.
-func verifyMultiSiteCluster(ctx context.Context, lr *littleredv1alpha1.LittleRed) error {
+// verifyMultiSite is the tier-aware entry point for `lrctl verify` on a
+// multi-site cluster. It resolves the transport (tier 2 live-via-hub-Job by
+// default; tier 1 --from-status; tier 3 --direct/--site-context) and renders the
+// same cross-site verdict over whichever source produced the ground truth. The
+// selected tier is announced in the output so the reader knows how the data was
+// obtained.
+func verifyMultiSite(
+	ctx context.Context, k8sClient client.Client, coreClient *kubernetes.Clientset, lr *littleredv1alpha1.LittleRed,
+) error {
+	tier, err := multisite.SelectTier("verify", currentTierFlags())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("Transport: %s\n", tier.Label())
+	switch tier {
+	case multisite.TierStatus:
+		return verifyMultiSiteFromStatus(lr)
+	case multisite.TierDirect:
+		return verifyMultiSiteDirect(ctx, lr)
+	default: // TierLive
+		return verifyMultiSiteLive(ctx, k8sClient, coreClient, lr)
+	}
+}
+
+// verifyMultiSiteDirect is tier 3: gather every site through the user's own
+// per-site kube-contexts and render. This was the M5 default; it is now the
+// explicit power-user fallback (e.g. the operator is gone) selected by --direct
+// or --site-context. It unions the per-site pods into one IP->site-qualified-key
+// map and reuses GatherClusterGroundTruth + the shared checks.
+func verifyMultiSiteDirect(ctx context.Context, lr *littleredv1alpha1.LittleRed) error {
 	gathers, _, err := resolveMultiSiteGathers(ctx, lr)
 	if err != nil {
 		return err
 	}
 
-	fmt.Println("Gathering Cluster Ground Truth across sites...")
+	fmt.Println("Gathering Cluster Ground Truth across sites (direct contexts)...")
 
-	// Site reachability summary + any site we could not gather.
 	fmt.Println("\nSites:")
 	var siteProblems []string
 	for _, sg := range gathers {
@@ -58,7 +83,116 @@ func verifyMultiSiteCluster(ctx context.Context, lr *littleredv1alpha1.LittleRed
 	g := newMultiSiteGatherer(gathers)
 	clusterPods := unionSitePods(gathers)
 	gt := redisclient.GatherClusterGroundTruth(ctx, g, clusterPods)
+	return renderMultiSiteVerdict(lr, gt, int32(len(clusterPods)), siteProblems)
+}
 
+// verifyMultiSiteLive is tier 2: obtain the ground truth from a throwaway hub
+// Job (the operator gathers every site and returns JSON over the control path),
+// then render exactly as the direct path does — no site access on the
+// workstation. This is the default for verify.
+func verifyMultiSiteLive(
+	ctx context.Context, k8sClient client.Client, coreClient *kubernetes.Clientset, lr *littleredv1alpha1.LittleRed,
+) error {
+	result, err := gatherViaHubJob(ctx, k8sClient, coreClient, lr, operatorNamespace, operatorDeployment)
+	if err != nil {
+		return err
+	}
+	fmt.Printf("(gathered %s)\n", result.GatheredAt.Format(time.RFC3339))
+
+	fmt.Println("\nSites:")
+	var siteProblems []string
+	reachablePods := 0
+	for _, s := range result.Sites {
+		if s.Reachable {
+			fmt.Printf("  - %s: reachable, %d pod(s)\n", s.Name, s.Pods)
+			reachablePods += s.Pods
+		} else {
+			fmt.Printf("  - %s: [FAIL] UNREACHABLE — %s\n", s.Name, s.Error)
+			siteProblems = append(siteProblems, s.Name)
+		}
+	}
+	return renderMultiSiteVerdict(lr, result.GroundTruth, int32(reachablePods), siteProblems)
+}
+
+// verifyMultiSiteFromStatus is tier 1: render the cross-site verdict from the
+// view the operator published to status.multiSite. Needs only get littlered on
+// the hub — no site access, no gather. Freshness is the last reconcile.
+func verifyMultiSiteFromStatus(lr *littleredv1alpha1.LittleRed) error {
+	ms := lr.Status.MultiSite
+	if ms == nil || ms.LastReconcileTime == nil {
+		fmt.Println("\n[!] The operator has not yet published a cross-site view for this instance.")
+		fmt.Println("    (Is it a fresh/initializing instance? Try tier 2 without --from-status for a live gather.)")
+		return fmt.Errorf("no published cross-site view in status for %s/%s", lr.Namespace, lr.Name)
+	}
+	age := time.Since(ms.LastReconcileTime.Time).Round(time.Second)
+	fmt.Printf("(as of last reconcile %s ago, at %s)\n", age, ms.LastReconcileTime.Format(time.RFC3339))
+
+	fmt.Printf("\nCluster State: %s\n", valueOrNone(ms.ClusterState))
+	fmt.Printf("Total Slots Assigned: %d / 16384\n", ms.SlotsAssigned)
+
+	var unreachable []string
+	fmt.Println("\nSites:")
+	for _, s := range ms.Sites {
+		reach := "reachable"
+		if !s.Reachable {
+			reach = "UNREACHABLE"
+			unreachable = append(unreachable, s.Name)
+		}
+		pods := ""
+		if s.Pods != nil {
+			pods = fmt.Sprintf(", pods %d/%d Ready", s.Pods.Ready, s.Pods.Total)
+		}
+		fmt.Printf("  - %s: %s%s\n", s.Name, reach, pods)
+	}
+
+	shardViews := make([]multisite.ShardView, 0, len(ms.Shards))
+	fmt.Println("\nCross-Site Placement (per shard):")
+	for _, sh := range ms.Shards {
+		marker := "[OK] cross-site"
+		if !sh.CrossSite {
+			marker = "[FAIL] single-site"
+		}
+		link := ""
+		if sh.LinkDown {
+			link = ", [WARN] a replica link is down"
+		}
+		fmt.Printf("  - shard %d: master@%s, replicas@%v %s%s\n",
+			sh.Shard, valueOrNone(sh.MasterSite), sh.ReplicaSites, marker, link)
+		shardViews = append(shardViews, multisite.ShardView{
+			Shard: sh.Shard, MasterSite: sh.MasterSite, ReplicaSites: sh.ReplicaSites,
+			CrossSite: sh.CrossSite, LinkDown: sh.LinkDown,
+		})
+	}
+
+	v := multisite.StatusVerdict(ms.ClusterState, int(ms.SlotsAssigned), shardViews, unreachable)
+	fmt.Printf("\nSummary:\n")
+	for _, r := range v.Reasons {
+		marker := "[FAIL]"
+		if strings.Contains(r, "link:down") {
+			marker = "[WARN]"
+		}
+		fmt.Printf("  %s %s\n", marker, r)
+	}
+	switch {
+	case !v.OK:
+		fmt.Println("  [FAIL] Stretched cluster has topology, placement, or health issues (per published status)!")
+		return fmt.Errorf("multi-site cluster %s/%s has issues (from operator status)", lr.Namespace, lr.Name)
+	case v.Degraded:
+		fmt.Println("  [DEGRADED] Stretched cluster is functional but not fully healthy (per published status).")
+		return nil
+	default:
+		fmt.Println("  [OK] Stretched cluster is healthy and cross-site consistent (per published status).")
+		return nil
+	}
+}
+
+// renderMultiSiteVerdict prints the cluster state, node status, ghosts,
+// partitions, topology, cross-site placement, colocation and health summary from
+// a gathered ground truth — shared by tiers 2 and 3, which differ only in how
+// the ground truth was obtained.
+func renderMultiSiteVerdict(
+	lr *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, expectedNodes int32, siteProblems []string,
+) error {
 	fmt.Printf("\nCluster State: %s\n", gt.ClusterState)
 	fmt.Printf("Total Slots Assigned: %d / 16384\n", gt.TotalSlots)
 
@@ -102,7 +236,6 @@ func verifyMultiSiteCluster(ctx context.Context, lr *littleredv1alpha1.LittleRed
 	}
 
 	fmt.Printf("\nSummary:\n")
-	expectedNodes := int32(len(clusterPods))
 	expectedShards := int32(gt.CountMasters())
 	healthy := gt.IsHealthy(expectedNodes, expectedShards)
 
@@ -171,6 +304,8 @@ type multiSiteVerifyJSON struct {
 	Namespace        string                `json:"namespace"`
 	Mode             string                `json:"mode"`
 	MultiSite        bool                  `json:"multiSite"`
+	Tier             string                `json:"tier"`
+	AsOf             string                `json:"asOf,omitempty"`
 	ClusterState     string                `json:"clusterState"`
 	TotalSlots       int                   `json:"totalSlots"`
 	Sites            []multiSiteSiteJSON   `json:"sites"`
@@ -182,14 +317,13 @@ type multiSiteVerifyJSON struct {
 	Healthy          bool                  `json:"healthy"`
 }
 
-// verifyMultiSiteClusterJSON gathers the stretched cluster ground truth across
-// sites and returns the JSON-serialisable verdict without printing.
-func verifyMultiSiteClusterJSON(ctx context.Context, lr *littleredv1alpha1.LittleRed) multiSiteVerifyJSON {
-	out := multiSiteVerifyJSON{
+func newMultiSiteVerifyJSON(lr *littleredv1alpha1.LittleRed, tier multisite.Tier) multiSiteVerifyJSON {
+	return multiSiteVerifyJSON{
 		Name:             lr.Name,
 		Namespace:        lr.Namespace,
 		Mode:             modeCluster,
 		MultiSite:        true,
+		Tier:             tier.Label(),
 		Sites:            []multiSiteSiteJSON{},
 		Nodes:            []multiSiteNodeJSON{},
 		GhostNodes:       []string{},
@@ -197,13 +331,37 @@ func verifyMultiSiteClusterJSON(ctx context.Context, lr *littleredv1alpha1.Littl
 		ColocationIssues: []string{},
 		UnreachableSites: []string{},
 	}
+}
 
+// verifyMultiSiteJSON returns the JSON-serialisable verdict, choosing the
+// transport tier exactly like the text path.
+func verifyMultiSiteJSON(
+	ctx context.Context, k8sClient client.Client, coreClient *kubernetes.Clientset, lr *littleredv1alpha1.LittleRed,
+) multiSiteVerifyJSON {
+	tier, err := multisite.SelectTier("verify", currentTierFlags())
+	if err != nil {
+		out := newMultiSiteVerifyJSON(lr, multisite.TierLive)
+		out.Healthy = false
+		return out
+	}
+	switch tier {
+	case multisite.TierStatus:
+		return verifyMultiSiteJSONFromStatus(lr)
+	case multisite.TierDirect:
+		return verifyMultiSiteJSONDirect(ctx, lr)
+	default:
+		return verifyMultiSiteJSONLive(ctx, k8sClient, coreClient, lr)
+	}
+}
+
+// verifyMultiSiteJSONDirect is the tier-3 JSON builder (direct site contexts).
+func verifyMultiSiteJSONDirect(ctx context.Context, lr *littleredv1alpha1.LittleRed) multiSiteVerifyJSON {
+	out := newMultiSiteVerifyJSON(lr, multisite.TierDirect)
 	gathers, _, err := resolveMultiSiteGathers(ctx, lr)
 	if err != nil {
 		out.Healthy = false
 		return out
 	}
-
 	for _, sg := range gathers {
 		entry := multiSiteSiteJSON{Name: sg.name, Context: sg.context, Reachable: sg.reachable, Pods: len(sg.pods)}
 		if sg.err != nil {
@@ -214,17 +372,46 @@ func verifyMultiSiteClusterJSON(ctx context.Context, lr *littleredv1alpha1.Littl
 			out.UnreachableSites = append(out.UnreachableSites, sg.name)
 		}
 	}
-
 	g := newMultiSiteGatherer(gathers)
 	clusterPods := unionSitePods(gathers)
 	gt := redisclient.GatherClusterGroundTruth(ctx, g, clusterPods)
+	fillMultiSiteVerifyJSONFromGT(&out, gt, int32(len(clusterPods)))
+	return out
+}
 
+// verifyMultiSiteJSONLive is the tier-2 JSON builder (live via hub Job).
+func verifyMultiSiteJSONLive(
+	ctx context.Context, k8sClient client.Client, coreClient *kubernetes.Clientset, lr *littleredv1alpha1.LittleRed,
+) multiSiteVerifyJSON {
+	out := newMultiSiteVerifyJSON(lr, multisite.TierLive)
+	result, err := gatherViaHubJob(ctx, k8sClient, coreClient, lr, operatorNamespace, operatorDeployment)
+	if err != nil {
+		out.Healthy = false
+		out.UnreachableSites = append(out.UnreachableSites, err.Error())
+		return out
+	}
+	out.AsOf = result.GatheredAt.Format(time.RFC3339)
+	reachablePods := 0
+	for _, s := range result.Sites {
+		out.Sites = append(out.Sites, multiSiteSiteJSON{Name: s.Name, Reachable: s.Reachable, Pods: s.Pods, Error: s.Error})
+		if s.Reachable {
+			reachablePods += s.Pods
+		} else {
+			out.UnreachableSites = append(out.UnreachableSites, s.Name)
+		}
+	}
+	fillMultiSiteVerifyJSONFromGT(&out, result.GroundTruth, int32(reachablePods))
+	return out
+}
+
+// fillMultiSiteVerifyJSONFromGT populates the node/placement/colocation/health
+// fields from a gathered ground truth — shared by tiers 2 and 3.
+func fillMultiSiteVerifyJSONFromGT(out *multiSiteVerifyJSON, gt *redisclient.ClusterGroundTruth, expectedNodes int32) {
 	out.ClusterState = gt.ClusterState
 	out.TotalSlots = gt.TotalSlots
 	if gt.GhostNodes != nil {
 		out.GhostNodes = gt.GhostNodes
 	}
-
 	keys := make([]string, 0, len(gt.Nodes))
 	for k := range gt.Nodes {
 		keys = append(keys, k)
@@ -242,7 +429,6 @@ func verifyMultiSiteClusterJSON(ctx context.Context, lr *littleredv1alpha1.Littl
 			MasterNodeID: masterID, Slots: n.Slots, LinkStatus: n.LinkStatus, Reachable: n.Reachable,
 		})
 	}
-
 	for _, v := range multisite.CheckSiteSpread(multisite.MembersFromGroundTruth(gt)) {
 		out.SiteSpreadIssues = append(out.SiteSpreadIssues, multiSiteSpreadJSON{Shard: v.Shard, Sites: v.Sites})
 	}
@@ -251,10 +437,45 @@ func verifyMultiSiteClusterJSON(ctx context.Context, lr *littleredv1alpha1.Littl
 			fmt.Sprintf("replica %s (shard %d) follows master %s (shard %d)",
 				v.ReplicaPod, v.ReplicaShard, v.MasterPod, v.MasterShard))
 	}
-
-	expectedNodes := int32(len(clusterPods))
 	out.Healthy = gt.IsHealthy(expectedNodes, int32(gt.CountMasters())) &&
 		len(out.SiteSpreadIssues) == 0 && len(out.ColocationIssues) == 0 && len(out.UnreachableSites) == 0
+}
+
+// verifyMultiSiteJSONFromStatus is the tier-1 JSON builder (published status).
+func verifyMultiSiteJSONFromStatus(lr *littleredv1alpha1.LittleRed) multiSiteVerifyJSON {
+	out := newMultiSiteVerifyJSON(lr, multisite.TierStatus)
+	ms := lr.Status.MultiSite
+	if ms == nil || ms.LastReconcileTime == nil {
+		out.Healthy = false
+		return out
+	}
+	out.AsOf = ms.LastReconcileTime.Format(time.RFC3339)
+	out.ClusterState = ms.ClusterState
+	out.TotalSlots = int(ms.SlotsAssigned)
+	var unreachable []string
+	for _, s := range ms.Sites {
+		entry := multiSiteSiteJSON{Name: s.Name, Reachable: s.Reachable}
+		if s.Pods != nil {
+			entry.Pods = int(s.Pods.Ready)
+		}
+		out.Sites = append(out.Sites, entry)
+		if !s.Reachable {
+			out.UnreachableSites = append(out.UnreachableSites, s.Name)
+			unreachable = append(unreachable, s.Name)
+		}
+	}
+	shardViews := make([]multisite.ShardView, 0, len(ms.Shards))
+	for _, sh := range ms.Shards {
+		if !sh.CrossSite {
+			out.SiteSpreadIssues = append(out.SiteSpreadIssues,
+				multiSiteSpreadJSON{Shard: sh.Shard, Sites: []string{sh.MasterSite}})
+		}
+		shardViews = append(shardViews, multisite.ShardView{
+			Shard: sh.Shard, MasterSite: sh.MasterSite, ReplicaSites: sh.ReplicaSites,
+			CrossSite: sh.CrossSite, LinkDown: sh.LinkDown,
+		})
+	}
+	out.Healthy = multisite.StatusVerdict(ms.ClusterState, int(ms.SlotsAssigned), shardViews, unreachable).OK
 	return out
 }
 

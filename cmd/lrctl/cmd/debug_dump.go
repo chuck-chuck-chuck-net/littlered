@@ -83,8 +83,10 @@ func runDebugDump(_ *cobra.Command, args []string) error {
 	if isMultiSite(lr) {
 		// A stretched cluster's pods/resources live in the sites, not on the hub —
 		// collecting from the hub context would capture nothing (the same
-		// zero-pods-on-hub trap verify hit). Fan out per site (design §8).
-		collectMultiSiteArtifacts(ctx, dir, lr)
+		// zero-pods-on-hub trap verify hit). Tier 2 (default) saves the operator's
+		// own hub gather (works without workstation site access); tier 3 (--direct)
+		// fans out the full per-site artifact collection through the user's contexts.
+		collectMultiSiteArtifactsTiered(ctx, dir, k8sClient, coreClient, lr)
 	} else {
 		collectPodLogsForCR(ctx, k8sClient, dir, name, targetNS)
 		collectRedisState(ctx, coreClient, config, k8sClient, dir, lr)

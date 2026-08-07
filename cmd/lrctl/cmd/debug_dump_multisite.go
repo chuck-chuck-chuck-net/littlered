@@ -18,13 +18,60 @@ package cmd
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"path/filepath"
 	"strings"
 
+	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
+	"github.com/littlered-operator/littlered-operator/internal/cli/multisite"
 )
+
+// collectMultiSiteArtifactsTiered routes debug-dump's multi-site collection by
+// tier. Tier 2 (default) runs the operator's own hub gather Job and saves the
+// site-attributed ground truth as JSON — operator-mediated, so it works even
+// when the workstation has no site access (and even when the operator pod is
+// unhealthy). Tier 3 (--direct) does the full per-site log/resource/exec
+// collection through the user's kube-contexts. Tier 1 (--from-status) leaves the
+// already-collected CR+status as the artifact.
+func collectMultiSiteArtifactsTiered(
+	ctx context.Context, dir string, k8sClient client.Client, coreClient *kubernetes.Clientset,
+	lr *littleredv1alpha1.LittleRed,
+) {
+	tier, err := multisite.SelectTier("debug-dump", currentTierFlags())
+	if err != nil {
+		writeFile(dir, "multisite-error.txt", err.Error())
+		return
+	}
+	switch tier {
+	case multisite.TierDirect:
+		collectMultiSiteArtifacts(ctx, dir, lr)
+	case multisite.TierStatus:
+		writeFile(dir, "multisite-note.txt",
+			"tier 1 (--from-status): only the hub-side CR and status were collected.\n"+
+				"Re-run with --direct for full per-site logs/resources/exec, or without --from-status for the live hub gather.\n")
+	default: // tier 2 (live via hub Job)
+		fmt.Println("  Collecting multi-site ground truth via hub gather Job (tier 2)...")
+		result, gerr := gatherViaHubJob(ctx, k8sClient, coreClient, lr, operatorNamespaceFlag, operatorDeployment)
+		if gerr != nil {
+			writeFile(dir, "multisite-gather-error.txt", gerr.Error())
+			return
+		}
+		raw, merr := json.MarshalIndent(result, "", "  ")
+		if merr != nil {
+			writeFile(dir, "multisite-gather-error.txt", merr.Error())
+			return
+		}
+		writeFile(dir, "multisite-gather.json", string(raw))
+		writeFile(dir, "multisite-note.txt",
+			"tier 2 (live via hub Job): multisite-gather.json holds the operator's site-attributed ground truth.\n"+
+				"For full per-site pod logs / k8s resources / raw redis-cli, re-run with --direct.\n")
+	}
+}
 
 // collectMultiSiteArtifacts collects pod logs, live Redis cluster state and
 // Kubernetes resources from EVERY site of a stretched cluster, into per-site

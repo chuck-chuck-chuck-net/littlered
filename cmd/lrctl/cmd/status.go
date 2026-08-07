@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
@@ -169,6 +170,33 @@ func printMultiSiteStatus(lr *littleredv1alpha1.LittleRed) {
 		for _, s := range ms.Sites {
 			fmt.Printf("  - %s: (no observed state yet)\n", s.Name)
 		}
+	}
+
+	// Tier-1 cross-site view: the operator's published, site-attributed topology
+	// (docs/LRCTL.md "Multi-Site Clusters"). Rendered from status alone — no site
+	// access — with its freshness (the last reconcile).
+	if mss := lr.Status.MultiSite; mss != nil && mss.LastReconcileTime != nil {
+		fmt.Printf("Slots Assigned: %d / 16384\n", mss.SlotsAssigned)
+		crossVerdict := "[OK] every shard spans >= 2 sites"
+		if !mss.CrossSiteOK {
+			crossVerdict = "[!] one or more shards are NOT cross-site"
+		}
+		fmt.Printf("Cross-Site Placement: %s\n", crossVerdict)
+		for _, sh := range mss.Shards {
+			marker := "cross-site"
+			if !sh.CrossSite {
+				marker = "[!] SINGLE-SITE"
+			}
+			link := ""
+			if sh.LinkDown {
+				link = " [WARN] a replica link is down"
+			}
+			fmt.Printf("  - shard %d: master@%s, replicas@%v (%s)%s\n",
+				sh.Shard, valueOrNone(sh.MasterSite), sh.ReplicaSites, marker, link)
+		}
+		fmt.Printf("View freshness: as of last reconcile %s ago (at %s)\n",
+			time.Since(mss.LastReconcileTime.Time).Round(time.Second),
+			mss.LastReconcileTime.Format(timeFormat))
 	}
 
 	if lr.Status.MultiSite != nil && lr.Status.MultiSite.TakeoverPendingSince != nil {

@@ -27,14 +27,26 @@ const (
 )
 
 var (
-	namespace     string
-	kubeconfig    string
-	kubeContext   string
-	siteContext   string
-	unmanaged     bool
-	kind          string
-	allNamespaces bool
-	jsonOutput    bool
+	namespace          string
+	kubeconfig         string
+	kubeContext        string
+	siteContext        string
+	fromStatus         bool
+	direct             bool
+	operatorNamespace  string
+	operatorDeployment string
+	unmanaged          bool
+	kind               string
+	allNamespaces      bool
+	jsonOutput         bool
+)
+
+// defaultOperatorNamespace / defaultOperatorDeployment are the well-known hub
+// location of the operator, used to discover the SA + image for the tier-2
+// gather Job. Overridable with --operator-namespace / --operator-deployment.
+const (
+	defaultOperatorNamespace  = "littlered-system"
+	defaultOperatorDeployment = "littlered"
 )
 
 var rootCmd = &cobra.Command{
@@ -140,8 +152,22 @@ func init() {
 		&kubeContext, "context", "", "Kube-context to use (the hub context for multi-site); defaults to the current context")
 	rootCmd.PersistentFlags().StringVar(
 		&siteContext, "site-context", "",
-		"Multi-site only: map site names to kube-contexts, e.g. --site-context alpha=ctxA,beta=ctxB "+
-			"(default convention: site name == context name)")
+		"Multi-site tier 3 (direct) only: map site names to kube-contexts, e.g. --site-context alpha=ctxA,beta=ctxB "+
+			"(implies --direct; within tier 3 an unmapped site falls back to the site-name==context-name convention)")
+	rootCmd.PersistentFlags().BoolVar(
+		&fromStatus, "from-status", false,
+		"Multi-site tier 1: render the cross-site view the operator published to status "+
+			"(needs only get littlered on the hub; no site access)")
+	rootCmd.PersistentFlags().BoolVar(
+		&direct, "direct", false,
+		"Multi-site tier 3: gather each site directly through the user's own per-site kube-contexts, "+
+			"bypassing the operator (fallback for when the operator is gone)")
+	rootCmd.PersistentFlags().StringVar(
+		&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
+		"Multi-site tier 2: the operator's namespace on the hub (where the gather Job runs)")
+	rootCmd.PersistentFlags().StringVar(
+		&operatorDeployment, "operator-deployment", defaultOperatorDeployment,
+		"Multi-site tier 2: the operator's Deployment name on the hub (to discover its SA and image)")
 	rootCmd.PersistentFlags().BoolVar(
 		&unmanaged, "unmanaged", false, "If true, skip looking for a LittleRed CR and use heuristics to find pods")
 	rootCmd.PersistentFlags().StringVar(

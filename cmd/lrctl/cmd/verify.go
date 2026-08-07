@@ -62,7 +62,7 @@ var verifyCmd = &cobra.Command{
 			if !unmanaged {
 				if lr, lerr := getLittleRed(ctx, k8sClient, key); lerr == nil && isMultiSite(lr) {
 					if jsonOutput {
-						jsonResults = append(jsonResults, verifyMultiSiteClusterJSON(ctx, lr))
+						jsonResults = append(jsonResults, verifyMultiSiteJSON(ctx, k8sClient, coreClient, lr))
 						continue
 					}
 					if i > 0 {
@@ -70,7 +70,7 @@ var verifyCmd = &cobra.Command{
 					}
 					fmt.Printf("Verifying Multi-Site Cluster: %s/%s (Mode: cluster, %d sites)\n",
 						key.Namespace, key.Name, len(lr.Spec.MultiSite.Sites))
-					if verr := verifyMultiSiteCluster(ctx, lr); verr != nil {
+					if verr := verifyMultiSite(ctx, k8sClient, coreClient, lr); verr != nil {
 						errCount++
 					}
 					continue
