@@ -23,6 +23,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"os"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -127,7 +128,9 @@ func gatherViaHubJob(
 		_ = k8sClient.Delete(context.Background(), job, &client.DeleteOptions{PropagationPolicy: &bg})
 	}()
 
-	fmt.Printf("Running gather Job %s/%s (image %s, as SA %s)...\n",
+	// Progress goes to stderr so it never pollutes --json (whose data contract is
+	// clean JSON on stdout); text-mode users still see it on the terminal.
+	fmt.Fprintf(os.Stderr, "Running gather Job %s/%s (image %s, as SA %s)...\n",
 		job.Namespace, job.Name, info.Image, info.ServiceAccountName)
 
 	finished, err := waitForJob(ctx, k8sClient, job.Namespace, job.Name)
