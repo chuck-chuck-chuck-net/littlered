@@ -232,7 +232,7 @@ func countMastersReplicas(h clusterHarness, crName string, g Gomega) (masters, r
 
 // --- Topology-gated Describe registrations ------------------------------------------------
 
-var _ = Describe("Cluster Behaviour Matrix [single-site]", func() {
+var _ = Describe("Cluster Behaviour Matrix [single-site]", Label("cluster-behaviour"), func() {
 	if !topologyEnabled("single") {
 		return
 	}
