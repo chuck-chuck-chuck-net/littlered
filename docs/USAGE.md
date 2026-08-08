@@ -653,7 +653,7 @@ With 3 shards, slots are distributed as:
 
 ### Important notes
 
-- **Supported topologies**: **3 or more shards** with **0 or more replicas per shard** (default: 3 shards, 1 replica). The minimum of 3 is a Redis Cluster requirement — it needs at least 3 masters. Both counts are validated (`shards ≥ 3`, `replicasPerShard ≥ 0`).
+- **Supported Topologies**: The operator validates a **minimum of 3 shards** (`spec.cluster.shards` >= 3, Redis Cluster's own floor) with **0 or more replicas per shard** (`spec.cluster.replicasPerShard` >= 0, default 1); there is no upper bound on either. Fewer than 3 shards is rejected by the validation logic.
 - **In-memory mode**: No persistence. Data will be lost on full cluster restart. By default, 'noeviction' is used, so data is not forgotten when memory is full (Redis will return errors instead).
 - **No PVCs**: Cluster state stored in CR status, not nodes.conf.
 - **Runtime scaling**: reducing `spec.cluster.shards` is refused (`ShardScaleDownRefused` — the operator never deletes data). Automated shard scale-up (resharding slots onto new shards) is not yet supported; treat the shard count as fixed after creation.
