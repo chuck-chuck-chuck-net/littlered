@@ -61,6 +61,42 @@ var _ = Describe("MultiSite finalizer teardown", func() {
 		}
 	})
 
+	It("does not panic and drops the finalizer when the finalizer is present but Spec.MultiSite is nil", func() {
+		// Malformed CR: the multi-site teardown finalizer is present but the
+		// MultiSite spec block is gone (e.g. edited away). Without a nil-guard,
+		// `range lr.Spec.MultiSite.Sites` dereferences a nil pointer and the
+		// operator panics on every reconcile, wedging deletion forever.
+		lr := &littleredv1alpha1.LittleRed{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       resourceName,
+				Namespace:  testNamespaceDefault,
+				Finalizers: []string{finalizerName, multiSiteFinalizerName},
+			},
+			Spec: littleredv1alpha1.LittleRedSpec{
+				Mode:    ModeCluster,
+				Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3},
+				// MultiSite intentionally nil.
+			},
+		}
+		Expect(k8sClient.Create(ctx, lr)).To(Succeed())
+		Expect(k8sClient.Get(ctx, nn, lr)).To(Succeed())
+
+		// Non-nil registry so the sweep is not short-circuited by the
+		// `r.sites == nil` guard — this drives execution into the loop that
+		// dereferences the nil MultiSite spec.
+		reconciler.sites = newSiteClientRegistry(k8sClient, k8sClient.Scheme(), nil)
+
+		var done bool
+		var err error
+		Expect(func() {
+			done, err = reconciler.handleMultiSiteDeletion(ctx, lr)
+		}).NotTo(Panic(), "must not dereference a nil Spec.MultiSite")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(done).To(BeTrue(), "with no per-site spec to sweep, teardown is done")
+		Expect(controllerutil.ContainsFinalizer(lr, multiSiteFinalizerName)).To(BeFalse(),
+			"the spoke-teardown finalizer must be released so deletion can complete")
+	})
+
 	It("adds the spoke-teardown finalizer and releases both on deletion", func() {
 		lr := &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{Name: resourceName, Namespace: testNamespaceDefault},

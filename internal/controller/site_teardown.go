@@ -85,6 +85,16 @@ func (r *LittleRedReconciler) handleMultiSiteDeletion(ctx context.Context, lr *l
 		return r.removeMultiSiteFinalizer(ctx, lr)
 	}
 
+	// Defensive: a malformed CR can carry the teardown finalizer while its
+	// MultiSite spec block is gone (finalizer present without the spec). There
+	// is no per-site spec to sweep, and dereferencing lr.Spec.MultiSite.Sites
+	// would nil-panic every reconcile and wedge deletion forever. Drop the
+	// finalizer so deletion can complete.
+	if lr.Spec.MultiSite == nil {
+		log.Info("Multi-site teardown: finalizer present but Spec.MultiSite is nil; nothing to sweep, releasing finalizer")
+		return r.removeMultiSiteFinalizer(ctx, lr)
+	}
+
 	owner := types.NamespacedName{Namespace: lr.Namespace, Name: lr.Name}
 	var unreachable []string
 	for _, site := range lr.Spec.MultiSite.Sites {
