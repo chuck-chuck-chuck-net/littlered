@@ -343,16 +343,35 @@ Remaining field-shape details are settled in the ADR, not here.
    `verify` gathers live via a throwaway hub Job that is then GC'd — and tier-2 still
    gathers with the operator scaled to zero (the operator-pod-independence payoff of the
    Job over exec). Independently re-verified by the orchestrator.
-7. **Multi-site scale-down / topology-shrink guards (pre-graduation).** The
-   single-site path refuses (surfaces a condition and waits, never deletes) when
-   `shards` is reduced or a legacy topology is detected — the "never delete data by
-   default" pillar. The initial multi-site reconcile does *not* yet carry per-site
-   equivalents: reducing `shards`, lowering `sitesPerShard`, or removing a site from
-   the list leaves the now-orphaned per-site StatefulSets **un-managed (drift), not
-   deleted** — no active data loss, but no refusal either. Per-site orphan detection
-   + refusal must land before multi-site graduates from design-draft. (The legacy
-   single-STS guard is correctly moot: a multi-site instance is post-0.3.0 by
-   construction.)
+7. **Multi-site scale-down / topology-shrink guards (pre-graduation). Implemented
+   (LR-027).** The single-site path refuses (surfaces a condition and waits, never
+   deletes) when `shards` is reduced or a legacy topology is detected — the "never
+   delete data by default" pillar. Multi-site now carries the per-site equivalent:
+   before creating any resources, `reconcileMultiSiteCluster` runs
+   `enforceMultiSiteScaleDownGuard`, which observes the per-site shard StatefulSets
+   across the sites and diffs them (pure `planMultiSiteScaleDown`) against the
+   desired round-robin placement set (`desiredMultiSiteShardSet`). Any observed
+   `(site, shard)` StatefulSet the desired topology no longer includes — from a
+   `shards` decrease, a `sitesPerShard` decrease, or a removed site — is an orphan,
+   and the operator **refuses**: a `MultiSiteScaleDownRefused` Warning event + Ready
+   condition (`False`, reason `MultiSiteScaleDownRefused`, phase `Failed`), requeue
+   and wait, **never delete** (cluster storage is EmptyDir; the orphaned STS still
+   holds its shard's slot data). All three shrink dimensions collapse to the one
+   "observed but not desired" diff. Resolution: restore the topology, or migrate the
+   data and delete the orphaned StatefulSet(s) manually — reconciliation resumes
+   automatically once no orphan remains. (The legacy single-STS guard is correctly
+   moot: a multi-site instance is post-0.3.0 by construction.)
+
+   **Observability limitation (documented, by design).** Refusal requires
+   observation, and the operator only builds a `SiteClient` for sites still named in
+   `spec.multiSite.sites`. So `shards`↓ and `sitesPerShard`↓ are refused in full
+   (their orphans live in sites still in the spec), but a site **fully removed** from
+   the list is no longer resolved — its StatefulSets become un-observable drift the
+   operator cannot see or refuse. The pure diff is general (given an observation of a
+   removed site it would flag it); the limit is in the I/O layer. Operators should
+   therefore **drain a site via a `sitesPerShard` reduction (or manual cleanup)
+   *before* deleting its entry** from `spec.multiSite.sites`; removing the entry
+   first strands that site's data silently.
 8. **Operator self-namespace for out-of-cluster runs.** The site-kubeconfig Secret
    lookup needs the operator's own namespace; in-cluster the ServiceAccount namespace
    file resolves it, but an out-of-cluster hub (e.g. during development before the

@@ -142,6 +142,11 @@ func (f *recordingSiteClient) List(_ context.Context, list client.ObjectList, _ 
 	if pl, ok := list.(*corev1.PodList); ok {
 		pl.Items = append([]corev1.Pod(nil), f.pods...)
 	}
+	if sl, ok := list.(*appsv1.StatefulSetList); ok {
+		for _, sts := range f.sts {
+			sl.Items = append(sl.Items, *sts)
+		}
+	}
 	return nil
 }
 
@@ -333,6 +338,109 @@ func TestRecoverMultiSiteWipePerSite(t *testing.T) {
 	}
 	if len(site1.deleted) != 0 {
 		t.Fatalf("unreachable site1 must not delete anything, got %v", site1.deleted)
+	}
+}
+
+// shardSTSForSite builds an observed shard StatefulSet as it would exist in a site: named
+// {instance}-shard-K and carrying the stable LabelShard identity label the guard reads back.
+func shardSTSForSite(instance string, shard int) *appsv1.StatefulSet {
+	sts := &appsv1.StatefulSet{}
+	sts.Name = fmt.Sprintf("%s-shard-%d", instance, shard)
+	sts.Namespace = testNamespaceDefault
+	sts.Labels = map[string]string{LabelShard: fmt.Sprintf("%d", shard)}
+	return sts
+}
+
+// fakeWithShardSTSs builds a recording site client pre-populated with the shard StatefulSets it
+// hosts (each keyed by object name, as SiteClient.Get/List expect).
+func fakeWithShardSTSs(name, instance string, shards ...int) *recordingSiteClient {
+	f := &recordingSiteClient{name: name, sts: map[string]*appsv1.StatefulSet{}}
+	for _, k := range shards {
+		s := shardSTSForSite(instance, k)
+		f.sts[s.Name] = s
+	}
+	return f
+}
+
+// TestEnforceMultiSiteScaleDownGuardRefusesAndNeverDeletes is the refusal WIRING test and the
+// load-bearing data-safety proof: a multi-site CR whose desired topology no longer includes some
+// existing per-site shard StatefulSets must be REFUSED (condition set, phase Failed) and NO
+// StatefulSet may be deleted. Models a shards decrease 3->2 against sites still holding shard-2.
+func TestEnforceMultiSiteScaleDownGuardRefusesAndNeverDeletes(t *testing.T) {
+	// New/desired topology: 2 sites, sitesPerShard 2, shards 2. Old cluster hosted shard 2 as
+	// well (in site0 and site1 under the round-robin), so those STSs are now orphaned.
+	lr := multiSiteClusterCR(2, 2, 2, 1)
+	r := &LittleRedReconciler{}
+	r.Client = newStatusFakeClient(t, lr)
+
+	// Both sites host shards 0,1 (desired) AND a lingering shard 2 (orphan from the old shards=3).
+	site0 := fakeWithShardSTSs("site0", lr.Name, 0, 1, 2)
+	site1 := fakeWithShardSTSs("site1", lr.Name, 0, 1, 2)
+	sites := []resolvedSite{
+		{idx: 0, name: "site0", client: site0},
+		{idx: 1, name: "site1", client: site1},
+	}
+
+	refused, _, err := r.enforceMultiSiteScaleDownGuard(context.Background(), lr, sites)
+	if err != nil {
+		t.Fatalf("enforceMultiSiteScaleDownGuard: %v", err)
+	}
+	if !refused {
+		t.Fatalf("expected refusal for orphaned shard-2 StatefulSets, got refused=false")
+	}
+
+	// Refusal surfaced.
+	if lr.Status.Status != reasonMultiSiteScaleDownRefused {
+		t.Fatalf("Status.Status = %q, want MultiSiteScaleDownRefused", lr.Status.Status)
+	}
+	if lr.Status.Phase != littleredv1alpha1.PhaseFailed {
+		t.Fatalf("Status.Phase = %q, want Failed", lr.Status.Phase)
+	}
+	var readyCond *metav1.Condition
+	for i := range lr.Status.Conditions {
+		if lr.Status.Conditions[i].Type == littleredv1alpha1.ConditionReady {
+			readyCond = &lr.Status.Conditions[i]
+		}
+	}
+	if readyCond == nil || readyCond.Status != metav1.ConditionFalse || readyCond.Reason != reasonMultiSiteScaleDownRefused {
+		t.Fatalf("Ready condition = %+v, want False/MultiSiteScaleDownRefused", readyCond)
+	}
+
+	// THE INVARIANT: no StatefulSet was deleted, in either site, and the observed STSs remain.
+	for _, f := range []*recordingSiteClient{site0, site1} {
+		if len(f.deleted) != 0 {
+			t.Fatalf("%s: guard deleted %v — it must NEVER delete data", f.name, f.deleted)
+		}
+		if _, ok := f.sts[fmt.Sprintf("%s-shard-2", lr.Name)]; !ok {
+			t.Fatalf("%s: orphaned shard-2 STS must still exist after refusal", f.name)
+		}
+	}
+}
+
+// TestEnforceMultiSiteScaleDownGuardNoOpWhenSteady asserts the guard does nothing (refused=false,
+// no condition) when the observed StatefulSets exactly match the desired placement.
+func TestEnforceMultiSiteScaleDownGuardNoOpWhenSteady(t *testing.T) {
+	// 2 sites, sitesPerShard 2, shards 2 -> every shard hosts in both sites: site0/site1 each host {0,1}.
+	lr := multiSiteClusterCR(2, 2, 2, 1)
+	r := &LittleRedReconciler{}
+	r.Client = newStatusFakeClient(t, lr)
+
+	site0 := fakeWithShardSTSs("site0", lr.Name, 0, 1)
+	site1 := fakeWithShardSTSs("site1", lr.Name, 0, 1)
+	sites := []resolvedSite{
+		{idx: 0, name: "site0", client: site0},
+		{idx: 1, name: "site1", client: site1},
+	}
+
+	refused, _, err := r.enforceMultiSiteScaleDownGuard(context.Background(), lr, sites)
+	if err != nil {
+		t.Fatalf("enforceMultiSiteScaleDownGuard: %v", err)
+	}
+	if refused {
+		t.Fatalf("steady topology must not be refused")
+	}
+	if lr.Status.Status == reasonMultiSiteScaleDownRefused {
+		t.Fatalf("steady topology must not set the refusal status")
 	}
 }
 

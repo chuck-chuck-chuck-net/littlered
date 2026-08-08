@@ -29,6 +29,8 @@ import (
 	"fmt"
 	"reflect"
 	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -230,6 +232,20 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 	}
 
 	sites := r.resolveSites(ctx, lr)
+
+	// 0. Scale-down / topology-shrink refusal guard (LR-027, MULTI_SITE_DESIGN.md §10 item 7).
+	// Before creating the new topology beside orphaned data, detect per-site shard StatefulSets
+	// the desired placement no longer includes — reducing shards, lowering sitesPerShard, or
+	// removing a still-observable site — and REFUSE (surface a condition, wait), never delete
+	// (pillar 3.13; cluster storage is EmptyDir). This is the multi-site analogue of the
+	// single-site detectOrphanedShardStatefulSets / reportShardScaleDown guard. A site fully
+	// removed from the spec is no longer resolved, so its StatefulSets are unobservable and
+	// cannot be refused — refusal requires observability (documented in §10).
+	if refused, res, err := r.enforceMultiSiteScaleDownGuard(ctx, lr, sites); err != nil {
+		return ctrl.Result{}, err
+	} else if refused {
+		return res, nil
+	}
 
 	// 1. Ensure resources across every hosting site (ConfigMap, Services, per-shard STS, PDB).
 	if err := r.ensureMultiSiteClusterResources(ctx, lr, sites); err != nil {
@@ -844,6 +860,94 @@ func (r *LittleRedReconciler) intendedShardMasterKey(lr *littleredv1alpha1.Littl
 		return multiSiteInitialMasterKey(lr.Name, multiSiteSiteNames(lr), shardIdx)
 	}
 	return shardMasterPodName(lr.Name, shardIdx)
+}
+
+// observeShardStatefulSets lists this instance's per-shard cluster StatefulSets in every
+// REACHABLE site through its SiteClient, recovering each shard index from the stable LabelShard
+// identity label. An unreachable site (client absent or List error) contributes nothing — it
+// cannot be observed this pass, so its StatefulSets are never treated as orphans (refusal
+// requires observability; a site fully removed from the spec is likewise never resolved and so
+// never appears here — MULTI_SITE_DESIGN.md §10 item 7).
+func (r *LittleRedReconciler) observeShardStatefulSets(ctx context.Context, lr *littleredv1alpha1.LittleRed, sites []resolvedSite) []observedShardSTS {
+	var out []observedShardSTS
+	sel := client.MatchingLabels(clusterSelectorLabels(lr))
+	inNS := client.InNamespace(lr.Namespace)
+	for _, s := range sites {
+		if s.client == nil {
+			continue
+		}
+		list := &appsv1.StatefulSetList{}
+		if err := s.client.List(ctx, list, inNS, sel); err != nil {
+			continue // unreachable this pass
+		}
+		for i := range list.Items {
+			sts := &list.Items[i]
+			val, ok := sts.Labels[LabelShard]
+			if !ok {
+				continue
+			}
+			shardIdx, err := strconv.Atoi(val)
+			if err != nil {
+				continue
+			}
+			out = append(out, observedShardSTS{Site: s.name, Shard: shardIdx, Name: sts.Name})
+		}
+	}
+	return out
+}
+
+// enforceMultiSiteScaleDownGuard observes the per-site shard StatefulSets across sites, runs the
+// pure planMultiSiteScaleDown diff against the desired placement, and refuses (reportMultiSite-
+// ScaleDown) if any are orphaned. Returns refused=true with the requeue Result when it refused;
+// refused=false lets the caller proceed to resource reconciliation. It NEVER deletes anything.
+func (r *LittleRedReconciler) enforceMultiSiteScaleDownGuard(ctx context.Context, lr *littleredv1alpha1.LittleRed, sites []resolvedSite) (bool, ctrl.Result, error) {
+	shards, _, sps := multiSiteParams(lr)
+	desired := desiredMultiSiteShardSet(multiSiteSiteNames(lr), shards, sps)
+	observed := r.observeShardStatefulSets(ctx, lr, sites)
+	orphans := planMultiSiteScaleDown(desired, observed)
+	if len(orphans) == 0 {
+		return false, ctrl.Result{}, nil
+	}
+	res, err := r.reportMultiSiteScaleDown(ctx, lr, orphans)
+	return true, res, err
+}
+
+// reportMultiSiteScaleDown surfaces a refused multi-site topology shrink and waits. Like the
+// single-site reportShardScaleDown (and the legacy guard), it does NOT delete the orphaned
+// StatefulSets — that would destroy their EmptyDir data, and LittleRed never deletes data by
+// default (pillar 3.13). An operator restores the topology or migrates+removes the data manually;
+// reconciliation resumes automatically once no orphan remains.
+func (r *LittleRedReconciler) reportMultiSiteScaleDown(ctx context.Context, lr *littleredv1alpha1.LittleRed, orphans []multiSiteOrphanSTS) (ctrl.Result, error) {
+	names := make([]string, 0, len(orphans))
+	for _, o := range orphans {
+		names = append(names, fmt.Sprintf("%s/%s", o.Site, o.Name))
+	}
+	sort.Strings(names) // stable message/event regardless of per-site List order
+	shards, _, sps := multiSiteParams(lr)
+	msg := fmt.Sprintf("Refusing multi-site topology shrink (shards=%d, sitesPerShard=%d): per-site "+
+		"shard StatefulSet(s) %s would be orphaned and their slots (and data) lost. Cluster storage "+
+		"is EmptyDir and there is no reshard-away path; LittleRed never deletes data by default. "+
+		"Restore spec.cluster.shards / spec.multiSite.sitesPerShard / the removed site(s), or migrate "+
+		"the data and delete the orphaned StatefulSet(s) manually.", shards, sps, strings.Join(names, ", "))
+
+	log := r.getLogger(ctx, lr, LogCategoryRecon)
+	log.Info("Refusing multi-site scale-down", "orphans", names)
+	r.event(lr, corev1.EventTypeWarning, reasonMultiSiteScaleDownRefused, msg)
+
+	lr.Status.Phase = littleredv1alpha1.PhaseFailed
+	lr.Status.Status = reasonMultiSiteScaleDownRefused
+	meta.SetStatusCondition(&lr.Status.Conditions, metav1.Condition{
+		Type:               littleredv1alpha1.ConditionReady,
+		Status:             metav1.ConditionFalse,
+		Reason:             reasonMultiSiteScaleDownRefused,
+		Message:            msg,
+		LastTransitionTime: metav1.Now(),
+	})
+	if err := r.Status().Update(ctx, lr); err != nil && !apierrors.IsConflict(err) {
+		return ctrl.Result{}, err
+	}
+	_, steady := lr.GetRequeueIntervals()
+	return ctrl.Result{RequeueAfter: steady}, nil
 }
 
 // errText renders an error for logging, tolerating nil.
