@@ -46,6 +46,16 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 	// Set initial phase
 	if littleRed.Status.Phase == "" {
 		littleRed.Status.Phase = littleredv1alpha1.PhasePending
+		// Experimental-mode warning for multi-site (parity with failover mode's
+		// ADR-011 §8 notice). A multi-site stretched cluster is experimental;
+		// single-site cluster CRs are unaffected (gated on isMultiSite). Phase is
+		// unset only on the very first reconcile(s) of a new CR, so this is a cheap
+		// "once" without a persisted flag; the recorder aggregates any repeats.
+		if isMultiSite(littleRed) {
+			r.event(littleRed, corev1.EventTypeWarning, reasonExperimentalMode,
+				"mode cluster with spec.multiSite (multi-site stretched cluster) is experimental — "+
+					"see docs/MULTI_SITE_DESIGN.md for current status, deferred items, and trade-offs")
+		}
 	}
 
 	// Multi-site cluster mode (docs/MULTI_SITE_DESIGN.md): resources, gather, gating and
