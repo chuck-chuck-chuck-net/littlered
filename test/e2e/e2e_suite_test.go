@@ -315,22 +315,34 @@ func waitForOperator() {
 
 // pinKubeContext snapshots the effective kubeconfig into a temp file and points
 // KUBECONFIG at it. This isolates the test process from context switches in
-// other terminals.
+// other terminals — the isolation comes from the snapshot FILE, not from
+// minifying (a `use-context` in another terminal edits the original, never this
+// copy).
 //
 //   - contextName == "": pin the current active context
 //   - contextName != "": pin a specific named context
 //
-// Uses "kubectl config view --raw --flatten --minify" which produces a
+// Single-site uses "kubectl config view --raw --flatten --minify", producing a
 // self-contained kubeconfig with only the selected context/cluster/user.
+//
+// Multi-site (E2E_TOPOLOGY=multi|both) MUST keep the sibling site contexts
+// (scm-s1/s2/s3, driven via `kubectl --context <site>`), so it does NOT minify;
+// it snapshots every context and then forces current-context to the pinned one
+// so ambient/hub calls still resolve.
 func pinKubeContext(contextName string) {
-	args := []string{"config", "view", "--raw", "--flatten", "--minify"}
+	// Multi-site drives sibling site contexts by name; --minify would strip them.
+	multiSite := topologyEnabled("multi")
+
+	args := []string{"config", "view", "--raw", "--flatten"}
 	label := "current"
 	if contextName != "" {
-		args = append(args, "--context", contextName)
 		label = contextName
+		if !multiSite {
+			args = append(args, "--minify", "--context", contextName)
+		}
 	}
 
-	By(fmt.Sprintf("pinning kubeconfig (context: %s)", label))
+	By(fmt.Sprintf("pinning kubeconfig (context: %s, multi-site: %v)", label, multiSite))
 
 	cmd := exec.Command("kubectl", args...)
 	raw, err := utils.Run(cmd)
@@ -343,5 +355,18 @@ func pinKubeContext(contextName string) {
 	ExpectWithOffset(1, os.WriteFile(tmpFile, []byte(raw), 0o600)).To(Succeed())
 
 	os.Setenv("KUBECONFIG", tmpFile) //nolint:errcheck
+
+	// Multi-site kept every context (no --minify), so the snapshot's current-context
+	// is whatever the source had. Force it to the pinned context so ambient (no
+	// --context) hub calls resolve. `kubectl config use-context` rewrites the file
+	// in place (atomic temp+rename), which can drop our 0600 mode — restore it.
+	if multiSite && contextName != "" {
+		_, err = utils.Run(exec.Command("kubectl", "--kubeconfig", tmpFile,
+			"config", "use-context", contextName))
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+			"Failed to set current-context %q on the pinned kubeconfig", contextName)
+		ExpectWithOffset(1, os.Chmod(tmpFile, 0o600)).To(Succeed())
+	}
+
 	_, _ = fmt.Fprintf(GinkgoWriter, "Pinned KUBECONFIG to %s (context: %s)\n", tmpFile, label)
 }
