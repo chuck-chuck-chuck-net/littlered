@@ -379,7 +379,7 @@ flowchart TD
     Gate -- "ConfirmedDown, or fence-safe, past cooldown" --> Fire["TAKEOVER → FORGET → recycle"]
 ```
 
-See ADR-012, `docs/MULTI_SITE_DESIGN.md` §6, and changelog LR-025.
+See ADR-012, `docs/MULTI_SITE_DESIGN.md` §6, and changelog LR-026.
 
 ---
 

@@ -17,7 +17,7 @@ limitations under the License.
 package controller
 
 // site_scaledown.go holds the PURE, I/O-free scale-down / topology-shrink refusal detector for
-// multi-site cluster mode (docs/MULTI_SITE_DESIGN.md §10 item 7, changelog LR-027). Reducing
+// multi-site cluster mode (docs/MULTI_SITE_DESIGN.md §10 item 7, changelog LR-028). Reducing
 // spec.cluster.shards, lowering spec.multiSite.sitesPerShard, or removing a site from
 // spec.multiSite.sites leaves per-site shard StatefulSets the desired placement no longer
 // includes. Cluster storage is EmptyDir, so those StatefulSets still hold their shard's slot

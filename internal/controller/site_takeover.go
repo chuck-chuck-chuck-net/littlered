@@ -129,7 +129,7 @@ type siteTakeoverInput struct {
 	// anywhere. Without this, initial bringup — fresh nodes reporting role:master, 0 slots,
 	// cluster_state:fail (uncovered) — is indistinguishable from "all masters lost" and the
 	// planner would arm/fire a takeover across pods that never formed a cluster, preempting
-	// bootstrap (a hard bringup deadlock — LR-025). false ⇒ siteTakeoverNone unconditionally.
+	// bootstrap (a hard bringup deadlock — LR-026). false ⇒ siteTakeoverNone unconditionally.
 	clusterFormed bool
 
 	// size is the total number of slot-serving masters in the stretched cluster. Every
@@ -215,7 +215,7 @@ func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, coo
 	}
 	plan := func(a siteTakeoverAction) siteTakeoverPlan { p := base; p.action = a; return p }
 
-	// Condition 0 (LR-025): the cluster must have been bootstrapped for a site-loss takeover
+	// Condition 0 (LR-026): the cluster must have been bootstrapped for a site-loss takeover
 	// to be meaningful. A never-formed cluster (no slot owned anywhere) presents the SAME
 	// surface as "all masters lost" — zero slot-serving masters, fresh nodes classifiable as
 	// promotable survivors, survivors reporting their own cluster_state:fail (uncovered) — so
@@ -581,7 +581,7 @@ func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.Littl
 		allowUnsafe:      lr.Spec.MultiSite != nil && lr.Spec.MultiSite.AllowUnsafeSiteTakeover,
 	}
 
-	// clusterFormed (LR-025): has the cluster ever been bootstrapped? ANY node in the gathered
+	// clusterFormed (LR-026): has the cluster ever been bootstrapped? ANY node in the gathered
 	// view owning a slot proves it — including a gossip-known DEAD master (Reachable=false)
 	// whose slot ownership the survivors still carry until FORGET/TAKEOVER. Zero slots anywhere
 	// means the cluster has not formed yet (initial bringup), so the site-loss takeover must

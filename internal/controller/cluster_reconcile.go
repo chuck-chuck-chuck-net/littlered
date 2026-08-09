@@ -523,7 +523,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 	// 4. Replication Repair. expectedReplicas is the per-shard replica count the repair
 	// reattaches empty masters up to; 0 disables the step. In multi-site the cross-site
 	// members ARE replicas even when spec.cluster.replicasPerShard is 0, so this is derived
-	// per mode (clusterRepairExpectedReplicas — LR-026), not keyed on replicasPerShard alone.
+	// per mode (clusterRepairExpectedReplicas — LR-027), not keyed on replicasPerShard alone.
 	expectedReplicas := clusterRepairExpectedReplicas(littleRed)
 
 	if expectedReplicas > 0 {

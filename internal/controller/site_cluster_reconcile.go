@@ -233,7 +233,7 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 
 	sites := r.resolveSites(ctx, lr)
 
-	// 0. Scale-down / topology-shrink refusal guard (LR-027, MULTI_SITE_DESIGN.md §10 item 7).
+	// 0. Scale-down / topology-shrink refusal guard (LR-028, MULTI_SITE_DESIGN.md §10 item 7).
 	// Before creating the new topology beside orphaned data, detect per-site shard StatefulSets
 	// the desired placement no longer includes — reducing shards, lowering sitesPerShard, or
 	// removing a still-observable site — and REFUSE (surface a condition, wait), never delete

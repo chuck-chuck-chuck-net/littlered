@@ -143,7 +143,7 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   `replicasPerShard: 0` still yields one cross-site replica per shard). The repair
   loop's expected-replica count is therefore this formula in multi-site, not
   `replicasPerShard` — the single-site "`replicasPerShard == 0` ⇒ no replicas"
-  short-circuit must not disable cross-site reattach (LR-026).
+  short-circuit must not disable cross-site reattach (LR-027).
 - Identity stays announced **pod IPs** (native Redis Cluster behavior); with routed
   pod CIDRs nothing needs `cluster-announce-*` overrides. Clients are ordinary
   cluster-aware clients reaching pod IPs from any site; replica reads can be kept
@@ -297,7 +297,7 @@ Remaining field-shape details are settled in the ADR, not here.
 1. Takeover trigger: designed in **ADR-012** (fence-gated site-loss takeover) and
    **implemented (Milestone 3)** — the pure `planSiteTakeover` + `classifySiteWitness`
    planner, the survivor-vantage gather fields, the `SiteClient.NodeReady` witness read,
-   and the TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-025).
+   and the TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-026).
    Remaining: the two-site e2e suite (Milestone 4). The `lrctl` site-kubeconfig helper's
    cluster-scoped `nodes` grant (Milestone 5) is implemented (item 6).
 2. Master rebalance follow-up (graceful `CLUSTER FAILOVER`), keeping the native
@@ -344,7 +344,7 @@ Remaining field-shape details are settled in the ADR, not here.
    gathers with the operator scaled to zero (the operator-pod-independence payoff of the
    Job over exec). Independently re-verified by the orchestrator.
 7. **Multi-site scale-down / topology-shrink guards (pre-graduation). Implemented
-   (LR-027).** The single-site path refuses (surfaces a condition and waits, never
+   (LR-028).** The single-site path refuses (surfaces a condition and waits, never
    deletes) when `shards` is reduced or a legacy topology is detected — the "never
    delete data by default" pillar. Multi-site now carries the per-site equivalent:
    before creating any resources, `reconcileMultiSiteCluster` runs

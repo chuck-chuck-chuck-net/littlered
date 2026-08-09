@@ -24,7 +24,7 @@ import (
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
-// TestClusterRepairExpectedReplicas is the red-first guard for LR-026: the Step-4
+// TestClusterRepairExpectedReplicas is the red-first guard for LR-027: the Step-4
 // replication-repair per-shard replica count must reflect the cross-site placement in
 // multi-site mode, where replicas exist even when spec.cluster.replicasPerShard is 0.
 func TestClusterRepairExpectedReplicas(t *testing.T) {

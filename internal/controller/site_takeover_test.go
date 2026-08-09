@@ -44,7 +44,7 @@ func TestPlanSiteTakeover(t *testing.T) {
 		wantTargets int // -1 = don't assert
 	}{
 		{
-			name: "never-bootstrapped cluster (no slots anywhere) => None even under the all-masters-lost signature (LR-025)",
+			name: "never-bootstrapped cluster (no slots anywhere) => None even under the all-masters-lost signature (LR-026)",
 			in: siteTakeoverInput{
 				// The bringup signature: fresh nodes classified as promotable survivors,
 				// zero slot-serving masters, survivors report cluster_state:fail (uncovered),

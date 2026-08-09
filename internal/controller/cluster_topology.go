@@ -82,7 +82,7 @@ func clusterReplicasPerShard(cluster *littleredv1alpha1.ClusterSpec) int {
 // only while a slot-master has fewer, and skips entirely when this is 0.
 //
 // Single-site: replicasPerShard, with a nil spec defaulting to 1 (the historical repair
-// default); an explicit 0 means "no replicas" and disables the step. MULTI-SITE (LR-026):
+// default); an explicit 0 means "no replicas" and disables the step. MULTI-SITE (LR-027):
 // replicas ALWAYS exist regardless of replicasPerShard, because a shard spans
 // sitesPerShard>=2 per-site StatefulSets each sized replicasPerShard+1 — so the per-shard
 // replica count is sitesPerShard*(replicasPerShard+1) - 1 (design §4). Keying the repair on

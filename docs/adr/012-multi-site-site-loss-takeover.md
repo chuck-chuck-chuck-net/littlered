@@ -14,7 +14,7 @@ data-plane partition with the site kept alive (Contradiction witness) is correct
 HELD — no takeover, no split-brain. M4b also hardened the **takeover-authority
 model** (see Consequences): `recoverSiteLoss` is now the *sole* quorum-loss takeover
 and ghost-FORGET authority in multi-site. See `docs/MULTI_SITE_DESIGN.md` and
-changelog LR-025 (+ its M4a/M4b addenda) / LR-026.
+changelog LR-026 (+ its M4a/M4b addenda) / LR-027.
 
 ## Context
 Multi-site cluster mode runs one stretched Redis Cluster across several sites
