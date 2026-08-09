@@ -22,13 +22,13 @@ import (
 	"testing"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/tools/record"
+	"k8s.io/client-go/tools/events"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
 // drainRecorderEvents returns all events currently buffered in the fake recorder.
-func drainRecorderEvents(rec *record.FakeRecorder) []string {
+func drainRecorderEvents(rec *events.FakeRecorder) []string {
 	var evs []string
 	for {
 		select {
@@ -66,7 +66,7 @@ func TestMultiSiteExperimentalModeEvent(t *testing.T) {
 				},
 			},
 		}
-		rec := record.NewFakeRecorder(16)
+		rec := events.NewFakeRecorder(16)
 		fc := newStatusFakeClient(t, lr)
 		r := &LittleRedReconciler{Client: fc, Scheme: fc.Scheme(), Recorder: rec}
 
@@ -90,7 +90,7 @@ func TestMultiSiteExperimentalModeEvent(t *testing.T) {
 				// No MultiSite: single-site cluster.
 			},
 		}
-		rec := record.NewFakeRecorder(16)
+		rec := events.NewFakeRecorder(16)
 		fc := newStatusFakeClient(t, lr)
 		r := &LittleRedReconciler{Client: fc, Scheme: fc.Scheme(), Recorder: rec}
 
