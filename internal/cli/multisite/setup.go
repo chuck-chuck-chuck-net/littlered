@@ -27,29 +27,26 @@ import (
 )
 
 // SiteSetupNames are the object names the site-Secret generator creates in a
-// site (SA/Role/RoleBinding/ClusterRole/ClusterRoleBinding/token Secret) plus
-// the resulting hub Secret name.
+// site (SA/Role/RoleBinding/token Secret) plus the resulting hub Secret name.
+// Multi-site needs only a namespaced Role in the site — no cluster-scoped access
+// (ADR-012 decision D1: the site-loss takeover is decided by pure quorum
+// arithmetic, so the earlier cluster-scoped `nodes` read is gone).
 type SiteSetupNames struct {
 	Namespace      string // instance namespace (on the site AND the hub)
 	ServiceAccount string
 	Role           string
 	RoleBinding    string
-	ClusterRole    string // nodes get;list (ADR-012 witness) — must not collide across instances
 	TokenSecret    string
 	HubSecret      string // Secret created in the operator namespace on the hub
 }
 
 // DefaultSiteSetupNames returns conventional names for a site's setup objects.
-// The ClusterRole/ClusterRoleBinding (cluster-scoped, ADR-012 node read) are
-// suffixed with the namespace so multiple instances in different namespaces do
-// not share — or clobber — one cluster-scoped RBAC object.
 func DefaultSiteSetupNames(namespace, hubSecret string) SiteSetupNames {
 	return SiteSetupNames{
 		Namespace:      namespace,
 		ServiceAccount: "littlered-site",
 		Role:           "littlered-site",
 		RoleBinding:    "littlered-site",
-		ClusterRole:    "littlered-site-nodes-" + namespace,
 		TokenSecret:    "littlered-site-token",
 		HubSecret:      hubSecret,
 	}
@@ -115,37 +112,6 @@ func BuildSiteRoleBinding(names SiteSetupNames) *rbacv1.RoleBinding {
 		TypeMeta:   metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "RoleBinding"},
 		ObjectMeta: objectMeta(names.RoleBinding, names.Namespace),
 		RoleRef:    rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "Role", Name: names.Role},
-		Subjects: []rbacv1.Subject{
-			{Kind: "ServiceAccount", Name: names.ServiceAccount, Namespace: names.Namespace},
-		},
-	}
-}
-
-// BuildSiteNodesClusterRole builds the ONE cluster-scoped grant multi-site needs:
-// nodes get;list, for the ADR-012 site-loss witness (§7). No other cluster-scoped
-// access is granted.
-func BuildSiteNodesClusterRole(names SiteSetupNames) *rbacv1.ClusterRole {
-	return &rbacv1.ClusterRole{
-		TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRole"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   names.ClusterRole,
-			Labels: map[string]string{"app.kubernetes.io/managed-by": "lrctl-multisite-setup"},
-		},
-		Rules: []rbacv1.PolicyRule{
-			{APIGroups: []string{""}, Resources: []string{"nodes"}, Verbs: []string{"get", "list"}},
-		},
-	}
-}
-
-// BuildSiteNodesClusterRoleBinding binds the site ServiceAccount to the node-read ClusterRole.
-func BuildSiteNodesClusterRoleBinding(names SiteSetupNames) *rbacv1.ClusterRoleBinding {
-	return &rbacv1.ClusterRoleBinding{
-		TypeMeta: metav1.TypeMeta{APIVersion: "rbac.authorization.k8s.io/v1", Kind: "ClusterRoleBinding"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name:   names.ClusterRole,
-			Labels: map[string]string{"app.kubernetes.io/managed-by": "lrctl-multisite-setup"},
-		},
-		RoleRef: rbacv1.RoleRef{APIGroup: "rbac.authorization.k8s.io", Kind: "ClusterRole", Name: names.ClusterRole},
 		Subjects: []rbacv1.Subject{
 			{Kind: "ServiceAccount", Name: names.ServiceAccount, Namespace: names.Namespace},
 		},

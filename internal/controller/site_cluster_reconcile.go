@@ -122,10 +122,6 @@ type sitePodObservation struct {
 	ready     bool
 	restarted bool
 	oomKilled bool
-	// nodeName is the pod's scheduled node (empty if unscheduled). The site-loss witness
-	// (ADR-012) reads this node's Ready condition to tell a kubelet-attested pod death from
-	// a node-controller inference.
-	nodeName string
 	// terminating is whether the pod is being deleted (DeletionTimestamp set) — the
 	// site-loss quiet-cluster gate excludes a terminating survivor (ADR-012 condition 6).
 	terminating bool
@@ -167,7 +163,6 @@ func (r *LittleRedReconciler) observeSites(ctx context.Context, lr *littleredv1a
 				objName:     pod.Name,
 				key:         siteQualifiedKey(s.name, pod.Name),
 				ip:          pod.Status.PodIP,
-				nodeName:    pod.Spec.NodeName,
 				terminating: pod.DeletionTimestamp != nil,
 			}
 			for j := range pod.Status.ContainerStatuses {
@@ -256,7 +251,7 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 	// 2. Observe every site.
 	obs := r.observeSites(ctx, lr, sites)
 
-	// 2a. Site-loss takeover (ADR-012). This is the SOLE fence/witness-gated authority for a
+	// 2a. Site-loss takeover (ADR-012). This is the SOLE fence-gated authority for a
 	// quorum-loss TAKEOVER in multi-site. It runs ahead of the readiness gate and repair, and
 	// — as a belt-and-braces guarantee — the generic repairCluster is itself made INCAPABLE of
 	// the unguarded acts here: repairMayForceTakeover is false in multi-site (so repair's Step-0

@@ -16,13 +16,6 @@
 - apiGroups:
   - ''
   resources:
-  - nodes
-  verbs:
-  - get
-  - list
-- apiGroups:
-  - ''
-  resources:
   - pods
   verbs:
   - delete

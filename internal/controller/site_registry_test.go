@@ -53,10 +53,7 @@ func (f *fakeSiteClient) List(context.Context, client.ObjectList, ...client.List
 	return nil
 }
 func (f *fakeSiteClient) Delete(context.Context, client.Object) error { return nil }
-func (f *fakeSiteClient) NodeReady(context.Context, string) (bool, bool, error) {
-	return false, false, nil
-}
-func (f *fakeSiteClient) Gatherer(string, bool) redisclient.Gatherer { return nil }
+func (f *fakeSiteClient) Gatherer(string, bool) redisclient.Gatherer  { return nil }
 
 const testOperatorNS = "littlered-system"
 

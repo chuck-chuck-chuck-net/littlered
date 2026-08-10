@@ -89,23 +89,12 @@ type recordingSiteClient struct {
 	sts         map[string]*appsv1.StatefulSet
 	applied     []string // "<Kind>/<name>"
 	deleted     []string // pod names deleted
-	// nodeReady drives the witness node read (friction B). A node not present in the map
-	// is reported found=false (its readiness unknown → witness downgrade).
-	nodeReady map[string]bool
 }
 
 func (f *recordingSiteClient) Name() string                               { return f.name }
 func (f *recordingSiteClient) IsHubLocal() bool                           { return false }
 func (f *recordingSiteClient) Stop()                                      {}
 func (f *recordingSiteClient) Gatherer(string, bool) redisclient.Gatherer { return nil }
-
-func (f *recordingSiteClient) NodeReady(_ context.Context, nodeName string) (bool, bool, error) {
-	if err := f.errIfDown(); err != nil {
-		return false, false, err
-	}
-	ready, ok := f.nodeReady[nodeName]
-	return ready, ok, nil
-}
 
 func (f *recordingSiteClient) errIfDown() error {
 	if f.unreachable {

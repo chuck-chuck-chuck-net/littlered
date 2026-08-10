@@ -126,19 +126,3 @@ func TestSiteRoleRulesMatchOperatorWorkloadVerbs(t *testing.T) {
 		t.Errorf("siteRoleRules drift:\n got = %v\nwant = %v", got, want)
 	}
 }
-
-func TestBuildSiteNodesClusterRole(t *testing.T) {
-	names := DefaultSiteSetupNames("ms-smoke", "site-scm-s1")
-	cr := BuildSiteNodesClusterRole(names)
-	if len(cr.Rules) != 1 {
-		t.Fatalf("want exactly 1 rule (nodes get;list), got %d", len(cr.Rules))
-	}
-	r := cr.Rules[0]
-	if !reflect.DeepEqual(r.Resources, []string{"nodes"}) || !reflect.DeepEqual(r.Verbs, []string{"get", "list"}) {
-		t.Errorf("node rule = %+v, want nodes get;list", r)
-	}
-	// The cluster-scoped name must be namespace-qualified to avoid cross-instance clobber.
-	if cr.Name != "littlered-site-nodes-ms-smoke" {
-		t.Errorf("ClusterRole name = %q, want namespace-suffixed", cr.Name)
-	}
-}

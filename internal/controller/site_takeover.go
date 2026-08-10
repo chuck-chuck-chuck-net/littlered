@@ -19,7 +19,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 	"time"
 
@@ -35,17 +34,21 @@ import (
 )
 
 // site_takeover.go holds the PURE, I/O-free site-loss TAKEOVER planner for multi-site
-// cluster mode (ADR-012), sibling of planClusterWipeRecovery / planGhostMasterRecovery /
-// planLeaderlessRecovery. It decides — behind a strict 6-condition gate — whether the hub
-// operator may issue CLUSTER FAILOVER TAKEOVER on surviving replicas to recover a whole
-// site's loss that native Redis failover cannot (a below-quorum survivor set).
+// cluster mode (ADR-012 decision D1), sibling of planClusterWipeRecovery /
+// planGhostMasterRecovery / planLeaderlessRecovery. It decides — behind a strict gate —
+// whether the hub operator may issue CLUSTER FAILOVER TAKEOVER on surviving replicas to
+// recover a whole site's loss that native Redis failover cannot (a below-quorum survivor set).
 //
 // A wrong takeover means a LIVE split-brain (two serving masters per shard), so every
-// condition is a veto: the planner fires ONLY when all six hold, and otherwise waits,
-// holds, or refuses. The dangerous ambiguity — "site dead" vs "site alive but partitioned
-// from the hub" — is resolved by two independent witnesses only the hub holds (the
-// per-site Kubernetes view in site_witness.go, and the survivors' own data-path view in
-// the gather), never by the hub's dial reachability alone (LR-017).
+// condition is a veto: the planner fires ONLY when all hold, and otherwise waits, holds, or
+// refuses. The dangerous ambiguity — "site dead" vs "site alive but partitioned from the
+// hub" — is resolved by pure Domain-M quorum ARITHMETIC (D1): the survivors' own
+// cluster_state:fail plus the reachable/unreachable slot-serving-master counts. An
+// alive-but-isolated site with a master minority has itself fail-stopped (Redis's
+// unconditional minority check) within cluster-node-timeout, so the fence — unreachable
+// masters short of a majority — is a mechanical split-brain guarantee, decided from the
+// survivors' first-hand evidence, never from the hub's dial reachability alone (LR-017).
+// (The earlier Kubernetes "witness" failure-detector is deleted; see ADR-012 D1.)
 
 // siteTakeoverAction is the planner's verdict.
 type siteTakeoverAction int
@@ -58,23 +61,23 @@ const (
 	// siteTakeoverWaitNative: the survivors still hold (or could regain) a master majority,
 	// so Redis will elect on its own (pillar 3.5). Clear the marker; wait. Condition 2 fails.
 	siteTakeoverWaitNative
-	// siteTakeoverHold: an affected site's witness is Contradiction (alive, link-cut — never
-	// take over, ADR-012 condition 3), OR the cluster is not quiet (condition 6). Clear the
-	// marker; do nothing this pass.
+	// siteTakeoverHold: the cluster is not quiet (condition 6) — a terminating survivor or an
+	// in-flight failover/reshard/rollout means Redis may still be resolving this itself.
+	// Clear the marker; do nothing this pass.
 	siteTakeoverHold
 	// siteTakeoverArm: the fire-able signature was just observed. Arm the cooldown
 	// (status.multiSite.takeoverPendingSince) and wait (condition 5).
 	siteTakeoverArm
 	// siteTakeoverWait: the signature persists but the cooldown has not elapsed. Wait.
 	siteTakeoverWait
-	// siteTakeoverRefuse: the fence is required (an Unobservable witness) but unavailable —
-	// the unreachable masters could hold a serving majority (drift), so a takeover might
-	// create a live dual writer. Refuse, surface a condition, keep the marker. Needs the
-	// allowUnsafeSiteTakeover opt-in or a human (condition 4).
+	// siteTakeoverRefuse: the fence is unsafe — the unreachable masters could hold a serving
+	// majority (drift), so an isolated-but-alive site might not have fenced itself and a
+	// takeover might create a live dual writer. Refuse, surface a condition, keep the marker.
+	// Needs the allowUnsafeSiteTakeover opt-in or a human (the fence gate).
 	siteTakeoverRefuse
-	// siteTakeover: fire — safe. Either every affected site is ConfirmedDown (Kubernetes-
-	// confirmed death; fence not needed) or the fence holds (unreachable masters short of a
-	// majority). Issue CLUSTER FAILOVER TAKEOVER on each orphan target.
+	// siteTakeover: fire — safe. The fence holds: the unreachable slot-serving masters are
+	// short of a majority, so an isolated-alive lost side has itself fail-stopped and no
+	// split-brain is possible. Issue CLUSTER FAILOVER TAKEOVER on each orphan target.
 	siteTakeover
 	// siteTakeoverUnsafe: fire despite the drift-unsafe fence, because
 	// allowUnsafeSiteTakeover authorizes it. Same actions as siteTakeover, surfaced loudly.
@@ -118,7 +121,7 @@ type orphanTarget struct {
 }
 
 // siteTakeoverInput is the pure, I/O-free view the planner decides on. The executor
-// (recoverSiteLoss) builds it from the gather + the per-site witness.
+// (recoverSiteLoss) builds it from the gather alone (no Kubernetes witness — ADR-012 D1).
 type siteTakeoverInput struct {
 	// clusterFormed reports whether the stretched cluster has ever been bootstrapped —
 	// i.e. ANY node in the gathered view (reachable survivor OR a gossip-known dead master)
@@ -154,13 +157,6 @@ type siteTakeoverInput struct {
 	// total loss with nothing to promote).
 	orphanTargets []orphanTarget
 
-	// affectedWitness is the witness grade of every AFFECTED site — a site hosting ≥1
-	// unreachable slot-serving master (data-path unreachable, or Kubernetes-API
-	// unreachable). Consulted only after conditions 1 and 2 pass, so single stray pod
-	// losses (which never exhaust the native path) never bring a healthy site's grade
-	// into the decision.
-	affectedWitness []siteWitnessGrade
-
 	// survivorsClusterFail is true iff ≥1 reachable survivor reports its OWN
 	// cluster_state:fail — the first-hand minority-fail-stop signal (ADR-012 condition 2
 	// vantage). Required corroboration for the arithmetic; the hub's dial is transport.
@@ -184,7 +180,6 @@ type siteTakeoverPlan struct {
 	size               int
 	reachableMasters   int
 	unreachableMasters int
-	needFence          bool
 	fenceSafe          bool
 }
 
@@ -193,24 +188,38 @@ type siteTakeoverPlan struct {
 // (ADR-012; Redis 8.4 cluster_legacy.c clusterUpdateState()).
 func majorityOf(size int) int { return size/2 + 1 }
 
-// planSiteTakeover is the pure decision for the multi-site site-loss takeover (ADR-012).
-// It performs no I/O. The six gate conditions are evaluated in an order chosen so that the
-// cheap, dispositive vetoes (nothing to do, native still possible, alive site, noisy
-// cluster) short-circuit BEFORE the cooldown is armed, and the fence — the split-brain
-// safety case — is checked last, immediately before firing.
+// planSiteTakeover is the pure decision for the multi-site site-loss takeover (ADR-012 D1).
+// It performs no I/O. Its SAFETY rests entirely on Domain-M quorum ARITHMETIC — there is no
+// Kubernetes witness. Two facts about the slot-serving masters carry the whole case:
 //
-//	1 (orphans+survivors) → 2 (native exhausted) → 3 (no Contradiction) → 6 (quiet) →
-//	5 (cooldown) → 4 (fence) → fire.
+//   - condition 2 (native exhausted): the reachable masters are BELOW a majority
+//     (reachable < (size/2)+1) AND the survivors report their own cluster_state:fail. So
+//     Redis cannot elect on its own and has fail-stopped — the operator must act.
+//   - the fence (last gate): the UNREACHABLE masters are themselves below a majority
+//     (unreachable < (size/2)+1). An alive-but-isolated site can reach only its own masters,
+//     so by the same unconditional minority check it too has fail-stopped within
+//     cluster-node-timeout of the cut — it is fenced, and a takeover is provably
+//     split-brain-free. When the unreachable masters COULD hold a majority (drift), an
+//     isolated site might still be serving: refuse unless allowUnsafeSiteTakeover.
+//
+// Arithmetic identity (ADR-012 condition 4): condition 2 (reachable ≤ size/2) and the fence
+// (unreachable ≤ size/2) hold together only when the masters split EXACTLY in half — the
+// fence-safe automated path IS the even-split case. Any odd/drifted split makes a loss either
+// native (condition 2 fails ⇒ WaitNative) or the drift refusal.
+//
+// Evaluation order (cheap dispositive vetoes first; the fence — the split-brain safety case —
+// last, immediately before firing):
+//
+//	0 (formed) → 1 (orphans+survivors) → 2 (native exhausted) → 6 (quiet) → 5 (cooldown) →
+//	fence → fire.
 func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, cooldown time.Duration) siteTakeoverPlan {
 	unreachable := in.size - in.reachableMasters
 	majority := majorityOf(in.size)
-	needFence := slices.Contains(in.affectedWitness, witnessUnobservable)
 	fenceSafe := unreachable < majority
 	base := siteTakeoverPlan{
 		size:               in.size,
 		reachableMasters:   in.reachableMasters,
 		unreachableMasters: unreachable,
-		needFence:          needFence,
 		fenceSafe:          fenceSafe,
 	}
 	plan := func(a siteTakeoverAction) siteTakeoverPlan { p := base; p.action = a; return p }
@@ -242,13 +251,6 @@ func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, coo
 		return plan(siteTakeoverWaitNative)
 	}
 
-	// Condition 3: no affected site may be a Contradiction. A Contradiction means the site
-	// is alive and the hub's DATA path is merely partitioned (the descoped link-cut) — a
-	// takeover there creates a live dual writer. Never fire; hold.
-	if slices.Contains(in.affectedWitness, witnessContradiction) {
-		return plan(siteTakeoverHold)
-	}
-
 	// Condition 6: quiet cluster (Rule-A analog). A terminating survivor or an in-flight
 	// failover/reshard/rollout means Redis may still be resolving this itself — hold.
 	if !in.quiet {
@@ -264,13 +266,11 @@ func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, coo
 		return plan(siteTakeoverWait)
 	}
 
-	// Condition 4: fence. ConfirmedDown alone (no Unobservable witness) authorises without
-	// a fence — the death is Kubernetes-confirmed, no split-brain is possible. When the
-	// fence IS required (any Unobservable witness) it holds iff the unreachable slot-serving
-	// masters are short of a majority: an isolated site with a master minority has itself
-	// fail-stopped within cluster-node-timeout. If they could hold a majority (drift), an
-	// alive isolated site might still be serving — refuse unless the opt-in authorises it.
-	if needFence && !fenceSafe {
+	// Fence (last): the takeover is provably split-brain-free iff the UNREACHABLE slot-serving
+	// masters are themselves short of a majority — an isolated site with a master minority has
+	// fail-stopped within cluster-node-timeout. If they could hold a majority (drift), an alive
+	// isolated site might still be serving: refuse unless allowUnsafeSiteTakeover authorises it.
+	if !fenceSafe {
 		if !in.allowUnsafe {
 			return plan(siteTakeoverRefuse)
 		}
@@ -487,9 +487,9 @@ func siteTakeoverCooldownFor(lr *littleredv1alpha1.LittleRed) time.Duration {
 // It returns acted=true for every verdict except the two that are safe to fall through to
 // the normal readiness/gather/repair flow: siteTakeoverNone (healthy, or a descoped total
 // loss) and siteTakeoverWaitNative (survivors still hold a majority, Redis self-heals). For
-// every other verdict — Hold (Contradiction/link-cut or not-quiet), Arm, Wait, Refuse, and
-// the fire actions — it returns acted=true and the caller requeues without running repair,
-// so the unguarded Step-0 takeover can never fire during a quorum loss.
+// every other verdict — Hold (cluster not quiet), Arm, Wait, Refuse, and the fire actions —
+// it returns acted=true and the caller requeues without running repair, so the unguarded
+// Step-0 takeover can never fire during a quorum loss.
 func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littleredv1alpha1.LittleRed, obs []siteObservation) (bool, error) {
 	if r.sites == nil || !isMultiSite(lr) {
 		return false, nil
@@ -500,13 +500,11 @@ func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littlered
 	shards, _, _ := multiSiteParams(lr)
 
 	// Gather the survivors' own view (bounded per-probe dials, LR-017). Everything below is
-	// decided from the survivors' first-hand evidence and the Kubernetes witness, never from
-	// the hub's dial reachability alone.
+	// decided from the survivors' first-hand evidence (their cluster_state and master counts),
+	// never from the hub's dial reachability alone.
 	gt := r.gatherMultiSiteGroundTruth(ctx, lr)
 
-	witness := r.siteWitnesses(ctx, lr, obs)
-
-	in := r.buildSiteTakeoverInput(lr, gt, obs, witness, shards)
+	in := r.buildSiteTakeoverInput(lr, gt, obs, shards)
 
 	// Fenced-alive rejoin recycle runs regardless of the takeover verdict: once the serving
 	// cluster has regained a majority, an isolated never-restarted pod is a fenced-out
@@ -528,9 +526,9 @@ func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littlered
 		return false, r.clearTakeoverPendingSince(ctx, lr, reasonRecovered, "No site-loss takeover needed.")
 
 	case siteTakeoverHold:
-		stateLog.Info("Site-loss takeover held: an affected site is alive (link-cut) or the cluster is not quiet; taking no action",
+		stateLog.Info("Site-loss takeover held: the cluster is not quiet (terminating survivor or in-flight failover/reshard/rollout); taking no action",
 			"reachableMasters", plan.reachableMasters, "size", plan.size)
-		return true, r.clearTakeoverPendingSince(ctx, lr, reasonRecovered, "Site loss not actionable (alive site or not quiet).")
+		return true, r.clearTakeoverPendingSince(ctx, lr, reasonRecovered, "Site loss not actionable (cluster not quiet).")
 
 	case siteTakeoverArm:
 		stateLog.Info("Site-loss takeover: native failover is exhausted; arming cooldown",
@@ -543,9 +541,9 @@ func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littlered
 		return true, nil
 
 	case siteTakeoverRefuse:
-		msg := fmt.Sprintf("Refusing automatic site-loss takeover: %d of %d slot-serving masters are unreachable under an "+
-			"unobservable witness — the lost side could still hold a serving majority (drift), so a takeover risks a live "+
-			"split-brain. Set multiSite.allowUnsafeSiteTakeover=true to authorise, or intervene manually.",
+		msg := fmt.Sprintf("Refusing automatic site-loss takeover: %d of %d slot-serving masters are unreachable — the lost "+
+			"side could still hold a serving majority (drift), so an isolated-but-alive site might not have fenced itself and a "+
+			"takeover risks a live split-brain. Set multiSite.allowUnsafeSiteTakeover=true to authorise, or intervene manually.",
 			plan.unreachableMasters, plan.size)
 		stateLog.Info(msg)
 		r.event(lr, corev1.EventTypeWarning, reasonRefusedSiteTakeover, msg)
@@ -566,12 +564,14 @@ func (r *LittleRedReconciler) recoverSiteLoss(ctx context.Context, lr *littlered
 	return true, nil
 }
 
-// buildSiteTakeoverInput projects the gather + per-site witness onto the pure planner input
-// (ADR-012). size is the shard count (every shard's slots are owned by exactly one master,
-// even a dead not-yet-failed-over one); reachableMasters is CountMasters(); the affected
-// sites are those the hub cannot fully data-reach; the orphan targets are the best surviving
-// replica of each shard with no reachable master.
-func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, obs []siteObservation, witness map[string]siteWitnessGrade, shards int) siteTakeoverInput {
+// buildSiteTakeoverInput projects the gather onto the pure planner input (ADR-012 D1). size
+// is the shard count (every shard's slots are owned by exactly one master, even a dead
+// not-yet-failed-over one); reachableMasters is CountMasters(); the orphan targets are the
+// best surviving replica of each shard with no reachable master. The takeover safety no
+// longer consults a Kubernetes witness (D1): it rests entirely on the Domain-M quorum
+// arithmetic (reachable-master majority + the unreachable-master minority self-fence),
+// corroborated by the survivors' own cluster_state:fail.
+func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, obs []siteObservation, shards int) siteTakeoverInput {
 	in := siteTakeoverInput{
 		size: shards,
 		// CountMasters counts gossip-known slot-serving masters in gt.Nodes; since gt.Nodes only
@@ -635,24 +635,6 @@ func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.Littl
 		}
 	}
 
-	// Affected sites = sites the hub cannot fully data-reach (an unreachable Kubernetes API,
-	// or fewer reachable pods than expected). Their witness grades drive conditions 3 and 4.
-	expected := expectedPodsPerSite(lr)
-	reachableBySite := map[string]int32{}
-	for _, n := range gt.Nodes {
-		if n.Reachable {
-			reachableBySite[siteFromKey(n.PodName)]++
-		}
-	}
-	for _, o := range obs {
-		site := o.site.name
-		if !o.reachable || reachableBySite[site] < expected[site] {
-			if g, ok := witness[site]; ok {
-				in.affectedWitness = append(in.affectedWitness, g)
-			}
-		}
-	}
-
 	// Quiet cluster (condition 6): no terminating survivor pod in any reachable site.
 	in.quiet = true
 	for _, o := range obs {
@@ -666,60 +648,6 @@ func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.Littl
 		}
 	}
 	return in
-}
-
-// siteWitnesses classifies every site's Kubernetes witness grade (ADR-012 condition 3) from
-// the observation (which pods are present/Ready and on which node) plus a bounded, uncached
-// per-Node Ready read through the SiteClient (friction B). A site whose API was unreachable
-// this pass classifies Unobservable without any node read.
-func (r *LittleRedReconciler) siteWitnesses(ctx context.Context, lr *littleredv1alpha1.LittleRed, obs []siteObservation) map[string]siteWitnessGrade {
-	log := r.getLogger(ctx, lr, LogCategoryState)
-	expectedNames := multiSiteExpectedPodNamesBySite(lr)
-	out := make(map[string]siteWitnessGrade, len(obs))
-	for _, o := range obs {
-		if !o.reachable {
-			out[o.site.name] = classifySiteWitness(false, nil)
-			continue
-		}
-		observed := make(map[string]sitePodObservation, len(o.pods))
-		for _, p := range o.pods {
-			observed[p.objName] = p
-		}
-		var pods []witnessPod
-		for _, name := range expectedNames[o.site.name] {
-			p, present := observed[name]
-			wp := witnessPod{present: present}
-			if present {
-				wp.ready = p.ready
-				if !p.ready && p.nodeName != "" && o.site.client != nil {
-					ready, found, err := o.site.client.NodeReady(ctx, p.nodeName)
-					if err != nil {
-						// Cannot attest node readiness → treat as node-controller-grade
-						// (nodeKnown=false ⇒ witness downgrade). The safe default.
-						log.Info("Site-loss witness: node read failed; treating as node-controller-inferred (downgrade)",
-							"site", o.site.name, "pod", name, "node", p.nodeName, "err", err.Error())
-					} else {
-						wp.nodeKnown = found
-						wp.nodeReady = ready
-					}
-				}
-			}
-			pods = append(pods, wp)
-		}
-		out[o.site.name] = classifySiteWitness(true, pods)
-	}
-	return out
-}
-
-// multiSiteExpectedPodNamesBySite lists the expected redis pod object names per site under
-// the placement SSOT (used to detect "gone" pods for the witness).
-func multiSiteExpectedPodNamesBySite(lr *littleredv1alpha1.LittleRed) map[string][]string {
-	shards, rps, sps := multiSiteParams(lr)
-	out := map[string][]string{}
-	for _, ref := range multiSiteClusterPodRefs(lr.Name, multiSiteSiteNames(lr), shards, rps, sps) {
-		out[ref.SiteName] = append(out[ref.SiteName], ref.ObjName)
-	}
-	return out
 }
 
 // executeSiteTakeover issues CLUSTER FAILOVER TAKEOVER on each orphan target (action 1) then
@@ -746,14 +674,17 @@ func (r *LittleRedReconciler) executeSiteTakeover(ctx context.Context, lr *littl
 	}
 
 	// Action 2: FORGET the lost site's node IDs (the ghosts) on every reachable node — but only
-	// when the lost site's witness SUPPORTS it, i.e. its Kubernetes API answered this pass
-	// (allSitesObservable). Under an Unobservable witness (the fence-safe fire path, site API
-	// unreachable) the node is "unknown, not gone" (pillar 3.4 / ADR-012: "forgotten only when
-	// its own site's witness supports it, never merely because the hub cannot reach it"), so
-	// FORGET is deferred — it trails idempotently to a later pass once the site is observable
-	// (its returnee pods are then recycled and their stale IDs become confirmed-gone ghosts).
+	// when every hosting site's Kubernetes API answered this pass (forgetSafe =
+	// allSitesObservable). While a hosting site's API is unreachable, a gossip-known node with
+	// no backing pod is "unknown, not gone" — indistinguishable by NodeID from a node on a
+	// merely-unreachable site (pillar 3.4 / ADR-012: "forgotten only when its own site's own
+	// view supports it, never merely because the hub cannot reach it"), so FORGET is deferred.
+	// It trails idempotently to a later pass once every site is observable again (a fenced-alive
+	// returnee's pods are then recycled and their stale IDs become confirmed-gone ghosts). NOTE:
+	// forgetSafe is REACHABILITY, not the deleted Kubernetes witness — the takeover firing
+	// decision itself (D1) is pure quorum arithmetic.
 	if !forgetSafe {
-		auditLog.Info("Site-loss takeover: deferring CLUSTER FORGET — a hosting site is unobservable, so its nodes are unknown-not-gone (pillar 3.4); FORGET will trail once observable")
+		auditLog.Info("Site-loss takeover: deferring CLUSTER FORGET — a hosting site's API is unreachable, so its nodes are unknown-not-gone (pillar 3.4); FORGET will trail once observable")
 		return
 	}
 	// Trails idempotently — "Can't forget my master" until the sibling replica follows the slot

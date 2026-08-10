@@ -171,7 +171,7 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 // observable) so routine ghost cleanup runs; false in multi-site when a hosting site is
 // unobservable, so a gossip-known node on an unreachable site is never forgotten (pillar 3.4).
 // Quorum-loss/orphan TAKEOVER is additionally gated on repairMayForceTakeover(littleRed): in
-// multi-site the fence/witness-gated recoverSiteLoss is the sole takeover authority (ADR-012).
+// multi-site the fence-gated recoverSiteLoss is the sole takeover authority (ADR-012).
 //
 //nolint:gocyclo
 func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, forgetSafe bool) (ctrl.Result, error) {
@@ -191,10 +191,10 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 	votingMasters := gt.CountMasters()
 
 	// Quorum is lost if available voting masters are <= shards / 2.
-	// In MULTI-SITE the fence/witness-gated recoverSiteLoss (ADR-012) is the sole takeover
-	// authority — it runs ahead of repair and either acts (blocking repair) or defers to
-	// native failover — so repair must never fire this cooldown-free, witness-blind takeover
-	// across a site that may be alive-but-unreachable. repairMayForceTakeover is false there.
+	// In MULTI-SITE the fence-gated recoverSiteLoss (ADR-012) is the sole takeover authority —
+	// it runs ahead of repair and either acts (blocking repair) or defers to native failover —
+	// so repair must never fire this cooldown-free, reachability-blind takeover across a site
+	// that may be alive-but-unreachable. repairMayForceTakeover is false there.
 	if repairMayForceTakeover(littleRed) && votingMasters <= shards/2 {
 		stateLog.Info("Quorum loss detected", "votingMasters", votingMasters, "targetShards", shards)
 
@@ -293,7 +293,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			age := now.Sub(orphanInfo.DetectedAt.Time)
 			if age >= orphanTimeout && repairMayForceTakeover(littleRed) {
 				// Timeout exceeded — force-promote. Suppressed in multi-site: the same
-				// cooldown-free, witness-blind takeover hazard as Step-0; recoverSiteLoss owns it.
+				// cooldown-free, reachability-blind takeover hazard as Step-0; recoverSiteLoss owns it.
 				auditLog.Info("Force-promoting stuck orphan replica",
 					"pod", node.PodName, "orphanAge", age, "timeout", orphanTimeout)
 				addr := fmt.Sprintf("%s:%d", node.PodIP, littleredv1alpha1.RedisPort)

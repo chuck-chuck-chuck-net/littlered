@@ -50,9 +50,9 @@ var multisiteSetupSiteCmd = &cobra.Command{
 	Long: `Automates the manual multi-site site onboarding (docs/MULTI_SITE_DESIGN.md §7).
 
 In the SITE (via --site-admin-context) it creates, in the instance namespace: the namespace
-(if absent), a ServiceAccount, a namespaced Role (workload CRUD the operator needs), a
-ClusterRole + ClusterRoleBinding granting cluster-scoped 'nodes get;list' (the ADR-012
-site-loss witness), and a long-lived ServiceAccount token. It then assembles a kubeconfig
+(if absent), a ServiceAccount, a namespaced Role (workload CRUD the operator needs — no
+cluster-scoped access; the ADR-012 site-loss takeover is decided by pure quorum arithmetic),
+and a long-lived ServiceAccount token. It then assembles a kubeconfig
 whose server is the site's REPLICATION-NET endpoint (--repl-endpoint, a required parameter:
 it is reachable only from hub pods and cannot be derived from your workstation kubeconfig,
 which holds the admin endpoint — design §8) and creates it as a Secret (data key "kubeconfig")
@@ -98,8 +98,6 @@ func runSetupSite(_ *cobra.Command, _ []string) error {
 		multisite.BuildSiteServiceAccount(names),
 		multisite.BuildSiteRole(names),
 		multisite.BuildSiteRoleBinding(names),
-		multisite.BuildSiteNodesClusterRole(names),
-		multisite.BuildSiteNodesClusterRoleBinding(names),
 		multisite.BuildSiteTokenSecret(names),
 	}
 

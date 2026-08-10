@@ -17,7 +17,6 @@ limitations under the License.
 package controller
 
 import (
-	"context"
 	"testing"
 	"time"
 
@@ -54,11 +53,10 @@ func TestBuildSiteTakeoverInput(t *testing.T) {
 				{objName: "cache-shard-1-0", key: "site0/cache-shard-1-0", ready: true},
 			},
 		},
-		{site: resolvedSite{name: "site1"}, reachable: false}, // API unreachable ⇒ Unobservable
+		{site: resolvedSite{name: "site1"}, reachable: false}, // API unreachable ⇒ lost site
 	}
-	witness := map[string]siteWitnessGrade{"site0": witnessContradiction, "site1": witnessUnobservable}
 
-	in := r.buildSiteTakeoverInput(lr, gt, obs, witness, 2)
+	in := r.buildSiteTakeoverInput(lr, gt, obs, 2)
 
 	if in.size != 2 || in.reachableMasters != 1 {
 		t.Fatalf("size/reachableMasters = %d/%d, want 2/1", in.size, in.reachableMasters)
@@ -72,54 +70,14 @@ func TestBuildSiteTakeoverInput(t *testing.T) {
 	if len(in.orphanTargets) != 1 || in.orphanTargets[0].shard != 1 || in.orphanTargets[0].key != "site0/cache-shard-1-0" {
 		t.Fatalf("orphanTargets = %+v, want single shard-1 target site0/cache-shard-1-0", in.orphanTargets)
 	}
-	// Only the LOST site is affected; its witness (Unobservable) is what the fence keys on.
-	if len(in.affectedWitness) != 1 || in.affectedWitness[0] != witnessUnobservable {
-		t.Fatalf("affectedWitness = %v, want [Unobservable]", in.affectedWitness)
-	}
 
-	// End-to-end: even split under an Unobservable witness, past cooldown ⇒ a safe takeover.
+	// End-to-end (D1): even split (unreachable 1 < majority 2), survivors report their own
+	// cluster_state:fail, quiet, past cooldown ⇒ a provably split-brain-free takeover — no
+	// Kubernetes witness consulted.
 	now := time.Unix(1_800_000_000, 0)
 	armed := now.Add(-2 * time.Minute)
 	plan := planSiteTakeover(in, &armed, now, 60*time.Second)
 	if plan.action != siteTakeover {
 		t.Fatalf("end-to-end action = %s, want Takeover", plan.action)
-	}
-}
-
-// TestSiteWitnesses exercises the witness executor: the per-site grade from the observation
-// plus the bounded per-Node read (friction B) through the SiteClient.
-func TestSiteWitnesses(t *testing.T) {
-	lr := multiSiteClusterCR(2, 2, 2, 0) // each site hosts cache-shard-0-0 and cache-shard-1-0
-	r := &LittleRedReconciler{}
-	ctx := context.Background()
-
-	// site0: one pod gone, one not-Ready on a Ready node ⇒ ConfirmedDown.
-	// site1: one not-Ready pod on a NotReady node ⇒ Unobservable (node-controller downgrade).
-	site0 := &recordingSiteClient{name: "site0", nodeReady: map[string]bool{"node-ok": true}}
-	site1 := &recordingSiteClient{name: "site1", nodeReady: map[string]bool{"node-bad": false}}
-
-	obs := []siteObservation{
-		{
-			site: resolvedSite{name: "site0", client: site0}, reachable: true,
-			pods: []sitePodObservation{
-				// cache-shard-0-0 is GONE (not present); cache-shard-1-0 not-Ready on a Ready node.
-				{objName: "cache-shard-1-0", key: "site0/cache-shard-1-0", ready: false, nodeName: "node-ok"},
-			},
-		},
-		{
-			site: resolvedSite{name: "site1", client: site1}, reachable: true,
-			pods: []sitePodObservation{
-				{objName: "cache-shard-0-0", key: "site1/cache-shard-0-0", ready: false, nodeName: "node-bad"},
-				{objName: "cache-shard-1-0", key: "site1/cache-shard-1-0", ready: false, nodeName: "node-bad"},
-			},
-		},
-	}
-
-	w := r.siteWitnesses(ctx, lr, obs)
-	if w["site0"] != witnessConfirmedDown {
-		t.Errorf("site0 witness = %s, want ConfirmedDown", w["site0"])
-	}
-	if w["site1"] != witnessUnobservable {
-		t.Errorf("site1 witness = %s, want Unobservable (Node NotReady downgrade)", w["site1"])
 	}
 }

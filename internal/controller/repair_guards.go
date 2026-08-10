@@ -21,14 +21,15 @@ package controller
 // (and therefore possibly alive) in multi-site mode:
 //
 //   - an unguarded quorum-loss CLUSTER FAILOVER TAKEOVER (repair Step-0, and the Step-1
-//     stuck-orphan force-promote) — both cooldown-free and witness-blind; and
+//     stuck-orphan force-promote) — both cooldown-free and reachability-blind; and
 //   - a CLUSTER FORGET of a node whose SITE the hub cannot reach.
 //
-// In multi-site the ONLY authority for a quorum-loss takeover is the fence/witness-gated
-// recoverSiteLoss (ADR-012): it runs ahead of repair, waits out the cooldown, and refuses on
-// an alive/contradictory site. Repair must never race ahead of that gate. Ghost FORGET is
-// likewise restricted to the case where every hosting site is observable, so a gossip-known
-// node on an unreachable site — "unknown, not gone" (pillar 3.4) — is never forgotten.
+// In multi-site the ONLY authority for a quorum-loss takeover is the fence-gated
+// recoverSiteLoss (ADR-012): it runs ahead of repair, waits out the cooldown, and refuses on a
+// drift split where the lost side could still hold a serving majority. Repair must never race
+// ahead of that gate. Ghost FORGET is likewise restricted to the case where every hosting site
+// is observable, so a gossip-known node on an unreachable site — "unknown, not gone"
+// (pillar 3.4) — is never forgotten.
 
 import (
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
@@ -38,8 +39,8 @@ import (
 // CLUSTER FAILOVER TAKEOVER for this instance. It is TRUE only in single-site mode: there the
 // repair loop's Step-0 quorum recovery and Step-1 stuck-orphan promotion are the correct
 // (and only) owner of quorum-loss recovery. In MULTI-SITE it is FALSE unconditionally — the
-// fence/witness-gated recoverSiteLoss (ADR-012) is the sole takeover authority, so repair can
-// never fire a cooldown-free, witness-blind takeover across a site that may be alive-but-
+// fence-gated recoverSiteLoss (ADR-012) is the sole takeover authority, so repair can never
+// fire a cooldown-free, reachability-blind takeover across a site that may be alive-but-
 // unreachable (a live split-brain). recoverSiteLoss runs before repair and, whenever a site
 // loss is in play, either acts (blocking repair) or defers to native failover.
 func repairMayForceTakeover(lr *littleredv1alpha1.LittleRed) bool {
@@ -54,8 +55,8 @@ func repairMayForceTakeover(lr *littleredv1alpha1.LittleRed) bool {
 // no-backing-pod ghost to a confirmed-gone pod versus a node on the unreachable site — the two
 // are indistinguishable by NodeID alone — so NONE are forgotten this pass: an unreachable
 // site's nodes are "unknown, not gone" (pillar 3.4 / ADR-012 "forgotten only when its own
-// site's witness supports it, never merely because the hub cannot reach it"). FORGET trails
-// idempotently until the site is observable again.
+// site's reachability supports it, never merely because the hub cannot reach it"). FORGET
+// trails idempotently until the site is observable again.
 func ghostForgetPlan(candidates []string, forgetSafe bool) []string {
 	if !forgetSafe {
 		return nil

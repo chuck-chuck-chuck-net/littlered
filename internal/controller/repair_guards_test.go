@@ -24,8 +24,8 @@ import (
 )
 
 // TestRepairMayForceTakeover asserts the generic repair loop may force a takeover ONLY in
-// single-site mode; in multi-site the fence/witness-gated recoverSiteLoss is the sole
-// authority (Finding #1 hardening).
+// single-site mode; in multi-site the fence-gated recoverSiteLoss is the sole authority
+// (Finding #1 hardening).
 func TestRepairMayForceTakeover(t *testing.T) {
 	single := &littleredv1alpha1.LittleRed{
 		Spec: littleredv1alpha1.LittleRedSpec{

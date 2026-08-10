@@ -29,8 +29,11 @@ func oneOrphan() []orphanTarget {
 	return []orphanTarget{{shard: 1, key: "alpha/inst-shard-1-1", ip: "10.0.0.9", site: "alpha", offset: 100, replid: "L1"}}
 }
 
-// TestPlanSiteTakeover is the red-first gate table for ADR-012: one case per branch, each
-// a distinct verdict of the 6-condition gate.
+// TestPlanSiteTakeover is the red-first gate table for ADR-012 decision D1: the witness-free
+// takeover whose safety rests entirely on Domain-M quorum arithmetic — the reachable-master
+// majority check (condition 2) and the unreachable-master minority self-fence (the fence),
+// corroborated by the survivors' own cluster_state:fail. There is no Kubernetes witness and
+// no Contradiction/Hold-on-alive branch anymore.
 func TestPlanSiteTakeover(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	armed := now.Add(-2 * testTakeoverCooldown) // well past the cooldown
@@ -48,11 +51,10 @@ func TestPlanSiteTakeover(t *testing.T) {
 			in: siteTakeoverInput{
 				// The bringup signature: fresh nodes classified as promotable survivors,
 				// zero slot-serving masters, survivors report cluster_state:fail (uncovered),
-				// witness clean, quiet, past cooldown — every other gate would fire. Only
-				// clusterFormed=false must veto it, so bootstrap can proceed.
+				// quiet, past cooldown — every other gate would fire. Only clusterFormed=false
+				// must veto it, so bootstrap can proceed.
 				clusterFormed: false,
 				size:          3, reachableMasters: 0, orphanTargets: oneOrphan(),
-				affectedWitness:      nil,
 				survivorsClusterFail: true, quiet: true,
 			},
 			since: &armed, wantAction: siteTakeoverNone, wantTargets: -1,
@@ -71,7 +73,6 @@ func TestPlanSiteTakeover(t *testing.T) {
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          3, reachableMasters: 2, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
 				survivorsClusterFail: false, quiet: true,
 			},
 			since: &armed, wantAction: siteTakeoverWaitNative, wantTargets: -1,
@@ -81,27 +82,31 @@ func TestPlanSiteTakeover(t *testing.T) {
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
 				survivorsClusterFail: false, quiet: true,
 			},
 			since: &armed, wantAction: siteTakeoverWaitNative, wantTargets: -1,
 		},
 		{
-			name: "affected site Contradiction => Hold (condition 3: alive, link-cut)",
+			// THE D1 BEHAVIORAL CHANGE (red-first anchor): an isolated-alive MINORITY site
+			// loss — even split (unreachable 1 < majority 2), survivors report their own
+			// cluster_state:fail, quiet, past cooldown. Under the OLD witness design this
+			// physical situation (site API reachable, its pods Ready) graded Contradiction
+			// and the planner HELD. Under D1 there is no witness: the fence proves the lost
+			// side has itself fail-stopped (a master minority), so the takeover is provably
+			// split-brain-free and FIRES.
+			name: "isolated-alive MINORITY (even split), survivors fail, quiet, past cooldown => Takeover (D1: was Hold-on-Contradiction)",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessContradiction},
 				survivorsClusterFail: true, quiet: true,
 			},
-			since: &armed, wantAction: siteTakeoverHold, wantTargets: -1,
+			since: &armed, wantAction: siteTakeover, wantTargets: 1,
 		},
 		{
 			name: "not quiet => Hold (condition 6)",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
 				survivorsClusterFail: true, quiet: false,
 			},
 			since: &armed, wantAction: siteTakeoverHold, wantTargets: -1,
@@ -111,7 +116,6 @@ func TestPlanSiteTakeover(t *testing.T) {
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
 				survivorsClusterFail: true, quiet: true,
 			},
 			since: nil, wantAction: siteTakeoverArm, wantTargets: -1,
@@ -121,51 +125,35 @@ func TestPlanSiteTakeover(t *testing.T) {
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
 				survivorsClusterFail: true, quiet: true,
 			},
 			since: &fresh, wantAction: siteTakeoverWait, wantTargets: -1,
 		},
 		{
-			name: "ConfirmedDown past cooldown => Takeover (fence not needed even if drift-unsafe)",
-			in: siteTakeoverInput{
-				// size 3, reachable 1 => unreachable 2 >= majority 2, so the fence would be
-				// UNSAFE — but ConfirmedDown alone authorises (Kubernetes-confirmed death).
-				clusterFormed: true,
-				size:          3, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
-				survivorsClusterFail: true, quiet: true,
-			},
-			since: &armed, wantAction: siteTakeover, wantTargets: 1,
-		},
-		{
-			name: "Unobservable + fence-safe (even split) past cooldown => Takeover",
+			name: "fence-safe even split past cooldown => Takeover with target",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessUnobservable},
 				survivorsClusterFail: true, quiet: true,
 			},
 			since: &armed, wantAction: siteTakeover, wantTargets: 1,
 		},
 		{
-			name: "Unobservable + drift-majority, no opt-in => Refuse (condition 4)",
+			name: "drift-majority unreachable, no opt-in => Refuse (fence unsafe)",
 			in: siteTakeoverInput{
 				// size 3, reachable 1 => unreachable 2 >= majority 2: the lost side could hold
 				// the master majority, so an isolated-but-alive site may still be serving.
 				clusterFormed: true,
 				size:          3, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessUnobservable},
 				survivorsClusterFail: true, quiet: true, allowUnsafe: false,
 			},
 			since: &armed, wantAction: siteTakeoverRefuse, wantTargets: -1,
 		},
 		{
-			name: "Unobservable + drift-majority, WITH opt-in => TakeoverUnsafe",
+			name: "drift-majority unreachable, WITH opt-in => TakeoverUnsafe",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          3, reachableMasters: 1, orphanTargets: oneOrphan(),
-				affectedWitness:      []siteWitnessGrade{witnessUnobservable},
 				survivorsClusterFail: true, quiet: true, allowUnsafe: true,
 			},
 			since: &armed, wantAction: siteTakeoverUnsafe, wantTargets: 1,
@@ -178,7 +166,6 @@ func TestPlanSiteTakeover(t *testing.T) {
 					{shard: 2, key: "alpha/inst-shard-2-1", ip: "10.0.0.7", offset: 50, replid: "L2"},
 					{shard: 3, key: "alpha/inst-shard-3-1", ip: "10.0.0.8", offset: 70, replid: "L3"},
 				},
-				affectedWitness:      []siteWitnessGrade{witnessConfirmedDown},
 				survivorsClusterFail: true, quiet: true,
 			},
 			since: &armed, wantAction: siteTakeover, wantTargets: 2,
@@ -214,7 +201,7 @@ func TestPlanSiteTakeover_CooldownClearsWhenStateClears(t *testing.T) {
 	in := siteTakeoverInput{
 		clusterFormed: true,
 		size:          3, reachableMasters: 2, orphanTargets: oneOrphan(),
-		affectedWitness: []siteWitnessGrade{witnessConfirmedDown}, survivorsClusterFail: false, quiet: true,
+		survivorsClusterFail: false, quiet: true,
 	}
 	got := planSiteTakeover(in, &armed, now, testTakeoverCooldown)
 	if got.action != siteTakeoverWaitNative {
