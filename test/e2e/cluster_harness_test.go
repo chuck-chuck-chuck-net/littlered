@@ -40,7 +40,7 @@ package e2e
 //   - multiSiteHarness  — built on the M4b registry (multisite_utils_test.go): hub + per-site
 //     contexts, per-site namespace/RBAC/Secret provisioning, per-pod site context.
 //
-// The disruption helpers that are INHERENTLY multi-site (talos reboot, Cilium partition) stay in
+// The disruption helpers that are INHERENTLY multi-site (hypervisor site kill, Cilium partition) stay in
 // multisite_takeover_test.go and are deliberately NOT part of this interface — the shared body
 // only exercises pod-level failures every cluster supports.
 

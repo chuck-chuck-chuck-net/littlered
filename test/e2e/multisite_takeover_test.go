@@ -27,7 +27,7 @@ package e2e
 //	  operator HOLDs. No CLUSTER FAILOVER TAKEOVER, no second serving master. Then heal ⇒
 //	  native recovery to healthy.
 //
-//	Scenario A (crown jewel, MUST fire): a whole-site kill (talosctl reboot) of one site of a
+//	Scenario A (crown jewel, MUST fire): a whole-site kill (virsh destroy of its VMs) of one site of a
 //	  dedicated 2-site instance with an even 2+2 master split (shards:4) ⇒ witness Unobservable +
 //	  survivors below quorum + fence-safe ⇒ the operator fires CLUSTER FAILOVER TAKEOVER on
 //	  the surviving site, which then serves all 16384 slots with the replicated data intact.
@@ -35,8 +35,8 @@ package e2e
 //
 // Each scenario uses its OWN dedicated throwaway instance + namespace (no shared Ordered
 // state — the LR-024 lesson). The specs assume: the operator already runs on the hub
-// (SKIP_OPERATOR_DEPLOY=true), talosctl is configured for the sites, and the chaos-client
-// image is pullable. Every disruption is reversed and the lab left healthy.
+// (SKIP_OPERATOR_DEPLOY=true), MS_VM_INVENTORY maps the sites' VMs for the hypervisor kill,
+// and the chaos-client image is pullable. Every disruption is reversed and the lab left healthy.
 //
 // Red-first note (CLAUDE.md tier-3): the live-disruption red is "observed once" against the
 // real lab — a network/reboot condition that CI cannot reproduce. The repeatable guards for
@@ -143,13 +143,22 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 		victim := "scm-s2" // the site we kill (hosts shard-1 and shard-3 masters)
 
 		AfterEach(func() {
-			// Best-effort: ensure the victim site is back before tearing down (teardown must be
-			// able to reach the spoke to sweep it).
+			// The hypervisor kill (virsh destroy) leaves the victim powered off; bring it back
+			// unconditionally so a failed or short-circuited run never leaves the site down.
+			// virsh start is a no-op if the VMs are already running or uninventoried. Then wait
+			// for readiness before teardown (teardown must reach the spoke to sweep it).
+			msStartSiteVMs(msVMInventory(), victim)
 			msWaitSiteReady(reg.site(victim), 8*time.Minute)
 			msTeardownInstance(reg, ns, crName)
 		})
 
 		It("detects the loss, waits the cooldown, fires TAKEOVER, serves all slots, keeps data, and rejoins", func() {
+			inv := msVMInventory()
+			if len(inv[victim]) == 0 {
+				Skip("Scenario A needs a hypervisor VM inventory to hard-kill site " + victim +
+					"; set MS_VM_INVENTORY to a file of '<site> <vm-name> <virsh-uri>' lines")
+			}
+
 			By("standing up a dedicated 2-site cluster [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
 			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
@@ -177,8 +186,8 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 
 			startedAt := time.Now()
 
-			By("KILLING the whole victim site " + victim + " (talosctl reboot — self-reversing)")
-			msRebootSite(reg.site(victim))
+			By("KILLING the whole victim site " + victim + " (virsh destroy — stays down until we power it back on)")
+			msKillSiteVMs(inv, victim)
 			msWaitSiteUnreachable(reg.site(victim), 3*time.Minute)
 
 			By("asserting the FENCE/WITNESS-GATED recoverSiteLoss fires the takeover after the cooldown")
@@ -229,7 +238,8 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			Expect(post.DataCorruptions).To(Equal(int64(0)), "replicated data must survive the takeover with zero corruptions")
 			deleteChaosClient(ns, verifyPod)
 
-			By("RESTORING the site: waiting for it to boot and rejoin to a healthy cross-site topology")
+			By("RESTORING the site: powering the VMs back on and waiting for it to boot and rejoin")
+			msStartSiteVMs(inv, victim)
 			msWaitSiteReady(reg.site(victim), 8*time.Minute)
 			Eventually(func(g Gomega) {
 				info, err := msClusterInfo(reg.site("scm-s1").context, ns, survivorPod)

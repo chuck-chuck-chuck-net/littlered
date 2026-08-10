@@ -24,20 +24,21 @@ package e2e
 // Redis Cluster across THREE Kubernetes clusters (one hub + N workload sites) and to inflict
 // — always reversibly — the two failures the site-loss takeover gate turns on:
 //
-//   - a WHOLE-SITE loss (talosctl reboot of a site's nodes) → the site's Kubernetes API and
-//     its redis pods go unreachable from the hub → witness Unobservable → the fence-safe
+//   - a WHOLE-SITE loss (hypervisor virsh destroy of a site's VMs) → the site's Kubernetes API
+//     and its redis pods go unreachable from the hub → witness Unobservable → the fence-safe
 //     even-master-split path fires CLUSTER FAILOVER TAKEOVER on the surviving site (Scenario A);
 //   - a DATA-PLANE-only partition (a Cilium deny policy on redis 6379 + gossip 16379) while
 //     the site's API stays reachable and its pods stay Ready → witness Contradiction → the
 //     operator must HOLD, never take over (Scenario B, the split-brain guard).
 //
 // Every disruption helper is paired with a restore helper, and the specs verify the lab
-// returns to healthy between scenarios. Nothing here is destructive-without-return: reboots
-// self-reverse on boot, Cilium policies are deleted to heal.
+// returns to healthy between scenarios. Nothing here is destructive-without-return: a killed
+// site is explicitly powered back on (virsh start), Cilium policies are deleted to heal.
 //
 // Cluster selection: the harness reads a hub kubecontext and an ordered list of site
-// kubecontexts (env MS_HUB_CONTEXT / MS_SITE_CONTEXTS), plus the per-site talosctl endpoints
-// for the reboot mechanism (MS_TALOS_ENDPOINTS). Defaults match the scm-* lab.
+// kubecontexts (env MS_HUB_CONTEXT / MS_SITE_CONTEXTS). The whole-site kill mechanism reads a
+// separate VM inventory (env MS_VM_INVENTORY); see the disruption helpers. Defaults match the
+// scm-* lab.
 
 import (
 	"encoding/json"
@@ -57,12 +58,12 @@ import (
 // --- Cluster registry --------------------------------------------------------------------
 
 // msSite is one workload site of the stretched cluster: its logical name (as it appears in
-// spec.multiSite.sites and in the site-qualified ground-truth keys) plus the kubecontext and
-// talosctl endpoints the harness drives it through.
+// spec.multiSite.sites and in the site-qualified ground-truth keys) and the kubecontext the
+// harness drives it through. Whole-site kill/restore is keyed on the site name via
+// MS_VM_INVENTORY (see the disruption helpers), not on anything stored here.
 type msSite struct {
-	name           string   // logical site name, e.g. "scm-s1"
-	context        string   // kubecontext for this site's Kubernetes API
-	talosEndpoints []string // talosctl -e endpoints (node management IPs) for the reboot mechanism
+	name    string // logical site name, e.g. "scm-s1"
+	context string // kubecontext for this site's Kubernetes API
 }
 
 // msRegistry is the multi-site harness's view of the lab: the hub (where the operator and the
@@ -79,21 +80,13 @@ type msRegistry struct {
 //	MS_HUB_CONTEXT     hub kubecontext                       (default "scm-cp")
 //	MS_OPERATOR_NS     operator namespace on the hub         (default "littlered-system")
 //	MS_SITE_CONTEXTS   comma list "name=ctx,..."             (default "scm-s1=scm-s1,scm-s2=scm-s2,scm-s3=scm-s3")
-//	MS_TALOS_ENDPOINTS comma list "name=ip;ip;ip,..."        (default per the scm-* repl-net)
+//
+// Whole-site kill/restore (Scenario A) is configured separately via MS_VM_INVENTORY — see the
+// disruption helpers below.
 func msDefaultRegistry() *msRegistry {
 	hub := envOr("MS_HUB_CONTEXT", "scm-cp")
 	opNS := envOr("MS_OPERATOR_NS", "littlered-system")
 	siteSpec := envOr("MS_SITE_CONTEXTS", "scm-s1=scm-s1,scm-s2=scm-s2,scm-s3=scm-s3")
-	talosSpec := envOr("MS_TALOS_ENDPOINTS",
-		"scm-s1=10.1.1.4;10.1.1.5;10.1.1.6,scm-s2=10.1.2.4;10.1.2.5;10.1.2.6,scm-s3=10.1.3.4;10.1.3.5;10.1.3.6")
-
-	talos := map[string][]string{}
-	for _, e := range strings.Split(talosSpec, ",") {
-		kv := strings.SplitN(strings.TrimSpace(e), "=", 2)
-		if len(kv) == 2 {
-			talos[kv[0]] = strings.Split(kv[1], ";")
-		}
-	}
 
 	reg := &msRegistry{hubContext: hub, operatorNS: opNS, sitesByName: map[string]msSite{}}
 	for _, e := range strings.Split(siteSpec, ",") {
@@ -101,7 +94,7 @@ func msDefaultRegistry() *msRegistry {
 		if len(kv) != 2 {
 			continue
 		}
-		s := msSite{name: kv[0], context: kv[1], talosEndpoints: talos[kv[0]]}
+		s := msSite{name: kv[0], context: kv[1]}
 		reg.sitesByName[s.name] = s
 		reg.orderedSites = append(reg.orderedSites, s)
 	}
@@ -541,32 +534,81 @@ func msPodCIDRsForSite(reg *msRegistry, siteCtx, ns string) []string {
 	return cidrs
 }
 
-// --- Disruption: whole-site loss via talosctl reboot (Scenario A) -------------------------
+// --- Disruption: whole-site loss via hypervisor power-off (Scenario A) ---------------------
+//
+// A true whole-site loss must be a sustained outage we control — not a self-reversing guest
+// reboot. `talosctl reboot` (any --mode) is guest-timed: the node decides when it returns,
+// which races the takeover cooldown (max(60s, 2×cluster-node-timeout) + detection). So we kill
+// the site at the hypervisor with `virsh destroy` (hard power-off) and bring it back with
+// `virsh start` only when the test decides — a deterministic down-window, no self-reversal.
+//
+// The site→VM mapping is provided out-of-band (no naming convention) via a file named by
+// MS_VM_INVENTORY, one VM per line: "<site> <vm-name> <virsh-uri>", e.g.
+//
+//	scm-s2 scm-s2-node1 qemu+ssh://user@t3e/system
+//	scm-s2 scm-s2-node2 qemu+ssh://user@t3e/system
+//	scm-s2 scm-s2-node3 qemu+ssh://user@t3e/system
+//
+// (blank lines and #-comments ignored). The lines for a site define exactly which VMs *are*
+// that site — so the file also decides kill scope (include or omit router/lb VMs as desired).
+// Requires non-interactive virsh access (key-based qemu+ssh) to each listed URI.
 
-// msRebootSite reboots every node of a workload site via talosctl. A reboot self-reverses on
-// boot (also exercising the fresh-pod rejoin path), so it needs no explicit power-on. The
-// site's Kubernetes API and its redis pods go unreachable for the reboot window (> the
-// takeover cooldown for a 3-node control-plane site), yielding an Unobservable witness.
-func msRebootSite(site msSite) {
-	Expect(site.talosEndpoints).NotTo(BeEmpty(), "no talos endpoints configured for site %s", site.name)
-	By(fmt.Sprintf("Scenario A: rebooting whole site %s via talosctl (nodes %v)", site.name, site.talosEndpoints))
-	// Pin the talos context to the site being rebooted: its talosconfig carries the CA/PKI
-	// for that site's nodes. Without this, talosctl inherits whatever context is current —
-	// in the lab a client config whose CA cannot verify these nodes ("certificate signed by
-	// unknown authority ... Ed25519 verification failure"). The per-site talos context is
-	// named after the site (scm-s1/s2/s3), mirroring how the kubectl helpers pin --context.
-	// --wait=false: fire-and-return. Newer talosctl defaults --wait=true, which blocks the
-	// command until every node is back healthy (up to 30m) — that would consume the very
-	// outage window this scenario must observe (the site going API-unreachable). We issue the
-	// reboot and track recovery ourselves via msWaitSiteReady.
-	args := []string{"reboot", "--context", site.name, "--wait=false"}
-	for _, ep := range site.talosEndpoints {
-		args = append(args, "-e", ep, "-n", ep)
+type msVM struct{ name, uri string }
+
+// msVMInventory parses MS_VM_INVENTORY into site → VMs. Returns nil when the env is unset (the
+// caller then Skips the hypervisor-driven scenario).
+func msVMInventory() map[string][]msVM {
+	path := strings.TrimSpace(os.Getenv("MS_VM_INVENTORY"))
+	if path == "" {
+		return nil
 	}
-	// talosctl reboot returns once the reboot is issued (--wait=false); it does not block on boot.
-	out, err := utils.Run(exec.Command("talosctl", args...))
-	_, _ = fmt.Fprintf(GinkgoWriter, "talosctl reboot output:\n%s\n", out)
-	Expect(err).NotTo(HaveOccurred(), "talosctl reboot %s", site.name)
+	data, err := os.ReadFile(path)
+	Expect(err).NotTo(HaveOccurred(), "reading MS_VM_INVENTORY %s", path)
+	inv := map[string][]msVM{}
+	for i, raw := range strings.Split(string(data), "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		f := strings.Fields(line)
+		Expect(f).To(HaveLen(3), "MS_VM_INVENTORY line %d must be '<site> <vm-name> <virsh-uri>': %q", i+1, line)
+		inv[f[0]] = append(inv[f[0]], msVM{name: f[1], uri: f[2]})
+	}
+	return inv
+}
+
+// msKillSiteVMs hard-powers-off every VM of a site (virsh destroy). Tolerates a VM that is
+// already off, so the call is idempotent. The VMs stay down until msStartSiteVMs — there is
+// no self-reversal, so the outage lasts exactly as long as the test holds it.
+func msKillSiteVMs(inv map[string][]msVM, site string) {
+	vms := inv[site]
+	Expect(vms).NotTo(BeEmpty(), "no MS_VM_INVENTORY entries for site %s", site)
+	By(fmt.Sprintf("Scenario A: hard-killing site %s at the hypervisor (virsh destroy, %d VMs)", site, len(vms)))
+	for _, vm := range vms {
+		out, err := utils.Run(exec.Command("virsh", "-c", vm.uri, "destroy", vm.name))
+		_, _ = fmt.Fprintf(GinkgoWriter, "virsh destroy %s @ %s: %s\n", vm.name, vm.uri, strings.TrimSpace(out))
+		if err != nil && !strings.Contains(out+err.Error(), "is not running") {
+			Expect(err).NotTo(HaveOccurred(), "virsh destroy %s @ %s", vm.name, vm.uri)
+		}
+	}
+}
+
+// msStartSiteVMs powers every VM of a site back on (virsh start). Tolerates an already-running
+// VM, and is a no-op when the site has no inventory — so it is safe to call unconditionally in
+// cleanup, even after a Skip or an early failure, to guarantee the lab is left healthy.
+func msStartSiteVMs(inv map[string][]msVM, site string) {
+	vms := inv[site]
+	if len(vms) == 0 {
+		return
+	}
+	By(fmt.Sprintf("restoring site %s at the hypervisor (virsh start, %d VMs)", site, len(vms)))
+	for _, vm := range vms {
+		out, err := utils.Run(exec.Command("virsh", "-c", vm.uri, "start", vm.name))
+		_, _ = fmt.Fprintf(GinkgoWriter, "virsh start %s @ %s: %s\n", vm.name, vm.uri, strings.TrimSpace(out))
+		if err != nil && !strings.Contains(out+err.Error(), "already active") {
+			Expect(err).NotTo(HaveOccurred(), "virsh start %s @ %s", vm.name, vm.uri)
+		}
+	}
 }
 
 // msWaitSiteUnreachable waits until the site's Kubernetes API stops answering (the hub can no
