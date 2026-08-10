@@ -550,7 +550,12 @@ func msPodCIDRsForSite(reg *msRegistry, siteCtx, ns string) []string {
 func msRebootSite(site msSite) {
 	Expect(site.talosEndpoints).NotTo(BeEmpty(), "no talos endpoints configured for site %s", site.name)
 	By(fmt.Sprintf("Scenario A: rebooting whole site %s via talosctl (nodes %v)", site.name, site.talosEndpoints))
-	args := []string{"reboot"}
+	// Pin the talos context to the site being rebooted: its talosconfig carries the CA/PKI
+	// for that site's nodes. Without this, talosctl inherits whatever context is current —
+	// in the lab a client config whose CA cannot verify these nodes ("certificate signed by
+	// unknown authority ... Ed25519 verification failure"). The per-site talos context is
+	// named after the site (scm-s1/s2/s3), mirroring how the kubectl helpers pin --context.
+	args := []string{"reboot", "--context", site.name}
 	for _, ep := range site.talosEndpoints {
 		args = append(args, "-e", ep, "-n", ep)
 	}
