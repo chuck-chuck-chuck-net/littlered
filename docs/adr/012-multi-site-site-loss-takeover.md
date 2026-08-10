@@ -247,10 +247,19 @@ degrades to Tier A (human), never to an unsafe guess.
   invariant is "reduced site-loss resilience," not silent drift.
 - New status: `status.multiSite.takeoverPendingSince`, a refusal condition. New spec
   knob: `multiSite.allowUnsafeSiteTakeover` (default false).
-- **Validation** refuses topologies where the invariant is unsatisfiable: all `K=2`;
-  and the `K=4`-over-3-sites trap (`⌈4/2⌉−1 = 1`, but 4 shards over 3 sites force a
-  `2+1+1` split by pigeonhole, so losing the 2-master site fails — 3 sites is not
-  automatically enough; the *ratio* matters).
+- **Reduced-resilience warning** (a surfaced condition, *not* an admission refusal):
+  when the invariant is structurally unsatisfiable — `S·(⌈K/2⌉−1) < K` for `S` sites
+  and `K` shards — the topology is still valid and functional, it simply cannot
+  auto-survive an arbitrary single-site loss (the heavier-master site's loss refuses
+  or needs the opt-in). Such a topology is a legitimate deployment (with manual /
+  `allowUnsafeSiteTakeover` recovery), so LittleRed **surfaces a
+  `ReducedSiteLossResilience` condition + event** rather than blocking it — consistent
+  with the opt-in-not-block norm. The headline case is the `K=4`-over-3-sites trap
+  (`⌈4/2⌉−1 = 1`, but 4 shards over 3 sites force a `2+1+1` split by pigeonhole, so
+  losing the 2-master site fails — 3 sites is not automatically enough; the *ratio*
+  matters). `K=2` needs no special handling — Redis Cluster's minimum of 3 masters
+  already rejects it. The warning is a status surface (grouped with the master-per-site
+  distribution view), not a validation gate.
 - Automated dual-site recovery presumes the hub survives the lost site: the hub must
   be a third failure domain holding no data and no Domain-M vote (design doc §6).
 - A multi-shard takeover issues several no-consensus epoch bumps close together;
