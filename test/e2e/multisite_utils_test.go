@@ -555,11 +555,15 @@ func msRebootSite(site msSite) {
 	// in the lab a client config whose CA cannot verify these nodes ("certificate signed by
 	// unknown authority ... Ed25519 verification failure"). The per-site talos context is
 	// named after the site (scm-s1/s2/s3), mirroring how the kubectl helpers pin --context.
-	args := []string{"reboot", "--context", site.name}
+	// --wait=false: fire-and-return. Newer talosctl defaults --wait=true, which blocks the
+	// command until every node is back healthy (up to 30m) — that would consume the very
+	// outage window this scenario must observe (the site going API-unreachable). We issue the
+	// reboot and track recovery ourselves via msWaitSiteReady.
+	args := []string{"reboot", "--context", site.name, "--wait=false"}
 	for _, ep := range site.talosEndpoints {
 		args = append(args, "-e", ep, "-n", ep)
 	}
-	// talosctl reboot returns once the reboot is issued; it does not block on boot.
+	// talosctl reboot returns once the reboot is issued (--wait=false); it does not block on boot.
 	out, err := utils.Run(exec.Command("talosctl", args...))
 	_, _ = fmt.Fprintf(GinkgoWriter, "talosctl reboot output:\n%s\n", out)
 	Expect(err).NotTo(HaveOccurred(), "talosctl reboot %s", site.name)
