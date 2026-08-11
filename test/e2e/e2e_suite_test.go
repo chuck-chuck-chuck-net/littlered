@@ -325,13 +325,18 @@ func waitForOperator() {
 // Single-site uses "kubectl config view --raw --flatten --minify", producing a
 // self-contained kubeconfig with only the selected context/cluster/user.
 //
-// Multi-site (E2E_TOPOLOGY=multi|both) MUST keep the sibling site contexts
-// (scm-s1/s2/s3, driven via `kubectl --context <site>`), so it does NOT minify;
-// it snapshots every context and then forces current-context to the pinned one
-// so ambient/hub calls still resolve.
+// A multi-site run MUST keep the sibling site contexts (driven via
+// `kubectl --context <site>`), so it does NOT minify; it snapshots every context and
+// then forces current-context to the pinned one so ambient/hub calls still resolve.
+// "Multi-site run" is detected from the run's actual configuration, not just
+// E2E_TOPOLOGY: the takeover suite is selected by label/focus (not by E2E_TOPOLOGY) and
+// is signalled by its required MS_SITE_CONTEXTS config — keying only on E2E_TOPOLOGY
+// would --minify away the site contexts for a `LABEL_FILTER=multisite` run.
 func pinKubeContext(contextName string) {
-	// Multi-site drives sibling site contexts by name; --minify would strip them.
-	multiSite := topologyEnabled("multi")
+	// Any configured multi-site run drives sibling site contexts by name; --minify would
+	// strip them. E2E_TOPOLOGY=multi|both covers the shared behaviour matrix; the presence
+	// of MS_SITE_CONTEXTS covers the takeover suite (and both require it now).
+	multiSite := topologyEnabled("multi") || os.Getenv("MS_SITE_CONTEXTS") != ""
 
 	args := []string{"config", "view", "--raw", "--flatten"}
 	label := "current"
