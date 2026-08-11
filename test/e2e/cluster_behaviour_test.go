@@ -244,7 +244,7 @@ var _ = Describe("Cluster Behaviour Matrix [multi-site]", Ordered, ContinueOnFai
 		return
 	}
 	const ns = "ms-behaviour"
-	reg := msDefaultRegistry()
+	reg := msRegistryFromEnv()
 	h := newMultiSiteHarness(reg, ns)
 
 	BeforeAll(func() {

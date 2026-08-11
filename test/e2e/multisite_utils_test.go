@@ -62,8 +62,9 @@ import (
 // harness drives it through. Whole-site kill/restore is keyed on the site name via
 // MS_VM_INVENTORY (see the disruption helpers), not on anything stored here.
 type msSite struct {
-	name    string // logical site name, e.g. "scm-s1"
-	context string // kubecontext for this site's Kubernetes API
+	name     string // logical site name (as it appears in spec.multiSite.sites)
+	context  string // kubecontext for this site's Kubernetes API
+	endpoint string // API server URL routable FROM HUB PODS (the repl-net VIP), baked into the site kubeconfig
 }
 
 // msRegistry is the multi-site harness's view of the lab: the hub (where the operator and the
@@ -75,29 +76,52 @@ type msRegistry struct {
 	orderedSites []msSite // spec order
 }
 
-// msDefaultRegistry builds the registry from env (falling back to the scm-* lab defaults):
+// msRegistryFromEnv builds the multi-site harness registry from REQUIRED environment. There
+// are deliberately NO lab-specific defaults: the configuration a run needs is always explicit
+// and always documented (docs/E2E_TESTING.md, "Multi-site"). When the required config is
+// absent the multi-site specs Skip with a pointer, so the rest of the suite is unaffected.
 //
-//	MS_HUB_CONTEXT     hub kubecontext                       (default "scm-cp")
-//	MS_OPERATOR_NS     operator namespace on the hub         (default "littlered-system")
-//	MS_SITE_CONTEXTS   comma list "name=ctx,..."             (default "scm-s1=scm-s1,scm-s2=scm-s2,scm-s3=scm-s3")
-//
-// Whole-site kill/restore (Scenario A) is configured separately via MS_VM_INVENTORY — see the
-// disruption helpers below.
-func msDefaultRegistry() *msRegistry {
-	hub := envOr("MS_HUB_CONTEXT", "scm-cp")
-	opNS := envOr("MS_OPERATOR_NS", "littlered-system")
-	siteSpec := envOr("MS_SITE_CONTEXTS", "scm-s1=scm-s1,scm-s2=scm-s2,scm-s3=scm-s3")
+//	MS_HUB_CONTEXT     (required) hub kubecontext — operator + LittleRed CR live here
+//	MS_SITE_CONTEXTS   (required) comma list "name=kubecontext,..." of the workload sites
+//	MS_SITE_ENDPOINTS  (required) comma list "name=https://host:port,..." — each site's API
+//	                   server URL as routable FROM HUB PODS (the repl-net VIP baked into the
+//	                   site kubeconfig the operator dials); one entry per MS_SITE_CONTEXTS name
+//	MS_OPERATOR_NS     (optional) operator namespace on the hub (default "littlered-system" —
+//	                   the chart's namespace, a project constant, not lab-specific)
+//	MS_VM_INVENTORY    (optional) whole-site kill/restore inventory for Scenario A (see below)
+func msRegistryFromEnv() *msRegistry {
+	hub := strings.TrimSpace(os.Getenv("MS_HUB_CONTEXT"))
+	siteSpec := strings.TrimSpace(os.Getenv("MS_SITE_CONTEXTS"))
+	endpointSpec := strings.TrimSpace(os.Getenv("MS_SITE_ENDPOINTS"))
+	if hub == "" || siteSpec == "" || endpointSpec == "" {
+		Skip("multi-site e2e requires MS_HUB_CONTEXT, MS_SITE_CONTEXTS, and MS_SITE_ENDPOINTS " +
+			"(and MS_VM_INVENTORY for the Scenario A whole-site kill) — no lab defaults are baked in; " +
+			"see docs/E2E_TESTING.md (\"Multi-site\").")
+	}
 
-	reg := &msRegistry{hubContext: hub, operatorNS: opNS, sitesByName: map[string]msSite{}}
+	endpoints := map[string]string{}
+	for _, e := range strings.Split(endpointSpec, ",") {
+		kv := strings.SplitN(strings.TrimSpace(e), "=", 2)
+		Expect(kv).To(HaveLen(2), "MS_SITE_ENDPOINTS entry %q must be 'name=https://host:port'", e)
+		endpoints[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
+	}
+
+	reg := &msRegistry{
+		hubContext:  hub,
+		operatorNS:  envOr("MS_OPERATOR_NS", "littlered-system"),
+		sitesByName: map[string]msSite{},
+	}
 	for _, e := range strings.Split(siteSpec, ",") {
 		kv := strings.SplitN(strings.TrimSpace(e), "=", 2)
-		if len(kv) != 2 {
-			continue
-		}
-		s := msSite{name: kv[0], context: kv[1]}
-		reg.sitesByName[s.name] = s
+		Expect(kv).To(HaveLen(2), "MS_SITE_CONTEXTS entry %q must be 'name=kubecontext'", e)
+		name, ctx := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
+		ep, ok := endpoints[name]
+		Expect(ok).To(BeTrue(), "MS_SITE_ENDPOINTS has no entry for site %q (listed in MS_SITE_CONTEXTS)", name)
+		s := msSite{name: name, context: ctx, endpoint: ep}
+		reg.sitesByName[name] = s
 		reg.orderedSites = append(reg.orderedSites, s)
 	}
+	Expect(reg.orderedSites).NotTo(BeEmpty(), "MS_SITE_CONTEXTS parsed to zero sites")
 	return reg
 }
 
@@ -133,10 +157,10 @@ func kctlIn(context, stdin string, args ...string) (string, error) {
 
 // --- Per-site bringup: namespace + RBAC + site kubeconfig Secret --------------------------
 
-// msSiteRBAC is the per-site namespace + ServiceAccount + namespaced workload Role + the
-// cluster-scoped nodes Role the ADR-012 witness needs + a long-lived SA token. Applied into
-// EACH workload site so the operator's site credentials can manage the instance namespace and
-// read node Ready conditions.
+// msSiteRBAC is the per-site namespace + ServiceAccount + namespaced workload Role + a
+// long-lived SA token, applied into EACH workload site so the operator's site credentials can
+// manage the instance namespace. It is fully NAMESPACED — multi-site needs no cluster-scoped
+// grant (site-loss safety is Domain-M quorum arithmetic, not a Kubernetes node read; ADR-012 D1).
 func msSiteRBAC(ns string) string {
 	return strings.ReplaceAll(`
 apiVersion: v1
@@ -164,17 +188,6 @@ metadata: {name: littlered-site, namespace: NS}
 roleRef: {apiGroup: rbac.authorization.k8s.io, kind: Role, name: littlered-site}
 subjects: [{kind: ServiceAccount, name: littlered-site, namespace: NS}]
 ---
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRole
-metadata: {name: littlered-site-nodes}
-rules: [{apiGroups: [""], resources: ["nodes"], verbs: ["get","list"]}]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata: {name: littlered-site-nodes-NS}
-roleRef: {apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: littlered-site-nodes}
-subjects: [{kind: ServiceAccount, name: littlered-site, namespace: NS}]
----
 apiVersion: v1
 kind: Secret
 metadata:
@@ -186,20 +199,9 @@ type: kubernetes.io/service-account-token
 }
 
 // msSetupSites creates the per-site RBAC in every site and assembles the site kubeconfig
-// Secrets (site-<ns>-<name>) in the operator namespace on the hub. The site API endpoint is
-// taken from MS_SITE_ENDPOINTS (the only hub-pod-routable API address — the repl-net VIP),
-// falling back to a default per the scm-* lab. Idempotent.
+// Secrets (site-<ns>-<name>) in the operator namespace on the hub, using each site's endpoint
+// (the hub-pod-routable repl-net API VIP) resolved once in msRegistryFromEnv. Idempotent.
 func msSetupSites(reg *msRegistry, ns string) {
-	endpointSpec := envOr("MS_SITE_ENDPOINTS",
-		"scm-s1=https://10.2.1.10:6443,scm-s2=https://10.2.2.10:6443,scm-s3=https://10.2.3.10:6443")
-	endpoints := map[string]string{}
-	for _, e := range strings.Split(endpointSpec, ",") {
-		kv := strings.SplitN(strings.TrimSpace(e), "=", 2)
-		if len(kv) == 2 {
-			endpoints[kv[0]] = kv[1]
-		}
-	}
-
 	for _, s := range reg.orderedSites {
 		By(fmt.Sprintf("multi-site setup: RBAC + token in site %s (ns %s)", s.name, ns))
 		_, err := kctlIn(s.context, msSiteRBAC(ns), "apply", "-f", "-")
@@ -222,7 +224,7 @@ clusters: [{name: %s, cluster: {server: %s, certificate-authority-data: %s}}]
 users: [{name: littlered-site, user: {token: %s}}]
 contexts: [{name: %s, context: {cluster: %s, user: littlered-site, namespace: %s}}]
 current-context: %s
-`, s.name, endpoints[s.name], ca, token, s.name, s.name, ns, s.name)
+`, s.name, s.endpoint, ca, token, s.name, s.name, ns, s.name)
 
 		secretName := msSiteSecretName(ns, s.name)
 		By(fmt.Sprintf("multi-site setup: creating hub Secret %s/%s", reg.operatorNS, secretName))

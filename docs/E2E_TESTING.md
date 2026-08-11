@@ -185,11 +185,12 @@ make test-e2e ARGS="-timeout 90m"
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |
 | `CLUSTER_REPLICAS_PER_SHARD` | `1` | Replicas per shard for cluster tests that use replicas |
 | `E2E_TOPOLOGY` | `single` | Which topologies the shared **cluster-behaviour** matrix runs under: `single` (default), `multi`, or `both`. See "Cross-Topology Cluster Matrix" below. |
-| `MS_HUB_CONTEXT` | (lab default) | Multi-site only: the hub kube-context (where the CR + operator live). Required for `E2E_TOPOLOGY=multi`/`both` and the takeover suite. |
-| `MS_OPERATOR_NS` | `littlered-system` | Multi-site only: the operator namespace on the hub (where per-site kubeconfig Secrets are created). |
-| `MS_SITE_CONTEXTS` | (lab default) | Multi-site only: comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. |
-| `MS_SITE_ENDPOINTS` | (lab default) | Multi-site only: comma list of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). |
-| `MS_TALOS_ENDPOINTS` | (lab default) | Multi-site takeover suite only: per-site node endpoints for the whole-site-kill (reboot) disruption mechanism. |
+| `MS_HUB_CONTEXT` | **(required)** | Multi-site only: the hub kube-context (where the CR + operator live). No default — the multi-site specs `Skip` if unset. |
+| `MS_OPERATOR_NS` | `littlered-system` | Multi-site only: the operator namespace on the hub (where per-site kubeconfig Secrets are created). The one project-constant default (the chart's namespace); not lab-specific. |
+| `MS_SITE_CONTEXTS` | **(required)** | Multi-site only: comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. No default. |
+| `MS_SITE_ENDPOINTS` | **(required)** | Multi-site only: comma list `name=https://host:port,…` of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). One entry per `MS_SITE_CONTEXTS` name. No default. |
+| `MS_VM_INVENTORY` | (none) | Multi-site takeover suite only: path to a file of `<site> <vm-name> <virsh-uri>` lines for the whole-site kill (`virsh destroy`/`start`). Unset ⇒ Scenario A `Skip`s. |
+| `MS_HUB_POD_CIDR` | (none) | Multi-site takeover Scenario B only: extra hub-pod CIDR(s) to deny in the data-plane-partition `CiliumNetworkPolicy`. |
 | `NON_GRACEFUL_RESTART` | (none) | Advanced: when `true`, pod-restart helpers use a hard/non-graceful kill instead of a graceful delete |
 | `FOCUS` | (none) | Ginkgo focus filter (regex) |
 | `ARGS` | (none) | Extra arguments passed to `go test` |
@@ -211,7 +212,7 @@ make test-e2e ARGS="-timeout 90m"
 | `failover_mode_test.go` | Failover Mode / Failover Mode Deadlock Recovery | `mode: failover` (ADR-011): functional (resources, assignment annotations, experimental event), graceful+crash failover (UID-asserted), event-path (<15s) and polling-only tiers, hybrid double-failover (the graduation scenario), kill-9 epoch-gate yield under chaos load, deadlock tiers (total-loss / single-survivor / multi-holder same-lineage), rolling update. Label: `failover-mode` |
 | `cluster_behaviour_test.go` | Cluster Behaviour Matrix [single-site] / [multi-site] | The ONE shared body of topology-agnostic cluster behaviours (bring-up to healthy serving 16384 slots, cross-shard ops, master-pod-failure recovery under chaos with data intact), run under single-site and/or multi-site via the `clusterHarness` abstraction. Gated by `E2E_TOPOLOGY`. Labels: `cluster-behaviour` (both); `multisite` (the multi-site Describe). |
 | `cluster_harness_test.go` + `cluster_harness_single_test.go` / `cluster_harness_multi_test.go` | (support) | The `clusterHarness` interface + `topologyEnabled` gating, and its single-site (ambient-context) and multi-site (hub + per-site contexts, per-pod site) implementations. Not specs themselves. |
-| `multisite_takeover_test.go` | Multi-Site Site-Loss Takeover (ADR-012) | `spec.multiSite` disruption: Scenario A whole-site kill of an even 2+2 split (`shards: 4`) MUST take over (survivor serves all slots, data intact); Scenario B data-plane-only partition with the site kept alive MUST NOT take over (no split-brain). Needs the hub+sites substrate + node-reboot / partition mechanisms. Labels: `multisite`, `multisite-takeover`, `multisite-hold`. |
+| `multisite_takeover_test.go` | Multi-Site Site-Loss Takeover (ADR-012) | `spec.multiSite` disruption: Scenario A whole-site kill of an even 2+2 split (`shards: 4`) MUST take over (survivor serves all slots, data intact); Scenario B data-plane-only partition with the site kept alive MUST NOT take over (no split-brain). Needs the hub+sites substrate + the hypervisor whole-site kill (`MS_VM_INVENTORY`, `virsh destroy`/`start`) / data-plane-partition (`CiliumNetworkPolicy`) mechanisms. Labels: `multisite`, `multisite-takeover`, `multisite-hold`. |
 
 > Naming caveat: `sentinel_advanced_failover_test.go` (Describe: *Sentinel Advanced
 > Failover*, formerly `failover_test.go`) tests **sentinel-mode** label mechanics and

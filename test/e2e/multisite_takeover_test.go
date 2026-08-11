@@ -57,7 +57,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 	var reg *msRegistry
 
 	BeforeEach(func() {
-		reg = msDefaultRegistry()
+		reg = msRegistryFromEnv()
 	})
 
 	// --- Scenario B: the split-brain guard (least destructive, run first) ------------------
