@@ -24,7 +24,7 @@ import (
 
 func TestFailoverSetDefaults(t *testing.T) {
 	t.Run("failover mode with nil section gets section + defaults", func(t *testing.T) {
-		lr := &LittleRed{Spec: LittleRedSpec{Mode: "failover"}}
+		lr := &LittleRed{Spec: LittleRedSpec{Mode: ModeFailover}}
 		lr.SetDefaults()
 		f := lr.Spec.Failover
 		if f == nil {
@@ -46,7 +46,7 @@ func TestFailoverSetDefaults(t *testing.T) {
 
 	t.Run("user values are preserved", func(t *testing.T) {
 		replicas := int32(4)
-		lr := &LittleRed{Spec: LittleRedSpec{Mode: "failover", Failover: &FailoverSpec{
+		lr := &LittleRed{Spec: LittleRedSpec{Mode: ModeFailover, Failover: &FailoverSpec{
 			Replicas:                         &replicas,
 			DownAfterMilliseconds:            12000,
 			MinReplicasToWrite:               1,
@@ -92,7 +92,7 @@ func TestValidateFailover(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lr := &LittleRed{Spec: LittleRedSpec{Mode: "failover", Failover: tt.failover}}
+			lr := &LittleRed{Spec: LittleRedSpec{Mode: ModeFailover, Failover: tt.failover}}
 			err := lr.Validate()
 			if (err != nil) != tt.wantErr {
 				t.Errorf("Validate() error = %v, wantErr %v", err, tt.wantErr)

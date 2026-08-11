@@ -913,7 +913,7 @@ func (r *LittleRed) Validate() error {
 	// cluster shards check above). Placement (spec.placement.shardAntiAffinity)
 	// stays cluster-only; the controller rejects it for every other mode,
 	// failover included.
-	if r.Spec.Mode == "failover" {
+	if r.Spec.Mode == ModeFailover {
 		if r.Spec.Failover != nil {
 			if r.Spec.Failover.Replicas != nil && *r.Spec.Failover.Replicas < 1 {
 				return fmt.Errorf("failover mode requires at least 1 replica (found %d)", *r.Spec.Failover.Replicas)

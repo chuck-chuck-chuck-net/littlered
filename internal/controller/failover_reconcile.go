@@ -836,14 +836,14 @@ func (r *LittleRedReconciler) updateFailoverStatus(ctx context.Context, lr *litt
 			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 				Type:               littleredv1alpha1.ConditionReady,
 				Status:             metav1.ConditionTrue,
-				Reason:             "AllPodsReady",
+				Reason:             reasonAllPodsReady,
 				Message:            "All Redis pods are ready and replicating from the intended master",
 				LastTransitionTime: metav1.Now(),
 			})
 			meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 				Type:               littleredv1alpha1.ConditionInitialized,
 				Status:             metav1.ConditionTrue,
-				Reason:             "Initialized",
+				Reason:             reasonInitialized,
 				Message:            "Redis failover instance is initialized",
 				LastTransitionTime: metav1.Now(),
 			})

@@ -135,7 +135,7 @@ func TestPlanFailover(t *testing.T) {
 	fresh := func() *time.Time { u := now.Add(-5 * time.Second); return &u }
 
 	// a single same-lineage survivor holding data — the plain crash-failover input.
-	survivor := []rnSpec{{ip: "10.0.0.2", reachable: true, keys: 5, offset: 100, replid: "A", role: "slave"}}
+	survivor := []rnSpec{{ip: ipReplica, reachable: true, keys: 5, offset: 100, replid: "A", role: roleSlave}}
 
 	tests := []struct {
 		name         string
@@ -154,17 +154,17 @@ func TestPlanFailover(t *testing.T) {
 		{
 			name: "gate: live master exists -> none (stragglers are Rule R's job, not a promotion)",
 			redis: []rnSpec{
-				{ip: "10.0.0.1", reachable: true, keys: 5, offset: 100, replid: "A", role: "master"},
-				{ip: "10.0.0.2", reachable: true, keys: 5, offset: 90, replid: "A", role: "master"}, // straggler
+				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: "A", role: RoleMaster},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 90, replid: "A", role: RoleMaster}, // straggler
 			},
-			liveMasterIP: "10.0.0.1",
+			liveMasterIP: ipMaster,
 			since:        elapsed(),
 			wantAction:   failoverNone,
 		},
 		{
 			name:         "gate: live master short-circuits even an unsettled transition -> none (executor resumes it)",
-			redis:        []rnSpec{{ip: "10.0.0.1", reachable: true, keys: 5, replid: "A", role: "master"}},
-			liveMasterIP: "10.0.0.1",
+			redis:        []rnSpec{{ip: ipMaster, reachable: true, keys: 5, replid: "A", role: RoleMaster}},
+			liveMasterIP: ipMaster,
 			unsettled:    true,
 			wantAction:   failoverNone,
 		},
@@ -183,7 +183,7 @@ func TestPlanFailover(t *testing.T) {
 		},
 		{
 			name:        "gate: 0 holders, no bootstrap candidate yet -> wait",
-			redis:       []rnSpec{{ip: "10.0.0.1", reachable: false}},
+			redis:       []rnSpec{{ip: ipMaster, reachable: false}},
 			bootstrapIP: "",
 			since:       elapsed(),
 			wantAction:  failoverWait,
@@ -195,7 +195,7 @@ func TestPlanFailover(t *testing.T) {
 			redis:        survivor,
 			since:        elapsed(),
 			wantAction:   failoverPromote,
-			wantMasterIP: "10.0.0.2",
+			wantMasterIP: ipReplica,
 			wantHolders:  1,
 		},
 		{
@@ -203,38 +203,38 @@ func TestPlanFailover(t *testing.T) {
 			redis:        survivor,
 			since:        nil,
 			wantAction:   failoverPromote,
-			wantMasterIP: "10.0.0.2",
+			wantMasterIP: ipReplica,
 			wantHolders:  1,
 		},
 		{
 			name:         "func: 0 holders + bootstrap candidate -> seed it (bootstrap is a row of the same table)",
-			redis:        []rnSpec{{ip: "10.0.0.1", reachable: false}, {ip: "10.0.0.2", reachable: true, keys: 0}},
-			bootstrapIP:  "10.0.0.1",
+			redis:        []rnSpec{{ip: ipMaster, reachable: false}, {ip: ipReplica, reachable: true, keys: 0}},
+			bootstrapIP:  ipMaster,
 			since:        nil,
 			wantAction:   failoverSeed,
-			wantMasterIP: "10.0.0.1",
+			wantMasterIP: ipMaster,
 		},
 		{
 			name: "func: 2 holders ONE lineage -> promote highest offset, NO opt-in",
 			redis: []rnSpec{
-				{ip: "10.0.0.1", reachable: true, keys: 5, offset: 100, replid: "A", role: "slave"},
-				{ip: "10.0.0.2", reachable: true, keys: 5, offset: 250, replid: "A", role: "slave"},
+				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: "A", role: roleSlave},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 250, replid: "A", role: roleSlave},
 			},
 			since:        nil,
 			wantAction:   failoverPromote,
-			wantMasterIP: "10.0.0.2",
+			wantMasterIP: ipReplica,
 			wantDiverged: false,
 			wantHolders:  2,
 		},
 		{
 			name: "func: promotion chain (replid rotated, linked via replid2) -> ONE lineage, promote, no opt-in (LR-024)",
 			redis: []rnSpec{
-				{ip: "10.0.0.1", reachable: true, keys: 1, offset: 100, replid: "716d42", role: "slave"},
-				{ip: "10.0.0.2", reachable: true, keys: 1, offset: 120, replid: "1cc4b7", replid2: "716d42", role: "master"},
+				{ip: ipMaster, reachable: true, keys: 1, offset: 100, replid: testReplid0, role: roleSlave},
+				{ip: ipReplica, reachable: true, keys: 1, offset: 120, replid: testReplid1, replid2: testReplid0, role: RoleMaster},
 			},
 			since:        nil,
 			wantAction:   failoverPromote,
-			wantMasterIP: "10.0.0.2",
+			wantMasterIP: ipReplica,
 			wantDiverged: false,
 			wantHolders:  2,
 		},
@@ -243,20 +243,20 @@ func TestPlanFailover(t *testing.T) {
 			redis: []rnSpec{
 				// the crashed master: pod still terminating (its IP is still a valid pod IP),
 				// unreachable — it must not suppress the decision.
-				{ip: "10.0.0.9", reachable: false, role: "master"},
-				{ip: "10.0.0.2", reachable: true, keys: 5, offset: 100, replid: "A", role: "slave"},
+				{ip: ipNode9, reachable: false, role: RoleMaster},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 100, replid: "A", role: roleSlave},
 			},
 			liveMasterIP: "",
 			since:        nil,
 			wantAction:   failoverPromote,
-			wantMasterIP: "10.0.0.2",
+			wantMasterIP: ipReplica,
 			wantHolders:  1,
 		},
 		{
 			name: "func: diverged lineages, opt-in OFF -> refuse",
 			redis: []rnSpec{
-				{ip: "10.0.0.1", reachable: true, keys: 5, offset: 100, replid: "AAA", replid2: "PPP", role: "master"},
-				{ip: "10.0.0.2", reachable: true, keys: 9, offset: 90, replid: "BBB", replid2: "QQQ", role: "master"},
+				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: testReplidA, replid2: "PPP", role: RoleMaster},
+				{ip: ipReplica, reachable: true, keys: 9, offset: 90, replid: testReplidB, replid2: "QQQ", role: RoleMaster},
 			},
 			allowUnsafe: false,
 			since:       nil,
@@ -266,13 +266,13 @@ func TestPlanFailover(t *testing.T) {
 		{
 			name: "func: diverged lineages, opt-in ON -> unsafe-elect best + diverged flag",
 			redis: []rnSpec{
-				{ip: "10.0.0.1", reachable: true, keys: 5, offset: 300, replid: "AAA", role: "master"},
-				{ip: "10.0.0.2", reachable: true, keys: 9, offset: 90, replid: "BBB", role: "master"},
+				{ip: ipMaster, reachable: true, keys: 5, offset: 300, replid: testReplidA, role: RoleMaster},
+				{ip: ipReplica, reachable: true, keys: 9, offset: 90, replid: testReplidB, role: RoleMaster},
 			},
 			allowUnsafe:  true,
 			since:        nil,
 			wantAction:   failoverUnsafeElect,
-			wantMasterIP: "10.0.0.1",
+			wantMasterIP: ipMaster,
 			wantDiverged: true,
 			wantHolders:  2,
 		},

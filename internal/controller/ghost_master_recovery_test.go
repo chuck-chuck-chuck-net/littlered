@@ -181,10 +181,10 @@ func TestPlanGhostMasterRecovery(t *testing.T) {
 			name:         "func: 0 holders, bootstrap IP set -> seed it",
 			sentinels:    ghostQuorum(),
 			redis:        []rnSpec{{ip: ipMaster, reachable: true, keys: 0, role: roleSlave}},
-			bootstrapIP:  "10.0.0.7",
+			bootstrapIP:  ipNode7,
 			since:        elapsed(),
 			wantAction:   recoverySeedNoData,
-			wantMasterIP: "10.0.0.7",
+			wantMasterIP: ipNode7,
 		},
 		{
 			name:         "func: exactly 1 survivor with data -> elect it, no opt-in",
@@ -241,7 +241,7 @@ func TestPlanGhostMasterRecovery(t *testing.T) {
 			sentinels: ghostQuorum(),
 			redis: []rnSpec{
 				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: testReplid0, role: roleSlave},
-				{ip: ipReplica, reachable: true, keys: 5, offset: 250, replid: "1cc4b7", replid2: testReplid0, role: RoleMaster},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 250, replid: testReplid1, replid2: testReplid0, role: RoleMaster},
 			},
 			since:        elapsed(),
 			wantAction:   recoveryPromoteSurvivor,
@@ -255,7 +255,7 @@ func TestPlanGhostMasterRecovery(t *testing.T) {
 			redis: []rnSpec{
 				{ip: ipMaster, reachable: true, keys: 1, offset: 100, replid: testReplid0, role: roleSlave},
 				{ip: ipReplica, reachable: true, keys: 1, offset: 100, replid: testReplid0, replid2: "7df3f8", role: roleSlave},
-				{ip: ipNode3, reachable: true, keys: 1, offset: 120, replid: "1cc4b7", replid2: testReplid0, role: RoleMaster},
+				{ip: ipNode3, reachable: true, keys: 1, offset: 120, replid: testReplid1, replid2: testReplid0, role: RoleMaster},
 			},
 			since:        elapsed(),
 			wantAction:   recoveryPromoteSurvivor,
@@ -267,8 +267,8 @@ func TestPlanGhostMasterRecovery(t *testing.T) {
 			name:      "func: genuinely independent lineages (no shared replid history) -> diverged, refuse",
 			sentinels: ghostQuorum(),
 			redis: []rnSpec{
-				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: "AAA", replid2: "PPP", role: RoleMaster},
-				{ip: ipReplica, reachable: true, keys: 5, offset: 90, replid: "BBB", replid2: "QQQ", role: RoleMaster},
+				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: testReplidA, replid2: "PPP", role: RoleMaster},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 90, replid: testReplidB, replid2: "QQQ", role: RoleMaster},
 			},
 			allowUnsafe: false,
 			since:       elapsed(),

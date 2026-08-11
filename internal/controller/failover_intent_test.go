@@ -43,63 +43,63 @@ func TestResolveFailoverIntent(t *testing.T) {
 		},
 		{
 			name: "unstamped pods only -> no intent",
-			pods: []failoverPodView{{name: "r-redis-0", ip: "10.0.0.1"}},
+			pods: []failoverPodView{{name: podRedis0, ip: ipMaster}},
 			want: failoverIntent{},
 		},
 		{
 			name: "bootstrap set: one master, two replicas at epoch 1",
 			pods: []failoverPodView{
-				assigned("r-redis-0", "10.0.0.1", RoleMaster, "", 1),
-				assigned("r-redis-1", "10.0.0.2", RoleReplica, "10.0.0.1", 1),
-				assigned("r-redis-2", "10.0.0.3", RoleReplica, "10.0.0.1", 1),
+				assigned(podRedis0, ipMaster, RoleMaster, "", 1),
+				assigned(podRedis1, ipReplica, RoleReplica, ipMaster, 1),
+				assigned(podRedis2, ipNode3, RoleReplica, ipMaster, 1),
 			},
-			want: failoverIntent{masterName: "r-redis-0", masterIP: "10.0.0.1", maxEpoch: 1},
+			want: failoverIntent{masterName: podRedis0, masterIP: ipMaster, maxEpoch: 1},
 		},
 		{
 			name: "two master assignments: highest epoch wins (stale ex-master superseded)",
 			pods: []failoverPodView{
-				assigned("r-redis-0", "10.0.0.1", RoleMaster, "", 1), // terminating ex-master, kept stale stamp
-				assigned("r-redis-1", "10.0.0.2", RoleMaster, "", 2),
-				assigned("r-redis-2", "10.0.0.3", RoleReplica, "10.0.0.2", 2),
+				assigned(podRedis0, ipMaster, RoleMaster, "", 1), // terminating ex-master, kept stale stamp
+				assigned(podRedis1, ipReplica, RoleMaster, "", 2),
+				assigned(podRedis2, ipNode3, RoleReplica, ipReplica, 2),
 			},
-			want: failoverIntent{masterName: "r-redis-1", masterIP: "10.0.0.2", maxEpoch: 2},
+			want: failoverIntent{masterName: podRedis1, masterIP: ipReplica, maxEpoch: 2},
 		},
 		{
 			name: "two master assignments at the SAME epoch: lowest name wins (deterministic)",
 			pods: []failoverPodView{
-				assigned("r-redis-2", "10.0.0.3", RoleMaster, "", 3),
-				assigned("r-redis-1", "10.0.0.2", RoleMaster, "", 3),
+				assigned(podRedis2, ipNode3, RoleMaster, "", 3),
+				assigned(podRedis1, ipReplica, RoleMaster, "", 3),
 			},
-			want: failoverIntent{masterName: "r-redis-1", masterIP: "10.0.0.2", maxEpoch: 3},
+			want: failoverIntent{masterName: podRedis1, masterIP: ipReplica, maxEpoch: 3},
 		},
 		{
 			name: "master pod replaced (annotations died with it): replica stamps remain, no intended master",
 			pods: []failoverPodView{
-				{name: "r-redis-0", ip: "10.0.0.9"}, // recreated, unstamped
-				assigned("r-redis-1", "10.0.0.2", RoleReplica, "10.0.0.1", 4),
-				assigned("r-redis-2", "10.0.0.3", RoleReplica, "10.0.0.1", 4),
+				{name: podRedis0, ip: ipNode9}, // recreated, unstamped
+				assigned(podRedis1, ipReplica, RoleReplica, ipMaster, 4),
+				assigned(podRedis2, ipNode3, RoleReplica, ipMaster, 4),
 			},
 			want: failoverIntent{maxEpoch: 4},
 		},
 		{
 			name: "maxEpoch spans replica re-auth stamps beyond the master's own epoch",
 			pods: []failoverPodView{
-				assigned("r-redis-0", "10.0.0.1", RoleMaster, "", 2),
-				assigned("r-redis-1", "10.0.0.2", RoleReplica, "10.0.0.1", 5), // re-authed parked pod
+				assigned(podRedis0, ipMaster, RoleMaster, "", 2),
+				assigned(podRedis1, ipReplica, RoleReplica, ipMaster, 5), // re-authed parked pod
 			},
-			want: failoverIntent{masterName: "r-redis-0", masterIP: "10.0.0.1", maxEpoch: 5},
+			want: failoverIntent{masterName: podRedis0, masterIP: ipMaster, maxEpoch: 5},
 		},
 		{
 			name: "terminating intended master still resolves (graceful handover sees the intent)",
 			pods: []failoverPodView{
 				func() failoverPodView {
-					v := assigned("r-redis-0", "10.0.0.1", RoleMaster, "", 1)
+					v := assigned(podRedis0, ipMaster, RoleMaster, "", 1)
 					v.terminating = true
 					return v
 				}(),
-				assigned("r-redis-1", "10.0.0.2", RoleReplica, "10.0.0.1", 1),
+				assigned(podRedis1, ipReplica, RoleReplica, ipMaster, 1),
 			},
-			want: failoverIntent{masterName: "r-redis-0", masterIP: "10.0.0.1", maxEpoch: 1},
+			want: failoverIntent{masterName: podRedis0, masterIP: ipMaster, maxEpoch: 1},
 		},
 	}
 
@@ -140,32 +140,32 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 	}{
 		{
 			name:       "no intent -> no live master",
-			state:      stateOf(node("10.0.0.1", "master", true)),
+			state:      stateOf(node(ipMaster, RoleMaster, true)),
 			intendedIP: "",
 			want:       "",
 		},
 		{
 			name:       "intended master reachable and role:master -> live",
-			state:      stateOf(node("10.0.0.1", "master", true), node("10.0.0.2", "slave", true)),
-			intendedIP: "10.0.0.1",
-			want:       "10.0.0.1",
+			state:      stateOf(node(ipMaster, RoleMaster, true), node(ipReplica, roleSlave, true)),
+			intendedIP: ipMaster,
+			want:       ipMaster,
 		},
 		{
 			name:       "intended master reachable but still role:slave (promotion not applied) -> not live",
-			state:      stateOf(node("10.0.0.1", "slave", true)),
-			intendedIP: "10.0.0.1",
+			state:      stateOf(node(ipMaster, roleSlave, true)),
+			intendedIP: ipMaster,
 			want:       "",
 		},
 		{
 			name:       "intended master unreachable -> not live",
-			state:      stateOf(node("10.0.0.1", "master", false)),
-			intendedIP: "10.0.0.1",
+			state:      stateOf(node(ipMaster, RoleMaster, false)),
+			intendedIP: ipMaster,
 			want:       "",
 		},
 		{
 			name:       "intended master unknown to the gather -> not live",
 			state:      stateOf(),
-			intendedIP: "10.0.0.1",
+			intendedIP: ipMaster,
 			want:       "",
 		},
 		{
@@ -173,8 +173,8 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 			// master still up mid-transition, or a bare restarted pod) is a
 			// STRAGGLER — it must never be adopted as the live master.
 			name:       "unintended reachable role:master is a straggler, never the live master",
-			state:      stateOf(node("10.0.0.9", "master", true), node("10.0.0.1", "slave", true)),
-			intendedIP: "10.0.0.1",
+			state:      stateOf(node(ipNode9, RoleMaster, true), node(ipMaster, roleSlave, true)),
+			intendedIP: ipMaster,
 			want:       "",
 		},
 	}
@@ -191,10 +191,10 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 // --- failoverTransitionSettled (ADR-011 §6: unsettled-transition definition) -
 
 func TestFailoverTransitionSettled(t *testing.T) {
-	intent := failoverIntent{masterName: "r-redis-1", masterIP: "10.0.0.2", maxEpoch: 2}
+	intent := failoverIntent{masterName: podRedis1, masterIP: ipReplica, maxEpoch: 2}
 	stateWith := func(role string, reachable bool) *redisclient.ReplicationState {
 		s := redisclient.NewReplicationState()
-		s.RedisNodes["10.0.0.2"] = &redisclient.RedisNodeState{IP: "10.0.0.2", Role: role, Reachable: reachable}
+		s.RedisNodes[ipReplica] = &redisclient.RedisNodeState{IP: ipReplica, Role: role, Reachable: reachable}
 		return s
 	}
 
@@ -215,36 +215,36 @@ func TestFailoverTransitionSettled(t *testing.T) {
 		{
 			name:   "intended master role:master + master label -> settled",
 			intent: intent,
-			state:  stateWith("master", true),
-			labels: map[string]string{"r-redis-1": RoleMaster},
+			state:  stateWith(RoleMaster, true),
+			labels: map[string]string{podRedis1: RoleMaster},
 			want:   true,
 		},
 		{
 			name:   "intended master role:master but label not yet flipped -> unsettled",
 			intent: intent,
-			state:  stateWith("master", true),
-			labels: map[string]string{"r-redis-1": RoleReplica},
+			state:  stateWith(RoleMaster, true),
+			labels: map[string]string{podRedis1: RoleReplica},
 			want:   false,
 		},
 		{
 			name:   "intended master reachable but still role:slave -> unsettled",
 			intent: intent,
-			state:  stateWith("slave", true),
-			labels: map[string]string{"r-redis-1": RoleMaster},
+			state:  stateWith(roleSlave, true),
+			labels: map[string]string{podRedis1: RoleMaster},
 			want:   false,
 		},
 		{
 			name:   "intended master unreachable -> unsettled",
 			intent: intent,
-			state:  stateWith("master", false),
-			labels: map[string]string{"r-redis-1": RoleMaster},
+			state:  stateWith(RoleMaster, false),
+			labels: map[string]string{podRedis1: RoleMaster},
 			want:   false,
 		},
 		{
 			name:   "intended master unknown to gather -> unsettled",
 			intent: intent,
 			state:  redisclient.NewReplicationState(),
-			labels: map[string]string{"r-redis-1": RoleMaster},
+			labels: map[string]string{podRedis1: RoleMaster},
 			want:   false,
 		},
 	}
@@ -266,14 +266,14 @@ func TestFailoverTransitionSettled(t *testing.T) {
 // report role:master).
 
 func TestFailoverPromotionUnsettled(t *testing.T) {
-	intent := failoverIntent{masterName: "r-redis-1", masterIP: "10.0.0.2", maxEpoch: 2}
+	intent := failoverIntent{masterName: podRedis1, masterIP: ipReplica, maxEpoch: 2}
 	stateWith := func(role string, reachable bool) *redisclient.ReplicationState {
 		s := redisclient.NewReplicationState()
-		s.RedisNodes["10.0.0.2"] = &redisclient.RedisNodeState{IP: "10.0.0.2", Role: role, Reachable: reachable}
+		s.RedisNodes[ipReplica] = &redisclient.RedisNodeState{IP: ipReplica, Role: role, Reachable: reachable}
 		return s
 	}
-	masterLabel := map[string]string{"r-redis-1": RoleMaster}
-	replicaLabel := map[string]string{"r-redis-1": RoleReplica}
+	masterLabel := map[string]string{podRedis1: RoleMaster}
+	replicaLabel := map[string]string{podRedis1: RoleReplica}
 
 	tests := []struct {
 		name   string
@@ -291,21 +291,21 @@ func TestFailoverPromotionUnsettled(t *testing.T) {
 		{
 			name:   "converged transition: not blocking",
 			intent: intent,
-			state:  stateWith("master", true),
+			state:  stateWith(RoleMaster, true),
 			labels: masterLabel,
 			want:   false,
 		},
 		{
 			name:   "intended master ALIVE, promotion not yet observed: blocking",
 			intent: intent,
-			state:  stateWith("slave", true),
+			state:  stateWith(roleSlave, true),
 			labels: replicaLabel,
 			want:   true,
 		},
 		{
 			name:   "intended master ALIVE role:master, label not yet flipped: blocking",
 			intent: intent,
-			state:  stateWith("master", true),
+			state:  stateWith(RoleMaster, true),
 			labels: replicaLabel,
 			want:   true,
 		},
@@ -316,7 +316,7 @@ func TestFailoverPromotionUnsettled(t *testing.T) {
 			// election must NOT be blocked, or recovery deadlocks.
 			name:   "intended master DEAD (unreachable): NOT blocking",
 			intent: intent,
-			state:  stateWith("master", false),
+			state:  stateWith(RoleMaster, false),
 			labels: masterLabel,
 			want:   false,
 		},
@@ -341,12 +341,12 @@ func TestFailoverPromotionUnsettled(t *testing.T) {
 // --- planFailoverReauth (ADR-011 §3: the re-authorization loop) --------------
 
 func TestPlanFailoverReauth(t *testing.T) {
-	const liveMaster = "10.0.0.1"
-	intent := failoverIntent{masterName: "r-redis-0", masterIP: liveMaster, maxEpoch: 3}
+	const liveMaster = ipMaster
+	intent := failoverIntent{masterName: podRedis0, masterIP: liveMaster, maxEpoch: 3}
 
-	masterPod := failoverPodView{name: "r-redis-0", ip: liveMaster, ready: true, reachable: true,
+	masterPod := failoverPodView{name: podRedis0, ip: liveMaster, ready: true, reachable: true,
 		hasAssignment: true, assignedRole: RoleMaster, epoch: 3}
-	healthyReplica := failoverPodView{name: "r-redis-1", ip: "10.0.0.2", ready: true, reachable: true,
+	healthyReplica := failoverPodView{name: podRedis1, ip: ipReplica, ready: true, reachable: true,
 		hasAssignment: true, assignedRole: RoleReplica, assignedMasterIP: liveMaster, epoch: 3}
 
 	tests := []struct {
@@ -362,37 +362,37 @@ func TestPlanFailoverReauth(t *testing.T) {
 		{
 			name: "brand-new pod (no assignment): replica at CURRENT epoch, no bump",
 			pods: []failoverPodView{masterPod, healthyReplica,
-				{name: "r-redis-2", ip: "10.0.0.7"}},
+				{name: podRedis2, ip: ipNode7}},
 			want: []failoverStamp{
-				{podName: "r-redis-2", role: RoleReplica, masterIP: liveMaster, epoch: 3},
+				{podName: podRedis2, role: RoleReplica, masterIP: liveMaster, epoch: 3},
 			},
 		},
 		{
 			name: "new pod without an IP yet: skipped",
 			pods: []failoverPodView{masterPod, healthyReplica,
-				{name: "r-redis-2"}},
+				{name: podRedis2}},
 			want: nil,
 		},
 		{
 			name: "parked pod (restarted, not-Ready, unreachable, consumed epoch): replica at maxEpoch+1",
 			pods: []failoverPodView{masterPod, healthyReplica,
-				{name: "r-redis-2", ip: "10.0.0.3", restarted: true, // parked in the wait loop
+				{name: podRedis2, ip: ipNode3, restarted: true, // parked in the wait loop
 					hasAssignment: true, assignedRole: RoleReplica, assignedMasterIP: liveMaster, epoch: 3}},
 			want: []failoverStamp{
-				{podName: "r-redis-2", role: RoleReplica, masterIP: liveMaster, epoch: 4},
+				{podName: podRedis2, role: RoleReplica, masterIP: liveMaster, epoch: 4},
 			},
 		},
 		{
 			name: "restarted but reachable (syncing replica, readiness lagging): NOT restamped",
 			pods: []failoverPodView{masterPod,
-				{name: "r-redis-1", ip: "10.0.0.2", restarted: true, reachable: true,
+				{name: podRedis1, ip: ipReplica, restarted: true, reachable: true,
 					hasAssignment: true, assignedRole: RoleReplica, assignedMasterIP: liveMaster, epoch: 3}},
 			want: nil,
 		},
 		{
 			name: "not-Ready but never restarted (first boot honoring a fresh stamp): NOT restamped",
 			pods: []failoverPodView{masterPod,
-				{name: "r-redis-1", ip: "10.0.0.2",
+				{name: podRedis1, ip: ipReplica,
 					hasAssignment: true, assignedRole: RoleReplica, assignedMasterIP: liveMaster, epoch: 3}},
 			want: nil,
 		},
@@ -402,7 +402,7 @@ func TestPlanFailoverReauth(t *testing.T) {
 			// ADR-001 hazard — its path is planMasterDeath/planFailover.
 			name: "parked INTENDED master: never blind-restamped here",
 			pods: []failoverPodView{
-				{name: "r-redis-0", ip: liveMaster, restarted: true,
+				{name: podRedis0, ip: liveMaster, restarted: true,
 					hasAssignment: true, assignedRole: RoleMaster, epoch: 3},
 				healthyReplica,
 			},
@@ -411,18 +411,18 @@ func TestPlanFailoverReauth(t *testing.T) {
 		{
 			name: "terminating pod: skipped",
 			pods: []failoverPodView{masterPod,
-				{name: "r-redis-2", ip: "10.0.0.3", terminating: true}},
+				{name: podRedis2, ip: ipNode3, terminating: true}},
 			want: nil,
 		},
 		{
 			name: "mixed: new pod at current epoch, parked pod at bumped epoch, sorted by name",
 			pods: []failoverPodView{masterPod,
-				{name: "r-redis-2", ip: "10.0.0.3", restarted: true,
+				{name: podRedis2, ip: ipNode3, restarted: true,
 					hasAssignment: true, assignedRole: RoleReplica, assignedMasterIP: liveMaster, epoch: 3},
-				{name: "r-redis-1", ip: "10.0.0.9"}},
+				{name: podRedis1, ip: ipNode9}},
 			want: []failoverStamp{
-				{podName: "r-redis-1", role: RoleReplica, masterIP: liveMaster, epoch: 3},
-				{podName: "r-redis-2", role: RoleReplica, masterIP: liveMaster, epoch: 4},
+				{podName: podRedis1, role: RoleReplica, masterIP: liveMaster, epoch: 3},
+				{podName: podRedis2, role: RoleReplica, masterIP: liveMaster, epoch: 4},
 			},
 		},
 	}
@@ -440,7 +440,7 @@ func TestPlanFailoverReauth(t *testing.T) {
 // --- planFailoverRepoints (Rule R analog) ------------------------------------
 
 func TestPlanFailoverRepoints(t *testing.T) {
-	const liveMaster = "10.0.0.1"
+	const liveMaster = ipMaster
 	stateOf := func(nodes ...*redisclient.RedisNodeState) *redisclient.ReplicationState {
 		s := redisclient.NewReplicationState()
 		for _, n := range nodes {
@@ -460,51 +460,51 @@ func TestPlanFailoverRepoints(t *testing.T) {
 		{
 			name: "healthy topology: nothing to repoint",
 			state: stateOf(
-				node(liveMaster, "master", "", "", true),
-				node("10.0.0.2", "slave", liveMaster, "up", true),
+				node(liveMaster, RoleMaster, "", "", true),
+				node(ipReplica, roleSlave, liveMaster, "up", true),
 			),
 			want: nil,
 		},
 		{
 			name: "unintended role:master straggler: repointed",
 			state: stateOf(
-				node(liveMaster, "master", "", "", true),
-				node("10.0.0.9", "master", "", "", true),
+				node(liveMaster, RoleMaster, "", "", true),
+				node(ipNode9, RoleMaster, "", "", true),
 			),
-			want: []string{"10.0.0.9"},
+			want: []string{ipNode9},
 		},
 		{
 			name: "replica following a wrong (dead) master IP: repointed",
 			state: stateOf(
-				node(liveMaster, "master", "", "", true),
-				node("10.0.0.2", "slave", "10.0.0.99", "down", true),
+				node(liveMaster, RoleMaster, "", "", true),
+				node(ipReplica, roleSlave, "10.0.0.99", "down", true),
 			),
-			want: []string{"10.0.0.2"},
+			want: []string{ipReplica},
 		},
 		{
 			name: "replica on the right master with link:down (handshake): NOT repointed",
 			state: stateOf(
-				node(liveMaster, "master", "", "", true),
-				node("10.0.0.2", "slave", liveMaster, "down", true),
+				node(liveMaster, RoleMaster, "", "", true),
+				node(ipReplica, roleSlave, liveMaster, "down", true),
 			),
 			want: nil,
 		},
 		{
 			name: "unreachable pod: skipped",
 			state: stateOf(
-				node(liveMaster, "master", "", "", true),
-				node("10.0.0.2", "master", "", "", false),
+				node(liveMaster, RoleMaster, "", "", true),
+				node(ipReplica, RoleMaster, "", "", false),
 			),
 			want: nil,
 		},
 		{
 			name: "multiple stragglers: sorted by IP",
 			state: stateOf(
-				node(liveMaster, "master", "", "", true),
-				node("10.0.0.5", "master", "", "", true),
-				node("10.0.0.3", "slave", "10.0.0.5", "up", true),
+				node(liveMaster, RoleMaster, "", "", true),
+				node("10.0.0.5", RoleMaster, "", "", true),
+				node(ipNode3, roleSlave, "10.0.0.5", "up", true),
 			),
-			want: []string{"10.0.0.3", "10.0.0.5"},
+			want: []string{ipNode3, "10.0.0.5"},
 		},
 	}
 

@@ -1010,7 +1010,7 @@ func TestBuildSentinelStatefulSetWithoutMetrics(t *testing.T) {
 // builders set them (a cross-mode-parity defect); this guards every builder
 // against regressing that passthrough.
 func TestStatefulSetBuildersPropagatePodTemplateScheduling(t *testing.T) {
-	nodeSelector := map[string]string{"disktype": "ssd"}
+	nodeSelector := map[string]string{"disktype": diskTypeSSD}
 	tolerations := []corev1.Toleration{{
 		Key:      "dedicated",
 		Operator: corev1.TolerationOpEqual,

@@ -28,7 +28,8 @@ import (
 
 // Mode values for LittleRedSpec.Mode.
 const (
-	ModeCluster = "cluster"
+	ModeCluster  = "cluster"
+	ModeFailover = "failover"
 )
 
 // Default values
@@ -183,7 +184,7 @@ func (r *LittleRed) SetDefaults() {
 	}
 
 	// Failover defaults (only if failover mode)
-	if spec.Mode == "failover" && spec.Failover == nil {
+	if spec.Mode == ModeFailover && spec.Failover == nil {
 		spec.Failover = &FailoverSpec{}
 	}
 	if spec.Failover != nil {

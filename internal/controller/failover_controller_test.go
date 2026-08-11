@@ -114,7 +114,7 @@ var _ = Describe("Failover mode reconciliation", func() {
 		sts := &appsv1.StatefulSet{}
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: resourceName + "-redis", Namespace: testNamespaceDefault}, sts)).To(Succeed())
 		Expect(*sts.Spec.Replicas).To(Equal(int32(3)))
-		volNames := []string{}
+		volNames := make([]string, 0, len(sts.Spec.Template.Spec.Volumes))
 		for _, v := range sts.Spec.Template.Spec.Volumes {
 			volNames = append(volNames, v.Name)
 		}

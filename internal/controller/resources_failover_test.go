@@ -132,9 +132,9 @@ func TestBuildRedisStatefulSetFailoverReplicaCount(t *testing.T) {
 
 func TestBuildRedisStatefulSetFailoverPropagatesScheduling(t *testing.T) {
 	lr := newFailoverTestLittleRed()
-	lr.Spec.PodTemplate.NodeSelector = map[string]string{"disktype": "ssd"}
+	lr.Spec.PodTemplate.NodeSelector = map[string]string{"disktype": diskTypeSSD}
 	sts := buildRedisStatefulSetFailover(lr)
-	if sts.Spec.Template.Spec.NodeSelector["disktype"] != "ssd" {
+	if sts.Spec.Template.Spec.NodeSelector["disktype"] != diskTypeSSD {
 		t.Error("StatefulSet should propagate spec.podTemplate.nodeSelector")
 	}
 }

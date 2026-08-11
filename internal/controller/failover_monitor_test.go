@@ -40,7 +40,7 @@ import (
 
 func TestAdvanceFailoverProbeStreak(t *testing.T) {
 	const downAfter = 5 * time.Second
-	const ipA, ipB = "10.0.0.1", "10.0.0.2"
+	const ipA, ipB = ipMaster, ipReplica
 	t0 := time.Unix(3_000_000, 0)
 
 	tests := []struct {

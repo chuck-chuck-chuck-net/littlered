@@ -24,6 +24,15 @@ import (
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
+// Shared string constants for the failover analyze tests (role/link/phase/replid
+// literals repeated across the table cases). RoleMaster lives in analyze.go.
+const (
+	roleSlave    = "slave"
+	linkDown     = "down"
+	phaseRunning = "Running"
+	replidAAAA   = "AAAA"
+)
+
 // TestConstantsMatchController pins the CLI's copies of the operator-stamped
 // annotation/label keys to the controller's authoritative constants, so the
 // two cannot silently drift (the controller package is deliberately not
@@ -74,7 +83,7 @@ func mkState(nodes ...node) *redisclient.ReplicationState {
 
 func assigned(name, ip, role, masterIP string, epoch int64) PodView {
 	return PodView{
-		Name: name, IP: ip, Phase: "Running", Ready: true,
+		Name: name, IP: ip, Phase: phaseRunning, Ready: true,
 		RoleLabel:     map[bool]string{true: RoleMaster, false: RoleReplica}[role == RoleMaster],
 		HasAssignment: true, AssignedRole: role, AssignedMasterIP: masterIP, Epoch: epoch,
 	}
@@ -121,9 +130,9 @@ func healthyPods() []PodView {
 // flagged as divergence (the LR-024 lesson).
 func healthyState() *redisclient.ReplicationState {
 	return mkState(
-		node{pod: pod0, ip: ip0, role: "master", offset: 100, keys: 5, replid: "AAAA"},
-		node{pod: pod1, ip: ip1, role: "slave", masterHost: ip0, link: "up", offset: 100, keys: 5, replid: "AAAA"},
-		node{pod: pod2, ip: ip2, role: "slave", masterHost: ip0, link: "up", offset: 90, keys: 5, replid: "BBBB", replid2: "AAAA"},
+		node{pod: pod0, ip: ip0, role: RoleMaster, offset: 100, keys: 5, replid: replidAAAA},
+		node{pod: pod1, ip: ip1, role: roleSlave, masterHost: ip0, link: "up", offset: 100, keys: 5, replid: replidAAAA},
+		node{pod: pod2, ip: ip2, role: roleSlave, masterHost: ip0, link: "up", offset: 90, keys: 5, replid: "BBBB", replid2: replidAAAA},
 	)
 }
 
@@ -153,9 +162,9 @@ func TestAnalyzeIntentHighestEpochWins(t *testing.T) {
 	}
 	pods[0].RoleLabel = RoleReplica
 	state := mkState(
-		node{pod: pod0, ip: ip0, role: "slave", masterHost: ip1, link: "up", keys: 5, replid: "AAAA"},
-		node{pod: pod1, ip: ip1, role: "master", offset: 100, keys: 5, replid: "AAAA"},
-		node{pod: pod2, ip: ip2, role: "slave", masterHost: ip1, link: "up", keys: 5, replid: "AAAA"},
+		node{pod: pod0, ip: ip0, role: roleSlave, masterHost: ip1, link: "up", keys: 5, replid: replidAAAA},
+		node{pod: pod1, ip: ip1, role: RoleMaster, offset: 100, keys: 5, replid: replidAAAA},
+		node{pod: pod2, ip: ip2, role: roleSlave, masterHost: ip1, link: "up", keys: 5, replid: replidAAAA},
 	)
 	a := Analyze(pods, state)
 	if a.Intent.MasterName != pod1 || a.Intent.MasterEpoch != 3 {
@@ -178,8 +187,8 @@ func TestAnalyzeDuplicateMasterAssignmentSameEpoch(t *testing.T) {
 		assigned(pod1, ip1, RoleMaster, "", 2),
 	}
 	state := mkState(
-		node{pod: pod0, ip: ip0, role: "master", keys: 1, replid: "AAAA"},
-		node{pod: pod1, ip: ip1, role: "slave", masterHost: ip0, link: "up", keys: 1, replid: "AAAA"},
+		node{pod: pod0, ip: ip0, role: RoleMaster, keys: 1, replid: replidAAAA},
+		node{pod: pod1, ip: ip1, role: roleSlave, masterHost: ip0, link: "up", keys: 1, replid: replidAAAA},
 	)
 	a := Analyze(pods, state)
 	// Deterministic tie-break: lexicographically smallest pod name.
@@ -193,8 +202,8 @@ func TestAnalyzeDuplicateMasterAssignmentSameEpoch(t *testing.T) {
 
 func TestAnalyzeNoAssignmentsAtAll(t *testing.T) {
 	pods := []PodView{
-		{Name: pod0, IP: ip0, Phase: "Running"},
-		{Name: pod1, IP: ip1, Phase: "Running"},
+		{Name: pod0, IP: ip0, Phase: phaseRunning},
+		{Name: pod1, IP: ip1, Phase: phaseRunning},
 	}
 	a := Analyze(pods, mkState())
 	if a.Intent.MasterName != "" || a.AuthorityIP != "" {
@@ -213,8 +222,8 @@ func TestAnalyzeNoMasterAssignment(t *testing.T) {
 		assigned(pod2, ip2, RoleReplica, ip0, 2),
 	}
 	state := mkState(
-		node{pod: pod1, ip: ip1, role: "slave", masterHost: ip0, link: "down", keys: 5, replid: "AAAA"},
-		node{pod: pod2, ip: ip2, role: "slave", masterHost: ip0, link: "down", keys: 5, replid: "AAAA"},
+		node{pod: pod1, ip: ip1, role: roleSlave, masterHost: ip0, link: linkDown, keys: 5, replid: replidAAAA},
+		node{pod: pod2, ip: ip2, role: roleSlave, masterHost: ip0, link: linkDown, keys: 5, replid: replidAAAA},
 	)
 	a := Analyze(pods, state)
 	if a.Intent.MasterName != "" {
@@ -247,7 +256,7 @@ func TestAnalyzeAuthorityRequiresObservedRoleMaster(t *testing.T) {
 	// intent alone is not authority.
 	pods := healthyPods()
 	state := healthyState()
-	state.RedisNodes[ip0].Role = "slave"
+	state.RedisNodes[ip0].Role = roleSlave
 	a := Analyze(pods, state)
 	if a.AuthorityIP != "" {
 		t.Fatalf("authority = %q, want none (intended master not role:master)", a.AuthorityIP)
@@ -261,7 +270,7 @@ func TestAnalyzeStragglerMaster(t *testing.T) {
 	// r-2 claims role:master although the intent (and authority) is r-0.
 	pods := healthyPods()
 	state := healthyState()
-	state.RedisNodes[ip2].Role = "master"
+	state.RedisNodes[ip2].Role = RoleMaster
 	state.RedisNodes[ip2].MasterHost = ""
 	state.RedisNodes[ip2].LinkStatus = ""
 	a := Analyze(pods, state)
@@ -277,7 +286,7 @@ func TestAnalyzeReplicaFollowsWrongIP(t *testing.T) {
 	pods := healthyPods()
 	state := healthyState()
 	state.RedisNodes[ip2].MasterHost = "10.9.9.9" // dead ex-master
-	state.RedisNodes[ip2].LinkStatus = "down"
+	state.RedisNodes[ip2].LinkStatus = linkDown
 	a := Analyze(pods, state)
 	if !hasFinding(a, SeverityFail, "wrong master") {
 		t.Errorf("want FAIL follows wrong master, got: %s", findingsStr(a))
@@ -288,7 +297,7 @@ func TestAnalyzeLinkDownIsDegradedOnly(t *testing.T) {
 	// Following the authority with link:down is a transient resync: WARN.
 	pods := healthyPods()
 	state := healthyState()
-	state.RedisNodes[ip2].LinkStatus = "down"
+	state.RedisNodes[ip2].LinkStatus = linkDown
 	a := Analyze(pods, state)
 	if !hasFinding(a, SeverityWarn, "link:down") {
 		t.Errorf("want WARN link:down, got: %s", findingsStr(a))
@@ -360,8 +369,8 @@ func TestAnalyzeLineageDivergence(t *testing.T) {
 		assigned(pod2, ip2, RoleReplica, ip0, 2),
 	}
 	state := mkState(
-		node{pod: pod1, ip: ip1, role: "slave", masterHost: ip0, link: "down", keys: 5, replid: "AAAA"},
-		node{pod: pod2, ip: ip2, role: "slave", masterHost: ip0, link: "down", keys: 7, replid: "CCCC", replid2: "DDDD"},
+		node{pod: pod1, ip: ip1, role: roleSlave, masterHost: ip0, link: linkDown, keys: 5, replid: replidAAAA},
+		node{pod: pod2, ip: ip2, role: roleSlave, masterHost: ip0, link: linkDown, keys: 7, replid: "CCCC", replid2: "DDDD"},
 	)
 	a := Analyze(pods, state)
 	if !hasFinding(a, SeverityFail, "independent replication lineages") {
@@ -382,7 +391,7 @@ func TestAnalyzeFreshPodAwaitingAuthorization(t *testing.T) {
 	// A recreated pod has no annotations yet (the StatefulSet wiped them):
 	// transient re-auth state, WARN only.
 	pods := healthyPods()
-	pods[2] = PodView{Name: pod2, IP: ip2, Phase: "Running", RoleLabel: RoleReplica}
+	pods[2] = PodView{Name: pod2, IP: ip2, Phase: phaseRunning, RoleLabel: RoleReplica}
 	state := healthyState()
 	state.RedisNodes[ip2].Reachable = false
 	a := Analyze(pods, state)

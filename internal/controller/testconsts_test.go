@@ -24,8 +24,14 @@ const (
 	ipReplica = "10.0.0.2"
 	ipNode3   = "10.0.0.3"
 	ipNode5   = "10.0.0.5"
+	ipNode7   = "10.0.0.7"
+	ipNode9   = "10.0.0.9"
 	ipTest    = "1.1.1.1"
 	roleSlave = "slave"
+
+	podRedis0 = "r-redis-0"
+	podRedis1 = "r-redis-1"
+	podRedis2 = "r-redis-2"
 
 	stsMrCluster0 = "mr-cluster-0"
 	stsMrCluster1 = "mr-cluster-1"
@@ -35,4 +41,9 @@ const (
 
 	testNodeID0 = "id0"
 	testReplid0 = "716d42"
+	testReplid1 = "1cc4b7"
+	testReplidA = "AAA"
+	testReplidB = "BBB"
+
+	diskTypeSSD = "ssd"
 )
