@@ -61,20 +61,24 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 	})
 
 	// --- Scenario B: the split-brain guard (least destructive, run first) ------------------
-	Context("Scenario B: data-plane partition with the site alive (must NOT take over)", Label("multisite-hold"), func() {
+	Context("Scenario B: hub-blind cut with the cluster healthy (must NOT take over)", Label("multisite-hold"), func() {
 		const (
 			ns     = "ms-e2e-b"
 			crName = "ms-b"
 		)
 		siteNames := []string{"scm-s1", "scm-s2"}
-		affected := "scm-s2" // the partitioned (but alive) site
+		affected := "scm-s2" // the site the HUB's dial is cut from (still connected to its peer s1)
 
 		AfterEach(func() {
 			msHealDataPlane(reg.site(affected).context, ns)
 			msTeardownInstance(reg, ns, crName)
 		})
 
-		It("classifies the affected site Contradiction and HOLDs — no takeover, no split-brain", func() {
+		It("HOLDs on a hub-blind cut while the survivors report cluster_state:ok — no takeover, no split-brain", func() {
+			if len(msHubPeerCIDRs()) == 0 {
+				Skip("Scenario B needs MS_HUB_POD_CIDR (the hub operator's pod CIDR) to cut ONLY the " +
+					"hub→site data path while the sites stay mutually connected — see docs/E2E_TESTING.md")
+			}
 			By("standing up a 2-site cluster instance [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
 			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
@@ -96,24 +100,33 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 
 			startedAt := time.Now()
 
-			By("cutting ONLY the cross-site redis/gossip data-plane to " + affected + " (site stays alive)")
-			peers := append(msPodCIDRsForSite(reg, reg.site("scm-s1").context, ns),
-				msHubPeerCIDRs()...)
-			msPartitionDataPlane(reg, reg.site(affected).context, ns, crName, peers)
+			By("cutting ONLY the hub→" + affected + " redis data path (the sites stay mutually connected)")
+			// Deny the hub operator's dials to the affected site's redis, but NOT peer site s1's —
+			// so s1↔s2 gossip stays up, both sites keep cluster_state:ok and serve all slots, and
+			// the "loss" exists ONLY from the hub's (dial) vantage. This is the case the arithmetic
+			// design must HOLD on: condition 2 gates on the SURVIVORS' own cluster_state, and they
+			// report ok, so recoverSiteLoss returns WaitNative — never a takeover (the LR-017
+			// survivors'-vantage rule). A FULL isolation, by contrast, self-fences the isolated
+			// minority and IS taken over safely — that path is a site loss (Scenario A).
+			msPartitionDataPlane(reg, reg.site(affected).context, ns, crName, msHubPeerCIDRs())
 
-			By("asserting the operator classifies " + affected + " as Contradiction and HOLDs (no takeover)")
-			// The affected site's pods stay Ready and its API answers, so the witness is
-			// Contradiction and planSiteTakeover returns Hold. We assert the STRONG negative:
-			// across a window comfortably longer than the takeover cooldown (max(60s,2×15s)=60s),
-			// no SiteTakeoverExecuted event is ever emitted and no shard gains a 2nd serving master.
+			By("asserting the operator HOLDs: no takeover while the survivors report cluster_state:ok")
+			// STRONG negative across a window well past the cooldown (max(60s,2×15s)=60s): no
+			// SiteTakeoverExecuted, no shard gains a 2nd serving master — AND the survivor keeps
+			// cluster_state:ok, proving the HOLD is "the cluster is fine, the hub is merely blind",
+			// not a refusal or a masked failure.
 			Consistently(func(g Gomega) {
 				g.Expect(msHasEvent(reg, ns, crName, "SiteTakeoverExecuted")).To(BeFalse(),
-					"a takeover must NEVER fire against an alive (Contradiction) site")
+					"a takeover must NEVER fire while the survivors are healthy (hub-blind cut)")
 				g.Expect(msSecondServingMasterExists(reg, ns, crName)).To(BeFalse(),
 					"no shard may gain a second serving master (split-brain)")
+				info, err := msClusterInfo(reg.site("scm-s1").context, ns, seedPod)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(info["cluster_state"]).To(Equal("ok"),
+					"the cluster stays healthy (sites still mutually connected); the hub is merely blind to "+affected)
 			}, "100s", "10s").Should(Succeed())
 
-			By("confirming the MultiSiteTakeover condition never latched a refusal/executed reason")
+			By("confirming the MultiSiteTakeover condition never latched an executed reason")
 			status, reason := msTakeoverCondition(reg, ns, crName)
 			_, _ = fmt.Fprintf(GinkgoWriter, "MultiSiteTakeover condition: status=%q reason=%q\n", status, reason)
 			Expect(reason).NotTo(Equal("SiteTakeoverExecuted"))

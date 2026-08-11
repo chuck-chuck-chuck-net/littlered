@@ -190,7 +190,7 @@ make test-e2e ARGS="-timeout 90m"
 | `MS_SITE_CONTEXTS` | **(required)** | Multi-site only: comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. No default. |
 | `MS_SITE_ENDPOINTS` | **(required)** | Multi-site only: comma list `name=https://host:port,…` of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). One entry per `MS_SITE_CONTEXTS` name. No default. |
 | `MS_VM_INVENTORY` | (none) | Multi-site takeover suite only: path to a file of `<site> <vm-name> <virsh-uri>` lines for the whole-site kill (`virsh destroy`/`start`). Unset ⇒ Scenario A `Skip`s. |
-| `MS_HUB_POD_CIDR` | (none) | Multi-site takeover Scenario B only: extra hub-pod CIDR(s) to deny in the data-plane-partition `CiliumNetworkPolicy`. |
+| `MS_HUB_POD_CIDR` | (none) | **Required for Scenario B** (`multisite-hold`): the hub operator pod CIDR(s) to deny, so the cut isolates the site **from the hub only** (the sites stay mutually connected) — the hub-blind HOLD case. Unset ⇒ Scenario B `Skip`s (the cut would be a no-op). Comma-separated. |
 | `NON_GRACEFUL_RESTART` | (none) | Advanced: when `true`, pod-restart helpers use a hard/non-graceful kill instead of a graceful delete |
 | `FOCUS` | (none) | Ginkgo focus filter (regex) |
 | `ARGS` | (none) | Extra arguments passed to `go test` |

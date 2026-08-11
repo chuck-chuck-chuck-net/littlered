@@ -254,9 +254,17 @@ degrades to Tier A (human), never to an unsafe guess.
   replicated data (Tier A/0b). A majority-master-site loss refuses (drift-refusal) and
   waits for the opt-in, a human (Phase 1), or the fence (Phase 2). ≥3-site losses stay
   native (Tier C) and `planSiteTakeover` is rarely reached.
-- A dual-site inter-site **link cut** remains a full outage until the link heals — by
-  design (the descoped link-partition case); the fence-safe arithmetic keeps it
-  split-brain-free (both minorities self-fence).
+- A dual-site inter-site **link cut** of an even split is **recovered, not held**: from
+  the survivors' vantage a dead site and a data-isolated-alive *minority* site are
+  indistinguishable (both self-fence via the unconditional minority check) and a takeover
+  is safe in both, so the operator promotes the reachable side — one side serves again;
+  the isolated minority stays fenced, takes no writes, and demotes on heal (no
+  divergence). This deliberately **supersedes** the earlier "link-cut is descoped, HOLD
+  until heal" stance — a strict availability win, and a consequence the arithmetic cannot
+  avoid (it cannot, and need not, tell the two apart). The one partition the operator must
+  **not** act on is a **hub-blind** cut where the sites stay mutually connected and
+  serving: the survivors then report their own `cluster_state:ok`, condition 2 fails, and
+  the operator HOLDs (the LR-017 survivors'-vantage rule — exercised by the e2e Scenario B).
 - **Drift is a first-class, surfaced state.** Master-per-site distribution and the
   balance invariant's health are surfaced (`lrctl verify`, a condition); a violated
   invariant is "reduced site-loss resilience," not silent drift.

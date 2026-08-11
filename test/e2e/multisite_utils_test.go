@@ -521,21 +521,6 @@ func msHealDataPlane(siteCtx, ns string) {
 	_, _ = kctl(siteCtx, "-n", ns, "delete", "ciliumnetworkpolicy", msDataPlanePolicyName, "--ignore-not-found")
 }
 
-// msPodCIDRsForSite returns the instance's redis pod IPs (as /32 CIDRs) in a site — the exact
-// peers to deny so the cut is surgical (only this instance's cross-site redis, nothing else).
-func msPodCIDRsForSite(reg *msRegistry, siteCtx, ns string) []string {
-	out, err := kctl(siteCtx, "-n", ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
-		"-o", "jsonpath={range .items[*]}{.status.podIP}{\"\\n\"}{end}")
-	Expect(err).NotTo(HaveOccurred())
-	var cidrs []string
-	for _, ip := range strings.Split(strings.TrimSpace(out), "\n") {
-		if ip = strings.TrimSpace(ip); ip != "" {
-			cidrs = append(cidrs, ip+"/32")
-		}
-	}
-	return cidrs
-}
-
 // --- Disruption: whole-site loss via hypervisor power-off (Scenario A) ---------------------
 //
 // A true whole-site loss must be a sustained outage we control — not a self-reversing guest
