@@ -752,6 +752,18 @@ const (
 	// set multiSite.allowUnsafeSiteTakeover to authorise, or act manually). False records
 	// a completed takeover or that no site-loss recovery is needed.
 	ConditionMultiSiteTakeover = "MultiSiteTakeover"
+	// ConditionReducedSiteLossResilience is a surfaced WARNING (not an admission refusal)
+	// for a multi-site topology that cannot structurally auto-survive an arbitrary
+	// single-site loss (cluster mode with spec.multiSite; ADR-012). It is True when the D2
+	// balance invariant is structurally unsatisfiable — S sites x (ceil(K/2)-1) masters/site
+	// < K shards, so pigeonhole forces some site over the balance target and losing that
+	// heavier-master site strands the survivors below quorum (the headline case is K=4 over
+	// 3 sites). The topology is still valid and functional — recovery of the heavier site's
+	// loss simply requires manual action or multiSite.allowUnsafeSiteTakeover — so LittleRed
+	// surfaces this rather than blocking it (the opt-in-not-block norm). Structural
+	// (spec-level) only; transient master drift within a resilient topology is owned by the
+	// rebalancer, not this condition. False records a resilient topology.
+	ConditionReducedSiteLossResilience = "ReducedSiteLossResilience"
 )
 
 // LittleRedStatus defines the observed state of LittleRed
@@ -887,6 +899,17 @@ type MultiSiteStatus struct {
 	// +optional
 	Shards []ShardSiteView `json:"shards,omitempty"`
 
+	// MasterCounts is the current number of slot-serving masters hosted per site
+	// (ADR-012 D2), from the last gather. Published so a tier-1 (read-only-hub)
+	// reader can render the master-per-site distribution and the balance invariant's
+	// live health (per-site count vs the ceil(K/2)-1 balance target) without any
+	// site access. Monitoring surface only — the balancing decision is re-derived
+	// from the live gather each pass.
+	// +listType=map
+	// +listMapKey=site
+	// +optional
+	MasterCounts []SiteMasterCount `json:"masterCounts,omitempty"`
+
 	// LastReconcileTime is when the operator last published this cross-site view.
 	// A tier-1 reader reports it as the data's freshness ("as of last reconcile
 	// N ago").
@@ -918,6 +941,19 @@ type ShardSiteView struct {
 	// link down at the last gather (reduced redundancy).
 	// +optional
 	LinkDown bool `json:"linkDown,omitempty"`
+}
+
+// SiteMasterCount is the number of slot-serving masters currently hosted in one
+// site (ADR-012 D2 master-per-site distribution). A site holding more than
+// ceil(K/2)-1 (the balance target, K = shards) violates the balance invariant —
+// surfaced as informational drift, corrected by the rebalancer.
+type SiteMasterCount struct {
+	// Site is the site name from spec.multiSite.sites.
+	Site string `json:"site"`
+
+	// Masters is the count of slot-serving masters observed in the site at the last
+	// gather.
+	Masters int32 `json:"masters"`
 }
 
 // SiteStatus is the observed state of one site.

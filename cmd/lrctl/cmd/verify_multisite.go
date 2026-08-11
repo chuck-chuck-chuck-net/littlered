@@ -164,6 +164,14 @@ func verifyMultiSiteFromStatus(lr *littleredv1alpha1.LittleRed) error {
 		})
 	}
 
+	// Master-per-site distribution + balance-invariant health (ADR-012 D2), from the
+	// operator's published counts. Informational — never changes the verdict.
+	msCounts := make([]multisite.SiteMasterCount, 0, len(ms.MasterCounts))
+	for _, mc := range ms.MasterCounts {
+		msCounts = append(msCounts, multisite.SiteMasterCount{Site: mc.Site, Masters: int(mc.Masters)})
+	}
+	printMasterDistribution(multisite.EvaluateMasterDistribution(len(ms.Shards), len(ms.Sites), msCounts))
+
 	v := multisite.StatusVerdict(ms.ClusterState, int(ms.SlotsAssigned), shardViews, unreachable)
 	fmt.Printf("\nSummary:\n")
 	for _, r := range v.Reasons {
@@ -234,6 +242,15 @@ func renderMultiSiteVerdict(
 		fmt.Printf("  [FAIL] Replica %s (shard %d) follows a master in shard %d (%s) — Redis shard spans two shard groups\n",
 			v.ReplicaPod, v.ReplicaShard, v.MasterShard, v.MasterPod)
 	}
+
+	// Master-per-site distribution + balance-invariant health (ADR-012 D2). Informational —
+	// [IMBALANCED] drift (the rebalancer corrects it) and the structural reduced-resilience
+	// [WARN] never change the verdict/exit code below. numSites counts every site the
+	// deployment spans (reachable nodes' sites + unreachable ones), so the structural verdict
+	// is not skewed by a site being down this pass.
+	numSites := distinctMultiSiteSites(gt, siteProblems)
+	printMasterDistribution(multisite.EvaluateMasterDistribution(gt.CountMasters(), numSites,
+		multisite.MasterCountsFromGroundTruth(gt)))
 
 	fmt.Printf("\nSummary:\n")
 	expectedShards := int32(gt.CountMasters())
@@ -477,6 +494,60 @@ func verifyMultiSiteJSONFromStatus(lr *littleredv1alpha1.LittleRed) multiSiteVer
 	}
 	out.Healthy = multisite.StatusVerdict(ms.ClusterState, int(ms.SlotsAssigned), shardViews, unreachable).OK
 	return out
+}
+
+// printMasterDistribution renders the ADR-012 D2 master-per-site distribution and the balance
+// invariant's live health: each site's current slot-serving-master count against the balance
+// target (ceil(K/2)-1), an [IMBALANCED] marker when a site currently exceeds it, and the
+// structural reduced-resilience [WARN] when the topology cannot auto-survive an arbitrary
+// single-site loss. All of it is INFORMATIONAL — imbalance is transient drift the operator's
+// rebalancer corrects, and reduced resilience is a surfaced warning, not a refusal — so none
+// of it changes the verify verdict or exit code.
+func printMasterDistribution(md multisite.MasterDistribution) {
+	fmt.Printf("\nMaster Distribution (balance target %d master(s)/site for %d shards, ADR-012 D2):\n",
+		md.Target, md.Shards)
+	imbal := make(map[string]bool, len(md.Imbalanced))
+	for _, s := range md.Imbalanced {
+		imbal[s] = true
+	}
+	if len(md.Counts) == 0 {
+		fmt.Println("  (no slot-serving masters observed)")
+	}
+	for _, c := range md.Counts {
+		marker := "[OK]"
+		if imbal[c.Site] {
+			marker = fmt.Sprintf("[IMBALANCED] (exceeds target %d)", md.Target)
+		}
+		fmt.Printf("  - site %s: %d master(s) %s\n", c.Site, c.Masters, marker)
+	}
+	switch {
+	case !md.Resilient:
+		fmt.Printf("  [WARN] reduced site-loss resilience: %d sites x %d (ceil(%d/2)-1) = %d < %d shards — "+
+			"the topology cannot auto-survive an arbitrary single-site loss; the heavier-master site's loss "+
+			"needs manual or multiSite.allowUnsafeSiteTakeover recovery\n",
+			md.NumSites, md.Target, md.Shards, md.NumSites*md.Target, md.Shards)
+	case len(md.Imbalanced) > 0:
+		fmt.Println("  [WARN] master drift: a site currently exceeds the balance target; the operator's rebalancer will " +
+			"correct it with a graceful failover (informational — no data at risk)")
+	default:
+		fmt.Println("  [OK] balanced: no site exceeds the target; the topology can auto-survive any single-site loss")
+	}
+}
+
+// distinctMultiSiteSites counts the sites the deployment spans: every site attributed to a
+// gathered node plus any additional (e.g. unreachable) sites the caller knows about. Used to
+// derive the structural resilience denominator so a site being down this pass does not skew it.
+func distinctMultiSiteSites(gt *redisclient.ClusterGroundTruth, extra []string) int {
+	set := make(map[string]bool)
+	for _, n := range gt.Nodes {
+		if site, _ := multisite.SplitSiteKey(n.PodName); site != "" {
+			set[site] = true
+		}
+	}
+	for _, s := range extra {
+		set[s] = true
+	}
+	return len(set)
 }
 
 // printMultiSiteNodeStatus renders each node with its owning site attributed.

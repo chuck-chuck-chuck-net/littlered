@@ -59,6 +59,24 @@ import (
 // exact drift the takeover fence refuses on.
 func masterBalanceTarget(shards int) int { return (shards+1)/2 - 1 }
 
+// siteLossResilient reports whether the D2 balance invariant is *structurally satisfiable*
+// for a topology of `shards` (K) shards over `numSites` (S) sites: whether K slot-serving
+// masters can be spread so that no single site holds more than masterBalanceTarget(K). The
+// total master-holding capacity under the invariant is S·masterBalanceTarget(K); if that is
+// below K, the pigeonhole principle forces some site over target, so losing that (heavier)
+// site strands the survivors below quorum — the topology cannot auto-survive an arbitrary
+// single-site loss (ADR-012 Consequence "Reduced-resilience warning": unsatisfiable iff
+// `S·(⌈K/2⌉−1) < K`).
+//
+// This is a spec-level (structural) predicate — it says nothing about the *current* master
+// distribution (drift, owned by the rebalancer); it only decides whether a balanced placement
+// exists at all. The headline trap is K=4 over 3 sites (target 1, but 4 masters over 3 sites
+// force a 2+1+1 split by pigeonhole → losing the 2-master site fails). K=2 needs no handling —
+// Redis Cluster's 3-master minimum already rejects it.
+func siteLossResilient(shards, numSites int) bool {
+	return numSites*masterBalanceTarget(shards) >= shards
+}
+
 // masterRebalanceInput is the pure view the balancer decides on: where each shard's
 // slot-serving master currently lives, and which sites hold a PROMOTABLE replica of each
 // shard (a graceful CLUSTER FAILOVER target). Indexed by shard.

@@ -42,10 +42,16 @@ func splitSiteQualifiedKey(key string) (site, objName string) {
 // guarantee), and whether any replica link is down. crossSiteOK is true only
 // when at least one shard exists and every shard is cross-site.
 //
+// It also returns the current per-site slot-serving-master distribution
+// (masterCounts, ADR-012 D2): the count of masters holding >= 1 slot in each
+// site, mirroring buildMasterRebalanceInput's master criterion. This is the
+// tier-1 published input for the balance-invariant live health (per-site count
+// vs the ceil(K/2)-1 target), sorted by site for determinism.
+//
 // Site + shard are read from each node's site-qualified ground-truth key
 // (site/objName; ShardIndexFromPodName tolerates the site prefix). Nodes whose
 // key carries no shard index are skipped — there is nothing to attribute.
-func buildCrossSiteView(gt *redisclient.ClusterGroundTruth) (state string, slots int32, crossSiteOK bool, shards []littleredv1alpha1.ShardSiteView) {
+func buildCrossSiteView(gt *redisclient.ClusterGroundTruth) (state string, slots int32, crossSiteOK bool, shards []littleredv1alpha1.ShardSiteView, masterCounts []littleredv1alpha1.SiteMasterCount) {
 	state = gt.ClusterState
 	slots = int32(gt.TotalSlots)
 
@@ -55,12 +61,19 @@ func buildCrossSiteView(gt *redisclient.ClusterGroundTruth) (state string, slots
 		linkDown     bool
 	}
 	byShard := map[int]*acc{}
+	mastersPerSite := map[string]int32{}
 	for _, n := range gt.Nodes {
 		shard := redisclient.ShardIndexFromPodName(n.PodName)
 		if shard < 0 {
 			continue
 		}
 		site, _ := splitSiteQualifiedKey(n.PodName)
+		// Slot-serving master distribution (D2): count only masters holding >= 1 slot,
+		// matching buildMasterRebalanceInput / buildSiteTakeoverInput (a fresh empty
+		// master is not yet a Domain-M vote).
+		if n.Role == RoleMaster && len(n.Slots) > 0 && site != "" {
+			mastersPerSite[site]++
+		}
 		a := byShard[shard]
 		if a == nil {
 			a = &acc{replicaSites: map[string]bool{}}
@@ -80,6 +93,12 @@ func buildCrossSiteView(gt *redisclient.ClusterGroundTruth) (state string, slots
 			}
 		}
 	}
+
+	masterCounts = make([]littleredv1alpha1.SiteMasterCount, 0, len(mastersPerSite))
+	for site, c := range mastersPerSite {
+		masterCounts = append(masterCounts, littleredv1alpha1.SiteMasterCount{Site: site, Masters: c})
+	}
+	sort.Slice(masterCounts, func(i, j int) bool { return masterCounts[i].Site < masterCounts[j].Site })
 
 	shardIdxs := make([]int, 0, len(byShard))
 	for k := range byShard {
@@ -114,5 +133,5 @@ func buildCrossSiteView(gt *redisclient.ClusterGroundTruth) (state string, slots
 			LinkDown:     a.linkDown,
 		})
 	}
-	return state, slots, crossSiteOK, shards
+	return state, slots, crossSiteOK, shards, masterCounts
 }

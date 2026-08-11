@@ -150,6 +150,59 @@ func TestCheckSiteSpreadSkipsUnreachableAndMalformed(t *testing.T) {
 	}
 }
 
+// TestMasterCountsFromGroundTruth checks the D2 slot-serving-master-per-site count: only
+// masters with >= 1 owned slot count (a fresh empty master is not yet a Domain-M vote), and
+// the result is site-attributed and sorted.
+func TestMasterCountsFromGroundTruth(t *testing.T) {
+	gt := redisclient.NewClusterGroundTruth()
+	// s1 hosts two slot-serving masters (drift).
+	gt.Nodes["s1/x-shard-0-0"] = &redisclient.ClusterNodeState{PodName: "s1/x-shard-0-0", Role: "master", Slots: []string{"0-100"}, Reachable: true}
+	gt.Nodes["s1/x-shard-1-0"] = &redisclient.ClusterNodeState{PodName: "s1/x-shard-1-0", Role: "master", Slots: []string{"101-200"}, Reachable: true}
+	// s2 hosts one slot-serving master.
+	gt.Nodes["s2/x-shard-2-0"] = &redisclient.ClusterNodeState{PodName: "s2/x-shard-2-0", Role: "master", Slots: []string{"201-300"}, Reachable: true}
+	// s2 also hosts a replica (not counted) and an EMPTY master (no slots — not counted).
+	gt.Nodes["s2/x-shard-0-1"] = &redisclient.ClusterNodeState{PodName: "s2/x-shard-0-1", Role: "replica", Reachable: true}
+	gt.Nodes["s3/x-shard-3-0"] = &redisclient.ClusterNodeState{PodName: "s3/x-shard-3-0", Role: "master", Slots: nil, Reachable: true}
+
+	got := MasterCountsFromGroundTruth(gt)
+	want := []SiteMasterCount{{Site: "s1", Masters: 2}, {Site: "s2", Masters: 1}}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("MasterCountsFromGroundTruth = %+v, want %+v", got, want)
+	}
+}
+
+// TestEvaluateMasterDistribution checks the D2 balance-invariant live health: the balance
+// target ceil(K/2)-1, the informational per-site over-target flag, and the structural
+// resilience verdict.
+func TestEvaluateMasterDistribution(t *testing.T) {
+	// K=4 over 3 sites: target 1; s1 currently holds 2 (over target) → imbalanced; and the
+	// topology is structurally NOT resilient (3*1 < 4 pigeonhole).
+	md := EvaluateMasterDistribution(4, 3, []SiteMasterCount{
+		{Site: "s2", Masters: 1}, {Site: "s1", Masters: 2}, {Site: "s3", Masters: 1},
+	})
+	if md.Target != 1 {
+		t.Errorf("Target = %d, want 1", md.Target)
+	}
+	if !reflect.DeepEqual(md.Imbalanced, []string{"s1"}) {
+		t.Errorf("Imbalanced = %v, want [s1]", md.Imbalanced)
+	}
+	if md.Resilient {
+		t.Errorf("K=4/3-sites must be structurally non-resilient")
+	}
+	// Counts must come back sorted by site.
+	if len(md.Counts) != 3 || md.Counts[0].Site != "s1" || md.Counts[2].Site != "s3" {
+		t.Errorf("Counts not sorted by site: %+v", md.Counts)
+	}
+
+	// K=4 over 4 sites, one master each: target 1, none over target, resilient.
+	md2 := EvaluateMasterDistribution(4, 4, []SiteMasterCount{
+		{Site: "s1", Masters: 1}, {Site: "s2", Masters: 1}, {Site: "s3", Masters: 1}, {Site: "s4", Masters: 1},
+	})
+	if len(md2.Imbalanced) != 0 || !md2.Resilient {
+		t.Errorf("K=4/4-sites balanced: imbalanced=%v resilient=%v, want none/true", md2.Imbalanced, md2.Resilient)
+	}
+}
+
 func TestMembersFromGroundTruth(t *testing.T) {
 	gt := redisclient.NewClusterGroundTruth()
 	gt.Nodes["scm-s1/x-shard-0-0"] = &redisclient.ClusterNodeState{

@@ -810,14 +810,22 @@ func (r *LittleRedReconciler) updateMultiSiteClusterStatus(ctx context.Context, 
 		// Publish the compact, site-attributed cross-site view for tier-1
 		// (read-only-hub) consumers (lrctl status / verify --from-status): they
 		// render this without any site access. Freshness = reconcile interval.
-		state, slots, crossSiteOK, shardViews := buildCrossSiteView(gt)
+		state, slots, crossSiteOK, shardViews, masterCounts := buildCrossSiteView(gt)
 		lr.Status.MultiSite.ClusterState = state
 		lr.Status.MultiSite.SlotsAssigned = slots
 		lr.Status.MultiSite.CrossSiteOK = crossSiteOK
 		lr.Status.MultiSite.Shards = shardViews
+		lr.Status.MultiSite.MasterCounts = masterCounts
 		reconTime := metav1.Now()
 		lr.Status.MultiSite.LastReconcileTime = &reconTime
 	}
+
+	// Reduced-site-loss-resilience warning (ADR-012 D2 "Reduced-resilience warning"):
+	// a STRUCTURAL, spec-level condition — set independent of the gather — for a topology
+	// that cannot auto-survive an arbitrary single-site loss (S sites x (ceil(K/2)-1) < K).
+	// It is a surfaced warning + one-shot event, never a refusal (the opt-in-not-block norm);
+	// transient master drift within a resilient topology is the rebalancer's concern, not this.
+	r.reconcileReducedResilienceCondition(lr)
 
 	if lr.Status.Redis.Ready == lr.Status.Redis.Total && clusterOK {
 		lr.Status.Phase = littleredv1alpha1.PhaseRunning
@@ -859,6 +867,51 @@ func (r *LittleRedReconciler) updateMultiSiteClusterStatus(ctx context.Context, 
 		return ctrl.Result{RequeueAfter: steady}, nil
 	}
 	return ctrl.Result{RequeueAfter: fast}, nil
+}
+
+// reconcileReducedResilienceCondition sets or clears the ReducedSiteLossResilience warning
+// condition (ADR-012 D2) from the STRUCTURAL, spec-level resilience predicate
+// siteLossResilient(shards, numSites) — it depends only on the topology (K shards over S
+// sites), never on the live master distribution. When the invariant is unsatisfiable the
+// condition is True with an explanatory message, plus a one-shot Warning event fired only on
+// the transition into the warning state (idempotent — subsequent passes re-affirm the True
+// condition without re-emitting). When satisfiable it is False (a resilient topology). It is
+// a surfaced warning, never a refusal (the opt-in-not-block norm): the reconcile continues
+// regardless.
+func (r *LittleRedReconciler) reconcileReducedResilienceCondition(lr *littleredv1alpha1.LittleRed) {
+	shards := clusterShardCount(lr)
+	numSites := len(multiSiteSiteNames(lr))
+	target := masterBalanceTarget(shards)
+
+	if siteLossResilient(shards, numSites) {
+		meta.SetStatusCondition(&lr.Status.Conditions, metav1.Condition{
+			Type:   littleredv1alpha1.ConditionReducedSiteLossResilience,
+			Status: metav1.ConditionFalse,
+			Reason: reasonSiteLossResilient,
+			Message: fmt.Sprintf("Topology can auto-survive any single-site loss: %d sites x %d master(s)/site "+
+				"(balance target ceil(%d/2)-1) >= %d shards.", numSites, target, shards, shards),
+			LastTransitionTime: metav1.Now(),
+		})
+		return
+	}
+
+	msg := fmt.Sprintf("Topology cannot auto-survive an arbitrary single-site loss: %d sites x %d master(s)/site "+
+		"(balance target ceil(%d/2)-1) < %d shards, so pigeonhole forces some site over the balance target; "+
+		"losing that heavier-master site strands the survivors below quorum. Add a site, reduce shards, or rely on "+
+		"manual / multiSite.allowUnsafeSiteTakeover recovery for the heavier site's loss.", numSites, target, shards, shards)
+
+	// One-shot Warning event: only on the transition INTO the warning state (the condition
+	// was absent or not True). meta.SetStatusCondition itself is idempotent for the condition.
+	if existing := meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionReducedSiteLossResilience); existing == nil || existing.Status != metav1.ConditionTrue {
+		r.event(lr, corev1.EventTypeWarning, reasonReducedSiteLossResilience, msg)
+	}
+	meta.SetStatusCondition(&lr.Status.Conditions, metav1.Condition{
+		Type:               littleredv1alpha1.ConditionReducedSiteLossResilience,
+		Status:             metav1.ConditionTrue,
+		Reason:             reasonReducedSiteLossResilience,
+		Message:            msg,
+		LastTransitionTime: metav1.Now(),
+	})
 }
 
 // multiSiteSitesPerShard is the resolved sitesPerShard (defaults applied).

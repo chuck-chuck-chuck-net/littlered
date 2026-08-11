@@ -1857,6 +1857,12 @@ const (
 	reasonSiteLossDetected     = "SiteLossDetected"
 	reasonSiteTakeoverExecuted = "SiteTakeoverExecuted"
 	reasonRefusedSiteTakeover  = "RefusedSiteTakeover"
+
+	// Multi-site reduced-site-loss-resilience warning reasons (ADR-012 D2). Structural,
+	// spec-level: the True reason when the balance invariant is unsatisfiable, the False
+	// reason when the topology can auto-survive any single-site loss.
+	reasonReducedSiteLossResilience = "ReducedSiteLossResilience"
+	reasonSiteLossResilient         = "SiteLossResilient"
 )
 
 // setLeaderlessSince stamps Status.LeaderlessSince and sets the LeaderlessRecovery

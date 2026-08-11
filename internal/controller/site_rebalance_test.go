@@ -27,8 +27,27 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	climultisite "github.com/littlered-operator/littlered-operator/internal/cli/multisite"
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
+
+// TestBalanceArithmeticDriftGuard pins the operator's balance arithmetic against lrctl's
+// render-side copy (internal/cli/multisite): the CLI re-implements masterBalanceTarget /
+// siteLossResilient because the controller symbols are unexported and its package is too
+// heavy to import into the CLI. This test asserts the two definitions never drift, so the
+// operator's published condition and lrctl's rendered verdict always agree.
+func TestBalanceArithmeticDriftGuard(t *testing.T) {
+	for k := 1; k <= 20; k++ {
+		if got, want := climultisite.MasterBalanceTarget(k), masterBalanceTarget(k); got != want {
+			t.Errorf("MasterBalanceTarget drift at shards=%d: cli=%d controller=%d", k, got, want)
+		}
+		for s := 1; s <= 8; s++ {
+			if got, want := climultisite.SiteLossResilient(k, s), siteLossResilient(k, s); got != want {
+				t.Errorf("SiteLossResilient drift at shards=%d sites=%d: cli=%v controller=%v", k, s, got, want)
+			}
+		}
+	}
+}
 
 // TestMasterBalanceTarget locks the D2 invariant threshold ceil(K/2)-1 (the maximum number
 // of slot-serving masters any single site may hold so that NO site holds a Redis master
@@ -46,6 +65,29 @@ func TestMasterBalanceTarget(t *testing.T) {
 	for k, want := range cases {
 		if got := masterBalanceTarget(k); got != want {
 			t.Errorf("masterBalanceTarget(%d) = %d, want %d", k, got, want)
+		}
+	}
+}
+
+// TestSiteLossResilient locks the D2 structural resilience predicate (ADR-012 "Reduced-
+// resilience warning"): a topology of K shards over S sites can auto-survive an arbitrary
+// single-site loss iff S·masterBalanceTarget(K) >= K (the invariant is structurally
+// satisfiable — no site is forced over target by pigeonhole).
+func TestSiteLossResilient(t *testing.T) {
+	cases := []struct {
+		shards, sites int
+		want          bool
+	}{
+		{shards: 3, sites: 3, want: true},  // 3*1=3 >= 3
+		{shards: 4, sites: 3, want: false}, // 3*1=3 < 4  (the K=4-over-3-sites pigeonhole trap)
+		{shards: 4, sites: 4, want: true},  // 4*1=4 >= 4
+		{shards: 5, sites: 3, want: true},  // 3*2=6 >= 5
+		{shards: 6, sites: 3, want: true},  // 3*2=6 >= 6
+		{shards: 2, sites: 2, want: false}, // 2*0=0 < 2  (dual-site unsatisfiable; min-3-shards rejects it anyway)
+	}
+	for _, c := range cases {
+		if got := siteLossResilient(c.shards, c.sites); got != c.want {
+			t.Errorf("siteLossResilient(shards=%d, sites=%d) = %v, want %v", c.shards, c.sites, got, c.want)
 		}
 	}
 }

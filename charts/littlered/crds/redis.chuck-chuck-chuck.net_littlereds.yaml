@@ -2430,6 +2430,38 @@ spec:
                       N ago").
                     format: date-time
                     type: string
+                  masterCounts:
+                    description: |-
+                      MasterCounts is the current number of slot-serving masters hosted per site
+                      (ADR-012 D2), from the last gather. Published so a tier-1 (read-only-hub)
+                      reader can render the master-per-site distribution and the balance invariant's
+                      live health (per-site count vs the ceil(K/2)-1 balance target) without any
+                      site access. Monitoring surface only — the balancing decision is re-derived
+                      from the live gather each pass.
+                    items:
+                      description: |-
+                        SiteMasterCount is the number of slot-serving masters currently hosted in one
+                        site (ADR-012 D2 master-per-site distribution). A site holding more than
+                        ceil(K/2)-1 (the balance target, K = shards) violates the balance invariant —
+                        surfaced as informational drift, corrected by the rebalancer.
+                      properties:
+                        masters:
+                          description: |-
+                            Masters is the count of slot-serving masters observed in the site at the last
+                            gather.
+                          format: int32
+                          type: integer
+                        site:
+                          description: Site is the site name from spec.multiSite.sites.
+                          type: string
+                      required:
+                      - masters
+                      - site
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - site
+                    x-kubernetes-list-type: map
                   rebalancePendingSince:
                     description: |-
                       RebalancePendingSince records when the operator last issued a graceful

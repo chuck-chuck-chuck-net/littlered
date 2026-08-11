@@ -194,6 +194,98 @@ func MembersFromGroundTruth(gt *redisclient.ClusterGroundTruth) []ShardMember {
 	return out
 }
 
+// roleMaster is the ground-truth Role string for a master node (redisclient's own constant
+// is unexported); replicated here for the render-side master-per-site distribution.
+const roleMaster = "master"
+
+// MasterBalanceTarget mirrors the operator's masterBalanceTarget (ADR-012 D2): the maximum
+// slot-serving masters a single site may hold without reaching a Redis master majority —
+// ceil(shards/2)-1. Re-implemented here because the controller symbol is unexported and its
+// package is too heavy to import into the CLI; a controller-side drift-guard test asserts the
+// two definitions agree.
+func MasterBalanceTarget(shards int) int { return (shards+1)/2 - 1 }
+
+// SiteLossResilient mirrors the operator's siteLossResilient (ADR-012 D2): whether the D2
+// balance invariant is *structurally satisfiable* for K=shards over S=numSites — i.e. K
+// masters can be spread so no site exceeds MasterBalanceTarget(K). False means the topology
+// cannot auto-survive an arbitrary single-site loss (pigeonhole forces a site over target).
+func SiteLossResilient(shards, numSites int) bool {
+	return numSites*MasterBalanceTarget(shards) >= shards
+}
+
+// SiteMasterCount is one site's current slot-serving-master count, for the master-per-site
+// distribution view (ADR-012 D2).
+type SiteMasterCount struct {
+	Site    string
+	Masters int
+}
+
+// MasterCountsFromGroundTruth counts slot-serving masters (role master with >= 1 owned slot)
+// per site from a gathered ground truth, deriving each node's site from its site-qualified
+// key. Sorted by site. Mirrors the operator's buildCrossSiteView / buildMasterRebalanceInput
+// master criterion so the live (tier 2/3) view matches the operator's published (tier 1) one.
+func MasterCountsFromGroundTruth(gt *redisclient.ClusterGroundTruth) []SiteMasterCount {
+	perSite := map[string]int{}
+	for _, n := range gt.Nodes {
+		if n.Role != roleMaster || len(n.Slots) == 0 {
+			continue
+		}
+		site, _ := SplitSiteKey(n.PodName)
+		if site == "" {
+			continue
+		}
+		perSite[site]++
+	}
+	out := make([]SiteMasterCount, 0, len(perSite))
+	for s, c := range perSite {
+		out = append(out, SiteMasterCount{Site: s, Masters: c})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Site < out[j].Site })
+	return out
+}
+
+// MasterDistribution is the ADR-012 D2 balance-invariant health assessment: the current
+// per-site slot-serving-master distribution plus its structural and live verdicts. It is
+// informational — imbalance never fails a verdict (the rebalancer corrects it); the structural
+// non-resilience is the same warning the operator surfaces as ReducedSiteLossResilience.
+type MasterDistribution struct {
+	Shards   int
+	NumSites int
+	// Target is MasterBalanceTarget(Shards): the max masters a site may hold to stay balanced.
+	Target int
+	// Counts is the per-site master count, sorted by site.
+	Counts []SiteMasterCount
+	// Imbalanced lists sites whose current master count EXCEEDS Target (live drift), sorted.
+	Imbalanced []string
+	// Resilient is the structural verdict SiteLossResilient(Shards, NumSites).
+	Resilient bool
+}
+
+// EvaluateMasterDistribution builds the D2 balance-invariant health from the shard/site counts
+// and the current per-site master distribution. Pure and deterministic. A site currently over
+// Target is flagged Imbalanced (informational drift); Resilient is the structural predicate.
+func EvaluateMasterDistribution(shards, numSites int, counts []SiteMasterCount) MasterDistribution {
+	target := MasterBalanceTarget(shards)
+	sorted := make([]SiteMasterCount, len(counts))
+	copy(sorted, counts)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Site < sorted[j].Site })
+	var imbalanced []string
+	for _, c := range sorted {
+		if c.Masters > target {
+			imbalanced = append(imbalanced, c.Site)
+		}
+	}
+	sort.Strings(imbalanced)
+	return MasterDistribution{
+		Shards:     shards,
+		NumSites:   numSites,
+		Target:     target,
+		Counts:     sorted,
+		Imbalanced: imbalanced,
+		Resilient:  SiteLossResilient(shards, numSites),
+	}
+}
+
 // SiteSpreadViolation records a shard whose reachable members do not span at
 // least two sites — a single site loss would take the whole shard with it,
 // defeating the multi-site failure-domain guarantee (design §1/§4). In
