@@ -158,6 +158,21 @@ maintains the invariant with a slow, convergent, **drift-triggered** reconciler
 LR-025 uses). It runs only on violation, so churn is bounded to real drift events —
 not a hot-path balancer.
 
+Execution (steady-state maintenance, so gated conservatively): it runs **only on the
+healthy path** of the reconcile (never during repair/takeover/not-ready) and **only
+when quiet** (no terminating survivor pods), issues **at most one graceful
+`CLUSTER FAILOVER` per reconcile** (LR-021-style serialization — a graceful failover is
+a per-shard write pause), and honours a post-move settle **cooldown**
+(`masterRebalanceCooldown` = 30s, anchored on `status.multiSite.rebalancePendingSince`,
+mirroring `takeoverPendingSince`) so a failover in flight is never restarted — a
+multi-move convergence advances one failover per cooldown. A graceful-failover **target
+must be an in-sync replica** (`role:replica` + `link:up`): `CLUSTER FAILOVER`
+coordinates the handoff with the replica, so a lagging/disconnected one is not a valid
+target. Because `planMasterRebalance` only ever selects a shard mastered at an
+over-target donor, a shard already at its target is never re-selected — no thrash. A
+worst-case bug here is at most an unnecessary graceful failover (an availability blip),
+never data loss or split-brain.
+
 Scope note: ADR-009 declines master balancing in **single-site** mode for *load*
 reasons (reads go to replicas; `replicasPerShard:1` has no freedom; churn). Those
 hold for load. Multi-site requires balancing for a **different** reason —
