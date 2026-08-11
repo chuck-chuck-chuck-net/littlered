@@ -1,6 +1,9 @@
 # Design: Multi-Site Cluster Mode (Hub-and-Spokes)
 
-> **Status:** Design draft — reviewed direction, not yet implemented.
+> **Status:** Implemented, ships **experimental** (ADR-012, CLAUDE.md pillar 3.15).
+> Steady state is live-verified on a real 4-cluster lab; the site-loss recovery
+> (quorum-arithmetic takeover + master rebalancer + reduced-resilience warning) is
+> unit/envtest-verified, live validation pending.
 > **Created:** 2026-08-01.
 > **Scope:** `mode: cluster` only (see §2).
 
@@ -124,16 +127,16 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   shard's per-site StatefulSets may hold the master at a given time.
 - Masters are *initially* distributed as evenly across sites as the arithmetic
   allows — an odd number of masters over two sites always leaves one site holding the
-  majority (`shards: 3`, the standard mental model, is a 2+1 split). No active master
-  balancing in the first iteration; a gentle rebalance (graceful `CLUSTER FAILOVER`
-  on a replica, no data loss) is a planned follow-up (§10) — without it, repeated
-  failovers can concentrate masters further. Consequence for site loss (§6, ADR-012):
-  losing a minority-master site heals natively; losing a majority-master site is
-  automatically recoverable only when the site's death is Kubernetes-confirmed —
-  under an unobservable witness it lands in the **drift-refusal** (the fence argument
-  is unavailable), surfacing a condition and waiting for the opt-in or a human. That
+  majority (`shards: 3`, the standard mental model, is a 2+1 split). Roles then drift as
+  Redis fails over, so the operator runs a **master rebalancer** (ADR-012 D2, §10
+  item 2): a slow, drift-triggered, no-data-loss graceful `CLUSTER FAILOVER` that keeps
+  `max_i mᵢ ≤ ⌈K/2⌉−1` so no site holds a Redis master majority. Consequence for site
+  loss (§6, ADR-012): losing a minority-master site heals natively; the automated
+  takeover is safe *exactly* in the even split (`reachable = unreachable = K/2`), and
+  any odd/drifted split where the lost side could hold the master majority lands in the
+  **drift-refusal**, surfacing a condition and waiting for the opt-in or a human. That
   refusal is an expected, common dual-site outcome, not a rare corner: uneven spreads
-  exist by construction (odd shards) and by drift (even shards).
+  exist by construction (odd shards) and, when drift outruns the rebalancer, by drift.
 - The shard-aware reattach (LR-020 `chooseReattachTarget`) keeps its rule "attach an
   empty pod to the under-replicated master of *its own shard*" — membership is per
   shard across sites; `cluster-allow-replica-migration no` stays. **A shard always
@@ -169,21 +172,23 @@ fact shapes the dual-site rows below.
 |---|---|---|
 | Pod / node loss | any | Native Redis failover to a replica (same or other site). Existing repair loop unchanged. |
 | Full site loss | ≥3 | **Native**: survivors keep a master majority, FAIL-mark the dead masters, elect cross-site replicas. Operator cleans up ghosts (FORGET) afterwards. |
-| Full site loss | 2 | **Operator takeover** (fence-gated, ADR-012): with an even master split, survivors hold exactly half the masters — below quorum — so native failover cannot trigger. The operator (which survives if the hub does) detects the site loss via the site's Kubernetes API and pods, then issues `CLUSTER FAILOVER TAKEOVER` on the surviving replicas and FORGETs the dead nodes — the existing quorum-loss machinery with a new trigger. If the *lost* site held the master majority (odd shards, or drift), the fence argument is unavailable: under an unobservable witness the operator **refuses** (drift-refusal) and waits for Kubernetes-confirmed death, the opt-in, or a human. |
+| Full site loss | 2 | **Operator takeover** (quorum-gated, ADR-012 D1): with an even master split, survivors hold exactly half the masters — below quorum — so native failover cannot trigger. The operator (which survives if the hub does) decides purely on Domain-M arithmetic — the survivors' own `cluster_state:fail` plus the reachable/unreachable master counts — and issues `CLUSTER FAILOVER TAKEOVER` on the surviving replicas, then FORGETs the dead nodes, only when the **fence** holds: the *unreachable* masters are themselves below quorum, so an isolated lost side has self-fenced. If the *lost* side could hold the master majority (odd shards, or drift), the fence is unavailable and the operator **refuses** (drift-refusal), waiting for the opt-in, a human, or the Phase-2 fence. |
 | Cross-site link cut | 2 | Both halves are minority ⇒ both fail-stop until the link heals; recovery is automatic on heal (rejoin delay applies). **Descoped**: no operator action; a runbook documents it. Link redundancy is the real mitigation. |
 | Cross-site link cut | ≥3 | Only the isolated site fail-stops; majority side continues, fails over the isolated site's shards. Rejoining site's demoted ex-masters resync. |
 | Multi-site / total failure | any | **Descoped**: manual re-bootstrap (the instance is a pure in-memory store; total loss is a documented, accepted outcome — cf. ADR-008 for the single-site analog). |
 
 Safety notes:
 
-- The takeover trigger must distinguish **site death from hub-side unreachability**.
-  Signals: the site's Kubernetes API state (pods gone vs. listed Ready) where
-  reachable, Redis-level reachability from surviving sites' pods, and a cooldown —
-  the same conservative gating style as Rule L / ADR-008 (`…Since` timestamp,
-  fire only on persistent state). A takeover during a mere hub↔site partition while
-  the site still serves would create two masters per shard; the gate must make this
-  practically impossible, and the losing side is demoted on heal (async-replication
-  write-loss semantics, same class Redis failover always has).
+- The takeover must never fire against a site that is alive and merely partitioned from
+  the hub — that would create two masters per shard. Safety does **not** rest on the hub
+  detecting whether the site is dead (a failure detector cannot decide safely under a
+  partition — FLP): it rests on the **fence**, the unreachable slot-serving masters
+  being below quorum. An alive-but-isolated site with a master minority has itself set
+  `cluster_state:fail` within `cluster-node-timeout` (Redis's unconditional minority
+  check), so it is no longer serving — the same check that causes the outage is the
+  split-brain guarantee. The gate layers a cooldown on top (the conservative `…Since`
+  gating style of Rule L / ADR-008), and the losing side is demoted on heal
+  (async-replication write-loss semantics, the class Redis failover always has).
 - **The fence-safe automated path is *exactly* the even-split case.** "Survivors
   below quorum" (takeover needed) and "lost side below quorum" (fence holds) can hold
   together only when the slot-serving masters split exactly in half. Any odd master
@@ -195,9 +200,10 @@ Safety notes:
   failure domain (or stretched across sites): a third domain holding **no data and no
   quorum participant**, which is exactly why the takeover still beats the witness
   shard (§6.1).
-- **Ghost handling stays Kubernetes-informed and becomes multi-site aware** (pillar
-  3.4): a node is only FORGOTTEN when *its* site's Kubernetes API confirms the pod is
-  gone — never merely because it is unreachable from the hub.
+- **Ghost handling becomes multi-site aware** (pillar 3.4): a lost site's node is
+  FORGOTTEN only while **every hosting site is observable** (`allSitesObservable`) — a
+  no-backing-pod ghost is indistinguishable by NodeID from a node on a
+  merely-unreachable site, so FORGET trails idempotently until the site answers again.
 - **Site rejoin is a full-sync storm**: every returning shard replica pulls a full RDB
   cross-site at once (EmptyDir ⇒ always full sync). The operator staggers the
   returning site's StatefulSet (re)creation per shard, reusing the serialized-rollout
@@ -235,21 +241,14 @@ spec:
 
 - Absent `multiSite` ⇒ existing single-site behavior, unchanged.
 - `kubeconfigSecretRef` names a Secret in the operator namespace holding a kubeconfig
-  whose credentials are bound to a **namespaced Role** in the target site (workload
-  CRUD + pod read in the instance namespace — not cluster-admin) **plus one
-  cluster-scoped read: `nodes` get/list**. A helper (`lrctl` or a script) generates
-  the ServiceAccount/Role/RoleBinding + a ClusterRole/ClusterRoleBinding for the node
-  read, the token, and the Secret.
-  - **Why the cluster-scoped node read (ADR-012, a real widening beyond a namespaced
-    Role).** The site-loss witness must tell a kubelet-attested pod death (the pod's
-    Node is Ready) from a node-controller inference (the Node is NotReady/Unknown — a
-    remote guess from missed heartbeats, the LR-017 trap). That needs each pod's Node
-    `Ready` condition, and Nodes are cluster-scoped, so the per-site cache (namespaced)
-    cannot serve them; the operator does a bounded, **uncached** direct read via
-    `SiteClient.NodeReady`. This is the only place per-site access reaches outside the
-    instance namespace. A failed/absent node read is treated conservatively (as the
-    node-controller downgrade → the takeover fence is required), so the widened read
-    can only make the witness more cautious.
+  whose credentials are bound to a **namespaced Role** in the target site — workload
+  CRUD + pod read in the instance namespace, not cluster-admin, and **nothing
+  cluster-scoped**. A helper (`lrctl` or a script) generates the
+  ServiceAccount/Role/RoleBinding, the token, and the Secret.
+  - **No cluster-scoped grant is needed.** Site-loss safety is pure Domain-M quorum
+    arithmetic (ADR-012 D1), decided from the Redis gather — not a Kubernetes liveness
+    read — so the operator never reads per-`Node` `Ready` state and each site's
+    credential stays fully namespaced.
 - Validation: `multiSite` only with `mode: cluster`; site names unique; ≥2 sites;
   `2 ≤ sitesPerShard ≤ len(sites)`.
 - Status gains per-site observed state (reachable, pods, discovered addresses) and
@@ -275,11 +274,10 @@ Remaining field-shape details are settled in the ADR, not here.
   different network paths and must both be verified at setup; `lrctl` should check
   both explicitly.
 - **RBAC blast radius:** the hub operator can modify workloads in every site — the
-  accepted cost of flat control, bounded by namespaced Roles per site — **plus one
-  cluster-scoped read per site (`nodes` get/list), required by the site-loss witness
-  (ADR-012 condition 3, §7).** That node read is the only per-site permission outside
-  the instance namespace; everything else stays namespaced. The operator's own
-  (hub-side) RBAC likewise gains `nodes` get/list.
+  accepted cost of flat control, bounded by **namespaced Roles per site**. Nothing
+  reaches outside the instance namespace and no cluster-scoped grant is required:
+  site-loss safety is Domain-M quorum arithmetic, not a Kubernetes liveness read
+  (§7, ADR-012 D1).
 - **Spoke-side garbage collection:** owner references do not work across Kubernetes clusters — a spoke-side object referencing the hub-resident `LittleRed` UID dangles, and the spoke's GC controller would treat the owner as absent and delete the object out from under us. Spoke-side children are therefore created **without** owner references (hub-local children keep `SetControllerReference` unchanged); instead the CR carries a finalizer whose delete path sweeps the instance-labeled workload objects through each `SiteClient` before the CR is released. A site unreachable at deletion time keeps the finalizer with bounded retries and a surfaced condition; the documented escape hatch is manual finalizer removal.
 
 ## 9. Deferred transports
@@ -294,14 +292,16 @@ Remaining field-shape details are settled in the ADR, not here.
 
 ## 10. Open items
 
-1. Takeover trigger: designed in **ADR-012** (fence-gated site-loss takeover) and
-   **implemented (Milestone 3)** — the pure `planSiteTakeover` + `classifySiteWitness`
-   planner, the survivor-vantage gather fields, the `SiteClient.NodeReady` witness read,
-   and the TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-026).
-   Remaining: the two-site e2e suite (Milestone 4). The `lrctl` site-kubeconfig helper's
-   cluster-scoped `nodes` grant (Milestone 5) is implemented (item 6).
-2. Master rebalance follow-up (graceful `CLUSTER FAILOVER`), keeping the native
-   failover path armed against master drift.
+1. Takeover trigger: designed in **ADR-012 D1** (quorum-gated site-loss takeover) and
+   **implemented** — the pure `planSiteTakeover` (Domain-M quorum arithmetic, no
+   Kubernetes failure detector), the survivor-vantage gather fields, and the
+   TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-026,
+   LR-029). Remaining: **live site-loss validation** on the two-site substrate.
+2. Master rebalancer: **implemented** (ADR-012 D2, changelog LR-029) — the pure
+   `planMasterRebalance` + the healthy-path `rebalanceMasters` executor keep
+   `max_i mᵢ ≤ ⌈K/2⌉−1` with one graceful `CLUSTER FAILOVER` per reconcile, plus the
+   structural `ReducedSiteLossResilience` warning for topologies that cannot satisfy
+   the invariant (`S·(⌈K/2⌉−1) < K`). Unit/envtest-verified; live validation pending.
 3. Witness-shard exploration (§6.1) — separate design + e2e.
 4. Rollout serialization across sites (LR-021 currently serializes shards within one
    site; define the cross-site ordering). *Implemented in the initial multi-site work
@@ -317,8 +317,8 @@ Remaining field-shape details are settled in the ADR, not here.
    read the CR on the hub; the union of per-site pods runs through the existing
    `GatherClusterGroundTruth` + checks, plus a cross-site placement check (a shard's master and
    replica must live in different sites). The preflight validates the two §8 network
-   prerequisites honestly; the generator provisions the §7 RBAC including the cluster-scoped
-   `nodes get;list` witness grant.
+   prerequisites honestly; the generator provisions the §7 RBAC — a fully **namespaced
+   Role** per site, no cluster-scoped grant.
 
    **Three gather tiers (M6)** — lrctl no longer requires direct site access or per-site
    kube-contexts. **Tier 1 (read-only hub):** the operator publishes a compact, site-attributed
