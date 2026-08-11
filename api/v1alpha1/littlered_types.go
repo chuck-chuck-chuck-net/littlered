@@ -852,6 +852,17 @@ type MultiSiteStatus struct {
 	// +optional
 	TakeoverPendingSince *metav1.Time `json:"takeoverPendingSince,omitempty"`
 
+	// RebalancePendingSince records when the operator last issued a graceful
+	// CLUSTER FAILOVER to correct master-distribution drift (ADR-012 D2). It is a
+	// post-move settle/anti-thrash marker: while it is set and within the
+	// rebalance cooldown, the drift-triggered rebalancer neither re-evaluates nor
+	// re-issues a move for the same shard, so a graceful failover in flight is
+	// never restarted. Cleared once the balance invariant holds again. Monitoring
+	// surface only; nothing load-bearing is persisted (the decision is re-derived
+	// from the live gather each pass).
+	// +optional
+	RebalancePendingSince *metav1.Time `json:"rebalancePendingSince,omitempty"`
+
 	// ClusterState is the stretched cluster's overall cluster_state from the last
 	// gather ("ok"/"fail"/"unknown") — the tier-1 published equivalent of the
 	// live gather's ClusterState.

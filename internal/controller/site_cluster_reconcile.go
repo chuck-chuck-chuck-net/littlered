@@ -304,6 +304,18 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 		return r.repairCluster(ctx, lr, gt, allSitesObservable(obs))
 	}
 
+	// 3b. Master-balance drift correction (ADR-012 D2). Steady-state MAINTENANCE, healthy path
+	// only: keep the slot-serving masters spread so no single site holds a Redis master majority
+	// (the placement property that keeps a whole-site loss inside planSiteTakeover's fence-safe
+	// even split rather than the drift-refusal). At most one graceful CLUSTER FAILOVER per
+	// reconcile; when it acts, requeue without updating status this pass. Multi-site only —
+	// ADR-009 declines master balancing in single-site mode.
+	if acted, err := r.rebalanceMasters(ctx, lr, gt, obs); err != nil {
+		return ctrl.Result{}, err
+	} else if acted {
+		return ctrl.Result{RequeueAfter: fast}, nil
+	}
+
 	// 4. Healthy — update status (also refreshes per-site observed state).
 	return r.updateMultiSiteClusterStatus(ctx, lr, gt, obs)
 }
@@ -406,7 +418,14 @@ func (r *LittleRedReconciler) reconcileMultiSiteClusterStatefulSets(ctx context.
 			appliedHash := existing.Spec.Template.Annotations[AnnotationPodSpecHash]
 			if appliedHash != desiredHash {
 				if err := s.client.Apply(ctx, lr, buildClusterShardStatefulSet(lr, k)); err != nil {
-					return err
+					// An unreachable site's live Apply/Patch times out even though its cached Get
+					// succeeded — skip it (retried next pass), never abort the whole reconcile
+					// (pillar 3.2: unreachable = unmanaged, not broken). Mirrors the CM/Service
+					// applies above. The deferred-rollout return below does not run, so a
+					// reachable sibling can still be rolled this pass.
+					log.Info("Multi-site serialized rollout: shard STS update apply failed, will retry",
+						"site", s.name, "shard", k, "err", err.Error())
+					continue
 				}
 				log.Info("Multi-site serialized rollout: rolling one shard STS, deferring the rest until it settles",
 					"site", s.name, "shard", k)
@@ -419,7 +438,9 @@ func (r *LittleRedReconciler) reconcileMultiSiteClusterStatefulSets(ctx context.
 			}
 			// Settled at desired: keep non-template fields in sync and advance.
 			if err := s.client.Apply(ctx, lr, buildClusterShardStatefulSet(lr, k)); err != nil {
-				return err
+				log.Info("Multi-site: settled shard STS sync apply failed, will retry",
+					"site", s.name, "shard", k, "err", err.Error())
+				continue
 			}
 		}
 	}

@@ -85,10 +85,15 @@ func equalInts(a, b []int) bool {
 type recordingSiteClient struct {
 	name        string
 	unreachable bool
-	pods        []corev1.Pod
-	sts         map[string]*appsv1.StatefulSet
-	applied     []string // "<Kind>/<name>"
-	deleted     []string // pod names deleted
+	// applyErrOnly models a site whose informer-cache READS still succeed (Get/List from a
+	// synced-then-partitioned cache) while the live WRITE path (Apply/Patch) times out — the
+	// exact shape of an unreachable site's API in the ensure path (item 8). Distinct from
+	// `unreachable`, which errors on every call.
+	applyErrOnly bool
+	pods         []corev1.Pod
+	sts          map[string]*appsv1.StatefulSet
+	applied      []string // "<Kind>/<name>"
+	deleted      []string // pod names deleted
 }
 
 func (f *recordingSiteClient) Name() string                               { return f.name }
@@ -106,6 +111,9 @@ func (f *recordingSiteClient) errIfDown() error {
 func (f *recordingSiteClient) Apply(_ context.Context, _ *littleredv1alpha1.LittleRed, obj client.Object) error {
 	if err := f.errIfDown(); err != nil {
 		return err
+	}
+	if f.applyErrOnly {
+		return errors.New("apply timeout (site API unreachable)")
 	}
 	f.applied = append(f.applied, fmt.Sprintf("%T/%s", obj, obj.GetName()))
 	return nil
@@ -266,6 +274,35 @@ func TestEnsureMultiSiteResourcesSkipsUnreachable(t *testing.T) {
 	}
 	if len(fakes[1].applied) == 0 {
 		t.Fatalf("reachable site1 must still be reconciled")
+	}
+}
+
+// TestReconcileMultiSiteSTSTolerantOfApplyFailure is the item-8 red-first repro: a site whose
+// reads (Get/List) succeed from the informer cache but whose live Apply times out must NOT abort
+// the whole reconcile. The pre-populated per-site STSs carry no pod-spec-hash annotation, so they
+// differ from the freshly built desired STS — forcing the template-update Apply path (the two
+// `return err` sites in reconcileMultiSiteClusterStatefulSets). RED against current code: the
+// site0 Apply error is returned and the reconcile aborts before the reachable site1 is reconciled.
+func TestReconcileMultiSiteSTSTolerantOfApplyFailure(t *testing.T) {
+	lr := multiSiteClusterCR(2, 2, 2, 1)
+	r := &LittleRedReconciler{}
+
+	// Both sites host shards 0,1 and answer reads; site0's Apply/Patch fails (unreachable API).
+	site0 := fakeWithShardSTSs("site0", lr.Name, 0, 1)
+	site0.applyErrOnly = true
+	site1 := fakeWithShardSTSs("site1", lr.Name, 0, 1)
+	sites := []resolvedSite{
+		{idx: 0, name: "site0", client: site0},
+		{idx: 1, name: "site1", client: site1},
+	}
+	shardsBySite := map[int][]int{0: {0, 1}, 1: {0, 1}}
+
+	if err := r.reconcileMultiSiteClusterStatefulSets(context.Background(), lr, sites, shardsBySite); err != nil {
+		t.Fatalf("reconcileMultiSiteClusterStatefulSets aborted on an unreachable site's Apply: %v", err)
+	}
+	// The reachable site must still have been reconciled (at least one STS applied).
+	if len(site1.applied) == 0 {
+		t.Fatalf("reachable site1 must still be reconciled when a sibling site's Apply fails")
 	}
 }
 

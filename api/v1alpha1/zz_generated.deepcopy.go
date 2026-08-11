@@ -514,6 +514,10 @@ func (in *MultiSiteStatus) DeepCopyInto(out *MultiSiteStatus) {
 		in, out := &in.TakeoverPendingSince, &out.TakeoverPendingSince
 		*out = (*in).DeepCopy()
 	}
+	if in.RebalancePendingSince != nil {
+		in, out := &in.RebalancePendingSince, &out.RebalancePendingSince
+		*out = (*in).DeepCopy()
+	}
 	if in.Shards != nil {
 		in, out := &in.Shards, &out.Shards
 		*out = make([]ShardSiteView, len(*in))

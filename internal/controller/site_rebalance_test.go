@@ -17,8 +17,17 @@ limitations under the License.
 package controller
 
 import (
+	"context"
 	"reflect"
+	"sort"
+	"strconv"
 	"testing"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
 // TestMasterBalanceTarget locks the D2 invariant threshold ceil(K/2)-1 (the maximum number
@@ -144,4 +153,153 @@ func TestPlanMasterRebalance(t *testing.T) {
 			}
 		})
 	}
+}
+
+// rbNode is a compact constructor for a gathered cluster node used by the input-builder test.
+func rbNode(key, role string, slots []string, reachable bool, link string) *redisclient.ClusterNodeState {
+	return &redisclient.ClusterNodeState{
+		PodName:    key, // multi-site ground truth is keyed by site-qualified pod name
+		PodIP:      "10.0." + key,
+		Role:       role,
+		Slots:      slots,
+		Reachable:  reachable,
+		LinkStatus: link,
+	}
+}
+
+// TestBuildMasterRebalanceInput is the red-first assertion for the pure input-builder that
+// projects the gather onto the D2 rebalance planner input: per shard, the site of its reachable
+// slot-serving master and the sites of its reachable, IN-SYNC (link:up) promotable replicas.
+// It models the "K=4 over 4 sites, drift (2,1,1,0)" case (masters A,B,C,A; a promotable replica
+// of shard0 in the empty site D) so the derived input feeds planMasterRebalance -> [{0,D}], plus
+// the exclusion rules (a link:down replica and an unreachable replica are NOT promotable).
+func TestBuildMasterRebalanceInput(t *testing.T) {
+	gt := redisclient.NewClusterGroundTruth()
+	slots := []string{"0-4095"}
+	add := func(n *redisclient.ClusterNodeState) { gt.Nodes[n.PodName] = n }
+
+	// Masters: A holds shard0 and shard3, B holds shard1, C holds shard2 (counts 2,1,1,0).
+	add(rbNode("A/cache-shard-0-0", RoleMaster, slots, true, "up"))
+	add(rbNode("A/cache-shard-3-0", RoleMaster, slots, true, "up"))
+	add(rbNode("B/cache-shard-1-0", RoleMaster, slots, true, "up"))
+	add(rbNode("C/cache-shard-2-0", RoleMaster, slots, true, "up"))
+
+	// In-sync promotable replicas: shard0 in B and D; shard1 in C; shard2 in D; shard3 in C.
+	add(rbNode("B/cache-shard-0-1", RoleReplica, nil, true, "up"))
+	add(rbNode("D/cache-shard-0-2", RoleReplica, nil, true, "up"))
+	add(rbNode("C/cache-shard-1-1", RoleReplica, nil, true, "up"))
+	add(rbNode("D/cache-shard-2-1", RoleReplica, nil, true, "up"))
+	add(rbNode("C/cache-shard-3-1", RoleReplica, nil, true, "up"))
+
+	// NOT promotable: a link:down replica of shard1 in E, and an unreachable replica of shard2 in E.
+	add(rbNode("E/cache-shard-1-2", RoleReplica, nil, true, "down"))
+	add(rbNode("E/cache-shard-2-2", RoleReplica, nil, false, "up"))
+
+	in := buildMasterRebalanceInput(gt, 4)
+
+	wantMasterSite := []string{"A", "B", "C", "A"}
+	if !reflect.DeepEqual(in.masterSite, wantMasterSite) {
+		t.Fatalf("masterSite = %v, want %v", in.masterSite, wantMasterSite)
+	}
+
+	// replicaSites are compared as sorted sets per shard (builder order is not contractual).
+	wantReplicaSites := [][]string{{"B", "D"}, {"C"}, {"D"}, {"C"}}
+	if len(in.replicaSites) != len(wantReplicaSites) {
+		t.Fatalf("replicaSites len = %d, want %d (%v)", len(in.replicaSites), len(wantReplicaSites), in.replicaSites)
+	}
+	for k := range wantReplicaSites {
+		got := append([]string(nil), in.replicaSites[k]...)
+		sort.Strings(got)
+		if !reflect.DeepEqual(got, wantReplicaSites[k]) {
+			t.Fatalf("replicaSites[%d] = %v, want %v (link:down/unreachable replicas must be excluded)", k, got, wantReplicaSites[k])
+		}
+	}
+
+	// The built input must feed the planner to the same single move the pure table asserts.
+	if moves := planMasterRebalance(in); !reflect.DeepEqual(moves, []masterMove{{shard: 0, toSite: "D"}}) {
+		t.Fatalf("planMasterRebalance(buildMasterRebalanceInput(...)) = %+v, want [{0 D}]", moves)
+	}
+}
+
+// balancedGT builds a K-shard stretched-cluster gather with exactly one reachable slot-serving
+// master per shard, each in its own site (counts all 1 -> invariant holds, no moves).
+func balancedGT(shards int) *redisclient.ClusterGroundTruth {
+	gt := redisclient.NewClusterGroundTruth()
+	for k := range shards {
+		key := fmtSiteShard(k, k, 0) // site k hosts shard k master
+		gt.Nodes[key] = rbNode(key, RoleMaster, []string{"0-1"}, true, "up")
+	}
+	return gt
+}
+
+// driftGT builds a K=4 gather with drift (2,1,1,0): site0 masters shards 0 and 3; site1 shard1;
+// site2 shard2; and shard0 has an in-sync replica in the empty site3 (a promotable move target).
+func driftGT() *redisclient.ClusterGroundTruth {
+	gt := redisclient.NewClusterGroundTruth()
+	m := func(site, shard int) {
+		key := fmtSiteShard(site, shard, 0)
+		gt.Nodes[key] = rbNode(key, RoleMaster, []string{"0-1"}, true, "up")
+	}
+	rep := func(site, shard, ord int) {
+		key := fmtSiteShard(site, shard, ord)
+		gt.Nodes[key] = rbNode(key, RoleReplica, nil, true, "up")
+	}
+	m(0, 0)
+	m(0, 3)
+	m(1, 1)
+	m(2, 2)
+	rep(3, 0, 1) // shard0 replica in the empty site3 -> planner move {0, site3}
+	return gt
+}
+
+func fmtSiteShard(site, shard, ord int) string {
+	return "site" + strconv.Itoa(site) + "/cache-shard-" + strconv.Itoa(shard) + "-" + strconv.Itoa(ord)
+}
+
+// TestRebalanceMastersGating exercises the executor's non-I/O gates — the paths that return
+// BEFORE any Redis dial. The fire path (drift past cooldown -> ClusterFailover) dials a real pod
+// and is left to e2e (untested plumbing, disclosed). Here: quiet-veto holds, a balanced cluster
+// clears the marker, and drift within the post-move cooldown neither re-evaluates nor re-issues.
+func TestRebalanceMastersGating(t *testing.T) {
+	t.Run("terminating survivor pod vetoes rebalance (quiet gate)", func(t *testing.T) {
+		lr := multiSiteClusterCR(4, 2, 4, 1)
+		r := &LittleRedReconciler{Client: newStatusFakeClient(t, lr)}
+		obs := []siteObservation{{
+			site: resolvedSite{name: "site0"}, reachable: true,
+			pods: []sitePodObservation{{key: "site0/cache-shard-0-0", terminating: true}},
+		}}
+		acted, err := r.rebalanceMasters(context.Background(), lr, driftGT(), obs)
+		if err != nil || acted {
+			t.Fatalf("quiet-veto: acted=%v err=%v, want acted=false err=nil", acted, err)
+		}
+	})
+
+	t.Run("balanced cluster clears the pending marker", func(t *testing.T) {
+		lr := multiSiteClusterCR(4, 2, 4, 1)
+		now := metav1.Now()
+		lr.Status.MultiSite = &littleredv1alpha1.MultiSiteStatus{RebalancePendingSince: &now}
+		r := &LittleRedReconciler{Client: newStatusFakeClient(t, lr)}
+		acted, err := r.rebalanceMasters(context.Background(), lr, balancedGT(4), nil)
+		if err != nil || acted {
+			t.Fatalf("balanced: acted=%v err=%v, want acted=false err=nil", acted, err)
+		}
+		if lr.Status.MultiSite.RebalancePendingSince != nil {
+			t.Fatalf("balanced cluster must clear RebalancePendingSince, got %v", lr.Status.MultiSite.RebalancePendingSince)
+		}
+	})
+
+	t.Run("drift within cooldown waits, does not re-issue", func(t *testing.T) {
+		lr := multiSiteClusterCR(4, 2, 4, 1)
+		recent := metav1.NewTime(time.Now().Add(-masterRebalanceCooldown / 2))
+		lr.Status.MultiSite = &littleredv1alpha1.MultiSiteStatus{RebalancePendingSince: &recent}
+		r := &LittleRedReconciler{Client: newStatusFakeClient(t, lr)}
+		acted, err := r.rebalanceMasters(context.Background(), lr, driftGT(), nil)
+		if err != nil || acted {
+			t.Fatalf("cooldown-wait: acted=%v err=%v, want acted=false err=nil", acted, err)
+		}
+		// Marker must be untouched (still set) — no dial, no re-stamp/clear.
+		if lr.Status.MultiSite.RebalancePendingSince == nil {
+			t.Fatalf("cooldown-wait must leave the pending marker set")
+		}
+	})
 }
