@@ -22,14 +22,20 @@ package e2e
 // multisite_takeover_test.go drives the ADR-012 site-loss takeover on the real hub+spokes
 // lab. Two scenarios, in ascending blast-radius order (least-destructive safety test first):
 //
-//	Scenario B (split-brain guard, MUST NOT fire): a data-plane-only partition of one site
-//	  while the site stays alive (API reachable, pods Ready) ⇒ witness Contradiction ⇒ the
-//	  operator HOLDs. No CLUSTER FAILOVER TAKEOVER, no second serving master. Then heal ⇒
-//	  native recovery to healthy.
+//	Scenario B (split-brain guard, MUST NOT fire): a hub-blind data-plane cut of one site while
+//	  the sites stay mutually connected and serving ⇒ the survivors report their OWN
+//	  cluster_state:ok, so condition 2 (the survivors'-vantage rule, LR-017 — never the hub's
+//	  dial) is not met ⇒ recoverSiteLoss returns WaitNative and the operator HOLDs. No CLUSTER
+//	  FAILOVER TAKEOVER, no second serving master. This is also the e2e that catches LR-030: if
+//	  the generic repair loop mistook the hub-unreachable-but-live masters for ghosts and FORGOT
+//	  them, the survivor's slots would unassign and cluster_state would flip to fail — so the
+//	  "cluster_state stays ok" assertion is red on that bug and green on the FailFlagged fix.
+//	  Then heal ⇒ native recovery to healthy.
 //
 //	Scenario A (crown jewel, MUST fire): a whole-site kill (virsh destroy of its VMs) of one site of a
-//	  dedicated 2-site instance with an even 2+2 master split (shards:4) ⇒ witness Unobservable +
-//	  survivors below quorum + fence-safe ⇒ the operator fires CLUSTER FAILOVER TAKEOVER on
+//	  dedicated 2-site instance with an even 2+2 master split (shards:4) ⇒ the survivors are below
+//	  quorum and report their own cluster_state:fail, and the fence holds (the unreachable
+//	  slot-serving masters are themselves < q) ⇒ the operator fires CLUSTER FAILOVER TAKEOVER on
 //	  the surviving site, which then serves all 16384 slots with the replicated data intact.
 //	  Then restore ⇒ the site rejoins back to a healthy cross-site topology.
 //
@@ -40,7 +46,7 @@ package e2e
 //
 // Red-first note (CLAUDE.md tier-3): the live-disruption red is "observed once" against the
 // real lab — a network/reboot condition that CI cannot reproduce. The repeatable guards for
-// the decision itself are the planSiteTakeover / classifySiteWitness unit tables.
+// the decision itself are the planSiteTakeover unit tables (pure quorum arithmetic).
 
 import (
 	"fmt"
@@ -203,7 +209,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			msKillSiteVMs(inv, victim)
 			msWaitSiteUnreachable(reg.site(victim), 3*time.Minute)
 
-			By("asserting the FENCE/WITNESS-GATED recoverSiteLoss fires the takeover after the cooldown")
+			By("asserting the FENCE-GATED recoverSiteLoss fires the takeover after the cooldown")
 			// Evidence priority: the operator log's gated-path audit line and the
 			// MultiSiteTakeover=SiteTakeoverExecuted condition — NOT Kubernetes Events, which
 			// some clusters do not retain (M4b Finding #3). The event is checked best-effort only.

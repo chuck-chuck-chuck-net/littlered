@@ -25,11 +25,15 @@ package e2e
 // — always reversibly — the two failures the site-loss takeover gate turns on:
 //
 //   - a WHOLE-SITE loss (hypervisor virsh destroy of a site's VMs) → the site's Kubernetes API
-//     and its redis pods go unreachable from the hub → witness Unobservable → the fence-safe
-//     even-master-split path fires CLUSTER FAILOVER TAKEOVER on the surviving site (Scenario A);
-//   - a DATA-PLANE-only partition (a Cilium deny policy on redis 6379 + gossip 16379) while
-//     the site's API stays reachable and its pods stay Ready → witness Contradiction → the
-//     operator must HOLD, never take over (Scenario B, the split-brain guard).
+//     and its redis pods go unreachable from the hub → the survivors drop below quorum and
+//     report their OWN cluster_state:fail, and the fence holds (the unreachable slot-serving
+//     masters are themselves < q) → the fence-safe even-master-split path fires CLUSTER FAILOVER
+//     TAKEOVER on the surviving site (Scenario A);
+//   - a HUB-BLIND data-plane cut (a Cilium deny policy on redis 6379 + gossip 16379 to the hub's
+//     peer CIDRs) while the sites stay mutually connected and serving → the survivors report
+//     their own cluster_state:ok, so condition 2 (the survivors'-vantage rule, LR-017 — never
+//     the hub's dial) is not met → the operator must HOLD, never take over (Scenario B, the
+//     split-brain guard).
 //
 // Every disruption helper is paired with a restore helper, and the specs verify the lab
 // returns to healthy between scenarios. Nothing here is destructive-without-return: a killed
@@ -476,8 +480,9 @@ const msDataPlanePolicyName = "ms-e2e-dataplane-cut"
 // that DROPS redis (6379) and gossip (16379) traffic to/from the given peer CIDRs, while
 // leaving everything else — crucially the kubelet readiness probe (reserved:host) and the
 // site's own API — untouched. Uses ingressDeny/egressDeny, which do NOT trip Cilium's
-// default-deny, so the pods stay Ready and the witness stays Contradiction (site alive, data
-// path cut). Fully reversible via msHealDataPlane.
+// default-deny, so the pods stay Ready and — in the hub-blind Scenario B — the survivors keep
+// reporting cluster_state:ok (site alive, only the data path to the given peers cut). Fully
+// reversible via msHealDataPlane.
 func msPartitionDataPlane(reg *msRegistry, siteCtx, ns, crName string, peerCIDRs []string) {
 	policy := fmt.Sprintf(`apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
