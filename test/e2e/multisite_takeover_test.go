@@ -76,6 +76,16 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 		affected := "scm-s2" // the site the HUB's dial is cut from (still connected to its peer s1)
 
 		AfterEach(func() {
+			// DEBUG_ON_FAILURE: leave the data-plane cut AND the instance in place so the live
+			// cross-site topology can be inspected (the per-spec teardown otherwise heals the cut
+			// and deletes the CR before anything can be gathered). Mirrors the guard every other
+			// spec's AfterEach uses. Manual cleanup: delete the CiliumNetworkPolicy on the affected
+			// site + `kubectl delete littlered` + drop the site Secrets/namespaces.
+			if debugOnFailure && suiteOrSpecFailed() {
+				By("DEBUG_ON_FAILURE: leaving the hub-blind cut and instance " + ns + "/" + crName +
+					" in place for live investigation (skipping heal + teardown)")
+				return
+			}
 			msHealDataPlane(reg.site(affected).context, ns)
 			msTeardownInstance(reg, ns, crName)
 		})
