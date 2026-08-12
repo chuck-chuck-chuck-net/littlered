@@ -476,13 +476,22 @@ func msOperatorLogSince(reg *msRegistry, since time.Time, substr string) (string
 // msDataPlanePolicyName is the Cilium deny policy the harness installs for a data-plane cut.
 const msDataPlanePolicyName = "ms-e2e-dataplane-cut"
 
-// msPartitionDataPlane installs a Cilium deny policy in the target site's instance namespace
-// that DROPS redis (6379) and gossip (16379) traffic to/from the given peer CIDRs, while
-// leaving everything else — crucially the kubelet readiness probe (reserved:host) and the
-// site's own API — untouched. Uses ingressDeny/egressDeny, which do NOT trip Cilium's
-// default-deny, so the pods stay Ready and — in the hub-blind Scenario B — the survivors keep
-// reporting cluster_state:ok (site alive, only the data path to the given peers cut). Fully
-// reversible via msHealDataPlane.
+// msPartitionDataPlane installs a Cilium policy in the target site's instance namespace that
+// DROPS redis (6379) and gossip (16379) traffic to/from the given peer CIDRs — and ONLY that —
+// while leaving every other path (peer-site pods, intra-site, the kubelet readiness probe via
+// reserved:host, the site's own API) untouched. This is what makes the hub-blind Scenario B cut
+// selective: deny only hub↔site, keep site↔site so the survivors stay cluster_state:ok.
+//
+// CRITICAL (LR-030 debug, 2026-08-12): a deny-ONLY CiliumNetworkPolicy does NOT stay scoped to the
+// named CIDRs. Selecting an endpoint with any rule — including an ingressDeny/egressDeny stanza —
+// puts it into Cilium DEFAULT-DENY for that direction (documented behavior since v1.16:
+// docs.cilium.io/en/stable/security/policy/{deny,intro}). With no allow rules, EVERYTHING not
+// explicitly allowed is dropped — so a "hub-only" deny actually severed site↔site too, turning the
+// intended hub-blind cut into a full inter-site partition (the operator then correctly took over).
+// Verified live: deny-only ⇒ s1↔s2 timed out; adding the allow-all below ⇒ s1↔s2 restored while
+// hub↔site stayed cut. So we pair the deny with an explicit allow-all (fromEntities/toEntities:
+// all); Deny rules take precedence over Allow, so only the named CIDRs on the named ports are cut.
+// Fully reversible via msHealDataPlane.
 func msPartitionDataPlane(reg *msRegistry, siteCtx, ns, crName string, peerCIDRs []string) {
 	policy := fmt.Sprintf(`apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
@@ -494,12 +503,16 @@ spec:
     matchLabels:
       app.kubernetes.io/component: cluster
       app.kubernetes.io/instance: %s
+  ingress:
+  - fromEntities: [all]
   ingressDeny:
   - fromCIDRSet:
 %s    toPorts:
     - ports:
       - {port: "6379", protocol: TCP}
       - {port: "16379", protocol: TCP}
+  egress:
+  - toEntities: [all]
   egressDeny:
   - toCIDRSet:
 %s    toPorts:
