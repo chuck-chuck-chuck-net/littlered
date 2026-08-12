@@ -124,6 +124,7 @@ const (
 	ComponentCluster      = "cluster"
 	LabelRole             = "redis.chuck-chuck-chuck.net/role"
 	LabelShard            = "redis.chuck-chuck-chuck.net/shard"
+	LabelMode             = "redis.chuck-chuck-chuck.net/mode"
 	ModeStandalone        = "standalone"
 	ModeSentinel          = "sentinel"
 	ModeCluster           = "cluster"
@@ -201,11 +202,11 @@ func computePodTemplateHash(tmpl *corev1.PodTemplateSpec) string {
 // commonLabels returns the standard labels applied to all resources
 func commonLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return map[string]string{
-		labelAppName:                       appName,
-		labelAppInstance:                   lr.Name,
-		"app.kubernetes.io/managed-by":     "littlered-operator",
-		"app.kubernetes.io/version":        lr.Spec.Image.Tag,
-		"redis.chuck-chuck-chuck.net/mode": lr.Spec.Mode,
+		labelAppName:                   appName,
+		labelAppInstance:               lr.Name,
+		"app.kubernetes.io/managed-by": "littlered-operator",
+		"app.kubernetes.io/version":    lr.Spec.Image.Tag,
+		LabelMode:                      lr.Spec.Mode,
 	}
 }
 

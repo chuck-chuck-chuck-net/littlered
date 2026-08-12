@@ -51,11 +51,11 @@ func TestBuildCrossSiteView_healthyCrossSite(t *testing.T) {
 	if len(shards) != 2 {
 		t.Fatalf("want 2 shards, got %d: %+v", len(shards), shards)
 	}
-	if shards[0].Shard != 0 || shards[0].MasterSite != "scm-s1" ||
-		len(shards[0].ReplicaSites) != 1 || shards[0].ReplicaSites[0] != "scm-s2" || !shards[0].CrossSite {
+	if shards[0].Shard != 0 || shards[0].MasterSite != siteCtxS1 ||
+		len(shards[0].ReplicaSites) != 1 || shards[0].ReplicaSites[0] != siteCtxS2 || !shards[0].CrossSite {
 		t.Errorf("shard0 wrong: %+v", shards[0])
 	}
-	if shards[1].Shard != 1 || shards[1].MasterSite != "scm-s2" || !shards[1].CrossSite {
+	if shards[1].Shard != 1 || shards[1].MasterSite != siteCtxS2 || !shards[1].CrossSite {
 		t.Errorf("shard1 wrong: %+v", shards[1])
 	}
 }
@@ -105,7 +105,7 @@ func TestBuildCrossSiteView_masterCountsPerSite(t *testing.T) {
 	gtNode(gt, "scm-s3/ms-shard-3-0", "master", "-", "") // empty master: no slots
 
 	_, _, _, _, masterCounts := buildCrossSiteView(gt)
-	want := []littleredv1alpha1.SiteMasterCount{{Site: "scm-s1", Masters: 2}, {Site: "scm-s2", Masters: 1}}
+	want := []littleredv1alpha1.SiteMasterCount{{Site: siteCtxS1, Masters: 2}, {Site: siteCtxS2, Masters: 1}}
 	if len(masterCounts) != len(want) {
 		t.Fatalf("masterCounts = %+v, want %+v", masterCounts, want)
 	}
@@ -130,7 +130,7 @@ func TestBuildCrossSiteView_replicaSitesSortedDeduped(t *testing.T) {
 		t.Fatalf("want 1 shard, got %d", len(shards))
 	}
 	got := shards[0].ReplicaSites
-	if len(got) != 2 || got[0] != "scm-s1" || got[1] != "scm-s3" {
+	if len(got) != 2 || got[0] != siteCtxS1 || got[1] != "scm-s3" {
 		t.Errorf("replica sites should be sorted+deduped [scm-s1 scm-s3], got %v", got)
 	}
 }

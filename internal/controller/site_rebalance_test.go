@@ -307,8 +307,8 @@ func TestRebalanceMastersGating(t *testing.T) {
 		lr := multiSiteClusterCR(4, 2, 4, 1)
 		r := &LittleRedReconciler{Client: newStatusFakeClient(t, lr)}
 		obs := []siteObservation{{
-			site: resolvedSite{name: "site0"}, reachable: true,
-			pods: []sitePodObservation{{key: "site0/cache-shard-0-0", terminating: true}},
+			site: resolvedSite{name: siteName0}, reachable: true,
+			pods: []sitePodObservation{{key: keySite0Shard00, terminating: true}},
 		}}
 		acted, err := r.rebalanceMasters(context.Background(), lr, driftGT(), obs)
 		if err != nil || acted {

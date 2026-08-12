@@ -33,12 +33,12 @@ func TestBuildSiteTakeoverInput(t *testing.T) {
 
 	gt := redisclient.NewClusterGroundTruth()
 	// Survivor site (site0): shard0's master (serving) and shard1's surviving replica.
-	gt.Nodes["site0/cache-shard-0-0"] = &redisclient.ClusterNodeState{
-		PodName: "site0/cache-shard-0-0", PodIP: "10.0.0.1", NodeID: "m0", Reachable: true,
+	gt.Nodes[keySite0Shard00] = &redisclient.ClusterNodeState{
+		PodName: keySite0Shard00, PodIP: "10.0.0.1", NodeID: "m0", Reachable: true,
 		Role: RoleMaster, Slots: []string{"0-8191"}, ClusterState: "fail",
 	}
-	gt.Nodes["site0/cache-shard-1-0"] = &redisclient.ClusterNodeState{
-		PodName: "site0/cache-shard-1-0", PodIP: "10.0.0.2", NodeID: "r1", Reachable: true,
+	gt.Nodes[keySite0Shard10] = &redisclient.ClusterNodeState{
+		PodName: keySite0Shard10, PodIP: "10.0.0.2", NodeID: "r1", Reachable: true,
 		Role: RoleReplica, ReplOffset: 500, MasterReplid: "L1", ClusterState: "fail",
 	}
 	// Lost site (site1): both its pods unreachable.
@@ -47,13 +47,13 @@ func TestBuildSiteTakeoverInput(t *testing.T) {
 
 	obs := []siteObservation{
 		{
-			site: resolvedSite{name: "site0", client: &recordingSiteClient{name: "site0"}}, reachable: true,
+			site: resolvedSite{name: siteName0, client: &recordingSiteClient{name: siteName0}}, reachable: true,
 			pods: []sitePodObservation{
-				{objName: "cache-shard-0-0", key: "site0/cache-shard-0-0", ready: true},
-				{objName: "cache-shard-1-0", key: "site0/cache-shard-1-0", ready: true},
+				{objName: podCacheShard00, key: keySite0Shard00, ready: true},
+				{objName: "cache-shard-1-0", key: keySite0Shard10, ready: true},
 			},
 		},
-		{site: resolvedSite{name: "site1"}, reachable: false}, // API unreachable ⇒ lost site
+		{site: resolvedSite{name: siteName1}, reachable: false}, // API unreachable ⇒ lost site
 	}
 
 	in := r.buildSiteTakeoverInput(lr, gt, obs, 2)
@@ -67,7 +67,7 @@ func TestBuildSiteTakeoverInput(t *testing.T) {
 	if !in.quiet {
 		t.Errorf("expected quiet=true (no terminating survivor)")
 	}
-	if len(in.orphanTargets) != 1 || in.orphanTargets[0].shard != 1 || in.orphanTargets[0].key != "site0/cache-shard-1-0" {
+	if len(in.orphanTargets) != 1 || in.orphanTargets[0].shard != 1 || in.orphanTargets[0].key != keySite0Shard10 {
 		t.Fatalf("orphanTargets = %+v, want single shard-1 target site0/cache-shard-1-0", in.orphanTargets)
 	}
 

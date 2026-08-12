@@ -85,15 +85,15 @@ func TestGatherClusterGroundTruth_SurvivorVantageFields(t *testing.T) {
 	// flagged FAIL, and a suspect peer flagged PFAIL.
 	survivorGossip := []ClusterNodeInfo{
 		{NodeID: "surv", Flags: []string{flagSlave}, MasterID: "deadm"},
-		{NodeID: "deadm", Flags: []string{roleMaster, flagFail}, MasterID: "-", Slots: []string{"0-8191"}},
-		{NodeID: "suspect", Flags: []string{roleMaster, flagPFail}, MasterID: "-", Slots: []string{"8192-16383"}},
+		{NodeID: "deadm", Flags: []string{roleMaster, flagFail}, MasterID: "-", Slots: []string{slotsLowerHalf}},
+		{NodeID: "suspect", Flags: []string{roleMaster, flagPFail}, MasterID: "-", Slots: []string{slotsUpperHalf}},
 	}
 
 	g := &perIPGatherer{
 		nodeID:   map[string]string{survivorIP: "surv"},
 		deadDial: map[string]bool{deadIP: true},
 		info: map[string]*ClusterInfo{
-			survivorIP: {State: "fail", SlotsAssigned: 16384},
+			survivorIP: {State: flagFail, SlotsAssigned: 16384},
 		},
 		nodes: map[string][]ClusterNodeInfo{
 			survivorIP: survivorGossip,
@@ -110,7 +110,7 @@ func TestGatherClusterGroundTruth_SurvivorVantageFields(t *testing.T) {
 	if surv == nil {
 		t.Fatalf("survivor node missing from ground truth")
 	}
-	if surv.ClusterState != "fail" {
+	if surv.ClusterState != flagFail {
 		t.Errorf("survivor ClusterState = %q, want fail (first-hand minority fail-stop)", surv.ClusterState)
 	}
 	if !slices.Contains(surv.FailFlagged, "deadm") {

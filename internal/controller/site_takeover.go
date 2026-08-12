@@ -457,8 +457,8 @@ func planFencedRejoinRecycle(cands []recycleCandidate, clusterHasMajority bool) 
 
 // siteFromKey returns the site name from a site-qualified ground-truth key (siteName/objName).
 func siteFromKey(key string) string {
-	if i := strings.Index(key, "/"); i >= 0 {
-		return key[:i]
+	if before, _, ok := strings.Cut(key, "/"); ok {
+		return before
 	}
 	return ""
 }

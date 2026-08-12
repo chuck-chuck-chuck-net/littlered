@@ -76,7 +76,7 @@ func TestKubeconfigFromSecret(t *testing.T) {
 func TestStampInstanceLabels(t *testing.T) {
 	lr := &littleredv1alpha1.LittleRed{}
 	lr.Name = "ms"
-	lr.Namespace = "default"
+	lr.Namespace = testNamespaceDefault
 	lr.Spec.Mode = ModeCluster
 	lr.SetDefaults()
 
@@ -95,14 +95,14 @@ func TestStampInstanceLabels(t *testing.T) {
 	t.Run("builder-set labels are not overridden", func(t *testing.T) {
 		obj := &appsv1.StatefulSet{
 			ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{
-				"redis.chuck-chuck-chuck.net/mode": "custom",
-				"builder-extra":                    "kept",
+				LabelMode:       "custom",
+				"builder-extra": "kept",
 			}},
 		}
 		stampInstanceLabels(lr, obj)
 		labels := obj.GetLabels()
-		if labels["redis.chuck-chuck-chuck.net/mode"] != "custom" {
-			t.Fatalf("builder label overridden: mode = %q", labels["redis.chuck-chuck-chuck.net/mode"])
+		if labels[LabelMode] != "custom" {
+			t.Fatalf("builder label overridden: mode = %q", labels[LabelMode])
 		}
 		if labels["builder-extra"] != "kept" {
 			t.Fatal("unrelated label lost")

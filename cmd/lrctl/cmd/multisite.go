@@ -138,7 +138,7 @@ func resolveMultiSiteGathers(
 			Namespace:      lr.Namespace,
 			Mode:           modeCluster,
 			RedisPods:      pods,
-			RedisContainer: "redis",
+			RedisContainer: containerRedis,
 		}
 		for _, p := range pods {
 			sg.pods = append(sg.pods, multisite.PodRef{ObjName: p.Name, IP: p.Status.PodIP})
@@ -155,7 +155,7 @@ func listSiteClusterPods(
 	ctx context.Context, coreClient *kubernetes.Clientset, namespace, name string,
 ) ([]corev1.Pod, error) {
 	selector := labels.SelectorFromSet(labels.Set{
-		"app.kubernetes.io/instance":  name,
+		labelAppInstance:              name,
 		"app.kubernetes.io/component": "cluster",
 	}).String()
 	list, err := coreClient.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: selector})

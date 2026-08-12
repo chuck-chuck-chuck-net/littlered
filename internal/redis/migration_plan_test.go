@@ -51,6 +51,10 @@ func rReplicaUp(pod, id, masterID string) *ClusterNodeState {
 }
 
 const (
+	// The two halves a 2-shard test cluster splits the slot space into.
+	slotsLowerHalf = "0-8191"
+	slotsUpperHalf = "8192-16383"
+
 	seedAddr    = "10.0.0.1:6379"
 	addrShard00 = "10.1.0.1:6379"
 	addrShard01 = "10.1.0.2:6379"
@@ -98,7 +102,7 @@ func TestPlanClusterMigration(t *testing.T) {
 	}
 	// The intact legacy cluster (L0 owns range 0, L1 owns range 1).
 	legFull := func() []*ClusterNodeState {
-		return legNodesFull([]string{"0-8191"}, []string{"8192-16383"})
+		return legNodesFull([]string{slotsLowerHalf}, []string{slotsUpperHalf})
 	}
 	// knowsOwners: every new pod knows its legacy range owner (so Replicate emits, not defers).
 	knowsOwners := map[string][]string{
@@ -196,9 +200,9 @@ func TestPlanClusterMigration(t *testing.T) {
 			// {10.1.0.2 -> N01} (ERR Can't replicate myself) and deadlocked forever.
 			name: "replicate CHAOS: native failover promoted a new replica to own the range (no REPLICATE self)",
 			gt: knows(mgt(
-				rMaster("mr-shard-0-1", nodeN01, "0-8191"), // promoted by native failover; owns range 0
-				rEmpty("mr-shard-0-0", nodeN00),            // intended master, crashed+restarted, re-MET
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-shard-0-1", nodeN01, slotsLowerHalf), // promoted by native failover; owns range 0
+				rEmpty("mr-shard-0-0", nodeN00),                  // intended master, crashed+restarted, re-MET
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplicaUp("mr-shard-1-0", nodeN10, "L1"),
 				rReplicaUp("mr-shard-1-1", nodeN11, "L1")),
 				map[string][]string{nodeN00: {nodeN01}, nodeN01: {nodeN01}}), // N01 knows itself (gossip includes self)
@@ -212,8 +216,8 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "INVARIANT (i): K-0 not a link-up replica of owner must NOT emit a Failover",
 			gt: knows(mgt(
-				rMaster("mr-cluster-0", "L0", "0-8191"),
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L1"),
 				rEmpty("mr-shard-0-0", nodeN00), // K-0 still an empty master (NOT synced)
@@ -230,8 +234,8 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "failover: all new pods synced replicas, no K-0 owns its range -> one, lowest K",
 			gt: mgt(
-				rMaster("mr-cluster-0", "L0", "0-8191"),
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L1"),
 				rReplicaUp("mr-shard-0-0", nodeN00, "L0"),
@@ -248,8 +252,12 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "failover FORCE edge: range owner unreachable + K-0 synced -> TAKEOVER",
 			gt: mgt(
-				func() *ClusterNodeState { n := rMaster("mr-cluster-0", "L0", "0-8191"); n.Reachable = false; return n }(),
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				func() *ClusterNodeState {
+					n := rMaster("mr-cluster-0", "L0", slotsLowerHalf)
+					n.Reachable = false
+					return n
+				}(),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L1"),
 				rReplicaUp("mr-shard-0-0", nodeN00, "L0"), // confirmed synced before L0 died
@@ -266,12 +274,12 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "failover: shard 0 done (owns range), shard 1 pending -> failover shard 1",
 			gt: mgt(
-				rMaster("mr-shard-0-0", nodeN00, "0-8191"), // shard 0 already promoted
+				rMaster("mr-shard-0-0", nodeN00, slotsLowerHalf), // shard 0 already promoted
 				rReplicaUp("mr-shard-0-1", nodeN01, nodeN00),
 				rReplicaUp("mr-shard-1-0", nodeN10, "L1"),
 				rReplicaUp("mr-shard-1-1", nodeN11, "L1"),
 				rReplica("mr-cluster-0", "L0", nodeN00), // demoted legacy master, now replica of N00
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L1")),
 			facts: mFacts(),
@@ -285,9 +293,9 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "INVARIANT (ii): a new replica not link-up on its new master must NOT emit legacy Forgets",
 			gt: knows(mgt(
-				rMaster("mr-shard-0-0", nodeN00, "0-8191"),
+				rMaster("mr-shard-0-0", nodeN00, slotsLowerHalf),
 				rEmpty("mr-shard-0-1", nodeN01), // NOT yet a link-up replica of its new master N00
-				rMaster("mr-shard-1-0", nodeN10, "8192-16383"),
+				rMaster("mr-shard-1-0", nodeN10, slotsUpperHalf),
 				rReplicaUp("mr-shard-1-1", nodeN11, nodeN10),
 				rReplica("mr-cluster-0", "L0", nodeN00),
 				rReplica("mr-cluster-1", "L1", nodeN10),
@@ -305,9 +313,9 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "decommission: all masters own ranges, all new replicas synced, legacy demoted+present",
 			gt: mgt(
-				rMaster("mr-shard-0-0", nodeN00, "0-8191"),
+				rMaster("mr-shard-0-0", nodeN00, slotsLowerHalf),
 				rReplicaUp("mr-shard-0-1", nodeN01, nodeN00),
-				rMaster("mr-shard-1-0", nodeN10, "8192-16383"),
+				rMaster("mr-shard-1-0", nodeN10, slotsUpperHalf),
 				rReplicaUp("mr-shard-1-1", nodeN11, nodeN10),
 				rReplica("mr-cluster-0", "L0", nodeN00), // demoted legacy masters (slot-less)
 				rReplica("mr-cluster-1", "L1", nodeN10),
@@ -325,9 +333,9 @@ func TestPlanClusterMigration(t *testing.T) {
 		{
 			name: "complete: no legacy nodes remain",
 			gt: mgt(
-				rMaster("mr-shard-0-0", nodeN00, "0-8191"),
+				rMaster("mr-shard-0-0", nodeN00, slotsLowerHalf),
 				rReplicaUp("mr-shard-0-1", nodeN01, nodeN00),
-				rMaster("mr-shard-1-0", nodeN10, "8192-16383"),
+				rMaster("mr-shard-1-0", nodeN10, slotsUpperHalf),
 				rReplicaUp("mr-shard-1-1", nodeN11, nodeN10)),
 			facts: mFacts(),
 			want:  MigrationPlan{Phase: MigrationComplete, ShardsMoved: 2, TotalShards: 2},
@@ -358,8 +366,8 @@ func TestPlanClusterMigrationRPS0(t *testing.T) {
 	// Intact rps=0 legacy: two masters, no legacy replicas.
 	legFull := func() []*ClusterNodeState {
 		return []*ClusterNodeState{
-			rMaster("mr-cluster-0", "L0", "0-8191"),
-			rMaster("mr-cluster-1", "L1", "8192-16383"),
+			rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+			rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 		}
 	}
 
@@ -395,8 +403,8 @@ func TestPlanClusterMigrationRPS0(t *testing.T) {
 		{
 			name: "decommission rps=0: both K-0 own ranges (vacuous redundancy gate), legacy demoted",
 			gt: mgt(
-				rMaster("mr-shard-0-0", nodeN00, "0-8191"),
-				rMaster("mr-shard-1-0", nodeN10, "8192-16383"),
+				rMaster("mr-shard-0-0", nodeN00, slotsLowerHalf),
+				rMaster("mr-shard-1-0", nodeN10, slotsUpperHalf),
 				rReplica("mr-cluster-0", "L0", nodeN00),
 				rReplica("mr-cluster-1", "L1", nodeN10)),
 			want: MigrationPlan{
@@ -451,8 +459,8 @@ func assertPlanEqual(t *testing.T, got, want MigrationPlan) {
 // range (regardless of reachability), or nil when none does.
 func TestOwnerOfRange(t *testing.T) {
 	gt := mgt(
-		rMaster("mr-cluster-0", "L0", "0-8191"),
-		rMaster("mr-cluster-1", "L1", "8192-16383"),
+		rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+		rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 		rReplica("mr-cluster-2", "L2", "L0"),
 	)
 	if got := ownerOfRange(gt, 0, 8191); got == nil || got.NodeID != "L0" {
@@ -512,9 +520,9 @@ func TestPlanReplicateNeverTargetsSelf(t *testing.T) {
 		{
 			name: "native failover promoted new replica mr-shard-0-1 to own range 0",
 			gt: knows(mgt(
-				rMaster("mr-shard-0-1", nodeN01, "0-8191"),
+				rMaster("mr-shard-0-1", nodeN01, slotsLowerHalf),
 				rEmpty("mr-shard-0-0", nodeN00),
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplicaUp("mr-shard-1-0", nodeN10, "L1"),
 				rReplicaUp("mr-shard-1-1", nodeN11, "L1")),
 				map[string][]string{nodeN00: {nodeN01}, nodeN01: {nodeN01}}),
@@ -522,11 +530,11 @@ func TestPlanReplicateNeverTargetsSelf(t *testing.T) {
 		{
 			name: "new replica mr-shard-1-1 owns range 1 while its shard is otherwise un-synced",
 			gt: knows(mgt(
-				rMaster("mr-shard-0-0", nodeN00, "0-8191"),
+				rMaster("mr-shard-0-0", nodeN00, slotsLowerHalf),
 				rReplicaUp("mr-shard-0-1", nodeN01, nodeN00),
-				rEmpty("mr-shard-1-0", nodeN10),                // intended master, not owner
-				rMaster("mr-shard-1-1", nodeN11, "8192-16383"), // promoted to own range 1
-				rEmpty("mr-cluster-1", "L1")),                  // a lingering (demoted) legacy node (keeps us pre-Complete)
+				rEmpty("mr-shard-1-0", nodeN10),                  // intended master, not owner
+				rMaster("mr-shard-1-1", nodeN11, slotsUpperHalf), // promoted to own range 1
+				rEmpty("mr-cluster-1", "L1")),                    // a lingering (demoted) legacy node (keeps us pre-Complete)
 				map[string][]string{nodeN10: {nodeN11}, nodeN11: {nodeN11}}),
 		},
 	}
@@ -554,8 +562,8 @@ func TestPlanReplicateNeverTargetsSelf(t *testing.T) {
 func TestLegacyMigrationReady(t *testing.T) {
 	healthy := func() *ClusterGroundTruth {
 		return mgt(
-			rMaster("mr-cluster-0", "L0", "0-8191"),
-			rMaster("mr-cluster-1", "L1", "8192-16383"),
+			rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+			rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 			rReplica("mr-cluster-2", "L2", "L0"),
 			rReplica("mr-cluster-3", "L3", "L1"),
 		)
@@ -569,7 +577,7 @@ func TestLegacyMigrationReady(t *testing.T) {
 	}{
 		{name: "healthy", mutate: func(*ClusterGroundTruth) {}, podsReady: true, want: true},
 		{name: "missing slots", mutate: func(gt *ClusterGroundTruth) { gt.TotalSlots = 16000 }, podsReady: true, want: false},
-		{name: "state not ok", mutate: func(gt *ClusterGroundTruth) { gt.ClusterState = "fail" }, podsReady: true, want: false},
+		{name: "state not ok", mutate: func(gt *ClusterGroundTruth) { gt.ClusterState = flagFail }, podsReady: true, want: false},
 		{name: "a legacy pod not ready", mutate: func(*ClusterGroundTruth) {}, podsReady: false, want: false},
 		{
 			name: "no master quorum",
@@ -596,8 +604,8 @@ func TestLegacyShapePreserved(t *testing.T) {
 	const shards, rps = 2, 1
 	exact := func() *ClusterGroundTruth {
 		return mgt(
-			rMaster("mr-cluster-0", "L0", "0-8191"),
-			rMaster("mr-cluster-1", "L1", "8192-16383"),
+			rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+			rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 			rReplica("mr-cluster-2", "L2", "L0"),
 			rReplica("mr-cluster-3", "L3", "L1"),
 		)
@@ -612,7 +620,7 @@ func TestLegacyShapePreserved(t *testing.T) {
 		{
 			name: "wrong master count (consolidated)",
 			gt: mgt(
-				rMaster("mr-cluster-0", "L0", "0-8191", "8192-16383"),
+				rMaster("mr-cluster-0", "L0", slotsLowerHalf, slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L0"),
 				rReplica("mr-cluster-1", "L1", "L0"),
@@ -623,7 +631,7 @@ func TestLegacyShapePreserved(t *testing.T) {
 			name: "fragmented / non-aligned range",
 			gt: mgt(
 				rMaster("mr-cluster-0", "L0", "0-4000"),
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L1"),
 			),
@@ -632,8 +640,8 @@ func TestLegacyShapePreserved(t *testing.T) {
 		{
 			name: "wrong member count",
 			gt: mgt(
-				rMaster("mr-cluster-0", "L0", "0-8191"),
-				rMaster("mr-cluster-1", "L1", "8192-16383"),
+				rMaster("mr-cluster-0", "L0", slotsLowerHalf),
+				rMaster("mr-cluster-1", "L1", slotsUpperHalf),
 				rReplica("mr-cluster-2", "L2", "L0"),
 				rReplica("mr-cluster-3", "L3", "L1"),
 				rReplica("mr-cluster-4", "L4", "L0"),

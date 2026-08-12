@@ -129,7 +129,7 @@ func TestMultiSiteClusterPodRefsMemberCounts(t *testing.T) {
 
 func TestMultiSiteClusterPodRefsMapping(t *testing.T) {
 	// Dual-site, 2 shards, rp1, sps2. Shard 0 -> sites [0,1]; shard 1 -> sites [1,0].
-	refs := multiSiteClusterPodRefs("cache", []string{"alpha", "beta"}, 2, 1, 2)
+	refs := multiSiteClusterPodRefs("cache", []string{siteAlpha, siteBeta}, 2, 1, 2)
 
 	// Initial master of shard 0 is alpha/cache-shard-0-0; shard 1 is beta/cache-shard-1-0.
 	wantMaster := map[int]string{
@@ -149,13 +149,13 @@ func TestMultiSiteClusterPodRefsMapping(t *testing.T) {
 	}
 
 	// ObjName collides across sites but Key does not: alpha and beta both host cache-shard-0-... only shard's sites.
-	if multiSiteInitialMasterKey("cache", []string{"alpha", "beta"}, 1) != "beta/cache-shard-1-0" {
-		t.Fatalf("multiSiteInitialMasterKey mismatch: %q", multiSiteInitialMasterKey("cache", []string{"alpha", "beta"}, 1))
+	if multiSiteInitialMasterKey("cache", []string{siteAlpha, siteBeta}, 1) != "beta/cache-shard-1-0" {
+		t.Fatalf("multiSiteInitialMasterKey mismatch: %q", multiSiteInitialMasterKey("cache", []string{siteAlpha, siteBeta}, 1))
 	}
 }
 
 func TestPlanMultiSiteBootstrap(t *testing.T) {
-	sites := []string{"alpha", "beta"}
+	sites := []string{siteAlpha, siteBeta}
 	refs := multiSiteClusterPodRefs("cache", sites, 3, 1, 2)
 	plan := planMultiSiteBootstrap(refs)
 

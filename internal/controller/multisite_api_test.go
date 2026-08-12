@@ -39,7 +39,7 @@ var _ = Describe("MultiSite CRD validation", func() {
 		lr := &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      fmt.Sprintf("ms-crd-%d", counter),
-				Namespace: "default",
+				Namespace: testNamespaceDefault,
 			},
 			Spec: littleredv1alpha1.LittleRedSpec{
 				Mode:      mode,

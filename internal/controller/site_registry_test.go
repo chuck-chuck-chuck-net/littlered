@@ -57,6 +57,29 @@ func (f *fakeSiteClient) Gatherer(string, bool) redisclient.Gatherer  { return n
 
 const testOperatorNS = "littlered-system"
 
+// Shared fixture values for the multi-site tests: site names, the kube-context
+// names of the lab sites, and recurring workload identifiers.
+const (
+	siteAlpha = "alpha"
+	siteBeta  = "beta"
+	siteCtxS1 = "scm-s1"
+	siteCtxS2 = "scm-s2"
+
+	siteName0 = "site0"
+	siteName1 = "site1"
+	siteName2 = "site2"
+
+	podCacheShard00 = "cache-shard-0-0"
+	keySite0Shard00 = "site0/cache-shard-0-0"
+	keySite0Shard10 = "site0/cache-shard-1-0"
+
+	// "<site>#<shard>" keys used by the per-site scale-down planner tests.
+	keySite0Shard2STS = "site0#2"
+	keySite2Shard1STS = "site2#1"
+	keySite2Shard2STS = "site2#2"
+	volDownward       = "downward"
+)
+
 func kubeconfigSecret(name string, content []byte) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testOperatorNS},
@@ -89,7 +112,7 @@ func newTestRegistry(t *testing.T, objs ...client.Object) (*siteClientRegistry, 
 func multiSiteCR() *littleredv1alpha1.LittleRed {
 	lr := &littleredv1alpha1.LittleRed{}
 	lr.Name = "ms"
-	lr.Namespace = "default"
+	lr.Namespace = testNamespaceDefault
 	lr.Spec.Mode = ModeCluster
 	return lr
 }
@@ -97,7 +120,7 @@ func multiSiteCR() *littleredv1alpha1.LittleRed {
 func TestSiteRegistryHubLocalReuse(t *testing.T) {
 	reg, built := newTestRegistry(t)
 	lr := multiSiteCR()
-	site := littleredv1alpha1.SiteSpec{Name: "alpha"} // no secret ref = hub-local
+	site := littleredv1alpha1.SiteSpec{Name: siteAlpha} // no secret ref = hub-local
 
 	c1, err := reg.siteClient(context.Background(), lr, site)
 	if err != nil {
@@ -123,7 +146,7 @@ func TestSiteRegistryRemoteLifecycle(t *testing.T) {
 	reg, built := newTestRegistry(t, secret)
 	lr := multiSiteCR()
 	site := littleredv1alpha1.SiteSpec{
-		Name:                "beta",
+		Name:                siteBeta,
 		KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: secret.Name},
 	}
 
@@ -178,7 +201,7 @@ func TestSiteRegistryErrors(t *testing.T) {
 		reg, _ := newTestRegistry(t)
 		lr := multiSiteCR()
 		_, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
-			Name:                "beta",
+			Name:                siteBeta,
 			KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "nope"},
 		})
 		if err == nil {
@@ -194,7 +217,7 @@ func TestSiteRegistryErrors(t *testing.T) {
 		reg, _ := newTestRegistry(t, secret)
 		lr := multiSiteCR()
 		_, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
-			Name:                "beta",
+			Name:                siteBeta,
 			KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "bad"},
 		})
 		if err == nil {
@@ -207,7 +230,7 @@ func TestSiteRegistryErrors(t *testing.T) {
 		reg.operatorNamespace = func() (string, error) { return "", errors.New("no namespace") }
 		lr := multiSiteCR()
 		_, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
-			Name:                "beta",
+			Name:                siteBeta,
 			KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "whatever"},
 		})
 		if err == nil {
@@ -228,15 +251,15 @@ func TestOperatorNamespaceFrom(t *testing.T) {
 	}{
 		{
 			name: "OPERATOR_NAMESPACE wins",
-			env:  map[string]string{"OPERATOR_NAMESPACE": "explicit", "POD_NAMESPACE": "downward"},
+			env:  map[string]string{"OPERATOR_NAMESPACE": "explicit", "POD_NAMESPACE": volDownward},
 			read: noFile,
 			want: "explicit",
 		},
 		{
 			name: "POD_NAMESPACE fallback",
-			env:  map[string]string{"POD_NAMESPACE": "downward"},
+			env:  map[string]string{"POD_NAMESPACE": volDownward},
 			read: noFile,
-			want: "downward",
+			want: volDownward,
 		},
 		{
 			name: "in-cluster namespace file, trimmed",

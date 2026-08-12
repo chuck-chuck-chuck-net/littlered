@@ -44,9 +44,9 @@ type SiteSetupNames struct {
 func DefaultSiteSetupNames(namespace, hubSecret string) SiteSetupNames {
 	return SiteSetupNames{
 		Namespace:      namespace,
-		ServiceAccount: "littlered-site",
-		Role:           "littlered-site",
-		RoleBinding:    "littlered-site",
+		ServiceAccount: siteIdentityName,
+		Role:           siteIdentityName,
+		RoleBinding:    siteIdentityName,
 		TokenSecret:    "littlered-site-token",
 		HubSecret:      hubSecret,
 	}
@@ -60,15 +60,15 @@ func DefaultSiteSetupNames(namespace, hubSecret string) SiteSetupNames {
 func siteRoleRules() []rbacv1.PolicyRule {
 	return []rbacv1.PolicyRule{
 		{APIGroups: []string{""}, Resources: []string{"configmaps", "services"},
-			Verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
-		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{"create", "patch"}},
+			Verbs: []string{verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch}},
+		{APIGroups: []string{""}, Resources: []string{"events"}, Verbs: []string{verbCreate, verbPatch}},
 		{APIGroups: []string{""}, Resources: []string{"pods"},
-			Verbs: []string{"delete", "get", "list", "patch", "update", "watch"}},
-		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{"get", "list", "watch"}},
+			Verbs: []string{verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch}},
+		{APIGroups: []string{""}, Resources: []string{"secrets"}, Verbs: []string{verbGet, verbList, verbWatch}},
 		{APIGroups: []string{"apps"}, Resources: []string{"statefulsets"},
-			Verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+			Verbs: []string{verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch}},
 		{APIGroups: []string{"policy"}, Resources: []string{"poddisruptionbudgets"},
-			Verbs: []string{"create", "delete", "get", "list", "patch", "update", "watch"}},
+			Verbs: []string{verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch}},
 	}
 }
 
@@ -76,7 +76,7 @@ func objectMeta(name, namespace string) metav1.ObjectMeta {
 	return metav1.ObjectMeta{
 		Name:      name,
 		Namespace: namespace,
-		Labels:    map[string]string{"app.kubernetes.io/managed-by": "lrctl-multisite-setup"},
+		Labels:    map[string]string{labelManagedBy: "lrctl-multisite-setup"},
 	}
 }
 
@@ -156,7 +156,6 @@ func BuildSiteKubeconfig(p SiteKubeconfigParams) ([]byte, error) {
 	if p.ContextName == "" || p.Server == "" || p.Token == "" {
 		return nil, fmt.Errorf("kubeconfig requires a context name, server endpoint, and token")
 	}
-	const user = "littlered-site"
 	cfg := clientcmdapiv1.Config{
 		APIVersion: "v1",
 		Kind:       "Config",
@@ -168,14 +167,14 @@ func BuildSiteKubeconfig(p SiteKubeconfigParams) ([]byte, error) {
 			},
 		}},
 		AuthInfos: []clientcmdapiv1.NamedAuthInfo{{
-			Name:     user,
+			Name:     siteIdentityName,
 			AuthInfo: clientcmdapiv1.AuthInfo{Token: p.Token},
 		}},
 		Contexts: []clientcmdapiv1.NamedContext{{
 			Name: p.ContextName,
 			Context: clientcmdapiv1.Context{
 				Cluster:   p.ContextName,
-				AuthInfo:  user,
+				AuthInfo:  siteIdentityName,
 				Namespace: p.Namespace,
 			},
 		}},
@@ -193,7 +192,7 @@ func BuildHubSiteSecret(operatorNamespace, secretName string, kubeconfig []byte)
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName,
 			Namespace: operatorNamespace,
-			Labels:    map[string]string{"app.kubernetes.io/managed-by": "lrctl-multisite-setup"},
+			Labels:    map[string]string{labelManagedBy: "lrctl-multisite-setup"},
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: map[string][]byte{"kubeconfig": kubeconfig},

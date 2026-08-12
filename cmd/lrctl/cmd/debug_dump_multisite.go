@@ -124,14 +124,14 @@ func collectMultiSiteArtifacts(ctx context.Context, dir string, lr *littleredv1a
 		for _, pod := range sg.cCtx.RedisPods {
 			// Pod logs (current + previous).
 			logs := kubectlContext(sg.context, "logs", pod.Name, "-n", lr.Namespace,
-				"-c", "redis", "--tail=2000", "--timestamps")
+				"-c", containerRedis, "--tail=2000", "--timestamps")
 			writeFile(siteDir, fmt.Sprintf("pod-%s-redis.log", pod.Name), logs)
 
 			// Live cluster state via exec.
 			clusterCmd := authShell + ` redis-cli $AUTH INFO replication` +
 				` && echo "---" && redis-cli $AUTH CLUSTER NODES` +
 				` && echo "---" && redis-cli $AUTH CLUSTER INFO`
-			out, _, _ := k8s.Exec(ctx, sg.coreClient, sg.config, lr.Namespace, pod.Name, "redis",
+			out, _, _ := k8s.Exec(ctx, sg.coreClient, sg.config, lr.Namespace, pod.Name, containerRedis,
 				[]string{"sh", "-c", clusterCmd})
 			writeFile(siteDir, fmt.Sprintf("redis-%s-cluster-state.txt", pod.Name), out)
 		}

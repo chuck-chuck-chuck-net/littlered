@@ -207,7 +207,7 @@ func resolvedFromFakes(fakes []*recordingSiteClient) []resolvedSite {
 func TestEnsureMultiSiteClusterResourcesPlacement(t *testing.T) {
 	// 3 sites, sitesPerShard 2, 3 shards, replicasPerShard 1.
 	lr := multiSiteClusterCR(3, 2, 3, 1)
-	fakes := []*recordingSiteClient{{name: "site0"}, {name: "site1"}, {name: "site2"}}
+	fakes := []*recordingSiteClient{{name: siteName0}, {name: siteName1}, {name: siteName2}}
 	sites := resolvedFromFakes(fakes)
 
 	r := &LittleRedReconciler{}
@@ -217,9 +217,9 @@ func TestEnsureMultiSiteClusterResourcesPlacement(t *testing.T) {
 
 	// hosting: shard0->{0,1}, shard1->{1,2}, shard2->{2,0}
 	wantShardsBySite := map[string][]int{
-		"site0": {0, 2},
-		"site1": {0, 1},
-		"site2": {1, 2},
+		siteName0: {0, 2},
+		siteName1: {0, 1},
+		siteName2: {1, 2},
 	}
 	for i, f := range fakes {
 		// Each hosting site applies CM + headless Service + client Service + one STS and one
@@ -262,7 +262,7 @@ func TestEnsureMultiSiteClusterResourcesPlacement(t *testing.T) {
 // applying to the reachable rest.
 func TestEnsureMultiSiteResourcesSkipsUnreachable(t *testing.T) {
 	lr := multiSiteClusterCR(2, 2, 3, 1)
-	fakes := []*recordingSiteClient{{name: "site0", unreachable: true}, {name: "site1"}}
+	fakes := []*recordingSiteClient{{name: siteName0, unreachable: true}, {name: siteName1}}
 	sites := resolvedFromFakes(fakes)
 
 	r := &LittleRedReconciler{}
@@ -288,12 +288,12 @@ func TestReconcileMultiSiteSTSTolerantOfApplyFailure(t *testing.T) {
 	r := &LittleRedReconciler{}
 
 	// Both sites host shards 0,1 and answer reads; site0's Apply/Patch fails (unreachable API).
-	site0 := fakeWithShardSTSs("site0", lr.Name, 0, 1)
+	site0 := fakeWithShardSTSs(siteName0, lr.Name, 0, 1)
 	site0.applyErrOnly = true
-	site1 := fakeWithShardSTSs("site1", lr.Name, 0, 1)
+	site1 := fakeWithShardSTSs(siteName1, lr.Name, 0, 1)
 	sites := []resolvedSite{
-		{idx: 0, name: "site0", client: site0},
-		{idx: 1, name: "site1", client: site1},
+		{idx: 0, name: siteName0, client: site0},
+		{idx: 1, name: siteName1, client: site1},
 	}
 	shardsBySite := map[int][]int{0: {0, 1}, 1: {0, 1}}
 
@@ -312,14 +312,14 @@ func TestUnionClusterPodsSkipsUnreachable(t *testing.T) {
 			site:      resolvedSite{name: "a"},
 			reachable: true,
 			pods: []sitePodObservation{
-				{objName: "cache-shard-0-0", key: "a/cache-shard-0-0", ip: "10.0.0.1"},
+				{objName: podCacheShard00, key: "a/cache-shard-0-0", ip: "10.0.0.1"},
 				{objName: "cache-shard-0-1", key: "a/cache-shard-0-1", ip: ""}, // no IP -> skipped
 			},
 		},
 		{
 			site:      resolvedSite{name: "b"},
 			reachable: false,
-			pods:      []sitePodObservation{{objName: "cache-shard-0-0", key: "b/cache-shard-0-0", ip: "10.1.0.1"}},
+			pods:      []sitePodObservation{{objName: podCacheShard00, key: "b/cache-shard-0-0", ip: "10.1.0.1"}},
 		},
 	}
 	got := unionClusterPods(obs)
@@ -332,24 +332,24 @@ func TestUnionClusterPodsSkipsUnreachable(t *testing.T) {
 // reachable sites, deleting each through its owning site's client, past the cooldown.
 func TestRecoverMultiSiteWipePerSite(t *testing.T) {
 	lr := multiSiteClusterCR(2, 2, 3, 1)
-	site0 := &recordingSiteClient{name: "site0"}
-	site1 := &recordingSiteClient{name: "site1", unreachable: true}
+	site0 := &recordingSiteClient{name: siteName0}
+	site1 := &recordingSiteClient{name: siteName1, unreachable: true}
 	// Arm the cooldown well in the past so the plan reaches wipeRecycle.
 	past := metav1.NewTime(metav1.Now().Add(-10 * clusterWipeRecoveryCooldown))
 	lr.Status.Cluster = &littleredv1alpha1.ClusterStatusInfo{WipeDeadlockSince: &past}
 
 	obs := []siteObservation{
 		{
-			site:      resolvedSite{name: "site0", client: site0},
+			site:      resolvedSite{name: siteName0, client: site0},
 			reachable: true,
 			pods: []sitePodObservation{
-				{objName: "cache-shard-0-0", key: "site0/cache-shard-0-0", ready: false, restarted: true},
-				{objName: "cache-shard-1-0", key: "site0/cache-shard-1-0", ready: true, restarted: true}, // ready -> never recycled
+				{objName: podCacheShard00, key: keySite0Shard00, ready: false, restarted: true},
+				{objName: "cache-shard-1-0", key: keySite0Shard10, ready: true, restarted: true}, // ready -> never recycled
 			},
 		},
 		{
 			// Unreachable: its pods are invisible, never recycled here.
-			site:      resolvedSite{name: "site1", client: site1},
+			site:      resolvedSite{name: siteName1, client: site1},
 			reachable: false,
 			pods:      nil,
 		},
@@ -359,7 +359,7 @@ func TestRecoverMultiSiteWipePerSite(t *testing.T) {
 	if err := r.recoverMultiSiteClusterWipeDeadlock(context.Background(), lr, obs); err != nil {
 		t.Fatalf("recoverMultiSiteClusterWipeDeadlock: %v", err)
 	}
-	if len(site0.deleted) != 1 || site0.deleted[0] != "cache-shard-0-0" {
+	if len(site0.deleted) != 1 || site0.deleted[0] != podCacheShard00 {
 		t.Fatalf("site0 deleted = %v, want [cache-shard-0-0]", site0.deleted)
 	}
 	if len(site1.deleted) != 0 {
@@ -400,11 +400,11 @@ func TestEnforceMultiSiteScaleDownGuardRefusesAndNeverDeletes(t *testing.T) {
 	r.Client = newStatusFakeClient(t, lr)
 
 	// Both sites host shards 0,1 (desired) AND a lingering shard 2 (orphan from the old shards=3).
-	site0 := fakeWithShardSTSs("site0", lr.Name, 0, 1, 2)
-	site1 := fakeWithShardSTSs("site1", lr.Name, 0, 1, 2)
+	site0 := fakeWithShardSTSs(siteName0, lr.Name, 0, 1, 2)
+	site1 := fakeWithShardSTSs(siteName1, lr.Name, 0, 1, 2)
 	sites := []resolvedSite{
-		{idx: 0, name: "site0", client: site0},
-		{idx: 1, name: "site1", client: site1},
+		{idx: 0, name: siteName0, client: site0},
+		{idx: 1, name: siteName1, client: site1},
 	}
 
 	refused, _, err := r.enforceMultiSiteScaleDownGuard(context.Background(), lr, sites)
@@ -451,11 +451,11 @@ func TestEnforceMultiSiteScaleDownGuardNoOpWhenSteady(t *testing.T) {
 	r := &LittleRedReconciler{}
 	r.Client = newStatusFakeClient(t, lr)
 
-	site0 := fakeWithShardSTSs("site0", lr.Name, 0, 1)
-	site1 := fakeWithShardSTSs("site1", lr.Name, 0, 1)
+	site0 := fakeWithShardSTSs(siteName0, lr.Name, 0, 1)
+	site1 := fakeWithShardSTSs(siteName1, lr.Name, 0, 1)
 	sites := []resolvedSite{
-		{idx: 0, name: "site0", client: site0},
-		{idx: 1, name: "site1", client: site1},
+		{idx: 0, name: siteName0, client: site0},
+		{idx: 1, name: siteName1, client: site1},
 	}
 
 	refused, _, err := r.enforceMultiSiteScaleDownGuard(context.Background(), lr, sites)
@@ -475,14 +475,14 @@ func TestUpdateMultiSiteClusterStatusSites(t *testing.T) {
 	lr := multiSiteClusterCR(2, 2, 3, 1)
 	obs := []siteObservation{
 		{
-			site:      resolvedSite{name: "site0"},
+			site:      resolvedSite{name: siteName0},
 			reachable: true,
 			pods: []sitePodObservation{
-				{key: "site0/cache-shard-0-0", ready: true},
+				{key: keySite0Shard00, ready: true},
 				{key: "site0/cache-shard-0-1", ready: true},
 			},
 		},
-		{site: resolvedSite{name: "site1"}, reachable: false},
+		{site: resolvedSite{name: siteName1}, reachable: false},
 	}
 	// Pass a non-nil (empty) gt so status update does not dial pod IPs.
 	gt := redisclient.NewClusterGroundTruth()
@@ -502,10 +502,10 @@ func TestUpdateMultiSiteClusterStatusSites(t *testing.T) {
 	for _, s := range lr.Status.MultiSite.Sites {
 		bySite[s.Name] = s
 	}
-	if !bySite["site0"].Reachable || bySite["site0"].Pods == nil || bySite["site0"].Pods.Ready != 2 {
-		t.Fatalf("site0 status wrong: %+v", bySite["site0"])
+	if !bySite[siteName0].Reachable || bySite[siteName0].Pods == nil || bySite[siteName0].Pods.Ready != 2 {
+		t.Fatalf("site0 status wrong: %+v", bySite[siteName0])
 	}
-	if bySite["site1"].Reachable {
+	if bySite[siteName1].Reachable {
 		t.Fatalf("site1 must be reported unreachable")
 	}
 	// Total expected members = shards(3) * sitesPerShard(2) * (rp(1)+1) = 12.

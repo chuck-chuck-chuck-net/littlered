@@ -57,8 +57,8 @@ func orphanKeys(orphans []multiSiteOrphanSTS) []string {
 // any observed per-(site, shard) StatefulSet the desired placement no longer includes.
 func TestPlanMultiSiteScaleDown(t *testing.T) {
 	const inst = "cache"
-	three := []string{"site0", "site1", "site2"}
-	two := []string{"site0", "site1"}
+	three := []string{siteName0, siteName1, siteName2}
+	two := []string{siteName0, siteName1}
 
 	tests := []struct {
 		name string
@@ -83,7 +83,7 @@ func TestPlanMultiSiteScaleDown(t *testing.T) {
 			oldSites: three, oldShard: 3, oldSPS: 2,
 			newSites: three, newShard: 2, newSPS: 2,
 			// shard2 hosted in sites (2,0) under sps2 -> orphaned in site2 and site0
-			want: []string{"site0#2", "site2#2"},
+			want: []string{keySite0Shard2STS, keySite2Shard2STS},
 		},
 		{
 			name:     "sitesPerShard decrease 2->1 orphans each shard's second site",
@@ -91,7 +91,7 @@ func TestPlanMultiSiteScaleDown(t *testing.T) {
 			newSites: three, newShard: 3, newSPS: 1,
 			// old hosting: 0->{0,1} 1->{1,2} 2->{2,0}; new: 0->{0} 1->{1} 2->{2}
 			// orphans: site1#0, site2#1, site0#2
-			want: []string{"site0#2", "site1#0", "site2#1"},
+			want: []string{keySite0Shard2STS, "site1#0", keySite2Shard1STS},
 		},
 		{
 			name:     "site removed (site2 gone) orphans every shard STS that lived in site2",
@@ -100,7 +100,7 @@ func TestPlanMultiSiteScaleDown(t *testing.T) {
 			// old hosting over 3 sites: 0->{s0,s1} 1->{s1,s2} 2->{s2,s0}. site2 hosted shard1 and
 			// shard2. New placement over 2 sites: 0->{s0,s1} 1->{s1,s0} 2->{s0,s1}. So desired
 			// covers all of site0/site1's (site,shard) pairs; only site2's two STSs orphan.
-			want: []string{"site2#1", "site2#2"},
+			want: []string{keySite2Shard1STS, keySite2Shard2STS},
 		},
 		{
 			name:     "combination: shards 3->2 AND site2 removed",
@@ -111,7 +111,7 @@ func TestPlanMultiSiteScaleDown(t *testing.T) {
 			// desired pairs: site0#0, site1#0, site1#1, site0#1.
 			// observed pairs: site0#0, site1#0, site1#1, site2#1, site2#2, site0#2.
 			// orphans: site2#1, site2#2, site0#2.
-			want: []string{"site0#2", "site2#1", "site2#2"},
+			want: []string{keySite0Shard2STS, keySite2Shard1STS, keySite2Shard2STS},
 		},
 	}
 

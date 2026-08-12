@@ -39,6 +39,31 @@ import (
 type Tier int
 
 const (
+	// verbStatus is the lrctl verb that renders from the operator's published status.
+	verbStatus = "status"
+	// containerManager is the operator container inside the manager Deployment.
+	containerManager = "manager"
+	// labelManagedBy marks the throwaway resources lrctl creates.
+	labelManagedBy = "app.kubernetes.io/managed-by"
+	// siteIdentityName is the ServiceAccount/Role/RoleBinding and kubeconfig user
+	// name lrctl provisions in each site.
+	siteIdentityName = "littlered-site"
+	// verbCreate is the RBAC verb, spelled out often enough to be worth naming.
+	verbCreate = "create"
+	// verbDelete is the RBAC verb, likewise.
+	verbDelete = "delete"
+	// verbGet is the RBAC verb, likewise.
+	verbGet = "get"
+	// verbList is the RBAC verb, likewise.
+	verbList = "list"
+	// verbPatch is the RBAC verb, likewise.
+	verbPatch = "patch"
+	// verbUpdate and verbWatch complete the RBAC verb set.
+	verbUpdate = "update"
+	verbWatch  = "watch"
+)
+
+const (
 	// TierLive is tier 2: live gather via a throwaway hub Job. The default for
 	// the live read verbs (verify/inspect/debug-dump).
 	TierLive Tier = iota
@@ -84,7 +109,7 @@ func SelectTier(verb string, f TierFlags) (Tier, error) {
 	if f.FromStatus && (f.Direct || f.SiteContextSet) {
 		return 0, fmt.Errorf("--from-status (tier 1) cannot be combined with --direct/--site-context (tier 3)")
 	}
-	if verb == "status" {
+	if verb == verbStatus {
 		return TierStatus, nil
 	}
 	if f.FromStatus {
@@ -125,9 +150,9 @@ func BuildGatherJob(p GatherJobParams) *batchv1.Job {
 	backoff := int32(0)
 	ttl := p.TTLSeconds
 	labels := map[string]string{
-		"app.kubernetes.io/name":       "lrctl-gather",
-		"app.kubernetes.io/managed-by": "lrctl",
-		"app.kubernetes.io/instance":   p.InstanceName,
+		"app.kubernetes.io/name":     "lrctl-gather",
+		labelManagedBy:               "lrctl",
+		"app.kubernetes.io/instance": p.InstanceName,
 	}
 	return &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -165,7 +190,7 @@ type OperatorInfo struct {
 }
 
 // ExtractOperatorInfo reads the SA and manager-container image off the operator
-// Deployment. It prefers the container named "manager" (the operator binary),
+// Deployment. It prefers the container named containerManager (the operator binary),
 // falling back to the first container. Errors when the SA is unset (the Job
 // would run as default and lack Secret/site RBAC) or there are no containers.
 func ExtractOperatorInfo(d *appsv1.Deployment) (OperatorInfo, error) {
@@ -180,7 +205,7 @@ func ExtractOperatorInfo(d *appsv1.Deployment) (OperatorInfo, error) {
 	}
 	image := containers[0].Image
 	for _, c := range containers {
-		if c.Name == "manager" {
+		if c.Name == containerManager {
 			image = c.Image
 			break
 		}

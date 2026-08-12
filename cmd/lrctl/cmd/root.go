@@ -18,6 +18,8 @@ const (
 	modeSentinel       = "sentinel"
 	modeFailover       = "failover"
 	roleMaster         = "master"
+	containerRedis     = "redis"
+	labelAppInstance   = "app.kubernetes.io/instance"
 	roleReplica        = "replica"
 	redisCliBin        = "redis-cli"
 	infoSubcommand     = "info"

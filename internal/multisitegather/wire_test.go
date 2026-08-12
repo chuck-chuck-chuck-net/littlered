@@ -29,17 +29,22 @@ import (
 // ground truth. NOTE: this is largely green-from-birth (encoding/json handles
 // exported fields), so it is pinned by TestResultRoundTripFieldTags below, which
 // fails if a load-bearing field stops serialising.
+const (
+	nodeIDMaster = "abc"
+	roleMaster   = "master"
+)
+
 func TestResultRoundTrip(t *testing.T) {
 	gt := redisclient.NewClusterGroundTruth()
 	gt.ClusterState = "ok"
 	gt.TotalSlots = 16384
 	gt.Nodes["scm-s1/ms-smoke-shard-0-0"] = &redisclient.ClusterNodeState{
-		PodName: "scm-s1/ms-smoke-shard-0-0", PodIP: "10.1.0.5", NodeID: "abc",
-		Role: "master", MasterNodeID: "-", Slots: []string{"0-8191"}, Reachable: true,
+		PodName: "scm-s1/ms-smoke-shard-0-0", PodIP: "10.1.0.5", NodeID: nodeIDMaster,
+		Role: roleMaster, MasterNodeID: "-", Slots: []string{"0-8191"}, Reachable: true,
 	}
 	gt.Nodes["scm-s2/ms-smoke-shard-0-1"] = &redisclient.ClusterNodeState{
 		PodName: "scm-s2/ms-smoke-shard-0-1", PodIP: "10.2.0.7", NodeID: "def",
-		Role: "replica", MasterNodeID: "abc", LinkStatus: "up", Reachable: true,
+		Role: "replica", MasterNodeID: nodeIDMaster, LinkStatus: "up", Reachable: true,
 	}
 	in := Result{
 		Instance:   "ms-smoke",
@@ -78,11 +83,11 @@ func TestResultRoundTrip(t *testing.T) {
 		t.Errorf("cluster state/slots lost: %+v", out.GroundTruth)
 	}
 	m := out.GroundTruth.Nodes["scm-s1/ms-smoke-shard-0-0"]
-	if m == nil || m.Role != "master" || len(m.Slots) != 1 || m.Slots[0] != "0-8191" {
+	if m == nil || m.Role != roleMaster || len(m.Slots) != 1 || m.Slots[0] != "0-8191" {
 		t.Errorf("master node lost: %+v", m)
 	}
 	r := out.GroundTruth.Nodes["scm-s2/ms-smoke-shard-0-1"]
-	if r == nil || r.Role != "replica" || r.MasterNodeID != "abc" || r.LinkStatus != "up" {
+	if r == nil || r.Role != "replica" || r.MasterNodeID != nodeIDMaster || r.LinkStatus != "up" {
 		t.Errorf("replica node lost: %+v", r)
 	}
 }
@@ -93,7 +98,7 @@ func TestResultRoundTrip(t *testing.T) {
 // break; this catches it.
 func TestResultRoundTripFieldTags(t *testing.T) {
 	gt := redisclient.NewClusterGroundTruth()
-	gt.Nodes["scm-s1/x-shard-0-0"] = &redisclient.ClusterNodeState{PodName: "scm-s1/x-shard-0-0", Role: "master"}
+	gt.Nodes["scm-s1/x-shard-0-0"] = &redisclient.ClusterNodeState{PodName: "scm-s1/x-shard-0-0", Role: roleMaster}
 	raw, err := json.Marshal(Result{Instance: "i", Namespace: "ns", GroundTruth: gt})
 	if err != nil {
 		t.Fatalf("marshal: %v", err)

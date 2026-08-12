@@ -62,7 +62,7 @@ func TestMultiSiteExperimentalModeEvent(t *testing.T) {
 				Mode:    ModeCluster,
 				Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3},
 				MultiSite: &littleredv1alpha1.MultiSiteSpec{
-					Sites: []littleredv1alpha1.SiteSpec{{Name: "alpha"}, {Name: "beta"}},
+					Sites: []littleredv1alpha1.SiteSpec{{Name: siteAlpha}, {Name: siteBeta}},
 				},
 			},
 		}

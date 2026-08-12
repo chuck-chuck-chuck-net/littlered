@@ -24,7 +24,25 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
-const ctxS1 = "scm-s1"
+// Shared fixture values for the multi-site lrctl tests.
+const (
+	ctxS1 = "scm-s1"
+	ctxG  = "ctxG"
+	ctxS2 = "scm-s2"
+
+	keyS1Shard00 = "scm-s1/x-shard-0-0"
+	keyS2Shard00 = "scm-s2/x-shard-0-0"
+
+	siteAlpha = "alpha"
+	siteGamma = "gamma"
+
+	roleReplica = "replica"
+
+	testInstanceName = "ms-smoke"
+	testOperatorNS   = "littlered-system"
+	verbVerify       = "verify"
+	testOpKey2       = "op:2"
+)
 
 func TestBuildSiteKubeconfig(t *testing.T) {
 	ca := []byte("-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n")
@@ -33,7 +51,7 @@ func TestBuildSiteKubeconfig(t *testing.T) {
 		Server:      "https://10.2.1.10:6443",
 		CAData:      ca,
 		Token:       "tok-abc",
-		Namespace:   "ms-smoke",
+		Namespace:   testInstanceName,
 	})
 	if err != nil {
 		t.Fatalf("BuildSiteKubeconfig: %v", err)
@@ -63,7 +81,7 @@ func TestBuildSiteKubeconfig(t *testing.T) {
 		t.Errorf("token not set correctly: %+v", authInfo)
 	}
 	kctx, ok := cfg.Contexts[ctxS1]
-	if !ok || kctx.Namespace != "ms-smoke" {
+	if !ok || kctx.Namespace != testInstanceName {
 		t.Errorf("context namespace = %q, want ms-smoke", kctx.Namespace)
 	}
 }
@@ -81,8 +99,8 @@ func TestBuildSiteKubeconfigRequiresServerAndToken(t *testing.T) {
 
 func TestBuildHubSiteSecretKeyIsKubeconfig(t *testing.T) {
 	// The data key MUST be "kubeconfig" — the operator's siteKubeconfigSecretKey.
-	s := BuildHubSiteSecret("littlered-system", "site-scm-s1", []byte("data"))
-	if s.Namespace != "littlered-system" || s.Name != "site-scm-s1" {
+	s := BuildHubSiteSecret(testOperatorNS, "site-scm-s1", []byte("data"))
+	if s.Namespace != testOperatorNS || s.Name != "site-scm-s1" {
 		t.Fatalf("secret meta = %s/%s", s.Namespace, s.Name)
 	}
 	if _, ok := s.Data["kubeconfig"]; !ok {
@@ -106,13 +124,13 @@ func TestSiteRoleRulesMatchOperatorWorkloadVerbs(t *testing.T) {
 	// workload verbs (config/rbac/role.yaml), scoped namespaced. If the operator's
 	// role gains/loses a workload resource, this must be updated in lockstep.
 	want := map[string][]string{
-		"/configmaps":                 {"create", "delete", "get", "list", "patch", "update", "watch"},
-		"/services":                   {"create", "delete", "get", "list", "patch", "update", "watch"},
-		"/events":                     {"create", "patch"},
-		"/pods":                       {"delete", "get", "list", "patch", "update", "watch"},
-		"/secrets":                    {"get", "list", "watch"},
-		"apps/statefulsets":           {"create", "delete", "get", "list", "patch", "update", "watch"},
-		"policy/poddisruptionbudgets": {"create", "delete", "get", "list", "patch", "update", "watch"},
+		"/configmaps":                 {verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch},
+		"/services":                   {verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch},
+		"/events":                     {verbCreate, verbPatch},
+		"/pods":                       {verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch},
+		"/secrets":                    {verbGet, verbList, verbWatch},
+		"apps/statefulsets":           {verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch},
+		"policy/poddisruptionbudgets": {verbCreate, verbDelete, verbGet, verbList, verbPatch, verbUpdate, verbWatch},
 	}
 	got := map[string][]string{}
 	for _, r := range siteRoleRules() {

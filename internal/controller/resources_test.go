@@ -131,7 +131,7 @@ func TestCommonLabels(t *testing.T) {
 		{"app.kubernetes.io/instance", testLRName},
 		{"app.kubernetes.io/managed-by", "littlered-operator"},
 		{"app.kubernetes.io/version", littleredv1alpha1.DefaultImageTag},
-		{"redis.chuck-chuck-chuck.net/mode", ModeStandalone},
+		{LabelMode, ModeStandalone},
 	}
 
 	for _, tt := range tests {
@@ -1056,7 +1056,7 @@ func TestStatefulSetBuildersPropagatePodTemplateScheduling(t *testing.T) {
 		{"standalone", ModeStandalone, buildStatefulSet},
 		{"sentinel-redis", ModeSentinel, buildRedisStatefulSetSentinel},
 		{"sentinel-monitor", ModeSentinel, buildSentinelStatefulSet},
-		{"cluster", ModeCluster, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
+		{ComponentCluster, ModeCluster, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
 			return buildClusterShardStatefulSet(lr, 0)
 		}},
 	}

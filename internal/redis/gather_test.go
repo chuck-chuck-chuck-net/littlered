@@ -113,8 +113,8 @@ func (f *fakeGatherer) GetClusterNodes(_ context.Context, _, ip string) ([]Clust
 // plus one ghost node (present in gossip but with no backing pod).
 func twoMasterOneReplicaGossip() []ClusterNodeInfo {
 	return []ClusterNodeInfo{
-		{NodeID: "m1", Flags: []string{roleMaster}, MasterID: "-", Slots: []string{"0-8191"}},
-		{NodeID: "m2", Flags: []string{roleMaster}, MasterID: "-", Slots: []string{"8192-16383"}},
+		{NodeID: "m1", Flags: []string{roleMaster}, MasterID: "-", Slots: []string{slotsLowerHalf}},
+		{NodeID: "m2", Flags: []string{roleMaster}, MasterID: "-", Slots: []string{slotsUpperHalf}},
 		{NodeID: "r1", Flags: []string{flagSlave}, MasterID: "m1"},
 		{NodeID: "ghost", Flags: []string{roleMaster, flagFail}, MasterID: "-"},
 	}

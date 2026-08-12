@@ -33,16 +33,16 @@ func TestSelectTier(t *testing.T) {
 		want    Tier
 		wantErr bool
 	}{
-		{"verify default → live", "verify", TierFlags{}, TierLive, false},
+		{"verify default → live", verbVerify, TierFlags{}, TierLive, false},
 		{"inspect default → live", "inspect", TierFlags{}, TierLive, false},
 		{"debug-dump default → live", "debug-dump", TierFlags{}, TierLive, false},
 		{"status default → status", "status", TierFlags{}, TierStatus, false},
-		{"verify --from-status → status", "verify", TierFlags{FromStatus: true}, TierStatus, false},
-		{"verify --direct → direct", "verify", TierFlags{Direct: true}, TierDirect, false},
-		{"verify --site-context → direct", "verify", TierFlags{SiteContextSet: true}, TierDirect, false},
+		{"verify --from-status → status", verbVerify, TierFlags{FromStatus: true}, TierStatus, false},
+		{"verify --direct → direct", verbVerify, TierFlags{Direct: true}, TierDirect, false},
+		{"verify --site-context → direct", verbVerify, TierFlags{SiteContextSet: true}, TierDirect, false},
 		{"status ignores flags → status", "status", TierFlags{Direct: true}, TierStatus, false},
-		{"conflict from-status+direct", "verify", TierFlags{FromStatus: true, Direct: true}, 0, true},
-		{"conflict from-status+site-context", "verify", TierFlags{FromStatus: true, SiteContextSet: true}, 0, true},
+		{"conflict from-status+direct", verbVerify, TierFlags{FromStatus: true, Direct: true}, 0, true},
+		{"conflict from-status+site-context", verbVerify, TierFlags{FromStatus: true, SiteContextSet: true}, 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -77,16 +77,16 @@ func TestTierLabel(t *testing.T) {
 
 func TestBuildGatherJob(t *testing.T) {
 	job := BuildGatherJob(GatherJobParams{
-		OperatorNamespace:  "littlered-system",
+		OperatorNamespace:  testOperatorNS,
 		ServiceAccountName: "littlered-controller-manager",
 		Image:              "ghcr.io/littlered-operator/littlered:abc123",
-		InstanceNamespace:  "ms-smoke",
-		InstanceName:       "ms-smoke",
+		InstanceNamespace:  testInstanceName,
+		InstanceName:       testInstanceName,
 		TTLSeconds:         120,
 		NameSuffix:         "fixed99",
 	})
 
-	if job.Namespace != "littlered-system" {
+	if job.Namespace != testOperatorNS {
 		t.Errorf("namespace=%q, want littlered-system", job.Namespace)
 	}
 	if !strings.HasSuffix(job.Name, "fixed99") {
@@ -121,7 +121,7 @@ func TestBuildGatherJob(t *testing.T) {
 func TestExtractOperatorInfo(t *testing.T) {
 	mk := func(sa string, containers ...corev1.Container) *appsv1.Deployment {
 		return &appsv1.Deployment{
-			ObjectMeta: metav1.ObjectMeta{Name: "littlered", Namespace: "littlered-system"},
+			ObjectMeta: metav1.ObjectMeta{Name: "littlered", Namespace: testOperatorNS},
 			Spec: appsv1.DeploymentSpec{Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
 				ServiceAccountName: sa, Containers: containers,
 			}}},
@@ -131,13 +131,13 @@ func TestExtractOperatorInfo(t *testing.T) {
 	t.Run("picks manager container", func(t *testing.T) {
 		d := mk("op-sa",
 			corev1.Container{Name: "kube-rbac-proxy", Image: "proxy:1"},
-			corev1.Container{Name: "manager", Image: "op:2"},
+			corev1.Container{Name: "manager", Image: testOpKey2},
 		)
 		info, err := ExtractOperatorInfo(d)
 		if err != nil {
 			t.Fatal(err)
 		}
-		if info.ServiceAccountName != "op-sa" || info.Image != "op:2" {
+		if info.ServiceAccountName != "op-sa" || info.Image != testOpKey2 {
 			t.Errorf("got %+v, want {op-sa op:2}", info)
 		}
 	})
@@ -151,7 +151,7 @@ func TestExtractOperatorInfo(t *testing.T) {
 	})
 
 	t.Run("errors on missing SA", func(t *testing.T) {
-		if _, err := ExtractOperatorInfo(mk("", corev1.Container{Name: "manager", Image: "op:2"})); err == nil {
+		if _, err := ExtractOperatorInfo(mk("", corev1.Container{Name: "manager", Image: testOpKey2})); err == nil {
 			t.Error("expected error for missing serviceAccountName")
 		}
 	})
@@ -165,8 +165,8 @@ func TestExtractOperatorInfo(t *testing.T) {
 
 func TestStatusVerdict(t *testing.T) {
 	healthy := []ShardView{
-		{Shard: 0, MasterSite: "scm-s1", ReplicaSites: []string{"scm-s2"}, CrossSite: true},
-		{Shard: 1, MasterSite: "scm-s2", ReplicaSites: []string{"scm-s3"}, CrossSite: true},
+		{Shard: 0, MasterSite: ctxS1, ReplicaSites: []string{ctxS2}, CrossSite: true},
+		{Shard: 1, MasterSite: ctxS2, ReplicaSites: []string{"scm-s3"}, CrossSite: true},
 	}
 
 	t.Run("all healthy", func(t *testing.T) {
@@ -191,7 +191,7 @@ func TestStatusVerdict(t *testing.T) {
 	})
 
 	t.Run("shard not cross-site → FAIL", func(t *testing.T) {
-		bad := []ShardView{{Shard: 0, MasterSite: "scm-s1", ReplicaSites: []string{"scm-s1"}, CrossSite: false}}
+		bad := []ShardView{{Shard: 0, MasterSite: ctxS1, ReplicaSites: []string{ctxS1}, CrossSite: false}}
 		v := StatusVerdict("ok", 16384, bad, nil)
 		if v.OK {
 			t.Errorf("want not OK for single-site shard, got %+v", v)
@@ -206,7 +206,7 @@ func TestStatusVerdict(t *testing.T) {
 	})
 
 	t.Run("link down → degraded not failed", func(t *testing.T) {
-		deg := []ShardView{{Shard: 0, MasterSite: "scm-s1", ReplicaSites: []string{"scm-s2"}, CrossSite: true, LinkDown: true}}
+		deg := []ShardView{{Shard: 0, MasterSite: ctxS1, ReplicaSites: []string{ctxS2}, CrossSite: true, LinkDown: true}}
 		v := StatusVerdict("ok", 16384, deg, nil)
 		if !v.OK || !v.Degraded {
 			t.Errorf("want OK & degraded for link down, got %+v", v)

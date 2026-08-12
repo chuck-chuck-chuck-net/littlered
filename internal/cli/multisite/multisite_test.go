@@ -24,12 +24,12 @@ import (
 )
 
 func TestSiteQualifiedKeyRoundTrip(t *testing.T) {
-	key := SiteQualifiedKey("alpha", "store-shard-0-0")
+	key := SiteQualifiedKey(siteAlpha, "store-shard-0-0")
 	if key != "alpha/store-shard-0-0" {
 		t.Fatalf("SiteQualifiedKey = %q", key)
 	}
 	site, obj := SplitSiteKey(key)
-	if site != "alpha" || obj != "store-shard-0-0" {
+	if site != siteAlpha || obj != "store-shard-0-0" {
 		t.Fatalf("SplitSiteKey(%q) = %q, %q", key, site, obj)
 	}
 	// A key with no site prefix is single-site / legacy.
@@ -40,7 +40,7 @@ func TestSiteQualifiedKeyRoundTrip(t *testing.T) {
 
 func TestUnionClusterPods(t *testing.T) {
 	sites := []SitePods{
-		{Site: "alpha", Pods: []PodRef{{ObjName: "s-shard-0-0", IP: "10.0.0.1"}, {ObjName: "s-shard-1-0", IP: ""}}},
+		{Site: siteAlpha, Pods: []PodRef{{ObjName: "s-shard-0-0", IP: "10.0.0.1"}, {ObjName: "s-shard-1-0", IP: ""}}},
 		{Site: "beta", Pods: []PodRef{{ObjName: "s-shard-0-0", IP: "10.1.0.1"}}},
 	}
 	got := UnionClusterPods(sites)
@@ -64,9 +64,9 @@ func TestParseSiteContextFlag(t *testing.T) {
 		wantErr bool
 	}{
 		{in: "", want: map[string]string{}},
-		{in: "alpha=scm-s1,beta=scm-s2", want: map[string]string{"alpha": "scm-s1", "beta": "scm-s2"}},
-		{in: " alpha = scm-s1 ", want: map[string]string{"alpha": "scm-s1"}},
-		{in: "alpha", wantErr: true},
+		{in: "alpha=scm-s1,beta=scm-s2", want: map[string]string{siteAlpha: ctxS1, "beta": ctxS2}},
+		{in: " alpha = scm-s1 ", want: map[string]string{siteAlpha: ctxS1}},
+		{in: siteAlpha, wantErr: true},
 		{in: "alpha=", wantErr: true},
 		{in: "=scm-s1", wantErr: true},
 		{in: "alpha=scm-s1,alpha=scm-s2", wantErr: true},
@@ -90,12 +90,12 @@ func TestParseSiteContextFlag(t *testing.T) {
 }
 
 func TestResolveSiteContexts(t *testing.T) {
-	siteNames := []string{"scm-s1", "scm-s2", "gamma"}
-	available := []string{"scm-cp", "scm-s1", "scm-s2", "ctxG"}
+	siteNames := []string{ctxS1, ctxS2, siteGamma}
+	available := []string{"scm-cp", ctxS1, ctxS2, ctxG}
 
 	// Convention (name==context) resolves s1/s2; gamma needs an explicit mapping.
-	res := ResolveSiteContexts(siteNames, map[string]string{"gamma": "ctxG"}, available)
-	want := map[string]string{"scm-s1": "scm-s1", "scm-s2": "scm-s2", "gamma": "ctxG"}
+	res := ResolveSiteContexts(siteNames, map[string]string{siteGamma: ctxG}, available)
+	want := map[string]string{ctxS1: ctxS1, ctxS2: ctxS2, siteGamma: ctxG}
 	if !reflect.DeepEqual(res.Resolved, want) {
 		t.Fatalf("Resolved = %v, want %v", res.Resolved, want)
 	}
@@ -104,17 +104,17 @@ func TestResolveSiteContexts(t *testing.T) {
 	}
 
 	// Unresolved: no mapping and no same-named context.
-	res = ResolveSiteContexts([]string{"gamma"}, nil, available)
-	if len(res.Unresolved) != 1 || res.Unresolved[0].Site != "gamma" {
+	res = ResolveSiteContexts([]string{siteGamma}, nil, available)
+	if len(res.Unresolved) != 1 || res.Unresolved[0].Site != siteGamma {
 		t.Fatalf("expected gamma unresolved, got %+v", res.Unresolved)
 	}
-	if _, ok := res.Resolved["gamma"]; ok {
+	if _, ok := res.Resolved[siteGamma]; ok {
 		t.Fatalf("gamma must not be resolved")
 	}
 
 	// Explicit mapping to a non-existent context is an error (unresolved with reason).
-	res = ResolveSiteContexts([]string{"scm-s1"}, map[string]string{"scm-s1": "nope"}, available)
-	if len(res.Unresolved) != 1 || res.Unresolved[0].Site != "scm-s1" {
+	res = ResolveSiteContexts([]string{ctxS1}, map[string]string{ctxS1: "nope"}, available)
+	if len(res.Unresolved) != 1 || res.Unresolved[0].Site != ctxS1 {
 		t.Fatalf("expected scm-s1 unresolved for bad mapping, got %+v", res)
 	}
 }
@@ -122,16 +122,16 @@ func TestResolveSiteContexts(t *testing.T) {
 func TestCheckSiteSpread(t *testing.T) {
 	// Shard 0 spans two sites (good); shard 1 is entirely in one site (bad).
 	members := []ShardMember{
-		{Key: "scm-s1/x-shard-0-0", Site: "scm-s1", Shard: 0, Role: "master", Reachable: true},
-		{Key: "scm-s2/x-shard-0-0", Site: "scm-s2", Shard: 0, Role: "replica", Reachable: true},
-		{Key: "scm-s2/x-shard-1-0", Site: "scm-s2", Shard: 1, Role: "master", Reachable: true},
-		{Key: "scm-s2/x-shard-1-1", Site: "scm-s2", Shard: 1, Role: "replica", Reachable: true},
+		{Key: keyS1Shard00, Site: ctxS1, Shard: 0, Role: roleMaster, Reachable: true},
+		{Key: keyS2Shard00, Site: ctxS2, Shard: 0, Role: roleReplica, Reachable: true},
+		{Key: "scm-s2/x-shard-1-0", Site: ctxS2, Shard: 1, Role: roleMaster, Reachable: true},
+		{Key: "scm-s2/x-shard-1-1", Site: ctxS2, Shard: 1, Role: roleReplica, Reachable: true},
 	}
 	got := CheckSiteSpread(members)
 	if len(got) != 1 {
 		t.Fatalf("CheckSiteSpread = %+v, want 1 violation (shard 1)", got)
 	}
-	if got[0].Shard != 1 || !reflect.DeepEqual(got[0].Sites, []string{"scm-s2"}) {
+	if got[0].Shard != 1 || !reflect.DeepEqual(got[0].Sites, []string{ctxS2}) {
 		t.Fatalf("violation = %+v, want shard 1 in [scm-s2]", got[0])
 	}
 }
@@ -139,10 +139,10 @@ func TestCheckSiteSpread(t *testing.T) {
 func TestCheckSiteSpreadSkipsUnreachableAndMalformed(t *testing.T) {
 	members := []ShardMember{
 		// Shard 0's cross-site copy is unreachable — do NOT synthesize a spread from a dead node.
-		{Key: "scm-s1/x-shard-0-0", Site: "scm-s1", Shard: 0, Role: "master", Reachable: true},
-		{Key: "scm-s2/x-shard-0-0", Site: "scm-s2", Shard: 0, Role: "replica", Reachable: false},
+		{Key: keyS1Shard00, Site: ctxS1, Shard: 0, Role: roleMaster, Reachable: true},
+		{Key: keyS2Shard00, Site: ctxS2, Shard: 0, Role: roleReplica, Reachable: false},
 		// Legacy / non-per-shard name (shard -1) and no-site key are skipped entirely.
-		{Key: "legacy-pod", Site: "", Shard: -1, Role: "master", Reachable: true},
+		{Key: "legacy-pod", Site: "", Shard: -1, Role: roleMaster, Reachable: true},
 	}
 	got := CheckSiteSpread(members)
 	if len(got) != 1 || got[0].Shard != 0 {
@@ -156,13 +156,13 @@ func TestCheckSiteSpreadSkipsUnreachableAndMalformed(t *testing.T) {
 func TestMasterCountsFromGroundTruth(t *testing.T) {
 	gt := redisclient.NewClusterGroundTruth()
 	// s1 hosts two slot-serving masters (drift).
-	gt.Nodes["s1/x-shard-0-0"] = &redisclient.ClusterNodeState{PodName: "s1/x-shard-0-0", Role: "master", Slots: []string{"0-100"}, Reachable: true}
-	gt.Nodes["s1/x-shard-1-0"] = &redisclient.ClusterNodeState{PodName: "s1/x-shard-1-0", Role: "master", Slots: []string{"101-200"}, Reachable: true}
+	gt.Nodes["s1/x-shard-0-0"] = &redisclient.ClusterNodeState{PodName: "s1/x-shard-0-0", Role: roleMaster, Slots: []string{"0-100"}, Reachable: true}
+	gt.Nodes["s1/x-shard-1-0"] = &redisclient.ClusterNodeState{PodName: "s1/x-shard-1-0", Role: roleMaster, Slots: []string{"101-200"}, Reachable: true}
 	// s2 hosts one slot-serving master.
-	gt.Nodes["s2/x-shard-2-0"] = &redisclient.ClusterNodeState{PodName: "s2/x-shard-2-0", Role: "master", Slots: []string{"201-300"}, Reachable: true}
+	gt.Nodes["s2/x-shard-2-0"] = &redisclient.ClusterNodeState{PodName: "s2/x-shard-2-0", Role: roleMaster, Slots: []string{"201-300"}, Reachable: true}
 	// s2 also hosts a replica (not counted) and an EMPTY master (no slots — not counted).
-	gt.Nodes["s2/x-shard-0-1"] = &redisclient.ClusterNodeState{PodName: "s2/x-shard-0-1", Role: "replica", Reachable: true}
-	gt.Nodes["s3/x-shard-3-0"] = &redisclient.ClusterNodeState{PodName: "s3/x-shard-3-0", Role: "master", Slots: nil, Reachable: true}
+	gt.Nodes["s2/x-shard-0-1"] = &redisclient.ClusterNodeState{PodName: "s2/x-shard-0-1", Role: roleReplica, Reachable: true}
+	gt.Nodes["s3/x-shard-3-0"] = &redisclient.ClusterNodeState{PodName: "s3/x-shard-3-0", Role: roleMaster, Slots: nil, Reachable: true}
 
 	got := MasterCountsFromGroundTruth(gt)
 	want := []SiteMasterCount{{Site: "s1", Masters: 2}, {Site: "s2", Masters: 1}}
@@ -205,21 +205,21 @@ func TestEvaluateMasterDistribution(t *testing.T) {
 
 func TestMembersFromGroundTruth(t *testing.T) {
 	gt := redisclient.NewClusterGroundTruth()
-	gt.Nodes["scm-s1/x-shard-0-0"] = &redisclient.ClusterNodeState{
-		PodName: "scm-s1/x-shard-0-0", Role: "master", Reachable: true,
+	gt.Nodes[keyS1Shard00] = &redisclient.ClusterNodeState{
+		PodName: keyS1Shard00, Role: roleMaster, Reachable: true,
 	}
-	gt.Nodes["scm-s2/x-shard-0-0"] = &redisclient.ClusterNodeState{
-		PodName: "scm-s2/x-shard-0-0", Role: "replica", Reachable: true,
+	gt.Nodes[keyS2Shard00] = &redisclient.ClusterNodeState{
+		PodName: keyS2Shard00, Role: roleReplica, Reachable: true,
 	}
 	members := MembersFromGroundTruth(gt)
 	if len(members) != 2 {
 		t.Fatalf("MembersFromGroundTruth len = %d, want 2", len(members))
 	}
 	// Deterministic order (by key).
-	if members[0].Site != "scm-s1" || members[0].Shard != 0 || members[0].Role != "master" {
+	if members[0].Site != ctxS1 || members[0].Shard != 0 || members[0].Role != roleMaster {
 		t.Fatalf("member[0] = %+v", members[0])
 	}
-	if members[1].Site != "scm-s2" || members[1].Shard != 0 {
+	if members[1].Site != ctxS2 || members[1].Shard != 0 {
 		t.Fatalf("member[1] = %+v", members[1])
 	}
 }

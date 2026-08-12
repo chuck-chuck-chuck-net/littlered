@@ -105,8 +105,8 @@ var _ = Describe("MultiSite finalizer teardown", func() {
 				Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3},
 				MultiSite: &littleredv1alpha1.MultiSiteSpec{
 					Sites: []littleredv1alpha1.SiteSpec{
-						{Name: "alpha"},
-						{Name: "beta", KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "site-beta-kubeconfig"}},
+						{Name: siteAlpha},
+						{Name: siteBeta, KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "site-beta-kubeconfig"}},
 					},
 				},
 			},

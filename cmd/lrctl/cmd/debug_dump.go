@@ -148,7 +148,7 @@ func collectPodLogsForCR(ctx context.Context, k8sClient client.Client, dir, name
 
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(ns), client.MatchingLabels{
-		"app.kubernetes.io/instance": name,
+		labelAppInstance: name,
 	}); err != nil {
 		writeFile(dir, "pod-logs-error.txt", fmt.Sprintf("failed to list pods: %v", err))
 		return
@@ -183,7 +183,7 @@ func collectRedisState(
 
 	podList := &corev1.PodList{}
 	if err := k8sClient.List(ctx, podList, client.InNamespace(lr.Namespace), client.MatchingLabels{
-		"app.kubernetes.io/instance": lr.Name,
+		labelAppInstance: lr.Name,
 	}); err != nil {
 		return
 	}
@@ -199,9 +199,9 @@ func collectRedisState(
 		component := pod.Labels["app.kubernetes.io/component"]
 
 		switch component {
-		case "redis":
+		case containerRedis:
 			// Sentinel-mode Redis pod.
-			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "redis",
+			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, containerRedis,
 				[]string{"sh", "-c", authShell + ` redis-cli $AUTH INFO replication`})
 			writeFile(dir, fmt.Sprintf("redis-%s-info-replication.txt", pod.Name), out)
 
@@ -210,7 +210,7 @@ func collectRedisState(
 			clusterCmd := authShell + ` redis-cli $AUTH INFO replication` +
 				` && echo "---" && redis-cli $AUTH CLUSTER NODES` +
 				` && echo "---" && redis-cli $AUTH CLUSTER INFO`
-			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "redis",
+			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, containerRedis,
 				[]string{"sh", "-c", clusterCmd})
 			writeFile(dir, fmt.Sprintf("redis-%s-cluster-state.txt", pod.Name), out)
 

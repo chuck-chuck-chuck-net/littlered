@@ -29,18 +29,18 @@ import (
 func TestRepairMayForceTakeover(t *testing.T) {
 	single := &littleredv1alpha1.LittleRed{
 		Spec: littleredv1alpha1.LittleRedSpec{
-			Mode:    "cluster",
+			Mode:    ComponentCluster,
 			Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3},
 		},
 	}
 	multi := &littleredv1alpha1.LittleRed{
 		Spec: littleredv1alpha1.LittleRedSpec{
-			Mode:    "cluster",
+			Mode:    ComponentCluster,
 			Cluster: &littleredv1alpha1.ClusterSpec{Shards: 4},
 			MultiSite: &littleredv1alpha1.MultiSiteSpec{
 				SitesPerShard: 2,
 				Sites: []littleredv1alpha1.SiteSpec{
-					{Name: "scm-s1"}, {Name: "scm-s2"},
+					{Name: siteCtxS1}, {Name: siteCtxS2},
 				},
 			},
 		},
