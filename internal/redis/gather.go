@@ -121,18 +121,19 @@ func GatherClusterGroundTruth(ctx context.Context, g Gatherer, clusterPods map[s
 		}
 	}
 
-	// 2. Query topology (CLUSTER INFO + NODES) from all reachable nodes and merge.
+	// 2. Query topology (CLUSTER INFO + NODES) from all reachable nodes and merge. This
+	// populates each reachable node's FailFlagged/PFailFlagged from its own gossip view.
 	adj := gatherTopology(ctx, g, gt)
 	// Retain the per-node adjacency (who each node directly knows) so repair can
 	// gate CLUSTER REPLICATE on the empty master actually knowing its target.
 	gt.KnownNodes = adj
 
-	// Detect ghosts: NodeIDs seen in the mesh that have no backing pod.
-	for nodeID := range gt.AllNodeIDs {
-		if _, hasPod := nodeIDtoPod[nodeID]; !hasPod {
-			gt.GhostNodes = append(gt.GhostNodes, nodeID)
-		}
-	}
+	// Detect ghosts from Redis's own quorum verdict, NOT from the hub's dial reachability
+	// (LR-030): a ghost is a NodeID that a reachable peer's gossip marks objectively FAIL
+	// (flagFail). Classifying every dial-unreachable NodeID as a ghost would FORGET the
+	// live masters of a hub-blind-but-gossip-healthy site and manufacture an outage. See
+	// deriveGhostNodes, ADR-012, and pillars 3.4 / 3.15.
+	gt.GhostNodes = deriveGhostNodes(gt.Nodes)
 
 	if gt.ClusterState == "" {
 		gt.ClusterState = "unknown"

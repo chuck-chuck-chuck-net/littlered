@@ -75,12 +75,16 @@ type ClusterNodeState struct {
 
 // ClusterGroundTruth represents the combined view of the Redis Cluster topology
 type ClusterGroundTruth struct {
-	Nodes        map[string]*ClusterNodeState // Map PodName -> ClusterNodeState
-	Partitions   [][]string                   // Sets of NodeIDs that see each other
-	GhostNodes   []string                     // NodeIDs present in cluster but not in K8s
-	ClusterState string                       // "ok" if ANY node says ok, else "fail" or "unknown"
-	TotalSlots   int                          // Max slots assigned reported by any node
-	AllNodeIDs   map[string]bool              // Set of all NodeIDs seen in the mesh
+	Nodes      map[string]*ClusterNodeState // Map PodName -> ClusterNodeState
+	Partitions [][]string                   // Sets of NodeIDs that see each other
+	// GhostNodes are NodeIDs that reachable peers' gossip marks objectively FAIL —
+	// Redis's own quorum verdict (flagFail) — NOT merely NodeIDs the hub cannot dial.
+	// Deriving these from dial reachability was the LR-030 bug: a hub-blind but
+	// gossip-healthy site's live masters would be FORGOTTEN. See deriveGhostNodes.
+	GhostNodes   []string
+	ClusterState string          // "ok" if ANY node says ok, else "fail" or "unknown"
+	TotalSlots   int             // Max slots assigned reported by any node
+	AllNodeIDs   map[string]bool // Set of all NodeIDs seen in the mesh
 	// KnownNodes maps a reachable node's NodeID to the set of NodeIDs it directly
 	// knows in its own CLUSTER NODES view (excluding fail/noaddr/handshake). It is
 	// the same adjacency used to compute Partitions, retained so the operator can
@@ -94,6 +98,39 @@ type ClusterGroundTruth struct {
 	// mixed-version cluster mid rolling-upgrade falls back to the dance. Unknown
 	// or any node lacking support ⇒ false ⇒ baseline dance. See LR-018 §7.3.
 	AtomicSlotMigration bool
+}
+
+// deriveGhostNodes returns the set of ghost NodeIDs — NodeIDs that reachable peers'
+// gossip marks objectively FAIL, deduplicated and sorted.
+//
+// FAIL is Redis's own quorum verdict (flagFail), propagated across the gossip mesh: a
+// node is FAIL only once a majority of masters agree it is down, so it is never flagged
+// while the cluster can still reach it. A ghost is therefore a NodeID that at least one
+// REACHABLE node marks FAIL — NOT a node the hub merely cannot dial (LR-030). Deriving
+// ghosts from the hub's dial reachability was the bug: in a hub-blind-but-gossip-healthy
+// data cut the operator would classify live, dial-unreachable nodes as ghosts and FORGET
+// them, manufacturing the outage it "repairs". PFAIL (flagPFail, subjective single-node
+// suspicion) is deliberately NOT a ghost. Only reachable nodes carry a first-hand gossip
+// verdict, so an unreachable node's FailFlagged (never populated in practice) is ignored.
+func deriveGhostNodes(nodes map[string]*ClusterNodeState) []string {
+	ghostSet := make(map[string]struct{})
+	for _, n := range nodes {
+		if !n.Reachable {
+			continue
+		}
+		for _, id := range n.FailFlagged {
+			ghostSet[id] = struct{}{}
+		}
+	}
+	if len(ghostSet) == 0 {
+		return nil
+	}
+	ghosts := make([]string, 0, len(ghostSet))
+	for id := range ghostSet {
+		ghosts = append(ghosts, id)
+	}
+	slices.Sort(ghosts)
+	return ghosts
 }
 
 // NewClusterGroundTruth initializes a new cluster ground truth

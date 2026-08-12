@@ -128,9 +128,10 @@ select the most-complete surviving replica (highest replication offset, within o
 replication lineage — the LR-024 union-find over `{replid, replid2}`) and
 `CLUSTER FAILOVER TAKEOVER` it; then `CLUSTER FORGET` the lost site's node IDs on
 every reachable node — but **only while every hosting site is observable**
-(`allSitesObservable`): a gossip-known node with no backing pod is indistinguishable
-by NodeID from a node on a merely-unreachable site, so FORGET trails idempotently
-until the site is observable again (pillar 3.4). `TAKEOVER→FORGET` ordering is
+(`allSitesObservable`): a ghost NodeID (see the LR-030 amendment below — a node
+reachable peers mark objectively FAIL) is indistinguishable by NodeID from a node on
+a merely-unreachable site, so FORGET trails idempotently until the site is observable
+again (pillar 3.4). `TAKEOVER→FORGET` ordering is
 required (a sibling replica still points at the dead master until it follows the slot
 claim; FORGET refuses "Can't forget my master" until then — a partial pass is
 normal). Rejoining fresh pods take the ordinary empty-pod MEET + shard-aware reattach
@@ -245,6 +246,20 @@ degrades to Tier A (human), never to an unsafe guess.
   and the takeover's FORGET are gated on `allSitesObservable` — otherwise repair
   could fire an unguarded takeover ahead of the fence/cooldown. Step-1's
   partition-heal `CLUSTER MEET` stays active (benign, non-takeover).
+- **Amendment (LR-030) — the ghost *criterion* is Redis's FAIL verdict, not dial
+  reachability.** As originally implemented, a ghost was `AllNodeIDs − dial-reachable`
+  ("a NodeID with no pod the hub can dial"). That equates hub-unreachability with
+  gone-ness — a failure-detection decision this ADR spends its whole length arguing the
+  operator must not make. In a **hub-blind-but-gossip-healthy** data cut (the hub loses
+  its route to a site's pods, but the sites gossip fine and the site's K8s API is up, so
+  `allSitesObservable` is *true*), that site's LIVE masters are dial-unreachable → ghosts,
+  and the `allSitesObservable` gate does **not** save them → repair FORGETs live nodes →
+  slots unassigned → outage. Fixed cross-mode: a ghost is now a NodeID that reachable
+  peers' gossip marks objectively **FAIL** (`deriveGhostNodes`, pillar 3.4). This makes
+  the `allSitesObservable` FORGET gate **belt-and-suspenders** (for the genuinely-
+  unobservable-site edge) rather than the primary safety mechanism — the primary
+  guarantee is now that a live-but-hub-unreachable node is *never a ghost in the first
+  place*. See changelog LR-030.
 - **Multi-site keeps the namespaced per-site Role — no cluster-scoped `nodes` RBAC.**
   Because safety is arithmetic (D1) and not a Kubernetes liveness witness, the
   operator needs no per-Node `Ready` read; the M1 namespace-scoped workload/pod Role
