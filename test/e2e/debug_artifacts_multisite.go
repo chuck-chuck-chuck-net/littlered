@@ -82,6 +82,11 @@ func collectMultiSiteDebugArtifacts(debugDir string, t *msDebugTarget) {
 	dumpKubectl(debugDir, "hub-events.txt", reg.hubContext, "-n", ns, "get", "events", "--sort-by", ".lastTimestamp")
 	dumpKubectl(debugDir, "hub-site-secrets.txt", reg.hubContext, "-n", reg.operatorNS, "get", "secrets", "-o", "name")
 
+	// Chaos-client pods, if any are alive at failure time (they are short-lived and deleted
+	// mid-spec, so this captures them only for a failure DURING a write/verify phase — exactly the
+	// data-integrity failures where the per-op log matters). Discovered by label, no bookkeeping.
+	collectMultiSiteChaosLogs(debugDir, ns, reg)
+
 	// --- Per site: workloads, the cut policy (if any), per-pod logs, and redis ground truth. ---
 	for _, s := range reg.orderedSites {
 		p := "site-" + s.name + "-"
@@ -120,6 +125,28 @@ func collectSitePodArtifacts(debugDir, prefix, siteCtx, ns string) {
 			"-c", "redis", "--", "redis-cli", "CLUSTER", "NODES")
 		dumpKubectl(debugDir, prefix+"pod-"+pod+"-cluster-info.txt", siteCtx, "exec", pod, "-n", ns,
 			"-c", "redis", "--", "redis-cli", "CLUSTER", "INFO")
+	}
+}
+
+// collectMultiSiteChaosLogs dumps the logs of any chaos-client pod (label app=chaos-client) found
+// in the instance namespace. An ambient chaos deploy lands on the hub; a *Ctx deploy could land on
+// a site — so scan both. The chaos metrics (writes / corruptions) are embedded in the pod log as a
+// METRICS_JSON line, so the log is the complete artifact. Best-effort: no pod ⇒ nothing written.
+func collectMultiSiteChaosLogs(debugDir, ns string, reg *msRegistry) {
+	type ctxRef struct{ label, kctx string }
+	refs := []ctxRef{{"hub", reg.hubContext}}
+	for _, s := range reg.orderedSites {
+		refs = append(refs, ctxRef{s.name, s.context})
+	}
+	for _, r := range refs {
+		out, err := kctl(r.kctx, "-n", ns, "get", "pods", "-l", "app=chaos-client",
+			"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
+		if err != nil || strings.TrimSpace(out) == "" {
+			continue
+		}
+		for _, pod := range strings.Fields(out) {
+			dumpKubectl(debugDir, "chaos-"+r.label+"-"+pod+".log", r.kctx, "-n", ns, "logs", pod, "--timestamps")
+		}
 	}
 }
 
