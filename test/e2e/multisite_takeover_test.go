@@ -86,7 +86,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 					" in place for live investigation (skipping heal + teardown)")
 				return
 			}
-			msHealDataPlane(reg.site(affected).context, ns)
+			msHealDataPlane(reg, affected, ns)
 			msTeardownInstance(reg, ns, crName)
 		})
 
@@ -126,7 +126,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			// report ok, so recoverSiteLoss returns WaitNative — never a takeover (the LR-017
 			// survivors'-vantage rule). A FULL isolation, by contrast, self-fences the isolated
 			// minority and IS taken over safely — that path is a site loss (Scenario A).
-			msPartitionDataPlane(reg, reg.site(affected).context, ns, crName, msHubPeerCIDRs())
+			msPartitionDataPlane(reg, affected, ns, crName, msHubPeerCIDRs())
 
 			By("asserting the operator HOLDs: no takeover while the survivors report cluster_state:ok")
 			// STRONG negative across a window well past the cooldown (max(60s,2×15s)=60s): no
@@ -150,7 +150,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			Expect(reason).NotTo(Equal("SiteTakeoverExecuted"))
 
 			By("healing the partition and asserting native recovery to a healthy cross-site topology")
-			msHealDataPlane(reg.site(affected).context, ns)
+			msHealDataPlane(reg, affected, ns)
 			msVerifyCrossSiteTopology(reg, ns, crName, "scm-s1", seedPod, true)
 
 			By("verifying the pre-partition anchor key survived the whole scenario")
@@ -174,11 +174,21 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 		victim := "scm-s2" // the site we kill (hosts shard-1 and shard-3 masters)
 
 		AfterEach(func() {
+			// DEBUG_ON_FAILURE: consistent with Scenario B leaving its cut in place — leave the
+			// killed site DOWN and the instance up for live investigation. The kill was recorded in
+			// the disruption ledger (msKillSiteVMs, write-ahead), so the platform is restored later
+			// via `LABEL_FILTER='ms-heal'` (or a manual `virsh start`). This is the whole reason the
+			// ledger exists: the leave-down promise is only safe because an out-of-band heal exists.
+			if debugOnFailure && suiteOrSpecFailed() {
+				By("DEBUG_ON_FAILURE: leaving site " + victim + " DOWN and instance " + ns + "/" + crName +
+					" up for investigation (recorded in the ledger; heal with LABEL_FILTER='ms-heal')")
+				return
+			}
 			// The hypervisor kill (virsh destroy) leaves the victim powered off; bring it back
-			// unconditionally so a failed or short-circuited run never leaves the site down.
-			// virsh start is a no-op if the VMs are already running or uninventoried. Then wait
-			// for readiness before teardown (teardown must reach the spoke to sweep it).
-			msStartSiteVMs(msVMInventory(), victim)
+			// unconditionally so a passing/short-circuited run never leaves the site down (this also
+			// clears the ledger record). virsh start is a no-op if the VMs are already running or
+			// uninventoried. Then wait for readiness before teardown (teardown must reach the spoke).
+			msStartSiteVMs(reg, msVMInventory(), victim)
 			msWaitSiteReady(reg.site(victim), 8*time.Minute)
 			msTeardownInstance(reg, ns, crName)
 		})
@@ -220,7 +230,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			startedAt := time.Now()
 
 			By("KILLING the whole victim site " + victim + " (virsh destroy — stays down until we power it back on)")
-			msKillSiteVMs(inv, victim)
+			msKillSiteVMs(reg, inv, victim)
 			msWaitSiteUnreachable(reg.site(victim), 3*time.Minute)
 
 			By("asserting the FENCE-GATED recoverSiteLoss fires the takeover after the cooldown")
@@ -272,7 +282,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			deleteChaosClient(ns, verifyPod)
 
 			By("RESTORING the site: powering the VMs back on and waiting for it to boot and rejoin")
-			msStartSiteVMs(inv, victim)
+			msStartSiteVMs(reg, inv, victim)
 			msWaitSiteReady(reg.site(victim), 8*time.Minute)
 			Eventually(func(g Gomega) {
 				info, err := msClusterInfo(reg.site("scm-s1").context, ns, survivorPod)

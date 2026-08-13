@@ -161,6 +161,22 @@ self-heal / custom-config / debug-no-slots / rolling-update / multipod specs in
 scenarios (whole-site kill, data-plane partition) live in `multisite_takeover_test.go`, not the
 shared body.
 
+**Disruption ledger + `ms-heal` (leave-damaged-then-heal).** Under `DEBUG_ON_FAILURE=true` the
+multi-site disruption specs deliberately **leave the damage in place** for investigation — a killed
+site stays powered off, a data-plane cut stays applied, and the instance stays up (consistent
+across Scenario A and B). Because an in-process cleanup can never survive an interrupted run
+(Ctrl-C / timeout / panic), and a killed site is un-discoverable (you cannot query a powered-off
+cluster), each disruption is recorded **write-ahead** as a ConfigMap in the `e2e-disruptions`
+namespace on the hub (a "poor-man's custom resource"); the matching restore deletes it. To restore
+the lab out-of-band afterwards, run the healer — it undoes every recorded disruption (reusing the
+same Go restore helpers) and asserts the ledger is empty:
+
+```bash
+make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=<hub> \
+  LABEL_FILTER='ms-heal' \
+  MS_HUB_CONTEXT=… MS_SITE_CONTEXTS=… MS_SITE_ENDPOINTS=… MS_VM_INVENTORY=…   # same env as the run
+```
+
 ### Additional Flags
 
 Pass extra arguments to `go test` via `ARGS`:
@@ -213,6 +229,7 @@ make test-e2e ARGS="-timeout 90m"
 | `cluster_behaviour_test.go` | Cluster Behaviour Matrix [single-site] / [multi-site] | The ONE shared body of topology-agnostic cluster behaviours (bring-up to healthy serving 16384 slots, cross-shard ops, master-pod-failure recovery under chaos with data intact), run under single-site and/or multi-site via the `clusterHarness` abstraction. Gated by `E2E_TOPOLOGY`. Labels: `cluster-behaviour` (both); `multisite` (the multi-site Describe). |
 | `cluster_harness_test.go` + `cluster_harness_single_test.go` / `cluster_harness_multi_test.go` | (support) | The `clusterHarness` interface + `topologyEnabled` gating, and its single-site (ambient-context) and multi-site (hub + per-site contexts, per-pod site) implementations. Not specs themselves. |
 | `multisite_takeover_test.go` | Multi-Site Site-Loss Takeover (ADR-012) | `spec.multiSite` disruption: Scenario A whole-site kill of an even 2+2 split (`shards: 4`) MUST take over (survivor serves all slots, data intact); Scenario B data-plane-only partition with the site kept alive MUST NOT take over (no split-brain). Needs the hub+sites substrate + the hypervisor whole-site kill (`MS_VM_INVENTORY`, `virsh destroy`/`start`) / data-plane-partition (`CiliumNetworkPolicy`) mechanisms. Labels: `multisite`, `multisite-takeover`, `multisite-hold`. |
+| `ms_heal_test.go` + `ms_disruption_ledger_test.go` | Multi-Site Disruption Heal | Out-of-band recovery: undoes every disruption still recorded in the ledger (ConfigMaps in `e2e-disruptions` on the hub, written write-ahead by the disrupt helpers) — used after a `DEBUG_ON_FAILURE` run that left a site down / a cut applied. Reuses the inline restore helpers; no-op when the ledger is empty. Label: `ms-heal` (opt-in, not `multisite`). |
 
 > Naming caveat: `sentinel_advanced_failover_test.go` (Describe: *Sentinel Advanced
 > Failover*, formerly `failover_test.go`) tests **sentinel-mode** label mechanics and

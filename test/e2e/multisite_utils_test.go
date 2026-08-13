@@ -492,7 +492,11 @@ const msDataPlanePolicyName = "ms-e2e-dataplane-cut"
 // hub↔site stayed cut. So we pair the deny with an explicit allow-all (fromEntities/toEntities:
 // all); Deny rules take precedence over Allow, so only the named CIDRs on the named ports are cut.
 // Fully reversible via msHealDataPlane.
-func msPartitionDataPlane(reg *msRegistry, siteCtx, ns, crName string, peerCIDRs []string) {
+func msPartitionDataPlane(reg *msRegistry, siteName, ns, crName string, peerCIDRs []string) {
+	// Write-ahead: record the disruption BEFORE applying it, so an interrupted run can still be
+	// healed (ms-heal) even if it dies right after the policy lands. See the ledger file.
+	recordDisruption(reg, msDisruption{kind: msDisruptionKindCNP, site: siteName, ns: ns})
+	siteCtx := reg.site(siteName).context
 	policy := fmt.Sprintf(`apiVersion: cilium.io/v2
 kind: CiliumNetworkPolicy
 metadata:
@@ -520,7 +524,7 @@ spec:
       - {port: "6379", protocol: TCP}
       - {port: "16379", protocol: TCP}
 `, msDataPlanePolicyName, ns, crName, msCIDRSet(peerCIDRs), msCIDRSet(peerCIDRs))
-	By(fmt.Sprintf("Scenario B: installing data-plane cut policy on %s (peers %v)", siteCtx, peerCIDRs))
+	By(fmt.Sprintf("Scenario B: installing data-plane cut policy on %s (peers %v)", siteName, peerCIDRs))
 	_, err := kctlIn(siteCtx, policy, "apply", "-f", "-")
 	Expect(err).NotTo(HaveOccurred(), "apply Cilium data-plane deny policy")
 }
@@ -533,10 +537,13 @@ func msCIDRSet(cidrs []string) string {
 	return b.String()
 }
 
-// msHealDataPlane removes the data-plane cut policy, restoring cross-site redis connectivity.
-func msHealDataPlane(siteCtx, ns string) {
-	By(fmt.Sprintf("Scenario B: removing data-plane cut policy on %s", siteCtx))
+// msHealDataPlane removes the data-plane cut policy, restoring cross-site redis connectivity, and
+// clears the ledger record. Reused by both inline cleanup and the ms-heal spec.
+func msHealDataPlane(reg *msRegistry, siteName, ns string) {
+	siteCtx := reg.site(siteName).context
+	By(fmt.Sprintf("removing data-plane cut policy on %s", siteName))
 	_, _ = kctl(siteCtx, "-n", ns, "delete", "ciliumnetworkpolicy", msDataPlanePolicyName, "--ignore-not-found")
+	clearDisruption(reg, msDisruption{kind: msDisruptionKindCNP, site: siteName, ns: ns})
 }
 
 // --- Disruption: whole-site loss via hypervisor power-off (Scenario A) ---------------------
@@ -585,9 +592,13 @@ func msVMInventory() map[string][]msVM {
 // msKillSiteVMs hard-powers-off every VM of a site (virsh destroy). Tolerates a VM that is
 // already off, so the call is idempotent. The VMs stay down until msStartSiteVMs — there is
 // no self-reversal, so the outage lasts exactly as long as the test holds it.
-func msKillSiteVMs(inv map[string][]msVM, site string) {
+func msKillSiteVMs(reg *msRegistry, inv map[string][]msVM, site string) {
 	vms := inv[site]
 	Expect(vms).NotTo(BeEmpty(), "no MS_VM_INVENTORY entries for site %s", site)
+	// Write-ahead: record BEFORE the kill so an interrupted run can be healed (ms-heal). A killed
+	// site is un-discoverable — you cannot query a powered-off cluster — so this record is the ONLY
+	// thing that knows the site is down and owes a virsh start.
+	recordDisruption(reg, msDisruption{kind: msDisruptionKindSite, site: site})
 	By(fmt.Sprintf("Scenario A: hard-killing site %s at the hypervisor (virsh destroy, %d VMs)", site, len(vms)))
 	for _, vm := range vms {
 		out, err := utils.Run(exec.Command("virsh", "-c", vm.uri, "destroy", vm.name))
@@ -601,9 +612,12 @@ func msKillSiteVMs(inv map[string][]msVM, site string) {
 // msStartSiteVMs powers every VM of a site back on (virsh start). Tolerates an already-running
 // VM, and is a no-op when the site has no inventory — so it is safe to call unconditionally in
 // cleanup, even after a Skip or an early failure, to guarantee the lab is left healthy.
-func msStartSiteVMs(inv map[string][]msVM, site string) {
+func msStartSiteVMs(reg *msRegistry, inv map[string][]msVM, site string) {
 	vms := inv[site]
 	if len(vms) == 0 {
+		// No inventory for this site ⇒ we cannot power it on, so we must NOT clear any record: if a
+		// kill was recorded, the site is genuinely still down and heal (with the inventory) must
+		// still see it. When no kill happened there is no record and this is simply a no-op.
 		return
 	}
 	By(fmt.Sprintf("restoring site %s at the hypervisor (virsh start, %d VMs)", site, len(vms)))
@@ -614,6 +628,8 @@ func msStartSiteVMs(inv map[string][]msVM, site string) {
 			Expect(err).NotTo(HaveOccurred(), "virsh start %s @ %s", vm.name, vm.uri)
 		}
 	}
+	// The VMs are powered on ⇒ the "site down" disruption is undone; clear the ledger record.
+	clearDisruption(reg, msDisruption{kind: msDisruptionKindSite, site: site})
 }
 
 // msWaitSiteUnreachable waits until the site's Kubernetes API stops answering (the hub can no
