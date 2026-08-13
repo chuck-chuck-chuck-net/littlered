@@ -51,23 +51,35 @@ const (
 
 	msDisruptionKindSite = "sitekill" // a whole site powered off at the hypervisor (undo: virsh start)
 	msDisruptionKindCNP  = "cnpcut"   // a data-plane CiliumNetworkPolicy cut (undo: delete the policy)
+	// msDisruptionKindInstance records that a test INSTANCE was stood up and may be left behind (a
+	// DEBUG_ON_FAILURE run leaves it up for inspection). It is not "damage to the lab" like the
+	// other kinds, but it IS state the platform-clean promise must reclaim — so ms-heal tears down
+	// the leftover instance, making "after heal, ready for tests" literally true. (undo:
+	// msTeardownInstance).
+	msDisruptionKindInstance = "instance"
 )
 
-// msDisruption is one outstanding lab disruption to undo. site is the logical site name (the heal
-// spec resolves its kube-context via the registry); ns is the instance namespace (cnpcut only).
+// msDisruption is one outstanding thing to undo. site is the logical site name (heal resolves its
+// kube-context via the registry); ns is the instance namespace (cnpcut + instance); crName is the
+// CR (instance only).
 type msDisruption struct {
-	kind string
-	site string
-	ns   string
+	kind   string
+	site   string
+	ns     string
+	crName string
 }
 
 // msDisruptionName is the deterministic ConfigMap name for a disruption, so the code that applies
 // it and the code that undoes it (inline OR heal) address the same record without coordination.
 func msDisruptionName(d msDisruption) string {
-	if d.kind == msDisruptionKindSite {
+	switch d.kind {
+	case msDisruptionKindSite:
 		return "sitekill-" + d.site
+	case msDisruptionKindInstance:
+		return "instance-" + d.ns
+	default: // cnpcut
+		return "cnpcut-" + d.site + "-" + d.ns
 	}
-	return "cnpcut-" + d.site + "-" + d.ns
 }
 
 // ensureDisruptionNS creates the ledger namespace on the hub if absent (idempotent via apply).
@@ -94,9 +106,17 @@ data:
   kind: %q
   site: %q
   ns: %q
-`, msDisruptionName(d), msDisruptionNS, msDisruptionLabel, d.kind, d.site, d.ns)
+  cr: %q
+`, msDisruptionName(d), msDisruptionNS, msDisruptionLabel, d.kind, d.site, d.ns, d.crName)
 	_, err := kctlIn(reg.hubContext, cm, "apply", "-f", "-")
 	Expect(err).NotTo(HaveOccurred(), "recording disruption %s", msDisruptionName(d))
+}
+
+// msRecordInstance records that a takeover-scenario instance was stood up, so ms-heal reclaims it
+// if a DEBUG_ON_FAILURE run (or a failed teardown) leaves it behind. Cleared by msTeardownInstance.
+// Call it right after msSetupSites (past the clean-slate guard) and before applying the CR.
+func msRecordInstance(reg *msRegistry, ns, crName string) {
+	recordDisruption(reg, msDisruption{kind: msDisruptionKindInstance, ns: ns, crName: crName})
 }
 
 // clearDisruption deletes the ledger record after the disruption has been undone (idempotent).
@@ -110,7 +130,7 @@ func clearDisruption(reg *msRegistry, d msDisruption) {
 func listDisruptions(reg *msRegistry) []msDisruption {
 	out, err := kctl(reg.hubContext, "-n", msDisruptionNS, "get", "configmap",
 		"-l", msDisruptionLabel,
-		"-o", `jsonpath={range .items[*]}{.data.kind}{"|"}{.data.site}{"|"}{.data.ns}{"\n"}{end}`)
+		"-o", `jsonpath={range .items[*]}{.data.kind}{"|"}{.data.site}{"|"}{.data.ns}{"|"}{.data.cr}{"\n"}{end}`)
 	if err != nil {
 		return nil
 	}
@@ -119,11 +139,11 @@ func listDisruptions(reg *msRegistry) []msDisruption {
 		if strings.TrimSpace(line) == "" {
 			continue
 		}
-		f := strings.SplitN(line, "|", 3)
-		if len(f) != 3 {
+		f := strings.SplitN(line, "|", 4)
+		if len(f) != 4 {
 			continue
 		}
-		ds = append(ds, msDisruption{kind: f[0], site: f[1], ns: f[2]})
+		ds = append(ds, msDisruption{kind: f[0], site: f[1], ns: f[2], crName: f[3]})
 	}
 	return ds
 }

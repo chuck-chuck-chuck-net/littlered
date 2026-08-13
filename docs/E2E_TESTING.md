@@ -167,15 +167,23 @@ site stays powered off, a data-plane cut stays applied, and the instance stays u
 across Scenario A and B). Because an in-process cleanup can never survive an interrupted run
 (Ctrl-C / timeout / panic), and a killed site is un-discoverable (you cannot query a powered-off
 cluster), each disruption is recorded **write-ahead** as a ConfigMap in the `e2e-disruptions`
-namespace on the hub (a "poor-man's custom resource"); the matching restore deletes it. To restore
-the lab out-of-band afterwards, run the healer — it undoes every recorded disruption (reusing the
-same Go restore helpers) and asserts the ledger is empty:
+namespace on the hub (a "poor-man's custom resource"); the matching restore deletes it. The **test
+instance itself** is recorded the same way, so the healer also **tears down a leftover instance** —
+making "after heal, ready for tests" literally true (the instance is a throwaway; you don't heal and
+reuse it — you reclaim it and the next run stands up a fresh one). To restore the lab out-of-band,
+run the healer — it undoes every recorded disruption (restore sites / remove cuts first, then tear
+down leftover instances, reusing the same Go helpers) and asserts the ledger is empty:
 
 ```bash
 make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=<hub> \
   LABEL_FILTER='ms-heal' \
   MS_HUB_CONTEXT=… MS_SITE_CONTEXTS=… MS_SITE_ENDPOINTS=… MS_VM_INVENTORY=…   # same env as the run
 ```
+
+**Clean-slate guard.** If a leftover instance is *not* reclaimed, `msSetupSites` refuses to run onto
+it (fail-fast with the fix in the message, mirroring the default-namespace guard) rather than
+silently reusing a contaminated, mid-recovery cluster — which otherwise shows up as a confusing
+stuck-`Initializing` bring-up timeout.
 
 ### Additional Flags
 

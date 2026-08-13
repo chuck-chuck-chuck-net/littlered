@@ -206,6 +206,17 @@ type: kubernetes.io/service-account-token
 // Secrets (site-<ns>-<name>) in the operator namespace on the hub, using each site's endpoint
 // (the hub-pod-routable repl-net API VIP) resolved once in msRegistryFromEnv. Idempotent.
 func msSetupSites(reg *msRegistry, ns string) {
+	// Clean-slate guard: refuse to run onto a leftover instance. A DEBUG_ON_FAILURE run (or a
+	// failed/rejected teardown) leaves the instance up; silently reusing it contaminates the run
+	// with the prior cluster's post-disruption recovery state (e.g. a stuck-Initializing bring-up
+	// as the operator recycles a killed site's returnees). Fail fast with the fix — mirroring the
+	// default-namespace clean-slate guard in BeforeSuite.
+	if leftover, _ := kctl(reg.hubContext, "-n", ns, "get", "littlered", "-o", "name", "--ignore-not-found"); strings.TrimSpace(leftover) != "" {
+		Fail(fmt.Sprintf("multi-site instance already present in namespace %s (%s) — a clean slate is "+
+			"required. Tear the leftover down first: run LABEL_FILTER='ms-heal' (now removes leftover "+
+			"instances too), or `kubectl --context %s -n %s delete littlered --all` and drop the "+
+			"per-site namespaces.", ns, strings.TrimSpace(leftover), reg.hubContext, ns))
+	}
 	for _, s := range reg.orderedSites {
 		By(fmt.Sprintf("multi-site setup: RBAC + token in site %s (ns %s)", s.name, ns))
 		_, err := kctlIn(s.context, msSiteRBAC(ns), "apply", "-f", "-")
@@ -261,6 +272,9 @@ func msTeardownInstance(reg *msRegistry, ns, crName string) {
 		_, _ = kctl(reg.hubContext, "-n", reg.operatorNS, "delete", "secret", msSiteSecretName(ns, s.name), "--ignore-not-found")
 	}
 	_, _ = kctl(reg.hubContext, "delete", "ns", ns, "--ignore-not-found", "--wait=false")
+	// The instance is gone ⇒ clear its ledger record (recorded in the scenario setup). Idempotent:
+	// a no-op when nothing was recorded (e.g. the behaviour harness, which does not use the ledger).
+	clearDisruption(reg, msDisruption{kind: msDisruptionKindInstance, ns: ns, crName: crName})
 }
 
 // --- CR construction ---------------------------------------------------------------------

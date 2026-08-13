@@ -99,6 +99,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			setMSDebugTarget(reg, ns, crName)
 			By("standing up a 2-site cluster instance [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
+			msRecordInstance(reg, ns, crName) // ledger: ms-heal reclaims this instance if left behind
 			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
 			Expect(err).NotTo(HaveOccurred())
 
@@ -204,6 +205,7 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 			setMSDebugTarget(reg, ns, crName)
 			By("standing up a dedicated 2-site cluster [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
+			msRecordInstance(reg, ns, crName) // ledger: ms-heal reclaims this instance if left behind
 			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
 			Expect(err).NotTo(HaveOccurred())
 

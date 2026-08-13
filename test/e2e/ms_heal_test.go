@@ -53,6 +53,9 @@ var _ = Describe("Multi-Site Disruption Heal", Label("ms-heal"), func() {
 
 		By(fmt.Sprintf("healing %d recorded disruption(s)", len(ds)))
 		inv := msVMInventory()
+
+		// Pass 1: undo INFRA disruptions first — restore killed sites, remove data-plane cuts — so a
+		// subsequent instance teardown (pass 2) can reach the sites' spokes to sweep their namespaces.
 		for _, d := range ds {
 			switch d.kind {
 			case msDisruptionKindSite:
@@ -64,9 +67,20 @@ var _ = Describe("Multi-Site Disruption Heal", Label("ms-heal"), func() {
 				msWaitSiteReady(reg.site(d.site), 8*time.Minute)
 			case msDisruptionKindCNP:
 				msHealDataPlane(reg, d.site, d.ns) // deletes the cut policy and clears the record
+			case msDisruptionKindInstance:
+				// handled in pass 2 (after the sites are back up)
 			default:
 				Fail(fmt.Sprintf("unknown disruption kind %q in ledger record %q — cannot heal it",
 					d.kind, msDisruptionName(d)))
+			}
+		}
+
+		// Pass 2: tear down leftover test INSTANCES — makes "after heal, ready for tests" literally
+		// true (a DEBUG_ON_FAILURE run leaves the instance up; this reclaims it). Sites are up now.
+		for _, d := range ds {
+			if d.kind == msDisruptionKindInstance {
+				By(fmt.Sprintf("tearing down leftover instance %s/%s", d.ns, d.crName))
+				msTeardownInstance(reg, d.ns, d.crName) // deletes the CR + namespaces + clears the record
 			}
 		}
 
