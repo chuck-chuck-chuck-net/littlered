@@ -207,7 +207,7 @@ Safety notes:
   below quorum" (takeover needed) and "lost side below quorum" (fence holds) can hold
   together only when the slot-serving masters split exactly in half. Any odd master
   count makes a dual-site loss either native (survivors hold quorum) or a
-  drift-refusal (the lost side could hold it). See ADR-012 condition 4.
+  drift-refusal (the lost side could hold it). See ADR-012 condition 3.
 - **Dual-site takeover presumes the hub survives the lost site.** A hub co-located in
   one of the two sites cannot recover that site's loss — the operator dies with it.
   Automated dual-site recovery therefore effectively requires the hub in a third
@@ -223,16 +223,26 @@ Safety notes:
   returning site's StatefulSet (re)creation per shard, reusing the serialized-rollout
   pattern (LR-021).
 
-### 6.1 Explored alternative for dual-site: witness shard (deferred)
+### 6.1 Rejected alternative for dual-site: witness shard
 
 Redis computes quorum over **slot-serving masters only** (verified: nodes with
 `numslots == 0` do not count). A minimal third-domain member — one tiny master owning
-a single hash slot ("witness shard"), e.g. scheduled on the hub — makes the master
-count odd and restores fully native failover for dual-site. Deferred because partial
-mesh partitions (sites cut from each other but both reaching the witness) can
-authorize **mutual cross-site failovers** with messy convergence; that behavior needs
-dedicated analysis and e2e before we trust it. The takeover path (§6) does not have
-this failure mode and reuses existing machinery, so it goes first.
+a single hash slot ("witness shard"), e.g. scheduled on the hub — would make the
+master count odd and restore fully native failover for dual-site.
+
+Rejected (ADR-012, Alternatives). The vote requirement is the decisive part: because
+only slot-serving masters vote, an arbiter **must hold data**, so it is not a cheap
+witness at all — it is a third data site, which is just Tier C by another name and
+carries a data site's placement, sizing and teardown obligations. A voting *empty*
+primary would fix that, but it does not exist in OSS Redis; it is an upstream proposal
+(Valkey #1600, discussion-phase), and forking Redis's vote logic to get it violates
+pillar 3.5 and the OSS-only stance. Revisit as a no-fork Tier-D option only if it
+lands upstream.
+
+Independently, the mechanism has its own hazard: partial mesh partitions (sites cut
+from each other but both reaching the witness) can authorize **mutual cross-site
+failovers** with messy convergence. The takeover path (§6) has neither problem and
+reuses existing machinery.
 
 ## 7. API sketch (tentative)
 
@@ -321,7 +331,9 @@ Remaining field-shape details are settled in the ADR, not here.
    three-master minimum that is exactly **two sites with an odd `K`**; for `S ≥ 3` the
    floor is always reachable, so the warning never fires there. Unit/envtest-verified;
    live validation pending.
-3. Witness-shard exploration (§6.1) — separate design + e2e.
+3. ~~Witness-shard exploration~~ — **rejected**, not deferred (§6.1, ADR-012
+   Alternatives): only slot-serving masters vote, so an arbiter must hold data and is
+   just a third data site. Reopens only if a voting empty primary lands upstream.
 4. Rollout serialization across sites (LR-021 currently serializes shards within one
    site; define the cross-site ordering). *Implemented in the initial multi-site work
    as "at most one shard StatefulSet rolling across the whole instance at a time" —

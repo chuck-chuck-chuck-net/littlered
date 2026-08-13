@@ -123,7 +123,7 @@ type sitePodObservation struct {
 	restarted bool
 	oomKilled bool
 	// terminating is whether the pod is being deleted (DeletionTimestamp set) — the
-	// site-loss quiet-cluster gate excludes a terminating survivor (ADR-012 condition 6).
+	// site-loss quiet-cluster gate excludes a terminating survivor (ADR-012 condition 5).
 	terminating bool
 	// restartCount is the redis container's restart count (0 = never restarted); the
 	// fenced-alive rejoin recycle only recycles pods that returned WITHOUT a restart.

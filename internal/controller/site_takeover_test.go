@@ -103,7 +103,7 @@ func TestPlanSiteTakeover(t *testing.T) {
 			since: &armed, wantAction: siteTakeover, wantTargets: 1,
 		},
 		{
-			name: "not quiet => Hold (condition 6)",
+			name: "not quiet => Hold (condition 5)",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
@@ -112,7 +112,7 @@ func TestPlanSiteTakeover(t *testing.T) {
 			since: &armed, wantAction: siteTakeoverHold, wantTargets: -1,
 		},
 		{
-			name: "first observation => Arm (condition 5, not fire)",
+			name: "first observation => Arm (condition 4, not fire)",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),
@@ -121,7 +121,7 @@ func TestPlanSiteTakeover(t *testing.T) {
 			since: nil, wantAction: siteTakeoverArm, wantTargets: -1,
 		},
 		{
-			name: "within cooldown => Wait (condition 5)",
+			name: "within cooldown => Wait (condition 4)",
 			in: siteTakeoverInput{
 				clusterFormed: true,
 				size:          2, reachableMasters: 1, orphanTargets: oneOrphan(),

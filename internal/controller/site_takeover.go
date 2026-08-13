@@ -61,12 +61,12 @@ const (
 	// siteTakeoverWaitNative: the survivors still hold (or could regain) a master majority,
 	// so Redis will elect on its own (pillar 3.5). Clear the marker; wait. Condition 2 fails.
 	siteTakeoverWaitNative
-	// siteTakeoverHold: the cluster is not quiet (condition 6) — a terminating survivor or an
+	// siteTakeoverHold: the cluster is not quiet (condition 5) — a terminating survivor or an
 	// in-flight failover/reshard/rollout means Redis may still be resolving this itself.
 	// Clear the marker; do nothing this pass.
 	siteTakeoverHold
 	// siteTakeoverArm: the fire-able signature was just observed. Arm the cooldown
-	// (status.multiSite.takeoverPendingSince) and wait (condition 5).
+	// (status.multiSite.takeoverPendingSince) and wait (condition 4).
 	siteTakeoverArm
 	// siteTakeoverWait: the signature persists but the cooldown has not elapsed. Wait.
 	siteTakeoverWait
@@ -162,11 +162,11 @@ type siteTakeoverInput struct {
 	// vantage). Required corroboration for the arithmetic; the hub's dial is transport.
 	survivorsClusterFail bool
 
-	// quiet is the Rule-A analog (condition 6): no terminating survivor pods and no
+	// quiet is the Rule-A analog (condition 5): no terminating survivor pods and no
 	// in-flight failover/reshard/serialized rollout. Decided on a fresh gather.
 	quiet bool
 
-	// allowUnsafe mirrors spec.multiSite.allowUnsafeSiteTakeover (condition 4 escape hatch).
+	// allowUnsafe mirrors spec.multiSite.allowUnsafeSiteTakeover (condition 3 escape hatch).
 	allowUnsafe bool
 }
 
@@ -202,7 +202,7 @@ func majorityOf(size int) int { return size/2 + 1 }
 //     split-brain-free. When the unreachable masters COULD hold a majority (drift), an
 //     isolated site might still be serving: refuse unless allowUnsafeSiteTakeover.
 //
-// Arithmetic identity (ADR-012 condition 4): condition 2 (reachable ≤ size/2) and the fence
+// Arithmetic identity (ADR-012 condition 3): condition 2 (reachable ≤ size/2) and the fence
 // (unreachable ≤ size/2) hold together only when the masters split EXACTLY in half — the
 // fence-safe automated path IS the even-split case. Any odd/drifted split makes a loss either
 // native (condition 2 fails ⇒ WaitNative) or the drift refusal.
@@ -210,7 +210,7 @@ func majorityOf(size int) int { return size/2 + 1 }
 // Evaluation order (cheap dispositive vetoes first; the fence — the split-brain safety case —
 // last, immediately before firing):
 //
-//	0 (formed) → 1 (orphans+survivors) → 2 (native exhausted) → 6 (quiet) → 5 (cooldown) →
+//	0 (formed) → 1 (orphans+survivors) → 2 (native exhausted) → 5 (quiet) → 4 (cooldown) →
 //	fence → fire.
 func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, cooldown time.Duration) siteTakeoverPlan {
 	unreachable := in.size - in.reachableMasters
@@ -251,13 +251,13 @@ func planSiteTakeover(in siteTakeoverInput, since *time.Time, now time.Time, coo
 		return plan(siteTakeoverWaitNative)
 	}
 
-	// Condition 6: quiet cluster (Rule-A analog). A terminating survivor or an in-flight
+	// Condition 5: quiet cluster (Rule-A analog). A terminating survivor or an in-flight
 	// failover/reshard/rollout means Redis may still be resolving this itself — hold.
 	if !in.quiet {
 		return plan(siteTakeoverHold)
 	}
 
-	// Condition 5: cooldown. First observation arms; then wait out max(60s, 2×node-timeout)
+	// Condition 4: cooldown. First observation arms; then wait out max(60s, 2×node-timeout)
 	// so the isolated side's fence has certainly engaged and stale Kubernetes views settle.
 	if since == nil {
 		return plan(siteTakeoverArm)
@@ -464,7 +464,7 @@ func siteFromKey(key string) string {
 }
 
 // siteTakeoverCooldownFor returns the site-loss takeover cooldown: max(60s, 2 ×
-// cluster-node-timeout) (ADR-012 condition 5) — long enough that the isolated side's own
+// cluster-node-timeout) (ADR-012 condition 4) — long enough that the isolated side's own
 // minority fail-stop (the fence) has certainly engaged and stale Kubernetes views settle.
 func siteTakeoverCooldownFor(lr *littleredv1alpha1.LittleRed) time.Duration {
 	nodeTimeoutMs := littleredv1alpha1.DefaultClusterNodeTimeout
@@ -635,7 +635,7 @@ func (r *LittleRedReconciler) buildSiteTakeoverInput(lr *littleredv1alpha1.Littl
 		}
 	}
 
-	// Quiet cluster (condition 6): no terminating survivor pod in any reachable site.
+	// Quiet cluster (condition 5): no terminating survivor pod in any reachable site.
 	in.quiet = true
 	for _, o := range obs {
 		if !o.reachable {
