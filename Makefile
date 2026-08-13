@@ -141,6 +141,19 @@ else
   endif
 endif
 
+# E2E_CODEGEN_DEP defines the codegen/format prerequisites for a test run. These matter ONLY
+# when we build+deploy the operator from the current tree (deployOperator -> make deploy ->
+# install -> manifests already regenerates the manifests). With SKIP_OPERATOR_DEPLOY=true the run
+# uses a pre-built image (tag = git hash) against already-applied CRDs, so `manifests`/`generate`
+# regenerate nothing that is used, and `fmt` needlessly rewrites source DURING a test run (a latent
+# hazard: any tool-version skew silently dirties the working tree mid-run). So skip them there.
+# The full build+deploy flow (and CI, which never sets the SKIP flags) is unchanged.
+ifeq ($(SKIP_OPERATOR_DEPLOY),true)
+  E2E_CODEGEN_DEP =
+else
+  E2E_CODEGEN_DEP = manifests generate fmt vet
+endif
+
 E2E_VARS = KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) SKIP_OPERATOR_DEPLOY=$(SKIP_OPERATOR_DEPLOY) SKIP_KIND_SETUP=$(SKIP_KIND_SETUP)
 
 # FOCUS allows running specific tests by name.
@@ -219,7 +232,7 @@ test-e2e-all: ## Run ALL e2e tests, including 'extended'/opt-in tiers.
 	$(MAKE) test-e2e E2E_ALL=true
 
 .PHONY: run-test-e2e
-run-test-e2e: manifests generate fmt vet
+run-test-e2e: $(E2E_CODEGEN_DEP)
 	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
 
 # list-e2e previews the spec selection of an e2e run WITHOUT running anything. It reuses the
