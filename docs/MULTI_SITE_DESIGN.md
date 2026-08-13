@@ -129,14 +129,28 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   allows — an odd number of masters over two sites always leaves one site holding the
   majority (`shards: 3`, the standard mental model, is a 2+1 split). Roles then drift as
   Redis fails over, so the operator runs a **master rebalancer** (ADR-012 D2, §10
-  item 2): a slow, drift-triggered, no-data-loss graceful `CLUSTER FAILOVER` that keeps
-  `max_i mᵢ ≤ ⌈K/2⌉−1` so no site holds a Redis master majority. Consequence for site
-  loss (§6, ADR-012): losing a minority-master site heals natively; the automated
-  takeover is safe *exactly* in the even split (`reachable = unreachable = K/2`), and
-  any odd/drifted split where the lost side could hold the master majority lands in the
+  item 2): a slow, drift-triggered, no-data-loss graceful `CLUSTER FAILOVER`. It holds
+  **two thresholds**, because the two ways a site loss survives impose *different*
+  conditions on `mᵢ` (the slot-serving masters in site `i`) — with `K` shards and
+  `q = ⌊K/2⌋+1` the Redis master majority:
+  - **takeover floor** (hard): `max_i mᵢ ≤ ⌊K/2⌋` — the *lost* side lacks quorum, so the
+    survivors hold a blocking minority, the takeover's fence holds, and the loss recovers
+    unattended. Breaching it makes that site's loss a **drift-refusal**: a human or
+    `multiSite.allowUnsafeSiteTakeover`.
+  - **native target** (standard): `max_i mᵢ ≤ ⌈K/2⌉−1` — the *survivors* keep quorum, so
+    Redis elects on its own with the operator uninvolved. Breaching it only downgrades
+    recovery to a takeover (cooldown + a live hub), not to an outage.
+
+  They coincide for odd `K` and differ by exactly one for even `K`. The rebalancer plans
+  to the target when a move set reaches it, otherwise to the floor — floor-only progress
+  is a valid plan, since the floor is what keeps a site loss recoverable at all (LR-031).
+  Consequence for site loss (§6, ADR-012): losing a site at or below the native target
+  heals natively; between the target and the floor it recovers by the automated takeover,
+  which is safe *exactly* in the even split (`reachable = unreachable = K/2`); above the
+  floor — the lost side could hold the master majority — it lands in the
   **drift-refusal**, surfacing a condition and waiting for the opt-in or a human. That
-  refusal is an expected, common dual-site outcome, not a rare corner: uneven spreads
-  exist by construction (odd shards) and, when drift outruns the rebalancer, by drift.
+  refusal is an expected dual-site outcome, not a rare corner: an odd `K` over two sites
+  cannot satisfy the floor at all, and drift can outrun the rebalancer.
 - The shard-aware reattach (LR-020 `chooseReattachTarget`) keeps its rule "attach an
   empty pod to the under-replicated master of *its own shard*" — membership is per
   shard across sites; `cluster-allow-replica-migration no` stays. **A shard always
@@ -297,11 +311,16 @@ Remaining field-shape details are settled in the ADR, not here.
    Kubernetes failure detector), the survivor-vantage gather fields, and the
    TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-026,
    LR-029). Remaining: **live site-loss validation** on the two-site substrate.
-2. Master rebalancer: **implemented** (ADR-012 D2, changelog LR-029) — the pure
-   `planMasterRebalance` + the healthy-path `rebalanceMasters` executor keep
-   `max_i mᵢ ≤ ⌈K/2⌉−1` with one graceful `CLUSTER FAILOVER` per reconcile, plus the
-   structural `ReducedSiteLossResilience` warning for topologies that cannot satisfy
-   the invariant (`S·(⌈K/2⌉−1) < K`). Unit/envtest-verified; live validation pending.
+2. Master rebalancer: **implemented** (ADR-012 D2, changelog LR-029, corrected by
+   LR-031) — the pure `planMasterRebalance` + the healthy-path `rebalanceMasters`
+   executor hold the two thresholds (§4), planning to the native target
+   `nativeSurvivalTarget(K) = ⌈K/2⌉−1` where a move set reaches it and otherwise to the
+   takeover floor `takeoverSurvivalFloor(K) = ⌊K/2⌋`, with one graceful
+   `CLUSTER FAILOVER` per reconcile. The structural `ReducedSiteLossResilience` warning
+   fires when the **floor** is unreachable (`S·⌊K/2⌋ < K`) — given Redis Cluster's
+   three-master minimum that is exactly **two sites with an odd `K`**; for `S ≥ 3` the
+   floor is always reachable, so the warning never fires there. Unit/envtest-verified;
+   live validation pending.
 3. Witness-shard exploration (§6.1) — separate design + e2e.
 4. Rollout serialization across sites (LR-021 currently serializes shards within one
    site; define the cross-site ordering). *Implemented in the initial multi-site work
