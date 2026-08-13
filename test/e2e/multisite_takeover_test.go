@@ -330,13 +330,12 @@ func msPodIPAddrs(reg *msRegistry, ns string) string {
 	return strings.Join(addrs, ",")
 }
 
-// msHubPeerCIDRs returns extra CIDRs to deny in the Scenario-B cut so the hub operator's own
-// gather dial to the affected site is also cut (making the site data-unreachable from the
-// survivors' AND the hub's vantage, while the site's Kubernetes API — a separate host-network
-// path — stays reachable). Configurable via MS_HUB_POD_CIDR; empty by default (the survivor
-// peer CIDRs already make the affected site's masters unreachable to the survivors).
+// msHubPeerCIDRs returns the hub pod CIDR(s) to deny in the Scenario-B cut so the hub operator's
+// own gather dial to the affected site is cut (making the site data-unreachable from the hub's
+// vantage, while the site's Kubernetes API — a separate host-network path — stays reachable). From
+// the config's hubPodCIDR (MS_CONFIG) or MS_HUB_POD_CIDR; empty ⇒ Scenario B Skips.
 func msHubPeerCIDRs() []string {
-	if v := envOr("MS_HUB_POD_CIDR", ""); v != "" {
+	if v := strings.TrimSpace(msLoadConfig().HubPodCIDR); v != "" {
 		return strings.Split(v, ",")
 	}
 	return nil

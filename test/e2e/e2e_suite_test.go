@@ -150,16 +150,24 @@ var _ = BeforeSuite(func() {
 	// Require the namespace to not exist yet. Stale resources from a previous run
 	// (Pods, LittleRed CRs, etc.) would corrupt the tests, so we refuse to start
 	// rather than silently inheriting leftover state.
-	By("verifying test namespace " + testNamespace + " does not exist")
-	cmd := exec.Command("kubectl", "get", "ns", testNamespace)
-	_, err := utils.Run(cmd)
-	Expect(err).To(HaveOccurred(),
-		"Test namespace %q already exists — delete it first to ensure a clean slate:\n  kubectl delete ns %s",
-		testNamespace, testNamespace)
+	By("ensuring test namespace " + testNamespace + " is a clean slate")
+	if _, err := utils.Run(exec.Command("kubectl", "get", "ns", testNamespace)); err == nil {
+		// The namespace already exists. A DEBUG_ON_FAILURE run leaves it behind; multi-site runs
+		// create it but never use it (the instance lives in its own namespace). If it holds no
+		// LittleRed instance it is a harmless vestige — delete it and proceed. If it holds an
+		// instance (a single-site DEBUG_ON_FAILURE leftover under inspection) fail rather than
+		// clobber it, so a re-run does not destroy what was left for debugging.
+		insts, _ := utils.Run(exec.Command("kubectl", "-n", testNamespace, "get", "littlered", "-o", "name"))
+		Expect(strings.TrimSpace(insts)).To(BeEmpty(),
+			"Test namespace %q already exists and holds a LittleRed instance (%s) — a DEBUG_ON_FAILURE "+
+				"leftover under inspection? Delete it first to ensure a clean slate:\n  kubectl delete ns %s",
+			testNamespace, strings.TrimSpace(insts), testNamespace)
+		By("deleting the empty leftover test namespace " + testNamespace)
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", testNamespace, "--timeout=2m"))
+	}
 
 	By("creating test namespace " + testNamespace)
-	cmd = exec.Command("kubectl", "create", "ns", testNamespace)
-	_, err = utils.Run(cmd)
+	_, err := utils.Run(exec.Command("kubectl", "create", "ns", testNamespace))
 	Expect(err).NotTo(HaveOccurred(), "Failed to create test namespace %q", testNamespace)
 
 	// The kill-9 chaos tests launch a helper pod with hostPID:true and a
@@ -171,7 +179,7 @@ var _ = BeforeSuite(func() {
 	// the helper pod. Pin this test-only namespace to the "privileged" level so
 	// the helper is admitted regardless of the cluster default.
 	By("labeling test namespace " + testNamespace + " as pod-security privileged")
-	cmd = exec.Command("kubectl", "label", "ns", testNamespace,
+	cmd := exec.Command("kubectl", "label", "ns", testNamespace,
 		"pod-security.kubernetes.io/enforce=privileged",
 		"pod-security.kubernetes.io/warn=privileged",
 		"pod-security.kubernetes.io/audit=privileged",

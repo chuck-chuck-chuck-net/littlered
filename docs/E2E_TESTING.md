@@ -144,10 +144,50 @@ make test-e2e LABEL_FILTER='cluster-behaviour' E2E_TOPOLOGY=both   # just the ma
 
 **The multi-site topology needs a real hub+sites substrate** — it is not runnable on the
 single Kind cluster of a default run. It requires a hub kube-context and per-site contexts
-over Kubernetes clusters with **mutually routed pod CIDRs**, wired via `MS_HUB_CONTEXT` /
-`MS_SITE_CONTEXTS` / `MS_OPERATOR_NS` / `MS_SITE_ENDPOINTS` (see the env table); the multi-site
-Describe provisions each site's namespace/RBAC/Secrets in a `BeforeAll`. The default
-`E2E_TOPOLOGY=single` keeps CI on Kind unchanged.
+over Kubernetes clusters with **mutually routed pod CIDRs**. Point the run at a **single YAML
+config** with `MS_CONFIG=<file>` — it holds everything (hub context, per-site context + endpoint,
+the whole-site-kill VM inventory, the hub pod CIDR):
+
+```yaml
+# MS_CONFIG schema
+hubContext: scm-cp
+operatorNamespace: littlered-system    # optional (default littlered-system)
+hubPodCIDR: "10.233.224.0/19"          # optional; the Scenario B hub-blind cut denies it
+sites:
+  - name: scm-s1
+    context: scm-s1
+    endpoint: https://10.2.1.10:6443    # site API URL routable FROM HUB PODS (repl-net VIP)
+    vms:                                # optional; the Scenario A whole-site kill inventory
+      - {name: scm-s1-node1, uri: qemu+ssh://user@host/system}
+```
+
+A ready-to-copy sample lives at [`docs/multisite-e2e-config.sample.yaml`](multisite-e2e-config.sample.yaml).
+So the whole invocation collapses to:
+
+```bash
+make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=scm-cp \
+  LABEL_FILTER='multisite' MS_CONFIG=$HOME/scm-littlered-ms-e2e.yaml
+```
+
+The individual `MS_HUB_CONTEXT` / `MS_SITE_CONTEXTS` / `MS_SITE_ENDPOINTS` / `MS_OPERATOR_NS` /
+`MS_HUB_POD_CIDR` / `MS_VM_INVENTORY` env vars remain as a backward-compatible fallback (used only
+when `MS_CONFIG` is unset). The multi-site Describe provisions each site's namespace/RBAC/Secrets in
+a `BeforeAll`. The default `E2E_TOPOLOGY=single` keeps CI on Kind unchanged.
+
+**What runs, by label** (`LABEL_FILTER=…`, same `MS_CONFIG` for all):
+
+| Label | Runs | Needs (in `MS_CONFIG`) |
+|---|---|---|
+| `multisite` | both takeover scenarios (A + B) | sites; `vms` for A; `hubPodCIDR` for B |
+| `multisite-takeover` | Scenario A only — whole-site kill **MUST take over** (survivor serves all 16384 slots, data intact, site rejoins) | per-site `vms` (else skips) |
+| `multisite-hold` | Scenario B only — hub-blind cut **MUST NOT take over** (survivors stay `cluster_state:ok`, no split-brain) | `hubPodCIDR` (else skips) |
+| `ms-heal` | the out-of-band healer (below) — restores the lab + reclaims a leftover instance | whatever the disrupting run needed |
+
+Add `DEBUG_ON_FAILURE=true` to any run to **leave the damage in place** on failure for investigation
+(see the ledger + `ms-heal` below). On a failure it also writes a `debug-artifacts-<ts>-<spec>/`
+directory with the hub CR/events **and per-site** pods, StatefulSets, CiliumNetworkPolicies, redis
+logs, and `CLUSTER NODES`/`CLUSTER INFO` from each site's own vantage — a killed/unreachable site is
+recorded (fast-fail) rather than hung on.
 
 **Shared vs single-site-only.** Shared through the matrix (both topologies): cluster
 bring-up + basic operations, and master-pod-failure recovery under chaos. Deliberately
@@ -176,8 +216,7 @@ down leftover instances, reusing the same Go helpers) and asserts the ledger is 
 
 ```bash
 make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=<hub> \
-  LABEL_FILTER='ms-heal' \
-  MS_HUB_CONTEXT=… MS_SITE_CONTEXTS=… MS_SITE_ENDPOINTS=… MS_VM_INVENTORY=…   # same env as the run
+  LABEL_FILTER='ms-heal' MS_CONFIG=<same config as the run>
 ```
 
 **Clean-slate guard.** If a leftover instance is *not* reclaimed, `msSetupSites` refuses to run onto
@@ -199,7 +238,7 @@ make test-e2e ARGS="-timeout 90m"
 |----------|---------|-------------|
 | `SKIP_KIND_SETUP` | `false` | Skip Kind cluster creation (use existing) |
 | `SKIP_OPERATOR_DEPLOY` | `false` | Skip operator deployment (use existing) |
-| `TEST_NAMESPACE` | `littlered-e2e` | Namespace for test resources (must not be `default`, and must not already exist) |
+| `TEST_NAMESPACE` | `littlered-e2e` | Namespace for test resources (must not be `default`). BeforeSuite ensures a clean slate: an *empty* leftover is deleted and recreated; one holding a LittleRed instance (a DEBUG leftover under inspection) fails fast so it is not clobbered. |
 | `DEBUG_ON_FAILURE` | `false` | Skip cleanup on failure (leave resources for inspection); also enables Ginkgo `--fail-fast` |
 | `KIND_CLUSTER` | `littlered-test-e2e` | Kind cluster name |
 | `OPERATOR_IMAGE` | `ghcr.io/littlered-operator/littlered:<git-tag>` | Operator image to deploy |
@@ -209,12 +248,13 @@ make test-e2e ARGS="-timeout 90m"
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |
 | `CLUSTER_REPLICAS_PER_SHARD` | `1` | Replicas per shard for cluster tests that use replicas |
 | `E2E_TOPOLOGY` | `single` | Which topologies the shared **cluster-behaviour** matrix runs under: `single` (default), `multi`, or `both`. See "Cross-Topology Cluster Matrix" below. |
-| `MS_HUB_CONTEXT` | **(required)** | Multi-site only: the hub kube-context (where the CR + operator live). No default — the multi-site specs `Skip` if unset. |
-| `MS_OPERATOR_NS` | `littlered-system` | Multi-site only: the operator namespace on the hub (where per-site kubeconfig Secrets are created). The one project-constant default (the chart's namespace); not lab-specific. |
-| `MS_SITE_CONTEXTS` | **(required)** | Multi-site only: comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. No default. |
-| `MS_SITE_ENDPOINTS` | **(required)** | Multi-site only: comma list `name=https://host:port,…` of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). One entry per `MS_SITE_CONTEXTS` name. No default. |
-| `MS_VM_INVENTORY` | (none) | Multi-site takeover suite only: path to a file of `<site> <vm-name> <virsh-uri>` lines for the whole-site kill (`virsh destroy`/`start`). Unset ⇒ Scenario A `Skip`s. |
-| `MS_HUB_POD_CIDR` | (none) | **Required for Scenario B** (`multisite-hold`): the hub operator pod CIDR(s) to deny, so the cut isolates the site **from the hub only** (the sites stay mutually connected) — the hub-blind HOLD case. Unset ⇒ Scenario B `Skip`s (the cut would be a no-op). Comma-separated. |
+| `MS_CONFIG` | (none) | **Multi-site: the preferred, single-file config** — a YAML file holding hub context, per-site context/endpoint/VMs, operator namespace, and hub pod CIDR (schema above). Set this and the individual `MS_*` vars below are unnecessary. Absent + no `MS_*` fallback ⇒ multi-site specs `Skip`. |
+| `MS_HUB_CONTEXT` | *(fallback)* | Multi-site (fallback for `MS_CONFIG`): the hub kube-context (where the CR + operator live). |
+| `MS_OPERATOR_NS` | `littlered-system` | Multi-site: the operator namespace on the hub (where per-site kubeconfig Secrets are created). The one project-constant default (the chart's namespace); not lab-specific. |
+| `MS_SITE_CONTEXTS` | *(fallback)* | Multi-site (fallback): comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. |
+| `MS_SITE_ENDPOINTS` | *(fallback)* | Multi-site (fallback): comma list `name=https://host:port,…` of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). One entry per `MS_SITE_CONTEXTS` name. |
+| `MS_VM_INVENTORY` | (none) | Multi-site takeover suite (fallback): path to a file of `<site> <vm-name> <virsh-uri>` lines for the whole-site kill (`virsh destroy`/`start`). In `MS_CONFIG` this is the per-site `vms`. Absent ⇒ Scenario A `Skip`s. |
+| `MS_HUB_POD_CIDR` | (none) | **Required for Scenario B** (`multisite-hold`), as `hubPodCIDR` in `MS_CONFIG` or this fallback: the hub operator pod CIDR(s) to deny, so the cut isolates the site **from the hub only** (the sites stay mutually connected) — the hub-blind HOLD case. Absent ⇒ Scenario B `Skip`s. Comma-separated. |
 | `NON_GRACEFUL_RESTART` | (none) | Advanced: when `true`, pod-restart helpers use a hard/non-graceful kill instead of a graceful delete |
 | `FOCUS` | (none) | Ginkgo focus filter (regex) |
 | `ARGS` | (none) | Extra arguments passed to `go test` |

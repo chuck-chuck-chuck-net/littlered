@@ -39,10 +39,10 @@ package e2e
 // returns to healthy between scenarios. Nothing here is destructive-without-return: a killed
 // site is explicitly powered back on (virsh start), Cilium policies are deleted to heal.
 //
-// Cluster selection: the harness reads a hub kubecontext and an ordered list of site
-// kubecontexts (env MS_HUB_CONTEXT / MS_SITE_CONTEXTS). The whole-site kill mechanism reads a
-// separate VM inventory (env MS_VM_INVENTORY); see the disruption helpers. Defaults match the
-// scm-* lab.
+// Cluster selection: the whole configuration (hub + site kubecontexts + endpoints + the
+// whole-site kill VM inventory + the hub pod CIDR) lives in ONE YAML file named by MS_CONFIG; the
+// individual MS_* env vars remain as a backward-compatible fallback. See msLoadConfig and the
+// MS_CONFIG schema below. No lab defaults are baked in — absent config ⇒ the specs Skip.
 
 import (
 	"encoding/json"
@@ -57,6 +57,7 @@ import (
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	"github.com/littlered-operator/littlered-operator/test/utils"
+	"sigs.k8s.io/yaml"
 )
 
 // --- Cluster registry --------------------------------------------------------------------
@@ -80,66 +81,128 @@ type msRegistry struct {
 	orderedSites []msSite // spec order
 }
 
-// msRegistryFromEnv builds the multi-site harness registry from REQUIRED environment. There
-// are deliberately NO lab-specific defaults: the configuration a run needs is always explicit
-// and always documented (docs/E2E_TESTING.md, "Multi-site"). When the required config is
-// absent the multi-site specs Skip with a pointer, so the rest of the suite is unaffected.
+// --- Multi-site config -------------------------------------------------------------------
 //
-//	MS_HUB_CONTEXT     (required) hub kubecontext — operator + LittleRed CR live here
-//	MS_SITE_CONTEXTS   (required) comma list "name=kubecontext,..." of the workload sites
-//	MS_SITE_ENDPOINTS  (required) comma list "name=https://host:port,..." — each site's API
-//	                   server URL as routable FROM HUB PODS (the repl-net VIP baked into the
-//	                   site kubeconfig the operator dials); one entry per MS_SITE_CONTEXTS name
-//	MS_OPERATOR_NS     (optional) operator namespace on the hub (default "littlered-system" —
-//	                   the chart's namespace, a project constant, not lab-specific)
-//	MS_VM_INVENTORY    (optional) whole-site kill/restore inventory for Scenario A (see below)
-func msRegistryFromEnv() *msRegistry {
+// The whole multi-site configuration lives in ONE place. Preferred: a single YAML file named by
+// MS_CONFIG, so a run is just `MS_CONFIG=<file>`. Fallback (backward compatible): the individual
+// MS_* env vars. When neither is provided the multi-site specs Skip, so the rest of the suite is
+// unaffected. See docs/E2E_TESTING.md ("Multi-site").
+//
+// MS_CONFIG schema:
+//
+//	hubContext:        scm-cp                 # hub kubecontext (operator + CR live here)
+//	operatorNamespace: littlered-system       # optional (default littlered-system)
+//	hubPodCIDR:        "10.233.224.0/19"       # optional; the Scenario B hub-blind cut denies it
+//	sites:
+//	  - name: scm-s1
+//	    context: scm-s1
+//	    endpoint: https://10.2.1.10:6443       # site API URL routable FROM HUB PODS (repl-net VIP)
+//	    vms:                                   # optional; the Scenario A whole-site kill inventory
+//	      - {name: scm-s1-node1, uri: qemu+ssh://user@host/system}
+//
+// Env-var fallback (each maps onto the schema): MS_HUB_CONTEXT, MS_SITE_CONTEXTS
+// ("name=ctx,..."), MS_SITE_ENDPOINTS ("name=url,..."), MS_OPERATOR_NS, MS_HUB_POD_CIDR, and the
+// legacy MS_VM_INVENTORY file ("<site> <vm> <uri>" lines).
+type msConfig struct {
+	HubContext        string         `json:"hubContext"`
+	OperatorNamespace string         `json:"operatorNamespace,omitempty"`
+	HubPodCIDR        string         `json:"hubPodCIDR,omitempty"`
+	Sites             []msConfigSite `json:"sites"`
+}
+
+type msConfigSite struct {
+	Name     string       `json:"name"`
+	Context  string       `json:"context"`
+	Endpoint string       `json:"endpoint"`
+	VMs      []msConfigVM `json:"vms,omitempty"`
+}
+
+type msConfigVM struct {
+	Name string `json:"name"`
+	URI  string `json:"uri"`
+}
+
+// msLoadConfig resolves the multi-site config from MS_CONFIG (YAML) or, failing that, the legacy
+// MS_* env vars. Skips the spec when neither is present. Re-reads on each call (the file is tiny);
+// no caching keeps it simple and lets a mid-suite edit take effect.
+func msLoadConfig() *msConfig {
+	if path := strings.TrimSpace(os.Getenv("MS_CONFIG")); path != "" {
+		data, err := os.ReadFile(path)
+		Expect(err).NotTo(HaveOccurred(), "reading MS_CONFIG %s", path)
+		var c msConfig
+		Expect(yaml.Unmarshal(data, &c)).To(Succeed(), "parsing MS_CONFIG %s as YAML", path)
+		Expect(c.HubContext).NotTo(BeEmpty(), "MS_CONFIG %s: hubContext is required", path)
+		Expect(c.Sites).NotTo(BeEmpty(), "MS_CONFIG %s: at least one site is required", path)
+		return &c
+	}
+	return msConfigFromEnvVars()
+}
+
+// msConfigFromEnvVars builds the config from the individual MS_* env vars (backward compat).
+func msConfigFromEnvVars() *msConfig {
 	hub := strings.TrimSpace(os.Getenv("MS_HUB_CONTEXT"))
 	siteSpec := strings.TrimSpace(os.Getenv("MS_SITE_CONTEXTS"))
 	endpointSpec := strings.TrimSpace(os.Getenv("MS_SITE_ENDPOINTS"))
 	if hub == "" || siteSpec == "" || endpointSpec == "" {
-		Skip("multi-site e2e requires MS_HUB_CONTEXT, MS_SITE_CONTEXTS, and MS_SITE_ENDPOINTS " +
-			"(and MS_VM_INVENTORY for the Scenario A whole-site kill) — no lab defaults are baked in; " +
-			"see docs/E2E_TESTING.md (\"Multi-site\").")
+		Skip("multi-site e2e requires MS_CONFIG (a single YAML config file) OR the individual " +
+			"MS_HUB_CONTEXT / MS_SITE_CONTEXTS / MS_SITE_ENDPOINTS env vars — no lab defaults are " +
+			"baked in; see docs/E2E_TESTING.md (\"Multi-site\").")
 	}
-
+	c := &msConfig{
+		HubContext:        hub,
+		OperatorNamespace: strings.TrimSpace(os.Getenv("MS_OPERATOR_NS")),
+		HubPodCIDR:        strings.TrimSpace(os.Getenv("MS_HUB_POD_CIDR")),
+	}
 	endpoints := map[string]string{}
 	for _, e := range strings.Split(endpointSpec, ",") {
 		kv := strings.SplitN(strings.TrimSpace(e), "=", 2)
 		Expect(kv).To(HaveLen(2), "MS_SITE_ENDPOINTS entry %q must be 'name=https://host:port'", e)
 		endpoints[strings.TrimSpace(kv[0])] = strings.TrimSpace(kv[1])
 	}
-
-	reg := &msRegistry{
-		hubContext:  hub,
-		operatorNS:  envOr("MS_OPERATOR_NS", "littlered-system"),
-		sitesByName: map[string]msSite{},
-	}
+	vms := parseLegacyVMInventory(strings.TrimSpace(os.Getenv("MS_VM_INVENTORY")))
 	for _, e := range strings.Split(siteSpec, ",") {
 		kv := strings.SplitN(strings.TrimSpace(e), "=", 2)
 		Expect(kv).To(HaveLen(2), "MS_SITE_CONTEXTS entry %q must be 'name=kubecontext'", e)
 		name, ctx := strings.TrimSpace(kv[0]), strings.TrimSpace(kv[1])
 		ep, ok := endpoints[name]
 		Expect(ok).To(BeTrue(), "MS_SITE_ENDPOINTS has no entry for site %q (listed in MS_SITE_CONTEXTS)", name)
-		s := msSite{name: name, context: ctx, endpoint: ep}
-		reg.sitesByName[name] = s
+		c.Sites = append(c.Sites, msConfigSite{Name: name, Context: ctx, Endpoint: ep, VMs: vms[name]})
+	}
+	return c
+}
+
+// msRegistryFromEnv builds the multi-site harness registry from the resolved config (MS_CONFIG or
+// env). When no config is present the multi-site specs Skip, so the rest of the suite is unaffected.
+func msRegistryFromEnv() *msRegistry {
+	cfg := msLoadConfig()
+	reg := &msRegistry{
+		hubContext:  cfg.HubContext,
+		operatorNS:  cfgOr(cfg.OperatorNamespace, "littlered-system"),
+		sitesByName: map[string]msSite{},
+	}
+	for _, sc := range cfg.Sites {
+		Expect(sc.Name).NotTo(BeEmpty(), "a site entry is missing its name")
+		Expect(sc.Context).NotTo(BeEmpty(), "site %q is missing its context", sc.Name)
+		Expect(sc.Endpoint).NotTo(BeEmpty(), "site %q is missing its endpoint", sc.Name)
+		s := msSite{name: sc.Name, context: sc.Context, endpoint: sc.Endpoint}
+		reg.sitesByName[sc.Name] = s
 		reg.orderedSites = append(reg.orderedSites, s)
 	}
-	Expect(reg.orderedSites).NotTo(BeEmpty(), "MS_SITE_CONTEXTS parsed to zero sites")
+	Expect(reg.orderedSites).NotTo(BeEmpty(), "the multi-site config has zero sites")
 	return reg
+}
+
+func cfgOr(v, def string) string {
+	if strings.TrimSpace(v) != "" {
+		return v
+	}
+	return def
 }
 
 func (r *msRegistry) site(name string) msSite {
 	s, ok := r.sitesByName[name]
 	Expect(ok).To(BeTrue(), "unknown site %q in the multi-site registry", name)
 	return s
-}
-
-func envOr(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
 }
 
 // --- Context-aware kubectl ---------------------------------------------------------------
@@ -568,29 +631,37 @@ func msHealDataPlane(reg *msRegistry, siteName, ns string) {
 // the site at the hypervisor with `virsh destroy` (hard power-off) and bring it back with
 // `virsh start` only when the test decides — a deterministic down-window, no self-reversal.
 //
-// The site→VM mapping is provided out-of-band (no naming convention) via a file named by
-// MS_VM_INVENTORY, one VM per line: "<site> <vm-name> <virsh-uri>", e.g.
-//
-//	scm-s2 scm-s2-node1 qemu+ssh://user@t3e/system
-//	scm-s2 scm-s2-node2 qemu+ssh://user@t3e/system
-//	scm-s2 scm-s2-node3 qemu+ssh://user@t3e/system
-//
-// (blank lines and #-comments ignored). The lines for a site define exactly which VMs *are*
-// that site — so the file also decides kill scope (include or omit router/lb VMs as desired).
-// Requires non-interactive virsh access (key-based qemu+ssh) to each listed URI.
+// The site→VM mapping comes from the config's per-site `vms` (MS_CONFIG), or the legacy
+// MS_VM_INVENTORY file ("<site> <vm-name> <virsh-uri>" lines). The VMs listed for a site define
+// exactly which VMs *are* that site — so they also decide kill scope (include or omit router/lb
+// VMs as desired). Requires non-interactive virsh access (key-based qemu+ssh) to each listed URI.
 
 type msVM struct{ name, uri string }
 
-// msVMInventory parses MS_VM_INVENTORY into site → VMs. Returns nil when the env is unset (the
-// caller then Skips the hypervisor-driven scenario).
+// msVMInventory returns the whole-site kill/restore inventory (site → VMs) from the resolved
+// config. Returns nil when no VMs are configured (the caller then Skips the hypervisor scenario).
 func msVMInventory() map[string][]msVM {
-	path := strings.TrimSpace(os.Getenv("MS_VM_INVENTORY"))
+	inv := map[string][]msVM{}
+	for _, s := range msLoadConfig().Sites {
+		for _, vm := range s.VMs {
+			inv[s.Name] = append(inv[s.Name], msVM{name: vm.Name, uri: vm.URI})
+		}
+	}
+	if len(inv) == 0 {
+		return nil
+	}
+	return inv
+}
+
+// parseLegacyVMInventory parses the legacy MS_VM_INVENTORY file (one "<site> <vm-name> <virsh-uri>"
+// line per VM; blank lines and #-comments ignored) into site → VMs. Empty path ⇒ nil (no VMs).
+func parseLegacyVMInventory(path string) map[string][]msConfigVM {
 	if path == "" {
 		return nil
 	}
 	data, err := os.ReadFile(path)
 	Expect(err).NotTo(HaveOccurred(), "reading MS_VM_INVENTORY %s", path)
-	inv := map[string][]msVM{}
+	inv := map[string][]msConfigVM{}
 	for i, raw := range strings.Split(string(data), "\n") {
 		line := strings.TrimSpace(raw)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -598,7 +669,7 @@ func msVMInventory() map[string][]msVM {
 		}
 		f := strings.Fields(line)
 		Expect(f).To(HaveLen(3), "MS_VM_INVENTORY line %d must be '<site> <vm-name> <virsh-uri>': %q", i+1, line)
-		inv[f[0]] = append(inv[f[0]], msVM{name: f[1], uri: f[2]})
+		inv[f[0]] = append(inv[f[0]], msConfigVM{Name: f[1], URI: f[2]})
 	}
 	return inv
 }
