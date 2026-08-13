@@ -341,13 +341,17 @@ func waitForOperator() {
 // then forces current-context to the pinned one so ambient/hub calls still resolve.
 // "Multi-site run" is detected from the run's actual configuration, not just
 // E2E_TOPOLOGY: the takeover suite is selected by label/focus (not by E2E_TOPOLOGY) and
-// is signalled by its required MS_SITE_CONTEXTS config — keying only on E2E_TOPOLOGY
-// would --minify away the site contexts for a `LABEL_FILTER=multisite` run.
+// is signalled by its multi-site config — keying only on E2E_TOPOLOGY would --minify
+// away the site contexts for a `LABEL_FILTER=multisite` run.
 func pinKubeContext(contextName string) {
 	// Any configured multi-site run drives sibling site contexts by name; --minify would
-	// strip them. E2E_TOPOLOGY=multi|both covers the shared behaviour matrix; the presence
-	// of MS_SITE_CONTEXTS covers the takeover suite (and both require it now).
-	multiSite := topologyEnabled("multi") || os.Getenv("MS_SITE_CONTEXTS") != ""
+	// strip them. E2E_TOPOLOGY=multi|both covers the shared behaviour matrix; the multi-site
+	// config covers the takeover suite — either the single-file MS_CONFIG or the legacy
+	// MS_SITE_CONTEXTS env var (the site contexts live inside MS_CONFIG, not in that env var,
+	// so it must be checked too, else an MS_CONFIG run gets --minify'd — the scm-s* "context
+	// does not exist" failure).
+	multiSite := topologyEnabled("multi") ||
+		os.Getenv("MS_CONFIG") != "" || os.Getenv("MS_SITE_CONTEXTS") != ""
 
 	args := []string{"config", "view", "--raw", "--flatten"}
 	label := "current"
