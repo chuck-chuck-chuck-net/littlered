@@ -38,8 +38,11 @@ import (
 // operator's published condition and lrctl's rendered verdict always agree.
 func TestBalanceArithmeticDriftGuard(t *testing.T) {
 	for k := 1; k <= 20; k++ {
-		if got, want := climultisite.MasterBalanceTarget(k), masterBalanceTarget(k); got != want {
-			t.Errorf("MasterBalanceTarget drift at shards=%d: cli=%d controller=%d", k, got, want)
+		if got, want := climultisite.NativeSurvivalTarget(k), nativeSurvivalTarget(k); got != want {
+			t.Errorf("NativeSurvivalTarget drift at shards=%d: cli=%d controller=%d", k, got, want)
+		}
+		if got, want := climultisite.TakeoverSurvivalFloor(k), takeoverSurvivalFloor(k); got != want {
+			t.Errorf("TakeoverSurvivalFloor drift at shards=%d: cli=%d controller=%d", k, got, want)
 		}
 		for s := 1; s <= 8; s++ {
 			if got, want := climultisite.SiteLossResilient(k, s), siteLossResilient(k, s); got != want {
@@ -49,41 +52,49 @@ func TestBalanceArithmeticDriftGuard(t *testing.T) {
 	}
 }
 
-// TestMasterBalanceTarget locks the D2 invariant threshold ceil(K/2)-1 (the maximum number
-// of slot-serving masters any single site may hold so that NO site holds a Redis master
-// majority (K/2)+1). It is the arithmetic the rebalancer restores.
-func TestMasterBalanceTarget(t *testing.T) {
-	cases := map[int]int{
-		1: 0, // ceil(0.5)-1 = 1-1 = 0
-		2: 0, // ceil(1)-1   = 1-1 = 0  (dual-site is unsatisfiable: 2 masters, target 0)
-		3: 1, // ceil(1.5)-1 = 2-1 = 1
-		4: 1, // ceil(2)-1   = 2-1 = 1
-		5: 2, // ceil(2.5)-1 = 3-1 = 2
-		6: 2, // ceil(3)-1   = 3-1 = 2
-		7: 3,
+// TestBalanceThresholds locks the two ADR-012 D2 thresholds. The NATIVE TARGET ceil(K/2)-1 is
+// the bound for the survivors keeping quorum (Redis elects on its own); the TAKEOVER FLOOR
+// floor(K/2) is the bound for the LOST side lacking quorum (the survivors hold a blocking
+// minority, so planSiteTakeover is fence-safe). They coincide for odd K and differ by one for
+// even K — see site_balance_property_test.go, which binds both to the planner's real decisions.
+func TestBalanceThresholds(t *testing.T) {
+	cases := []struct{ shards, target, floor int }{
+		{shards: 1, target: 0, floor: 0},
+		{shards: 2, target: 0, floor: 1}, // moot: Redis Cluster's 3-master minimum rejects K=2
+		{shards: 3, target: 1, floor: 1},
+		{shards: 4, target: 1, floor: 2}, // the D3-recommended dual-site 2+2 sits AT the floor
+		{shards: 5, target: 2, floor: 2},
+		{shards: 6, target: 2, floor: 3},
+		{shards: 7, target: 3, floor: 3},
+		{shards: 8, target: 3, floor: 4},
 	}
-	for k, want := range cases {
-		if got := masterBalanceTarget(k); got != want {
-			t.Errorf("masterBalanceTarget(%d) = %d, want %d", k, got, want)
+	for _, c := range cases {
+		if got := nativeSurvivalTarget(c.shards); got != c.target {
+			t.Errorf("nativeSurvivalTarget(%d) = %d, want %d", c.shards, got, c.target)
+		}
+		if got := takeoverSurvivalFloor(c.shards); got != c.floor {
+			t.Errorf("takeoverSurvivalFloor(%d) = %d, want %d", c.shards, got, c.floor)
 		}
 	}
 }
 
 // TestSiteLossResilient locks the D2 structural resilience predicate (ADR-012 "Reduced-
 // resilience warning"): a topology of K shards over S sites can auto-survive an arbitrary
-// single-site loss iff S·masterBalanceTarget(K) >= K (the invariant is structurally
-// satisfiable — no site is forced over target by pigeonhole).
+// single-site loss iff S·takeoverSurvivalFloor(K) >= K — the FLOOR is reachable, so no site is
+// forced over it by pigeonhole. Given K >= 3 that is false in exactly one regime: two sites
+// with an odd K.
 func TestSiteLossResilient(t *testing.T) {
 	cases := []struct {
 		shards, sites int
 		want          bool
 	}{
 		{shards: 3, sites: 3, want: true},  // 3*1=3 >= 3
-		{shards: 4, sites: 3, want: false}, // 3*1=3 < 4  (the K=4-over-3-sites pigeonhole trap)
-		{shards: 4, sites: 4, want: true},  // 4*1=4 >= 4
+		{shards: 3, sites: 2, want: false}, // 2*1=2 < 3  — odd K over two sites, the whole warned regime
+		{shards: 5, sites: 2, want: false}, // 2*2=4 < 5
+		{shards: 4, sites: 2, want: true},  // 2*2=4 >= 4 — the D3-recommended dual-site topology
+		{shards: 4, sites: 3, want: true},  // 3*2=6 >= 4 — LR-031: the former "headline trap" is resilient
+		{shards: 6, sites: 2, want: true},  // 2*3=6 >= 6
 		{shards: 5, sites: 3, want: true},  // 3*2=6 >= 5
-		{shards: 6, sites: 3, want: true},  // 3*2=6 >= 6
-		{shards: 2, sites: 2, want: false}, // 2*0=0 < 2  (dual-site unsatisfiable; min-3-shards rejects it anyway)
 	}
 	for _, c := range cases {
 		if got := siteLossResilient(c.shards, c.sites); got != c.want {
@@ -131,7 +142,7 @@ func TestPlanMasterRebalance(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "K=3 over 2 sites => nil (unsatisfiable: 3 masters, 2 sites, target 1)",
+			name: "K=3 over 2 sites => nil (odd K on two sites: BOTH thresholds are 1 and neither is reachable)",
 			in: masterRebalanceInput{
 				masterSite:   []string{"A", "B", "A"},
 				replicaSites: [][]string{{"B"}, {"A"}, {"B"}},
@@ -139,13 +150,37 @@ func TestPlanMasterRebalance(t *testing.T) {
 			want: nil,
 		},
 		{
-			name: "K=4 over 3 sites => nil (unsatisfiable: 4 masters, 3 sites, target 1)",
+			name: "K=4 over 3 sites, 2+1+1 => nil (target 1 unreachable, but already AT the floor 2)",
 			in: masterRebalanceInput{
-				// counts A=2,B=1,C=1; even with a replica in a fuller site, capacity < excess.
+				// LR-031: this is the former "headline trap". 2+1+1 satisfies the floor, so
+				// losing any single site is recoverable — nothing to correct.
 				masterSite:   []string{"A", "B", "C", "A"},
 				replicaSites: [][]string{{"B", "C"}, {"A"}, {"A"}, {"B", "C"}},
 			},
 			want: nil,
+		},
+		{
+			name: "K=4 over 2 sites, drift 3+1 => one move to the floor (2+2)",
+			in: masterRebalanceInput{
+				// LR-031 regression: the native target (1) is unreachable for K=4 over 2 sites, so
+				// the old single-threshold planner returned nil and left 3+1 standing — and losing
+				// the 3-master site then REFUSES. The floor (2) is reachable, and 2+2 is exactly
+				// the D3-recommended fence-safe placement.
+				masterSite:   []string{"A", "A", "A", "B"},
+				replicaSites: [][]string{{"B"}, {"B"}, {"B"}, {"A"}},
+			},
+			want: []masterMove{{shard: 0, toSite: "B"}},
+		},
+		{
+			name: "K=4 over 3 sites, drift 3+1+0 => falls back to the floor rather than discarding progress",
+			in: masterRebalanceInput{
+				// The target (1) is unreachable: one move gets to 2+1+1 and then sticks. The old
+				// planner threw that move away as "partial churn" and left a 3-master site — over
+				// the floor, so its loss refused. The floor tier reaches 2+1+1 in one move.
+				masterSite:   []string{"A", "A", "A", "B"},
+				replicaSites: [][]string{{"B", "C"}, {"B"}, {"C"}, {"A"}},
+			},
+			want: []masterMove{{shard: 0, toSite: "C"}},
 		},
 		{
 			name: "K=4 over 4 sites, drift (2,1,1,0) with a replica in the empty site => one move",

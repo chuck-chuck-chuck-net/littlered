@@ -62,11 +62,15 @@ func multiSiteStatusLR(
 }
 
 // TestVerifyMultiSiteFromStatus_masterDistribution asserts the tier-1 verify render surfaces
-// the ADR-012 D2 master-per-site distribution: the balance target, an [IMBALANCED] marker for
-// a site over target, and the structural reduced-resilience [WARN] for a K-over-S topology
-// that cannot auto-survive an arbitrary single-site loss (K=4 over 3 sites).
+// the ADR-012 D2 master-per-site distribution with BOTH thresholds, and distinguishes the two
+// kinds of drift: a site over the native target (a recovery downgrade — its loss recovers by
+// operator takeover instead of a Redis election) from a site over the takeover floor (an
+// actionable availability exposure — its loss cannot be fenced at all).
+//
+// LR-031: K=4 over 3 sites at 2+1+1 sits AT the floor, so it renders as recoverable and no
+// reduced-resilience WARN fires. The pre-correction render flagged it [IMBALANCED] + [WARN].
 func TestVerifyMultiSiteFromStatus_masterDistribution(t *testing.T) {
-	// 3 sites, 4 shards; s1 currently holds 2 masters (imbalanced, target 1). Not resilient.
+	// 3 sites, 4 shards; s1 holds 2 — over the native target 1, at the floor 2.
 	lr := multiSiteStatusLR(3, 4,
 		map[string]int32{"s1": 2, "s2": 1, "s3": 1},
 		[]string{"s1", "s1", "s2", "s3"})
@@ -74,14 +78,42 @@ func TestVerifyMultiSiteFromStatus_masterDistribution(t *testing.T) {
 	out := captureStdout(t, func() { _ = verifyMultiSiteFromStatus(lr) })
 
 	for _, want := range []string{
-		"Master Distribution (balance target 1 master(s)/site for 4 shards",
-		"site s1: 2 master(s) [IMBALANCED]",
+		"Master Distribution (4 shards; native target 1, takeover floor 2 master(s)/site",
+		"site s1: 2 master(s) [OVER TARGET]",
 		"site s2: 1 master(s) [OK]",
-		"[WARN] reduced site-loss resilience",
+		"[OK] recoverable, but not natively",
 	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("verify output missing %q\n---\n%s", want, out)
 		}
+	}
+	if strings.Contains(out, "[WARN] reduced site-loss resilience") {
+		t.Errorf("K=4 over 3 sites must NOT warn — the floor is reachable\n---\n%s", out)
+	}
+}
+
+// TestVerifyMultiSiteFromStatus_overFloor asserts a site past the takeover FLOOR renders as the
+// actionable exposure it is: that site's loss leaves the lost side holding a master majority,
+// so the takeover cannot be fenced and recovery needs a human or allowUnsafeSiteTakeover.
+func TestVerifyMultiSiteFromStatus_overFloor(t *testing.T) {
+	// 2 sites, 4 shards drifted to 3+1: floor is 2, so s1 is over it.
+	lr := multiSiteStatusLR(2, 4,
+		map[string]int32{"s1": 3, "s2": 1},
+		[]string{"s1", "s1", "s1", "s2"})
+
+	out := captureStdout(t, func() { _ = verifyMultiSiteFromStatus(lr) })
+
+	for _, want := range []string{
+		"site s1: 3 master(s) [OVER FLOOR]",
+		"[WARN] master drift past the takeover floor",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("verify output missing %q\n---\n%s", want, out)
+		}
+	}
+	// The topology itself is fine (2+2 is reachable) — the drift is live, not structural.
+	if strings.Contains(out, "[WARN] reduced site-loss resilience") {
+		t.Errorf("K=4 over 2 sites is structurally resilient; drift must not read as structural\n---\n%s", out)
 	}
 }
 

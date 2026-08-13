@@ -34,8 +34,10 @@ import (
 // mode (ADR-012 decision D2), sibling of planSiteTakeover / planClusterWipeRecovery /
 // planFencedRejoinRecycle. It is a *prevention* seam for the drift-refusal that the
 // site-loss takeover (D1) surfaces: by keeping the slot-serving masters spread so that no
-// single site can hold a Redis master MAJORITY, it narrows the odd/drifted split that would
-// otherwise refuse (or need the allowUnsafeSiteTakeover opt-in) on a whole-site loss.
+// single site can hold a Redis master MAJORITY, it keeps a whole-site loss inside D1's
+// fence-safe window instead of the drifted split that refuses (or needs the
+// allowUnsafeSiteTakeover opt-in). Where the topology allows, it aims one step further and
+// keeps the loss natively electable — see the two thresholds below.
 //
 // The pure planner (planMasterRebalance) is wired into the multi-site reconcile spine on the
 // steady-state HEALTHY path only (reconcileMultiSiteCluster): buildMasterRebalanceInput projects
@@ -46,35 +48,60 @@ import (
 // site-loss takeover, repair, or bringup. Cluster-mode multi-site only — ADR-009 declines master
 // balancing in single-site mode, so rebalanceMasters is never called there.
 
-// masterBalanceTarget is the D2 invariant threshold: the maximum number of slot-serving
-// masters any single site may hold so that NO site reaches a Redis master majority
-// (majority of the `shards` masters is (shards/2)+1). It is ceil(shards/2)-1 — one below the
-// count that would give a site the majority on the OTHER side of an even split.
+// The two ADR-012 D2 balance thresholds. With K = shards = slot-serving masters and
+// q = (K/2)+1 the Redis master majority, losing a site that holds `l` masters survives by
+// either of two paths, and they impose DIFFERENT conditions:
 //
-//	shards: 2 => 0 (dual-site is unsatisfiable — two masters must live somewhere)
-//	shards: 3 => 1   shards: 4 => 1   shards: 5 => 2   shards: 6 => 2
+//   - NATIVE — the survivors keep quorum (K−l >= q), so Redis elects on its own within
+//     cluster-node-timeout with the operator uninvolved. Bound: l <= K−q = ceil(K/2)-1.
+//   - TAKEOVER — the LOST side lacks quorum (l < q), so the survivors hold a "blocking
+//     minority" (too few to elect, enough to deny the other side an election), D1's fence
+//     holds, and planSiteTakeover fires provably split-brain-free. Bound: l <= q-1 = floor(K/2).
 //
-// A site holding more than this owns enough masters that losing the complementary site(s)
-// can strand the survivors below quorum with the lost side potentially still serving — the
-// exact drift the takeover fence refuses on.
-func masterBalanceTarget(shards int) int { return (shards+1)/2 - 1 }
+// Since K−q <= q−1 always, the takeover condition is the WEAKER one. The two coincide for odd
+// K and differ by exactly one for even K — the placement-side reading of D1's blocking-minority
+// window (empty for odd K, one value wide for even K).
+//
+// Conflating them is LR-031: the native bound alone was used to gate BOTH paths, which
+// declared the D3-recommended dual-site K=4 "2+2" placement unsurvivable (planSiteTakeover
+// fires on it with no opt-in) and stopped the rebalancer from ever maintaining it.
 
-// siteLossResilient reports whether the D2 balance invariant is *structurally satisfiable*
-// for a topology of `shards` (K) shards over `numSites` (S) sites: whether K slot-serving
-// masters can be spread so that no single site holds more than masterBalanceTarget(K). The
-// total master-holding capacity under the invariant is S·masterBalanceTarget(K); if that is
-// below K, the pigeonhole principle forces some site over target, so losing that (heavier)
-// site strands the survivors below quorum — the topology cannot auto-survive an arbitrary
-// single-site loss (ADR-012 Consequence "Reduced-resilience warning": unsatisfiable iff
-// `S·(⌈K/2⌉−1) < K`).
+// nativeSurvivalTarget is the STANDARD: the maximum slot-serving masters a site may hold for
+// its loss to leave the survivors holding quorum, so Redis recovers natively — faster,
+// seamless, and independent of the operator. Exceeding it only downgrades recovery to a
+// takeover (the cooldown, plus a live hub); it is not an outage.
+//
+//	shards: 3 => 1   shards: 4 => 1   shards: 5 => 2   shards: 6 => 2
+func nativeSurvivalTarget(shards int) int { return (shards+1)/2 - 1 }
+
+// takeoverSurvivalFloor is the HARD constraint: the maximum slot-serving masters a site may
+// hold for its loss to leave the lost side short of quorum, so the survivors hold a blocking
+// minority and planSiteTakeover can recover unattended. Exceeding it is an availability
+// exposure — that site's loss hits the drift-refusal and needs a human or
+// multiSite.allowUnsafeSiteTakeover.
+//
+//	shards: 3 => 1   shards: 4 => 2   shards: 5 => 2   shards: 6 => 3
+func takeoverSurvivalFloor(shards int) int { return shards / 2 }
+
+// siteLossResilient reports whether the D2 FLOOR is *structurally reachable* for a topology of
+// `shards` (K) over `numSites` (S): whether K slot-serving masters can be spread so no single
+// site exceeds takeoverSurvivalFloor(K). Total capacity under the floor is S·floor(K/2); below
+// K, the pigeonhole principle forces some site over it, and losing that site refuses — the
+// topology cannot auto-survive an arbitrary single-site loss (ADR-012 Consequence
+// "Reduced-resilience warning": unreachable iff `S·⌊K/2⌋ < K`).
 //
 // This is a spec-level (structural) predicate — it says nothing about the *current* master
-// distribution (drift, owned by the rebalancer); it only decides whether a balanced placement
-// exists at all. The headline trap is K=4 over 3 sites (target 1, but 4 masters over 3 sites
-// force a 2+1+1 split by pigeonhole → losing the 2-master site fails). K=2 needs no handling —
-// Redis Cluster's 3-master minimum already rejects it.
+// distribution (drift, owned by the rebalancer); it only decides whether a survivable placement
+// exists at all. Given Redis Cluster's three-master minimum (K >= 3) it is false in exactly one
+// regime: TWO SITES WITH AN ODD K. For S >= 3 the floor is always reachable (3·⌊K/2⌋ >= K for
+// every K >= 3), so the warning never fires there.
+//
+// Superseded (LR-031): the former "K=4 over 3 sites" headline trap was an artefact of deriving
+// this from the native bound. A 2+1+1 split loses at most 2 = ⌊4/2⌋ masters, which is fence-safe,
+// so that topology does auto-survive any single-site loss — by takeover for the 2-master site,
+// natively for the others.
 func siteLossResilient(shards, numSites int) bool {
-	return numSites*masterBalanceTarget(shards) >= shards
+	return numSites*takeoverSurvivalFloor(shards) >= shards
 }
 
 // masterRebalanceInput is the pure view the balancer decides on: where each shard's
@@ -97,16 +124,16 @@ type masterMove struct {
 }
 
 // planMasterRebalance returns the MINIMAL, deterministic set of graceful promotions that
-// restores the D2 invariant max_i m_i <= masterBalanceTarget(K) — one move per unit of
-// excess, so the returned length equals the total excess and is minimal. It returns nil when
-//   - the placement already satisfies the invariant, OR
-//   - no set of moves can restore it under the replica-placement constraints (unsatisfiable:
-//     e.g. K=2, or K=4 with only 3 sites, or a donor whose over-target shards have no
-//     promotable replica in a site that can still receive) — the balancer never emits a
-//     partial, non-restoring churn.
+// restores the best ADR-012 D2 threshold currently reachable — the native target if a move set
+// attains it, else the takeover floor. One move per unit of excess, so the returned length
+// equals the total excess and is minimal. It returns nil when
+//   - the placement already satisfies the native target, OR
+//   - no set of moves attains EITHER threshold under the replica-placement constraints (e.g. a
+//     donor whose over-threshold shards have no promotable replica in a site that can still
+//     receive) — the balancer never emits a partial, non-restoring churn.
 //
-// A move is only ever emitted from a site currently AT the maximum-over-target load onto a
-// site that has a promotable replica of that shard AND stays <= target after receiving it, so
+// A move is only ever emitted from a site currently AT the maximum-over-threshold load onto a
+// site that has a promotable replica of that shard AND stays <= threshold after receiving it, so
 // every move strictly reduces the excess and none creates a new violation. Selection is fully
 // deterministic (donors by count desc then name asc; recipients by count asc then name asc;
 // shards by ascending index) so the same input always yields the same plan. This is a greedy
@@ -117,7 +144,25 @@ func planMasterRebalance(in masterRebalanceInput) []masterMove {
 	if k == 0 {
 		return nil
 	}
-	target := masterBalanceTarget(k)
+	// Two tiers (ADR-012 D2). Aim for the native target — a natively-survivable placement is
+	// strictly better — but fall back to the takeover floor when the target is out of reach,
+	// because the floor is what keeps a site loss recoverable AT ALL. Progress that reaches
+	// only the floor is real progress, not partial churn; refusing to move because the target
+	// is unreachable is how a topology comes to sit permanently below the floor (LR-031: for
+	// K=4 over 2 sites the target is unreachable, so a 3+1 drift was never corrected to 2+2).
+	//
+	// A placement already satisfying the target satisfies the floor too (target <= floor), so
+	// the "no moves needed" and "unsatisfiable" nil returns cannot be confused here.
+	if moves := planToThreshold(in, nativeSurvivalTarget(k)); moves != nil {
+		return moves
+	}
+	return planToThreshold(in, takeoverSurvivalFloor(k))
+}
+
+// planToThreshold is planMasterRebalance's solver for ONE threshold: the minimal deterministic
+// move set restoring max_i m_i <= threshold, nil when already satisfied or unreachable.
+func planToThreshold(in masterRebalanceInput, target int) []masterMove {
+	k := len(in.masterSite)
 
 	counts := map[string]int{}
 	for _, s := range in.masterSite {
@@ -276,10 +321,11 @@ func buildMasterRebalanceInput(gt *redisclient.ClusterGroundTruth, shards int) m
 const masterRebalanceCooldown = 30 * time.Second
 
 // rebalanceMasters corrects master-distribution drift (ADR-012 D2) on the steady-state HEALTHY
-// path of the multi-site reconcile. It maintains the balance invariant max_i m_i <=
-// ceil(K/2)-1 so that no single site holds a Redis master majority — the placement property that
-// keeps a whole-site loss inside planSiteTakeover's fence-safe even-split (D1), rather than the
-// drift-refusal. It issues at most ONE graceful CLUSTER FAILOVER per reconcile.
+// path of the multi-site reconcile. It maintains the best threshold the topology allows: the
+// takeoverSurvivalFloor at minimum — no site holds a Redis master majority, so a whole-site loss
+// stays inside planSiteTakeover's fence-safe window rather than the drift-refusal — and the
+// tighter nativeSurvivalTarget where reachable, so the loss is electable natively. It issues at
+// most ONE graceful CLUSTER FAILOVER per reconcile.
 //
 // Returns acted=true only when it issued a failover (caller requeues fast, skipping the status
 // update this pass); false lets the caller fall through to the normal status update — including

@@ -881,7 +881,7 @@ func (r *LittleRedReconciler) updateMultiSiteClusterStatus(ctx context.Context, 
 func (r *LittleRedReconciler) reconcileReducedResilienceCondition(lr *littleredv1alpha1.LittleRed) {
 	shards := clusterShardCount(lr)
 	numSites := len(multiSiteSiteNames(lr))
-	target := masterBalanceTarget(shards)
+	floor := takeoverSurvivalFloor(shards)
 
 	if siteLossResilient(shards, numSites) {
 		meta.SetStatusCondition(&lr.Status.Conditions, metav1.Condition{
@@ -889,16 +889,17 @@ func (r *LittleRedReconciler) reconcileReducedResilienceCondition(lr *littleredv
 			Status: metav1.ConditionFalse,
 			Reason: reasonSiteLossResilient,
 			Message: fmt.Sprintf("Topology can auto-survive any single-site loss: %d sites x %d master(s)/site "+
-				"(balance target ceil(%d/2)-1) >= %d shards.", numSites, target, shards, shards),
+				"(takeover floor floor(%d/2)) >= %d shards.", numSites, floor, shards, shards),
 			LastTransitionTime: metav1.Now(),
 		})
 		return
 	}
 
 	msg := fmt.Sprintf("Topology cannot auto-survive an arbitrary single-site loss: %d sites x %d master(s)/site "+
-		"(balance target ceil(%d/2)-1) < %d shards, so pigeonhole forces some site over the balance target; "+
-		"losing that heavier-master site strands the survivors below quorum. Add a site, reduce shards, or rely on "+
-		"manual / multiSite.allowUnsafeSiteTakeover recovery for the heavier site's loss.", numSites, target, shards, shards)
+		"(takeover floor floor(%d/2)) < %d shards, so pigeonhole forces some site over the floor; losing that "+
+		"heavier-master site leaves the lost side holding a master majority, so the takeover cannot be fenced "+
+		"safely. Use an even shard count for two sites, add a site, or rely on manual / "+
+		"multiSite.allowUnsafeSiteTakeover recovery for the heavier site's loss.", numSites, floor, shards, shards)
 
 	// One-shot Warning event: only on the transition INTO the warning state (the condition
 	// was absent or not True). meta.SetStatusCondition itself is idempotent for the condition.

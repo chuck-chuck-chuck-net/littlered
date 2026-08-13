@@ -175,31 +175,49 @@ func TestMasterCountsFromGroundTruth(t *testing.T) {
 // target ceil(K/2)-1, the informational per-site over-target flag, and the structural
 // resilience verdict.
 func TestEvaluateMasterDistribution(t *testing.T) {
-	// K=4 over 3 sites: target 1; s1 currently holds 2 (over target) → imbalanced; and the
-	// topology is structurally NOT resilient (3*1 < 4 pigeonhole).
+	// K=4 over 3 sites at 2+1+1: target 1, floor 2. s1 holds 2 — over the native target (its
+	// loss recovers by takeover, not a native election) but AT the floor, so it is not an
+	// availability exposure. LR-031: the topology IS structurally resilient (3*2 >= 4); the
+	// former "K=4-over-3-sites trap" was an artefact of deriving this from the native bound.
 	md := EvaluateMasterDistribution(4, 3, []SiteMasterCount{
 		{Site: "s2", Masters: 1}, {Site: "s1", Masters: 2}, {Site: "s3", Masters: 1},
 	})
-	if md.Target != 1 {
-		t.Errorf("Target = %d, want 1", md.Target)
+	if md.Target != 1 || md.Floor != 2 {
+		t.Errorf("Target = %d, Floor = %d, want 1 and 2", md.Target, md.Floor)
 	}
-	if !reflect.DeepEqual(md.Imbalanced, []string{"s1"}) {
-		t.Errorf("Imbalanced = %v, want [s1]", md.Imbalanced)
+	if len(md.OverFloor) != 0 {
+		t.Errorf("OverFloor = %v, want none (2+1+1 sits at the floor)", md.OverFloor)
 	}
-	if md.Resilient {
-		t.Errorf("K=4/3-sites must be structurally non-resilient")
+	if !reflect.DeepEqual(md.OverTarget, []string{"s1"}) {
+		t.Errorf("OverTarget = %v, want [s1]", md.OverTarget)
+	}
+	if !md.Resilient {
+		t.Errorf("K=4/3-sites must be structurally resilient (floor 2 reachable)")
 	}
 	// Counts must come back sorted by site.
 	if len(md.Counts) != 3 || md.Counts[0].Site != "s1" || md.Counts[2].Site != "s3" {
 		t.Errorf("Counts not sorted by site: %+v", md.Counts)
 	}
 
-	// K=4 over 4 sites, one master each: target 1, none over target, resilient.
-	md2 := EvaluateMasterDistribution(4, 4, []SiteMasterCount{
+	// K=4 over 2 sites drifted to 3+1: s1 is over the FLOOR (2), so losing it leaves the lost
+	// side holding a master majority and the takeover cannot be fenced — an actionable exposure.
+	md2 := EvaluateMasterDistribution(4, 2, []SiteMasterCount{
+		{Site: "s1", Masters: 3}, {Site: "s2", Masters: 1},
+	})
+	if !reflect.DeepEqual(md2.OverFloor, []string{"s1"}) {
+		t.Errorf("OverFloor = %v, want [s1]", md2.OverFloor)
+	}
+	if !md2.Resilient {
+		t.Errorf("K=4/2-sites is structurally resilient (2+2 reachable); the 3+1 drift is live, not structural")
+	}
+
+	// K=4 over 4 sites, one master each: at the native target, nothing flagged.
+	md3 := EvaluateMasterDistribution(4, 4, []SiteMasterCount{
 		{Site: "s1", Masters: 1}, {Site: "s2", Masters: 1}, {Site: "s3", Masters: 1}, {Site: "s4", Masters: 1},
 	})
-	if len(md2.Imbalanced) != 0 || !md2.Resilient {
-		t.Errorf("K=4/4-sites balanced: imbalanced=%v resilient=%v, want none/true", md2.Imbalanced, md2.Resilient)
+	if len(md3.OverFloor) != 0 || len(md3.OverTarget) != 0 || !md3.Resilient {
+		t.Errorf("K=4/4-sites balanced: overFloor=%v overTarget=%v resilient=%v",
+			md3.OverFloor, md3.OverTarget, md3.Resilient)
 	}
 }
 

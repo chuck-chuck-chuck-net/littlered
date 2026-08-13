@@ -496,41 +496,56 @@ func verifyMultiSiteJSONFromStatus(lr *littleredv1alpha1.LittleRed) multiSiteVer
 	return out
 }
 
-// printMasterDistribution renders the ADR-012 D2 master-per-site distribution and the balance
-// invariant's live health: each site's current slot-serving-master count against the balance
-// target (ceil(K/2)-1), an [IMBALANCED] marker when a site currently exceeds it, and the
-// structural reduced-resilience [WARN] when the topology cannot auto-survive an arbitrary
-// single-site loss. All of it is INFORMATIONAL — imbalance is transient drift the operator's
-// rebalancer corrects, and reduced resilience is a surfaced warning, not a refusal — so none
+// printMasterDistribution renders the ADR-012 D2 master-per-site distribution and the live
+// health of both balance thresholds: each site's slot-serving-master count, an [OVER FLOOR]
+// marker when it exceeds the takeover floor (floor(K/2) — that site's loss could not be fenced,
+// an actionable availability exposure), an [OVER TARGET] marker when it exceeds only the native
+// target (ceil(K/2)-1 — its loss recovers by operator takeover instead of a Redis election, a
+// downgrade), and the structural reduced-resilience [WARN] when no placement can auto-survive an
+// arbitrary single-site loss. All of it is INFORMATIONAL — drift is transient and the operator's
+// rebalancer corrects it, and reduced resilience is a surfaced warning, not a refusal — so none
 // of it changes the verify verdict or exit code.
 func printMasterDistribution(md multisite.MasterDistribution) {
-	fmt.Printf("\nMaster Distribution (balance target %d master(s)/site for %d shards, ADR-012 D2):\n",
-		md.Target, md.Shards)
-	imbal := make(map[string]bool, len(md.Imbalanced))
-	for _, s := range md.Imbalanced {
-		imbal[s] = true
+	fmt.Printf("\nMaster Distribution (%d shards; native target %d, takeover floor %d master(s)/site, ADR-012 D2):\n",
+		md.Shards, md.Target, md.Floor)
+	overFloor := make(map[string]bool, len(md.OverFloor))
+	for _, s := range md.OverFloor {
+		overFloor[s] = true
+	}
+	overTarget := make(map[string]bool, len(md.OverTarget))
+	for _, s := range md.OverTarget {
+		overTarget[s] = true
 	}
 	if len(md.Counts) == 0 {
 		fmt.Println("  (no slot-serving masters observed)")
 	}
 	for _, c := range md.Counts {
 		marker := "[OK]"
-		if imbal[c.Site] {
-			marker = fmt.Sprintf("[IMBALANCED] (exceeds target %d)", md.Target)
+		switch {
+		case overFloor[c.Site]:
+			marker = fmt.Sprintf("[OVER FLOOR] (exceeds takeover floor %d)", md.Floor)
+		case overTarget[c.Site]:
+			marker = fmt.Sprintf("[OVER TARGET] (exceeds native target %d)", md.Target)
 		}
 		fmt.Printf("  - site %s: %d master(s) %s\n", c.Site, c.Masters, marker)
 	}
 	switch {
 	case !md.Resilient:
-		fmt.Printf("  [WARN] reduced site-loss resilience: %d sites x %d (ceil(%d/2)-1) = %d < %d shards — "+
+		fmt.Printf("  [WARN] reduced site-loss resilience: %d sites x %d (floor(%d/2)) = %d < %d shards — "+
 			"the topology cannot auto-survive an arbitrary single-site loss; the heavier-master site's loss "+
 			"needs manual or multiSite.allowUnsafeSiteTakeover recovery\n",
-			md.NumSites, md.Target, md.Shards, md.NumSites*md.Target, md.Shards)
-	case len(md.Imbalanced) > 0:
-		fmt.Println("  [WARN] master drift: a site currently exceeds the balance target; the operator's rebalancer will " +
-			"correct it with a graceful failover (informational — no data at risk)")
+			md.NumSites, md.Floor, md.Shards, md.NumSites*md.Floor, md.Shards)
+	case len(md.OverFloor) > 0:
+		fmt.Println("  [WARN] master drift past the takeover floor: losing that site would leave the lost side " +
+			"holding a master majority, so the takeover cannot be fenced safely and the loss would need manual " +
+			"or multiSite.allowUnsafeSiteTakeover recovery. The operator's rebalancer corrects this with a " +
+			"graceful failover (no data at risk)")
+	case len(md.OverTarget) > 0:
+		fmt.Println("  [OK] recoverable, but not natively: a site exceeds the native target, so its loss recovers " +
+			"by operator takeover rather than a Redis election. The rebalancer corrects it where the topology allows")
 	default:
-		fmt.Println("  [OK] balanced: no site exceeds the target; the topology can auto-survive any single-site loss")
+		fmt.Println("  [OK] balanced: every site is at or below the native target; any single-site loss recovers " +
+			"by a native Redis election")
 	}
 }
 

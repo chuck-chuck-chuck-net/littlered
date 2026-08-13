@@ -198,19 +198,29 @@ func MembersFromGroundTruth(gt *redisclient.ClusterGroundTruth) []ShardMember {
 // is unexported); replicated here for the render-side master-per-site distribution.
 const roleMaster = "master"
 
-// MasterBalanceTarget mirrors the operator's masterBalanceTarget (ADR-012 D2): the maximum
-// slot-serving masters a single site may hold without reaching a Redis master majority —
-// ceil(shards/2)-1. Re-implemented here because the controller symbol is unexported and its
-// package is too heavy to import into the CLI; a controller-side drift-guard test asserts the
-// two definitions agree.
-func MasterBalanceTarget(shards int) int { return (shards+1)/2 - 1 }
+// NativeSurvivalTarget mirrors the operator's nativeSurvivalTarget (ADR-012 D2): the maximum
+// slot-serving masters a site may hold for its loss to leave the survivors holding quorum, so
+// Redis recovers natively — ceil(shards/2)-1. Exceeding it downgrades recovery to an operator
+// takeover; it is not an outage.
+//
+// Re-implemented here because the controller symbol is unexported and its package is too heavy
+// to import into the CLI; a controller-side drift-guard test asserts the definitions agree.
+func NativeSurvivalTarget(shards int) int { return (shards+1)/2 - 1 }
 
-// SiteLossResilient mirrors the operator's siteLossResilient (ADR-012 D2): whether the D2
-// balance invariant is *structurally satisfiable* for K=shards over S=numSites — i.e. K
-// masters can be spread so no site exceeds MasterBalanceTarget(K). False means the topology
-// cannot auto-survive an arbitrary single-site loss (pigeonhole forces a site over target).
+// TakeoverSurvivalFloor mirrors the operator's takeoverSurvivalFloor (ADR-012 D2): the maximum
+// slot-serving masters a site may hold for its loss to leave the LOST side short of quorum, so
+// the survivors hold a blocking minority and the operator's takeover is fence-safe —
+// floor(shards/2). Exceeding it is an availability exposure: that site's loss needs a human or
+// multiSite.allowUnsafeSiteTakeover.
+func TakeoverSurvivalFloor(shards int) int { return shards / 2 }
+
+// SiteLossResilient mirrors the operator's siteLossResilient (ADR-012 D2): whether the takeover
+// FLOOR is *structurally reachable* for K=shards over S=numSites — i.e. K masters can be spread
+// so no site exceeds TakeoverSurvivalFloor(K). False means the topology cannot auto-survive an
+// arbitrary single-site loss (pigeonhole forces a site over the floor); given K >= 3 that is
+// exactly the two-sites-with-odd-K regime.
 func SiteLossResilient(shards, numSites int) bool {
-	return numSites*MasterBalanceTarget(shards) >= shards
+	return numSites*TakeoverSurvivalFloor(shards) >= shards
 }
 
 // SiteMasterCount is one site's current slot-serving-master count, for the master-per-site
@@ -251,12 +261,20 @@ func MasterCountsFromGroundTruth(gt *redisclient.ClusterGroundTruth) []SiteMaste
 type MasterDistribution struct {
 	Shards   int
 	NumSites int
-	// Target is MasterBalanceTarget(Shards): the max masters a site may hold to stay balanced.
+	// Target is NativeSurvivalTarget(Shards): the max masters a site may hold for its loss to
+	// still be recoverable by a native Redis election.
 	Target int
+	// Floor is TakeoverSurvivalFloor(Shards): the max masters a site may hold for its loss to
+	// be recoverable AT ALL (by the operator's fence-safe takeover).
+	Floor int
 	// Counts is the per-site master count, sorted by site.
 	Counts []SiteMasterCount
-	// Imbalanced lists sites whose current master count EXCEEDS Target (live drift), sorted.
-	Imbalanced []string
+	// OverFloor lists sites whose master count exceeds Floor, sorted — an actionable
+	// availability exposure: that site's loss hits the drift-refusal.
+	OverFloor []string
+	// OverTarget lists sites whose master count exceeds Target but not Floor, sorted — a
+	// recovery downgrade only (takeover instead of a native election), not an exposure.
+	OverTarget []string
 	// Resilient is the structural verdict SiteLossResilient(Shards, NumSites).
 	Resilient bool
 }
@@ -265,23 +283,29 @@ type MasterDistribution struct {
 // and the current per-site master distribution. Pure and deterministic. A site currently over
 // Target is flagged Imbalanced (informational drift); Resilient is the structural predicate.
 func EvaluateMasterDistribution(shards, numSites int, counts []SiteMasterCount) MasterDistribution {
-	target := MasterBalanceTarget(shards)
+	target, floor := NativeSurvivalTarget(shards), TakeoverSurvivalFloor(shards)
 	sorted := make([]SiteMasterCount, len(counts))
 	copy(sorted, counts)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Site < sorted[j].Site })
-	var imbalanced []string
+	var overFloor, overTarget []string
 	for _, c := range sorted {
-		if c.Masters > target {
-			imbalanced = append(imbalanced, c.Site)
+		switch {
+		case c.Masters > floor:
+			overFloor = append(overFloor, c.Site)
+		case c.Masters > target:
+			overTarget = append(overTarget, c.Site)
 		}
 	}
-	sort.Strings(imbalanced)
+	sort.Strings(overFloor)
+	sort.Strings(overTarget)
 	return MasterDistribution{
 		Shards:     shards,
 		NumSites:   numSites,
 		Target:     target,
+		Floor:      floor,
 		Counts:     sorted,
-		Imbalanced: imbalanced,
+		OverFloor:  overFloor,
+		OverTarget: overTarget,
 		Resilient:  SiteLossResilient(shards, numSites),
 	}
 }
