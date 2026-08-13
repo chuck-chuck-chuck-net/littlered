@@ -8,9 +8,11 @@ is implemented and live-verified on a real 4-cluster lab (hub + 3 sites). The
 **site-loss recovery** this ADR specifies is **phased**, and its status is called
 out per part:
 
-- **Phase 1** — the quorum-arithmetic takeover (D1), the master-balance invariant +
+- **Phase 1** — the quorum-arithmetic takeover (D1), the master-balance thresholds +
   drift rebalancer (D2), the 2-site even-`K` auto-takeover and the ≥3-site native
-  path (D3). *Design accepted; implementation pending.*
+  path (D3). *Implemented; unit/envtest-verified, live site-loss validation pending.*
+  D2's thresholds were corrected after first implementation — a single bound derived
+  from the native path was gating the takeover path as well (changelog LR-031).
 - **Phase 2** — an out-of-band STONITH fence provider + a site-quorum leg (D4),
   which lift the drifted / majority-loss / multi-site-loss cases from fail-closed to
   automatable. *Scoped, not started.*
@@ -113,15 +115,24 @@ lost site's nodes — behind a gate built **only** from first-hand Domain-M evid
 5. **Quiet cluster** (Rule-A analog): no terminating survivor pods, no in-flight
    failover / reshard / serialized rollout; decided on a fresh gather.
 
-**Arithmetic identity (the crux).** Conditions 2 (`reachable < q`) and 3
-(`unreachable < q`) can hold together *only when the slot-serving masters split
-exactly in half* — `K` even and `reachable = unreachable = K/2`. This is the
-**fence-safe automated takeover**, and it is the *only* configuration where a
-takeover is both necessary (both sides fail-stopped) and provably safe (the other
-side is a guaranteed minority, hence self-fenced — whether dead or alive-partitioned).
-Any odd `K`, or any drifted split, makes a site loss either native (condition 2
-fails) or a refusal (condition 3 fails). Safety therefore never depends on knowing
-*why* a master is unreachable — only on counting.
+**Arithmetic identity (the crux).** Condition 2 requires the survivors to lack
+quorum (`reachable < q`); condition 3 requires the lost side to lack it as well
+(`unreachable = K − reachable < q`). Together they confine the survivors to
+
+```
+K − q  <  reachable  <  q
+```
+
+— the survivors hold a **blocking minority**: too few to elect, enough to deny the
+other side an election. That window is empty for odd `K` (`K − q + 1 = q`, so a
+blocking minority *is* a quorum), and for even `K` it admits exactly one value,
+`reachable = K/2` — the symmetric split. This is the **fence-safe automated
+takeover**, and it is the only configuration where a takeover is both necessary
+(both sides fail-stopped) and provably safe (the other side is a guaranteed
+minority, hence self-fenced — whether dead or alive-partitioned). Any odd `K`, or
+any drifted split, makes a site loss either native (condition 2 fails) or a refusal
+(condition 3 fails). Safety therefore never depends on knowing *why* a master is
+unreachable — only on counting.
 
 Actions, in order (unchanged from the primitive, which is sound): per orphaned shard
 select the most-complete surviving replica (highest replication offset, within one
@@ -140,24 +151,71 @@ that heals has its never-restarted returnee pods **recycled** (ADR-008 machinery
 once the survivors hold a majority and no shard is orphaned, so they rejoin fresh
 rather than re-MEET stale ex-masters.
 
-### D2 — Master-balance invariant + drift rebalancer
+**What the arithmetic assumes about its inputs.** `reachable` counts slot-serving
+masters among the pods the hub *observes* across reachable sites — not the pods it
+can dial. What makes that the right quantity is an assumption about the failure
+model: a site either works, in which case Kubernetes reschedules its pods and Redis
+converges, or it is gone and its pods are not observable at all. Scattered node
+death inside a working site is therefore not a site loss and not this path's
+business — the pods return, or the wipe-recovery path recycles them (pillar 3.13).
+We accept the degenerate-site case (scheduler broken, resources exhausted, pods
+Pending indefinitely) as out of model.
+
+Both miscount directions are fail-safe. An overcount — a dead pod still listed —
+leaves `reachable` too high, so condition 2 fails and the planner waits. An
+undercount pushes `unreachable` up and out of the blocking-minority window, so
+condition 3 fails and the planner refuses. The one dangerous undercount, the hub
+losing sight of a *serving* site, is caught by condition 2's other leg: a healthy
+cluster has no survivor reporting its own `cluster_state:fail`. → Counting
+individual dead nodes instead of whole sites would require per-node liveness at the
+hub — the failure detector this ADR exists to avoid.
+
+### D2 — Two balance thresholds: the blocking-minority floor and the native target
 
 Site-loss survivability is a **joint** property of data placement (replicas in ≥2
 sites — already true) and **master distribution**. With `mᵢ` = slot-serving masters
-in site `i`, a site loss removes `k = Σ_{i∈L} mᵢ`; native survival needs
-`K − k ≥ q`, i.e. `k ≤ ⌈K/2⌉ − 1`. To survive the loss of **any single** site,
-enforce the **balance invariant**:
+in site `i`, losing site `i` removes `l = mᵢ` votes from Domain-M. Two paths survive
+that loss, and they impose *different* conditions:
+
+- Native survival — the survivors keep quorum: `K − l ≥ q`, i.e. `l ≤ K − q =
+  ⌈K/2⌉ − 1`. Redis elects on its own within `cluster-node-timeout`; the operator is
+  not involved and the hub may be down.
+- Takeover survival — the lost side lacks quorum: `l < q`, i.e. `l ≤ q − 1 =
+  ⌊K/2⌋`. The survivors hold a blocking minority, D1's fence holds, and the takeover
+  is provably split-brain-free.
+
+Because `K − q ≤ q − 1` always, the takeover condition is the weaker one. → Two
+thresholds, and we hold both:
 
 ```
-max_i mᵢ ≤ ⌈K/2⌉ − 1
+takeover floor  (must):     max_i mᵢ ≤ ⌊K/2⌋      takeoverSurvivalFloor(K)
+native target   (better):   max_i mᵢ ≤ ⌈K/2⌉ − 1   nativeSurvivalTarget(K)
 ```
+
+They coincide for odd `K` and differ by exactly one for even `K` — the same fact as
+D1's blocking-minority window (empty for odd `K`, one value wide for even `K`), read
+from the placement side rather than the loss side.
+
+The two are not interchangeable, and the cost of breaching them is not comparable.
+Breaching the floor turns a survivable site loss into an outage that only a human or
+`allowUnsafeSiteTakeover` clears. Breaching the target merely downgrades recovery
+from a native election to a takeover — the `max(60s, 2×cluster-node-timeout)`
+cooldown, and a live hub that can reach the survivors. Native survival is strictly
+better: faster, seamless, and independent of the operator. → The floor is a hard
+constraint; the target is the standard we hold wherever the topology admits it
+(D3).
 
 Redis roles are fluid — masters drift on failover and can concentrate. The operator
-maintains the invariant with a slow, convergent, **drift-triggered** reconciler
-(`planMasterRebalance` over `mᵢ` vs the invariant) that issues graceful
-`CLUSTER FAILOVER` on a replica in an under-mastered site (the no-data-loss primitive
-LR-025 uses). It runs only on violation, so churn is bounded to real drift events —
-not a hot-path balancer.
+maintains both thresholds with a slow, convergent, **drift-triggered** reconciler
+(`planMasterRebalance` over `mᵢ`) that issues graceful `CLUSTER FAILOVER` on a
+replica in an under-mastered site (the no-data-loss primitive LR-025 uses). It runs
+only on violation, so churn is bounded to real drift events — not a hot-path
+balancer. It plans in two tiers: emit the move set that reaches the target if one
+exists; otherwise the move set that reaches the floor; otherwise nothing. Progress
+that reaches only the floor is a valid plan, not partial churn — the floor is the
+property that keeps a site loss recoverable at all, and refusing to make a move
+because the *target* is out of reach is how a topology sits permanently below the
+floor.
 
 Execution (steady-state maintenance, so gated conservatively): it runs **only on the
 healthy path** of the reconcile (never during repair/takeover/not-ready) and **only
@@ -169,8 +227,9 @@ mirroring `takeoverPendingSince`) so a failover in flight is never restarted —
 multi-move convergence advances one failover per cooldown. A graceful-failover **target
 must be an in-sync replica** (`role:replica` + `link:up`): `CLUSTER FAILOVER`
 coordinates the handoff with the replica, so a lagging/disconnected one is not a valid
-target. Because `planMasterRebalance` only ever selects a shard mastered at an
-over-target donor, a shard already at its target is never re-selected — no thrash. A
+target. Because `planMasterRebalance` only ever selects a shard mastered at a donor
+above the threshold it is planning to, and only ever moves it onto a site that stays
+at or below that threshold, no move creates a new violation — no thrash. A
 worst-case bug here is at most an unnecessary graceful failover (an availability blip),
 never data loss or split-brain.
 
@@ -180,30 +239,41 @@ hold for load. Multi-site requires balancing for a **different** reason —
 quorum-on-site-loss (availability) — which is a distinct concern; ADR-009 stands for
 single-site.
 
-### D3 — Regimes and the 2-site recommendation
+### D3 — Regimes: what each topology can reach
 
-**Two sites never survive a site loss natively, for any `K`** (the heavier side
-holds `⌈K/2⌉ > ⌈K/2⌉−1`). So 2-site is Tier A/B, never Tier C. The arithmetic
-auto-takeover ("0b", the fence-safe path of D1) fires iff `K` even and the split is
-exactly `K/2 : K/2`:
+A threshold is only worth holding if some placement satisfies it. Spreading `K`
+masters over `S` sites reaches the native target iff `S·(⌈K/2⌉−1) ≥ K` and the
+takeover floor iff `S·⌊K/2⌋ ≥ K`. Given Redis Cluster's three-master minimum:
 
-| `K` | balanced 2-site split | lose a site | outcome |
-|---|---|---|---|
-| 3 (odd) | 2 + 1 | minority-loss: native · **majority-loss: refuse** | asymmetric; 0b never fires |
-| **4 (even)** | 2 + 2 | either side: `reachable=2<3` ∧ `unreachable=2<3` | **0b fires on *either* loss — symmetric auto-survival** |
-| 5 (odd) | 3 + 2 | minority-loss: native · majority-loss: refuse | asymmetric; 0b never fires |
-| 6 (even) | 3 + 3 | either side | 0b fires on either loss |
+| `K` | native target reachable | takeover floor reachable |
+|---|---|---|
+| 3 | `S ≥ 3` | `S ≥ 3` |
+| **4** | **`S ≥ 4`** | **`S ≥ 2`** |
+| 5 | `S ≥ 3` | `S ≥ 3` |
+| **6** | `S ≥ 3` | **`S ≥ 2`** |
+| 7 | `S ≥ 3` | `S ≥ 3` |
+| **8** | `S ≥ 3` | **`S ≥ 2`** |
 
-Odd `K` in 2-site is structurally an availability half-measure (an odd count over two
-sites is always lopsided, and you don't choose which site you lose). **Recommend even
-`K ≥ 4` for 2-site**; then 0b (coupled to D2's balance) gives complete,
-detection-free auto-survival of either site loss.
+**Two sites never survive a site loss natively, for any `K`** — the heavier side
+always holds `⌈K/2⌉`, one over the native target. A 2-site deployment therefore
+lives or dies on the floor, and the floor is reachable there iff `K` is even (the
+`K/2 : K/2` split). → **Recommend even `K ≥ 4` for 2-site**; then D1's arithmetic
+auto-takeover ("0b"), coupled to D2's balance, gives complete detection-free
+auto-survival of either site loss. An odd `K` over two sites cannot auto-survive an
+arbitrary site loss at all: the heavier side's loss is a refusal by construction,
+and no rebalancing fixes it.
+
+For `S ≥ 3` the floor is always reachable (`3⌊K/2⌋ ≥ K` for every `K ≥ 3`), so the
+only open question is whether the native target is reachable too. It is, except for
+`K = 4`, which needs a fourth site — 4 masters over 3 sites are forced to `2+1+1` by
+pigeonhole, and the 2-master site's loss recovers by takeover rather than natively.
 
 | Tier | Precondition | Automatic safe recovery envelope | Phase |
 |---|---|---|---|
 | **A / 0a** | 2 sites, any `K` | none — human-confirmed fence (operator does not guess) | 1 |
-| **A / 0b** | 2 sites, **even `K≥4`**, balanced | either site loss (arithmetic + self-fence) | 1 |
-| **C** | ≥3 sites, balance invariant satisfiable | native Redis survival; `planSiteTakeover` rarely reached | 1 |
+| **A / 0b** | 2 sites, **even `K≥4`**, at the floor | either site loss (arithmetic + self-fence) | 1 |
+| **C / 0b** | ≥3 sites, at the floor but not the target (`K=4` over 3 sites) | any site loss; the over-target site's loss by takeover, the rest natively | 1 |
+| **C** | ≥3 sites, at the native target | native Redis survival; `planSiteTakeover` rarely reached | 1 |
 | **B** | out-of-band STONITH provider | any single-/multi-site loss incl. drift (fence→takeover); degrades to A when the fence plane is down | 2 |
 
 ### D4 — Phase 2: STONITH + site-quorum leg
@@ -237,6 +307,13 @@ degrades to Tier A (human), never to an unsafe guess.
 - **Why balancing is mandatory here (not ADR-009's decline).** Without it, drift
   silently removes both native survival (Tier C) and the 0b even-split, converting a
   survivable loss into an outage — an availability property ADR-009 never weighed.
+- **Why two thresholds and not one.** A single threshold has to pick a survival path
+  and forfeit the other. The native bound alone declares the 2-site even split
+  unreachable and stops the rebalancer from maintaining the very placement D3
+  recommends; the takeover floor alone gives up reachable native survival wherever
+  `S ≥ 3`. Both are worth holding, they are cheap to hold together (the rebalancer
+  plans to one, falls back to the other), and separating them makes the cost of each
+  breach explicit — outage versus a slower recovery.
 
 ## Consequences
 - **`recoverSiteLoss` is the sole quorum-loss takeover AND ghost-FORGET authority in
@@ -281,23 +358,28 @@ degrades to Tier A (human), never to an unsafe guess.
   serving: the survivors then report their own `cluster_state:ok`, condition 2 fails, and
   the operator HOLDs (the LR-017 survivors'-vantage rule — exercised by the e2e Scenario B).
 - **Drift is a first-class, surfaced state.** Master-per-site distribution and the
-  balance invariant's health are surfaced (`lrctl verify`, a condition); a violated
-  invariant is "reduced site-loss resilience," not silent drift.
+  balance thresholds' health are surfaced (`lrctl verify`, a condition). A breach of
+  the floor is an actionable availability exposure; sitting between floor and target
+  is a recovery downgrade, reported but not alarming. Neither is silent drift.
 - New status: `status.multiSite.takeoverPendingSince`, a refusal condition. New spec
   knob: `multiSite.allowUnsafeSiteTakeover` (default false).
 - **Reduced-resilience warning** (a surfaced condition, *not* an admission refusal):
-  when the invariant is structurally unsatisfiable — `S·(⌈K/2⌉−1) < K` for `S` sites
-  and `K` shards — the topology is still valid and functional, it simply cannot
-  auto-survive an arbitrary single-site loss (the heavier-master site's loss refuses
-  or needs the opt-in). Such a topology is a legitimate deployment (with manual /
-  `allowUnsafeSiteTakeover` recovery), so LittleRed **surfaces a
-  `ReducedSiteLossResilience` condition + event** rather than blocking it — consistent
-  with the opt-in-not-block norm. The headline case is the `K=4`-over-3-sites trap
-  (`⌈4/2⌉−1 = 1`, but 4 shards over 3 sites force a `2+1+1` split by pigeonhole, so
-  losing the 2-master site fails — 3 sites is not automatically enough; the *ratio*
-  matters). `K=2` needs no special handling — Redis Cluster's minimum of 3 masters
-  already rejects it. The warning is a status surface (grouped with the master-per-site
-  distribution view), not a validation gate.
+  when the **floor** is structurally unreachable — `S·⌊K/2⌋ < K` — the topology is
+  still valid and functional, it simply cannot auto-survive an arbitrary single-site
+  loss (the heavier-master site's loss refuses or needs the opt-in). Such a topology
+  is a legitimate deployment (with manual / `allowUnsafeSiteTakeover` recovery), so
+  LittleRed **surfaces a `ReducedSiteLossResilience` condition + event** rather than
+  blocking it — consistent with the opt-in-not-block norm. Given `K ≥ 3`, that
+  predicate is satisfied in exactly one regime: **two sites with an odd `K`**. For
+  `S ≥ 3` the floor is always reachable, so the warning never fires there. The
+  warning is a status surface (grouped with the master-per-site distribution view),
+  not a validation gate.
+- **Superseded:** the earlier `K=4`-over-3-sites "headline trap" was a consequence
+  of deriving the warning from the *native* bound. `2+1+1` loses at most `2 = ⌊4/2⌋`
+  masters, which is fence-safe, so that topology does auto-survive any single-site
+  loss — by takeover for the 2-master site, natively for the others. It is a Tier
+  C/0b deployment, not a warned one. Likewise `K=2` would now be fence-safe at `1+1`;
+  it stays moot because Redis Cluster's three-master minimum rejects it.
 - Automated dual-site recovery presumes the hub survives the lost site: the hub must
   be a third failure domain holding no data and no Domain-M vote (design doc §6).
 - A multi-shard takeover issues several no-consensus epoch bumps close together;
@@ -306,7 +388,15 @@ degrades to Tier A (human), never to an unsafe guess.
 - Test plan (red-first): planner table tests for every branch — the fence-safe even
   split (fire), drift-majority (refuse without opt-in), native-still-possible (wait),
   `!clusterFormed` (do nothing), cooldown arm/clear, quiet-gating; `planMasterRebalance`
-  invariant restore/no-op; validation refusals (`K=2`, `K=4`/3-site). e2e: dual-site
+  restore-to-target / fall-back-to-floor / no-op / nothing-reachable; the
+  reduced-resilience warning (`K` odd over 2 sites warns, `S ≥ 3` never does).
+- **A cross-seam property test binds D2 to D1.** For every `K` and every master
+  distribution, the threshold predicates must agree with what `planSiteTakeover`
+  actually decides on the corresponding loss: at or below the floor ⇒ it fires or the
+  loss is native, above it ⇒ it refuses. Nothing previously connected the two, which
+  is how a bound derived for one path (native) came to gate the other (takeover)
+  inside a single ADR. Hand-written expectation tables authored beside the
+  implementation cannot catch that class — they restate it. e2e: dual-site
   even-split kill → takeover + serve, data intact; ≥3-site single loss → native, no
   takeover; drift → refuse (or Phase-2 fence→takeover); site rejoin (fresh pods) →
   staggered resync, no epoch conflict. Also verify e2e that `CLUSTER FAILOVER
