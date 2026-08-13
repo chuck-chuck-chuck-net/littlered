@@ -106,7 +106,7 @@ func collectMultiSiteDebugArtifacts(debugDir string, t *msDebugTarget) {
 // collectSitePodArtifacts dumps, for every cluster pod on one site, its redis log (+ previous, if
 // it restarted) and its redis ground truth (CLUSTER NODES + CLUSTER INFO from that pod's vantage).
 func collectSitePodArtifacts(debugDir, prefix, siteCtx, ns string) {
-	out, err := kctl(siteCtx, "-n", ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
+	out, err := kctl(siteCtx, msDebugRequestTimeout, "-n", ns, "get", "pods", "-l", "app.kubernetes.io/component=cluster",
 		"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
 	if err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "  [%s] could not list cluster pods: %v\n", strings.TrimRight(prefix, "-"), err)
@@ -139,7 +139,7 @@ func collectMultiSiteChaosLogs(debugDir, ns string, reg *msRegistry) {
 		refs = append(refs, ctxRef{s.name, s.context})
 	}
 	for _, r := range refs {
-		out, err := kctl(r.kctx, "-n", ns, "get", "pods", "-l", "app=chaos-client",
+		out, err := kctl(r.kctx, msDebugRequestTimeout, "-n", ns, "get", "pods", "-l", "app=chaos-client",
 			"-o", "jsonpath={range .items[*]}{.metadata.name}{\"\\n\"}{end}")
 		if err != nil || strings.TrimSpace(out) == "" {
 			continue
@@ -150,11 +150,17 @@ func collectMultiSiteChaosLogs(debugDir, ns string, reg *msRegistry) {
 	}
 }
 
-// dumpKubectl runs a context-scoped kubectl and writes its output (plus any error) to filename.
-// Best-effort: a non-zero exit still produces an artifact carrying whatever output + the error, so
-// an unreachable site or a missing resource is recorded rather than silently dropped.
+// msDebugRequestTimeout bounds every collector kubectl call so a killed/unreachable site (Scenario
+// A's virsh-destroyed site, whose Kubernetes API is down) fails fast instead of hanging ~30s per
+// call on the dead API — the collector must not stall on the very site loss it is documenting.
+const msDebugRequestTimeout = "--request-timeout=10s"
+
+// dumpKubectl runs a context-scoped kubectl (with a bounded request timeout) and writes its output
+// (plus any error) to filename. Best-effort: a non-zero exit still produces an artifact carrying
+// whatever output + the error, so an unreachable site or a missing resource is recorded rather than
+// silently dropped.
 func dumpKubectl(debugDir, filename, siteCtx string, args ...string) {
-	out, err := kctl(siteCtx, args...)
+	out, err := kctl(siteCtx, append([]string{msDebugRequestTimeout}, args...)...)
 	if err != nil {
 		out = strings.TrimRight(out, "\n") + fmt.Sprintf("\n[collection error: %v]\n", err)
 	}
