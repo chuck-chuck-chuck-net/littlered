@@ -95,6 +95,8 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 				Skip("Scenario B needs MS_HUB_POD_CIDR (the hub operator's pod CIDR) to cut ONLY the " +
 					"hub→site data path while the sites stay mutually connected — see docs/E2E_TESTING.md")
 			}
+			// Publish the target so a failure collects hub + per-site ground truth (DEBUG_ON_FAILURE).
+			setMSDebugTarget(reg, ns, crName)
 			By("standing up a 2-site cluster instance [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
 			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")
@@ -188,6 +190,8 @@ var _ = Describe("Multi-Site Site-Loss Takeover (ADR-012)", Label("multisite"), 
 					"; set MS_VM_INVENTORY to a file of '<site> <vm-name> <virsh-uri>' lines")
 			}
 
+			// Publish the target so a failure collects hub + per-site ground truth (DEBUG_ON_FAILURE).
+			setMSDebugTarget(reg, ns, crName)
 			By("standing up a dedicated 2-site cluster [s1,s2] shards:4 sitesPerShard:2 (even 2+2 master split)")
 			msSetupSites(reg, ns)
 			_, err := kctlIn(reg.hubContext, msClusterCR(reg, ns, crName, siteNames, 4, 0, 2, 15000), "apply", "-f", "-")

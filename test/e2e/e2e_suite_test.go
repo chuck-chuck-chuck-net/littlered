@@ -198,6 +198,9 @@ var _ = BeforeEach(func() {
 	resetPreDeleteLogs()
 	// Stop any streaming log processes from the previous test
 	resetStreamingLogs()
+	// Clear any multi-site debug target published by a previous test, so a single-site spec
+	// never inherits a stale target (a multi-site spec re-publishes it via setMSDebugTarget).
+	resetMSDebugTarget()
 })
 
 var _ = AfterEach(func() {
