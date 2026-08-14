@@ -337,6 +337,24 @@ degrades to Tier A (human), never to an unsafe guess.
   unobservable-site edge) rather than the primary safety mechanism — the primary
   guarantee is now that a live-but-hub-unreachable node is *never a ghost in the first
   place*. See changelog LR-030.
+- **Amendment (LR-032) — the multi-site topology is immutable for an instance's
+  lifetime, enforced at admission.** Everything this ADR decides — the two D2
+  thresholds (`takeoverSurvivalFloor(K) = ⌊K/2⌋`, `nativeSurvivalTarget(K) = ⌈K/2⌉−1`),
+  the even-split fence identity, `siteLossResilient`'s structural check `S·⌊K/2⌋ < K`,
+  and D3's regimes — is arithmetic over a **fixed** `(S, K)`. Changing
+  `S` or `K` on a running instance does not merely re-run that arithmetic: because
+  placement is index-based (shard K → sites `(K+j) mod S`), it *relocates live members*
+  across sites, over EmptyDir storage, with no relocation mechanism in the design. Such
+  a change was never in scope, but nothing said so and nothing stopped it — and the
+  LR-028 runtime guard, aimed at shrink, silently **permitted** the additive case
+  (`sitesPerShard` unset defaults to `len(sites)`, so appending a site makes the desired
+  placement a superset and the orphan diff finds nothing). CRD transition rules now pin
+  `sites` (names *and* order), `sitesPerShard`, `shards`-while-multi-site, and the
+  presence of the `multiSite` block. Admission, not runtime, is the correct layer: a
+  runtime detector would have to distinguish "a site was added" from "a site is
+  temporarily unobservable" — a **failure-detection** input, exactly what D1 forbids —
+  and would risk refusing during the site outage `recoverSiteLoss` exists to handle. See
+  changelog LR-032 and `docs/MULTI_SITE_DESIGN.md` §2/§7.
 - **Multi-site keeps the namespaced per-site Role — no cluster-scoped `nodes` RBAC.**
   Because safety is arithmetic (D1) and not a Kubernetes liveness witness, the
   operator needs no per-Node `Ready` read; the M1 namespace-scoped workload/pod Role

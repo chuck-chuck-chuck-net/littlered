@@ -108,6 +108,7 @@ var _ = Describe("MultiSite finalizer teardown", func() {
 						{Name: siteAlpha},
 						{Name: siteBeta, KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "site-beta-kubeconfig"}},
 					},
+					SitesPerShard: 2,
 				},
 			},
 		}

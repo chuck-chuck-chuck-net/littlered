@@ -59,7 +59,13 @@ spec:
           metadata:
             type: object
           spec:
-            description: LittleRedSpec defines the desired state of LittleRed
+            description: |-
+              LittleRedSpec defines the desired state of LittleRed
+
+              Multi-site topology immutability (LR-032), the two clauses that need a
+              spec-level view; the site list and sitesPerShard are pinned on MultiSiteSpec.
+              Converting a running instance between single-site and stretched, or resharding
+              a stretched instance, are both undesigned topology changes over EmptyDir data.
             properties:
               auth:
                 description: Auth defines authentication settings
@@ -430,6 +436,15 @@ spec:
                       instance. At least 2 sites are required (sitesPerShard >= 2 is what lets
                       the design descope single-site-loss data repair); site names must be
                       unique. At most one site may be hub-local (kubeconfigSecretRef omitted).
+
+                      ORDER IS SIGNIFICANT: a site's position in this list is its placement
+                      index — shard K is hosted by sites (K+j) mod S for j < sitesPerShard — so
+                      the list is an ordered sequence of objects, keyed by position, and is
+                      declared listType=atomic accordingly (LR-033). It was previously
+                      listType=map keyed on name, which tells the API machinery the opposite:
+                      that entries are identified by name and order carries no meaning (CEL
+                      equality on such a list is order-blind, and a server-side-apply merge is
+                      free to reorder it — which would silently re-place every shard).
                     items:
                       description: |-
                         SiteSpec identifies one site (workload Kubernetes cluster) of a multi-site
@@ -451,8 +466,14 @@ spec:
                           - name
                           type: object
                         name:
-                          description: Name is the site's unique name within this
-                            instance.
+                          description: |-
+                            Name is the site's unique name within this instance. It is the operator's
+                            ground-truth key for everything observed in the site (siteQualifiedKey) and
+                            is surfaced in status, so keep it a short identifier. The upper bound is not
+                            cosmetic: CEL cost estimation assumes the declared maximum for every string
+                            comparison, and the uniqueness rule compares names pairwise — without a
+                            MaxLength the CRD is rejected for exceeding the rule-cost budget.
+                          maxLength: 63
                           minLength: 1
                           type: string
                       required:
@@ -461,29 +482,47 @@ spec:
                     maxItems: 16
                     minItems: 2
                     type: array
-                    x-kubernetes-list-map-keys:
-                    - name
-                    x-kubernetes-list-type: map
+                    x-kubernetes-list-type: atomic
                   sitesPerShard:
                     description: |-
-                      SitesPerShard is how many sites host each shard. Defaults to the number
-                      of sites (every site hosts every shard); pinning it at 2 or 3 with many
-                      sites scales out capacity instead of multiplying copies. Must be between
-                      2 and the number of sites. Total members per shard =
-                      sitesPerShard x (replicasPerShard + 1).
+                      SitesPerShard is how many sites host each shard. REQUIRED and immutable —
+                      deliberately not defaulted (LR-033). This is the copy-factor knob of a
+                      RAM-resident store: total members per shard = sitesPerShard x
+                      (replicasPerShard + 1), so it sets the memory bill, the cross-site
+                      replication traffic, and how many simultaneous site losses the data
+                      survives. Every candidate default is wrong for somebody — the number of
+                      sites multiplies copies as sites are added, a constant is arbitrary — and a
+                      default would also hide the knob from the reader of a CR. Choose it once, at
+                      creation. 2 keeps the design's contract (survive one site loss) at the
+                      lowest cost and lets further sites scale capacity rather than copies; a
+                      higher value buys more simultaneous site losses. Must be between 2 and the
+                      number of sites.
                     minimum: 2
                     type: integer
                 required:
                 - sites
+                - sitesPerShard
                 type: object
                 x-kubernetes-validations:
                 - message: spec.multiSite.sitesPerShard cannot exceed the number of
                     sites
-                  rule: '!has(self.sitesPerShard) || self.sitesPerShard <= self.sites.size()'
+                  rule: self.sitesPerShard <= self.sites.size()
                 - message: at most one site may be hub-local (kubeconfigSecretRef
                     omitted)
                   rule: self.sites.filter(s, !has(s.kubeconfigSecretRef)).size() <=
                     1
+                - message: spec.multiSite.sites names must be unique
+                  rule: self.sites.all(s, self.sites.filter(x, x.name == s.name).size()
+                    == 1)
+                - message: 'spec.multiSite.sites is immutable: the site list (names
+                    and order) is fixed for an instance''s lifetime — adding, removing
+                    or reordering sites remaps shard placement onto different sites
+                    and is not supported; create a new instance instead'
+                  rule: self.sites.map(s, s.name) == oldSelf.sites.map(s, s.name)
+                - message: 'spec.multiSite.sitesPerShard is immutable: changing it
+                    re-places every shard across sites and would orphan the per-site
+                    StatefulSets it moves away from'
+                  rule: self.sitesPerShard == oldSelf.sitesPerShard
               placement:
                 description: Placement defines topology/failure-domain placement rules
                   (cluster mode only)
@@ -2174,6 +2213,14 @@ spec:
               rule: self.mode == 'failover' || !has(self.failover)
             - message: spec.multiSite may only be set when spec.mode is 'cluster'
               rule: self.mode == 'cluster' || !has(self.multiSite)
+            - message: 'spec.multiSite cannot be added to or removed from an existing
+                instance: converting between single-site and stretched topology is
+                not supported; create a new instance instead'
+              rule: has(self.multiSite) == has(oldSelf.multiSite)
+            - message: 'spec.cluster.shards is immutable while spec.multiSite is set:
+                the multi-site topology is fixed for an instance''s lifetime'
+              rule: '!has(self.multiSite) || !has(self.cluster) || !has(oldSelf.cluster)
+                || self.cluster.shards == oldSelf.cluster.shards'
           status:
             description: LittleRedStatus defines the observed state of LittleRed
             properties:

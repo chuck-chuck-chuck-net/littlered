@@ -73,12 +73,15 @@ func TestClusterRepairExpectedReplicas(t *testing.T) {
 			want: 5,
 		},
 		{
-			name: "multi-site default sitesPerShard (= len sites) with replicasPerShard 0",
+			// LR-033: sitesPerShard is required and never defaulted, so an unset one is
+			// a spec that never passed validation, not "every site hosts every shard".
+			// The count must not silently invent a topology; it degenerates visibly.
+			name: "multi-site with sitesPerShard unset never invents one",
 			lr: &littleredv1alpha1.LittleRed{Spec: littleredv1alpha1.LittleRedSpec{
 				Cluster:   &littleredv1alpha1.ClusterSpec{Shards: 3, ReplicasPerShard: rps(0)},
 				MultiSite: &littleredv1alpha1.MultiSiteSpec{Sites: sites(2)},
 			}},
-			want: 1, // sps defaults to 2, 2*(0+1)-1 = 1
+			want: 0, // 0*(0+1)-1 clamped at 0 — not 1 (which would be the old default)
 		},
 	}
 	for _, tc := range cases {

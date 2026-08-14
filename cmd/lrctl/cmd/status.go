@@ -143,12 +143,11 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 // (the operator's aggregated per-site view) plus the site-loss takeover marker.
 func printMultiSiteStatus(lr *littleredv1alpha1.LittleRed) {
 	ms := lr.Spec.MultiSite
-	sitesPerShard := len(ms.Sites)
-	if ms.SitesPerShard > 0 {
-		sitesPerShard = ms.SitesPerShard
-	}
+	// sitesPerShard is required and never defaulted (LR-033) — render what the spec
+	// says. This used to fall back to len(sites), mirroring the dynamic default; that
+	// fallback would now report a copy factor the operator does not actually use.
 	fmt.Printf("Multi-Site: %d sites, sitesPerShard=%d, network=%s\n",
-		len(ms.Sites), sitesPerShard, valueOrNone(ms.Network.Mode))
+		len(ms.Sites), ms.SitesPerShard, valueOrNone(ms.Network.Mode))
 	if lr.Status.Cluster != nil && lr.Status.Cluster.State != "" {
 		fmt.Printf("Cluster State: %s\n", lr.Status.Cluster.State)
 	}

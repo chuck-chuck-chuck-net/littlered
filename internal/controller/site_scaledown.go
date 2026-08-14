@@ -16,6 +16,17 @@ limitations under the License.
 
 package controller
 
+// LR-032: the topology-change POLICY now lives at admission — CRD transition rules pin
+// spec.multiSite.sites (names + order), spec.multiSite.sitesPerShard, spec.cluster.shards (while
+// multiSite is set) and the presence of the multiSite block itself, so none of the shrink
+// dimensions below — nor the additive site growth this diff never caught — can reach the
+// reconciler through the API. This guard is retained as DEFENCE IN DEPTH for drift admission
+// cannot see: hand-created/hand-edited StatefulSets, an instance whose CRD predates the rules, or
+// a cluster without CEL validation. It is a drift net, not the policy. Runtime is deliberately the
+// wrong layer for the policy: a runtime detector would have to tell "a site was added" apart from
+// "a site is temporarily unobservable", and would risk refusing during the very site outage
+// recoverSiteLoss exists to handle. See docs/MULTI_SITE_DESIGN.md §2/§7.
+//
 // site_scaledown.go holds the PURE, I/O-free scale-down / topology-shrink refusal detector for
 // multi-site cluster mode (docs/MULTI_SITE_DESIGN.md §10 item 7, changelog LR-028). Reducing
 // spec.cluster.shards, lowering spec.multiSite.sitesPerShard, or removing a site from

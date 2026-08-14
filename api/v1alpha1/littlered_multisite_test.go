@@ -38,6 +38,10 @@ func hubLocalSite(name string) SiteSpec {
 }
 
 func TestValidateMultiSite(t *testing.T) {
+	// errSitesPerShard is the substring shared by every sitesPerShard rejection
+	// (missing, below 2, above the site count).
+	const errSitesPerShard = "sitesPerShard"
+
 	tests := []struct {
 		name    string
 		lr      *LittleRed
@@ -51,7 +55,8 @@ func TestValidateMultiSite(t *testing.T) {
 		{
 			name: "valid dual-site (one hub-local, one remote)",
 			lr: multiSiteLR("cluster", &MultiSiteSpec{
-				Sites: []SiteSpec{hubLocalSite("alpha"), remoteSite("beta", "site-beta-kubeconfig")},
+				Sites:         []SiteSpec{hubLocalSite("alpha"), remoteSite("beta", "site-beta-kubeconfig")},
+				SitesPerShard: 2,
 			}),
 			wantErr: "",
 		},
@@ -108,12 +113,23 @@ func TestValidateMultiSite(t *testing.T) {
 			wantErr: "at most one site may be hub-local",
 		},
 		{
+			// LR-033: sitesPerShard is REQUIRED — it is the copy-factor knob of a
+			// RAM-resident store (members per shard = sitesPerShard x
+			// (replicasPerShard+1)), so it must be a conscious choice, not a default
+			// derived from however many sites happen to be listed.
+			name: "sitesPerShard missing",
+			lr: multiSiteLR("cluster", &MultiSiteSpec{
+				Sites: []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
+			}),
+			wantErr: errSitesPerShard,
+		},
+		{
 			name: "sitesPerShard below 2",
 			lr: multiSiteLR("cluster", &MultiSiteSpec{
 				Sites:         []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
 				SitesPerShard: 1,
 			}),
-			wantErr: "sitesPerShard",
+			wantErr: errSitesPerShard,
 		},
 		{
 			name: "sitesPerShard above site count",
@@ -121,21 +137,23 @@ func TestValidateMultiSite(t *testing.T) {
 				Sites:         []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
 				SitesPerShard: 3,
 			}),
-			wantErr: "sitesPerShard",
+			wantErr: errSitesPerShard,
 		},
 		{
 			name: "future network mode nodeport is not accepted",
 			lr: multiSiteLR("cluster", &MultiSiteSpec{
-				Sites:   []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
-				Network: MultiSiteNetworkSpec{Mode: "nodeport"},
+				Sites:         []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
+				SitesPerShard: 2,
+				Network:       MultiSiteNetworkSpec{Mode: "nodeport"},
 			}),
 			wantErr: "network.mode",
 		},
 		{
 			name: "explicit pod-routed network mode is accepted",
 			lr: multiSiteLR("cluster", &MultiSiteSpec{
-				Sites:   []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
-				Network: MultiSiteNetworkSpec{Mode: MultiSiteNetworkModePodRouted},
+				Sites:         []SiteSpec{remoteSite("alpha", "a"), remoteSite("beta", "b")},
+				SitesPerShard: 2,
+				Network:       MultiSiteNetworkSpec{Mode: MultiSiteNetworkModePodRouted},
 			}),
 			wantErr: "",
 		},
@@ -165,15 +183,23 @@ func TestValidateMultiSite(t *testing.T) {
 }
 
 func TestMultiSiteSetDefaults(t *testing.T) {
-	t.Run("sitesPerShard defaults to the number of sites (dynamic)", func(t *testing.T) {
+	// LR-033: sitesPerShard is REQUIRED and must never be invented. Defaulting it
+	// (it used to become len(sites)) hid the copy factor of a RAM-resident store from
+	// the reader of a CR, made the stored spec diverge from the effective value, and
+	// let the reconciler's own finalizer Update persist a computed value back into the
+	// user's spec.
+	t.Run("sitesPerShard is never defaulted", func(t *testing.T) {
 		lr := multiSiteLR("cluster", &MultiSiteSpec{
 			Sites: []SiteSpec{
 				remoteSite("alpha", "a"), remoteSite("beta", "b"), remoteSite("gamma", "c"),
 			},
 		})
 		lr.SetDefaults()
-		if got := lr.Spec.MultiSite.SitesPerShard; got != 3 {
-			t.Fatalf("SitesPerShard = %d, want 3 (number of sites)", got)
+		if got := lr.Spec.MultiSite.SitesPerShard; got != 0 {
+			t.Fatalf("SitesPerShard = %d, want 0 (required, never defaulted)", got)
+		}
+		if err := lr.Validate(); err == nil {
+			t.Fatal("Validate() = nil, want an error for a missing required sitesPerShard")
 		}
 	})
 

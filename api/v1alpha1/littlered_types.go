@@ -31,6 +31,13 @@ import (
 // +kubebuilder:validation:XValidation:rule="self.mode == 'sentinel' || !has(self.sentinel)",message="spec.sentinel may only be set when spec.mode is 'sentinel'"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'failover' || !has(self.failover)",message="spec.failover may only be set when spec.mode is 'failover'"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'cluster' || !has(self.multiSite)",message="spec.multiSite may only be set when spec.mode is 'cluster'"
+//
+// Multi-site topology immutability (LR-032), the two clauses that need a
+// spec-level view; the site list and sitesPerShard are pinned on MultiSiteSpec.
+// Converting a running instance between single-site and stretched, or resharding
+// a stretched instance, are both undesigned topology changes over EmptyDir data.
+// +kubebuilder:validation:XValidation:rule="has(self.multiSite) == has(oldSelf.multiSite)",message="spec.multiSite cannot be added to or removed from an existing instance: converting between single-site and stretched topology is not supported; create a new instance instead"
+// +kubebuilder:validation:XValidation:rule="!has(self.multiSite) || !has(self.cluster) || !has(oldSelf.cluster) || self.cluster.shards == oldSelf.cluster.shards",message="spec.cluster.shards is immutable while spec.multiSite is set: the multi-site topology is fixed for an instance's lifetime"
 type LittleRedSpec struct {
 	// Mode is the deployment mode: standalone, sentinel, cluster, or failover (experimental)
 	// +kubebuilder:validation:Enum=standalone;sentinel;cluster;failover
@@ -578,27 +585,65 @@ type ClusterSpec struct {
 // MultiSiteSpec configures a stretched Redis Cluster across multiple sites
 // (workload Kubernetes clusters), managed hub-and-spokes by one operator.
 // Cluster mode only. See docs/MULTI_SITE_DESIGN.md and ADR-012.
-// +kubebuilder:validation:XValidation:rule="!has(self.sitesPerShard) || self.sitesPerShard <= self.sites.size()",message="spec.multiSite.sitesPerShard cannot exceed the number of sites"
+// +kubebuilder:validation:XValidation:rule="self.sitesPerShard <= self.sites.size()",message="spec.multiSite.sitesPerShard cannot exceed the number of sites"
 // +kubebuilder:validation:XValidation:rule="self.sites.filter(s, !has(s.kubeconfigSecretRef)).size() <= 1",message="at most one site may be hub-local (kubeconfigSecretRef omitted)"
+//
+// Site names must be unique. This was previously enforced for free by the sites
+// list being a listType=map keyed on name; LR-033 made the list ATOMIC (its ORDER
+// is load-bearing — it is the round-robin placement input — which is exactly what
+// a map-typed list declares to be insignificant), so uniqueness is now an explicit
+// rule. It is still load-bearing beyond tidiness: the site name is the operator's
+// ground-truth key (siteQualifiedKey), so duplicates would collide observations.
+// Quadratic, but MaxItems=16 keeps it far inside the CEL cost budget.
+// +kubebuilder:validation:XValidation:rule="self.sites.all(s, self.sites.filter(x, x.name == s.name).size() == 1)",message="spec.multiSite.sites names must be unique"
+//
+// The multi-site TOPOLOGY is immutable for an instance's lifetime (LR-032): the
+// round-robin placement (shard K -> sites (K+j) mod S) is index-based, so adding,
+// removing or reordering a site remaps shards onto different sites — a relocation
+// of live members, for which no mechanism exists (EmptyDir storage, pillar 3.1).
+// Pinned here at admission rather than refused at runtime, because a runtime
+// detector would have to distinguish "site added" from "site temporarily
+// unobservable" and would fire during the very outage recoverSiteLoss must handle.
+// Only the site NAMES and their ORDER are pinned; a site's kubeconfigSecretRef
+// stays mutable so Secret rotation remains possible. sitesPerShard is a plain
+// equality comparison because it is required and never defaulted (LR-033) — the
+// stored spec always equals the effective value.
+// +kubebuilder:validation:XValidation:rule="self.sites.map(s, s.name) == oldSelf.sites.map(s, s.name)",message="spec.multiSite.sites is immutable: the site list (names and order) is fixed for an instance's lifetime — adding, removing or reordering sites remaps shard placement onto different sites and is not supported; create a new instance instead"
+// +kubebuilder:validation:XValidation:rule="self.sitesPerShard == oldSelf.sitesPerShard",message="spec.multiSite.sitesPerShard is immutable: changing it re-places every shard across sites and would orphan the per-site StatefulSets it moves away from"
 type MultiSiteSpec struct {
 	// Sites lists the workload Kubernetes clusters hosting Redis pods of this
 	// instance. At least 2 sites are required (sitesPerShard >= 2 is what lets
 	// the design descope single-site-loss data repair); site names must be
 	// unique. At most one site may be hub-local (kubeconfigSecretRef omitted).
+	//
+	// ORDER IS SIGNIFICANT: a site's position in this list is its placement
+	// index — shard K is hosted by sites (K+j) mod S for j < sitesPerShard — so
+	// the list is an ordered sequence of objects, keyed by position, and is
+	// declared listType=atomic accordingly (LR-033). It was previously
+	// listType=map keyed on name, which tells the API machinery the opposite:
+	// that entries are identified by name and order carries no meaning (CEL
+	// equality on such a list is order-blind, and a server-side-apply merge is
+	// free to reorder it — which would silently re-place every shard).
 	// +kubebuilder:validation:MinItems=2
 	// +kubebuilder:validation:MaxItems=16
-	// +listType=map
-	// +listMapKey=name
+	// +listType=atomic
 	Sites []SiteSpec `json:"sites"`
 
-	// SitesPerShard is how many sites host each shard. Defaults to the number
-	// of sites (every site hosts every shard); pinning it at 2 or 3 with many
-	// sites scales out capacity instead of multiplying copies. Must be between
-	// 2 and the number of sites. Total members per shard =
-	// sitesPerShard x (replicasPerShard + 1).
+	// SitesPerShard is how many sites host each shard. REQUIRED and immutable —
+	// deliberately not defaulted (LR-033). This is the copy-factor knob of a
+	// RAM-resident store: total members per shard = sitesPerShard x
+	// (replicasPerShard + 1), so it sets the memory bill, the cross-site
+	// replication traffic, and how many simultaneous site losses the data
+	// survives. Every candidate default is wrong for somebody — the number of
+	// sites multiplies copies as sites are added, a constant is arbitrary — and a
+	// default would also hide the knob from the reader of a CR. Choose it once, at
+	// creation. 2 keeps the design's contract (survive one site loss) at the
+	// lowest cost and lets further sites scale capacity rather than copies; a
+	// higher value buys more simultaneous site losses. Must be between 2 and the
+	// number of sites.
 	// +kubebuilder:validation:Minimum=2
-	// +optional
-	SitesPerShard int `json:"sitesPerShard,omitempty"`
+	// +kubebuilder:validation:Required
+	SitesPerShard int `json:"sitesPerShard"`
 
 	// Network selects the cross-site replication transport.
 	// +optional
@@ -617,8 +662,14 @@ type MultiSiteSpec struct {
 // SiteSpec identifies one site (workload Kubernetes cluster) of a multi-site
 // instance.
 type SiteSpec struct {
-	// Name is the site's unique name within this instance.
+	// Name is the site's unique name within this instance. It is the operator's
+	// ground-truth key for everything observed in the site (siteQualifiedKey) and
+	// is surfaced in status, so keep it a short identifier. The upper bound is not
+	// cosmetic: CEL cost estimation assumes the declared maximum for every string
+	// comparison, and the uniqueness rule compares names pairwise — without a
+	// MaxLength the CRD is rejected for exceeding the rule-cost budget.
 	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
 	Name string `json:"name"`
 
 	// KubeconfigSecretRef names a Secret in the operator namespace holding a
@@ -1208,7 +1259,13 @@ func (r *LittleRed) validateMultiSite() error {
 		return fmt.Errorf("at most one site may be hub-local (kubeconfigSecretRef omitted); found %d", hubLocal)
 	}
 
-	if ms.SitesPerShard != 0 && (ms.SitesPerShard < 2 || ms.SitesPerShard > len(ms.Sites)) {
+	// Required, never defaulted (LR-033): 0 means "the user did not choose", which is
+	// an error here, not a cue to pick for them. The CRD schema rejects it at
+	// admission; this mirror covers objects that predate the requirement.
+	if ms.SitesPerShard == 0 {
+		return fmt.Errorf("spec.multiSite.sitesPerShard is required (between 2 and the number of sites, %d): it sets how many copies of each shard exist, so it is not defaulted", len(ms.Sites))
+	}
+	if ms.SitesPerShard < 2 || ms.SitesPerShard > len(ms.Sites) {
 		return fmt.Errorf("spec.multiSite.sitesPerShard must be between 2 and the number of sites (%d), got %d", len(ms.Sites), ms.SitesPerShard)
 	}
 

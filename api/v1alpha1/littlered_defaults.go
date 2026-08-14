@@ -215,13 +215,16 @@ func (r *LittleRed) SetDefaults() {
 	}
 }
 
-// SetDefaults applies default values to MultiSiteSpec. sitesPerShard defaults
-// dynamically to the number of sites (every site hosts every shard), so it
-// cannot be a static CRD default marker.
+// SetDefaults applies default values to MultiSiteSpec.
+//
+// sitesPerShard is deliberately NOT defaulted (LR-033) — it is required. It used
+// to default dynamically to the number of sites, which had to live here rather
+// than in a +kubebuilder:default marker (a CRD default is a constant), and that
+// dynamism was the whole problem: the stored spec diverged from the effective
+// value, the reconciler's own finalizer Update persisted the computed default
+// back into the user's spec, and a later change to the rule would silently
+// re-place shards on existing instances. A required field has none of that.
 func (m *MultiSiteSpec) SetDefaults() {
-	if m.SitesPerShard == 0 {
-		m.SitesPerShard = len(m.Sites)
-	}
 	if m.Network.Mode == "" {
 		m.Network.Mode = MultiSiteNetworkModePodRouted
 	}

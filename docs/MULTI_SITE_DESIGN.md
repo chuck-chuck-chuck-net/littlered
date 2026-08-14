@@ -52,6 +52,19 @@ survive a site loss deploy the hub accordingly.
   deferred (§9).
 - **Two sites initially, three or more supported by the same design.** The failure
   model differs materially between the two (§6) — this is documented, not hidden.
+- **Non-goal: changing the topology of a running instance.** The site list,
+  `sitesPerShard`, and (in multi-site) `shards` are **fixed for an instance's
+  lifetime**. Growth and shrink are *both* out of scope, for the same reason: the
+  round-robin placement is **index-based** (shard K → sites `(K+j) mod S`), so any
+  change to `S` — including appending a site at the end — re-maps existing shards onto
+  *different* sites. That is a **relocation of live members**, not an addition: cluster
+  storage is EmptyDir (pillar 3.1) and no member-relocation mechanism exists (LR-025's
+  replicate-then-failover primitive is wired for the legacy migration only), so the
+  members left behind can only be orphaned. Enforced at admission by CRD transition
+  rules (§7, LR-032); to change the topology, create a new instance and migrate at the
+  application level. This was never a stated requirement — it is spelled out here
+  because the absence of a statement read, to a reader of the code, like an open
+  question.
 
 ## 3. Architecture: hub-and-spokes, flat control
 
@@ -109,8 +122,15 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   a dual-site instance yields 4 members per shard (1 master + 3 replicas), not 2 — the
   docs must state the total-member formula `sitesPerShard × (replicasPerShard + 1)`
   prominently. A future rename remains possible if the name proves too surprising.
-- `sitesPerShard` selects **how many sites host each shard** (default: all sites, i.e.
-  every site hosts every shard). With many sites, pinning `sitesPerShard` at 2 or 3
+- `sitesPerShard` selects **how many sites host each shard**. It is **required and not
+  defaulted** (LR-033): it is the *copy factor* of a RAM-resident store — members per
+  shard = `sitesPerShard × (replicasPerShard + 1)` — so it sets the memory bill, the
+  cross-site replication traffic, and how many simultaneous site losses the data
+  survives. Every candidate default is wrong for somebody: defaulting to the number of
+  sites makes *adding a site multiply copies* (and is the opposite of the advice below),
+  while any constant is arbitrary. A default would also hide the knob from the reader of
+  a CR; requiring it advertises that it is a choice. `2` keeps this design's contract
+  (survive one site loss) at the lowest cost; with many sites, pinning it at 2 or 3
   scales out capacity instead of multiplying copies. Assignment is a deterministic
   round-robin over the ordered site list (shard K → sites `(K+j) mod S` for
   `j < sitesPerShard`), evening out capacity when shards don't divide evenly by sites.
@@ -120,6 +140,24 @@ Extends the per-shard StatefulSet model (ADR-007) with a site dimension:
   data repair entirely (no orphan-slot adoption, no lossy re-seeding — the repair
   families a `sitesPerShard: 1` topology would force us to build). Not a placeholder
   restriction; permitting 1 would re-import that machinery.
+- **The site list's ORDER is load-bearing, and the whole placement input is immutable.**
+  Placement keys off each site's *index* in `spec.multiSite.sites`, so reordering the
+  list re-maps shards just as surely as adding or removing one. Worked example — a
+  2-site instance with `shards: 4, sitesPerShard: 2` (every shard in both sites) gaining
+  a third site: shard 1's desired sites become `{B, C}` and shard 2's `{C, A}`, so the
+  existing `A/shard-1` and `B/shard-2` StatefulSets are no longer wanted while still
+  holding their shards' slot data. This is why the site list, `sitesPerShard`, and
+  `shards` are pinned immutable at admission (§2 non-goal, §7, LR-032) rather than
+  refused at runtime: the CRD rule pins site **names and order** (a site's
+  `kubeconfigSecretRef` stays mutable so Secret rotation still works).
+  Correspondingly, `sites` is declared **`listType=atomic`** (LR-033) — an ordered
+  sequence of objects keyed by position, which is what the placement actually treats it
+  as. It was previously `listType=map` keyed on `name`, which declares the opposite
+  (entries identified by name, order insignificant): under that marker CEL equality on
+  the list is order-blind, and a server-side-apply merge is free to reorder it — which
+  would silently re-place every shard. Site-name uniqueness, previously a free
+  side effect of the map key, is now an explicit CEL rule; it stays load-bearing because
+  the site name is the operator's ground-truth key (`siteQualifiedKey`).
 - **Roles are fluid** (pillar 3.5): the operator places pods and wires initial
   replication so that each shard has members in multiple sites, then lets Redis
   Cluster elect and move masters as it sees fit. The operator observes; it does not
@@ -253,17 +291,33 @@ spec:
     shards: 3
     replicasPerShard: 1       # per-site STS size = replicasPerShard + 1 (see §4)
   multiSite:
-    sites:
+    sites:                    # ORDER IS THE PLACEMENT INDEX (shard K → sites (K+j) mod S)
       - name: alpha
         kubeconfigSecretRef: {name: site-alpha-kubeconfig}   # omitted ⇒ hub-local site
       - name: beta
         kubeconfigSecretRef: {name: site-beta-kubeconfig}
-    sitesPerShard: 2          # default: number of sites; how many sites host each shard
+    sitesPerShard: 2          # REQUIRED, no default; how many sites host each shard
     network:
       mode: pod-routed        # future: nodeport | multus
 ```
 
 - Absent `multiSite` ⇒ existing single-site behavior, unchanged.
+- **Topology fields are immutable (LR-032).** CRD transition rules (CEL `oldSelf`)
+  reject, at admission: adding/removing/reordering `sites`; changing `sitesPerShard`;
+  changing `cluster.shards` while `multiSite` is set; and adding or removing the
+  `multiSite` block itself (single-site ⇄ stretched conversion). Mutable: everything
+  else, including each site's `kubeconfigSecretRef` (Secret rotation) and
+  `allowUnsafeSiteTakeover`. The `sitesPerShard` rule is plain equality, because the
+  field is required and never defaulted (LR-033) — the stored spec always equals the
+  effective value. (While it *was* dynamically defaulted, the rule had to compare
+  *effective* values, absent ⇒ `sites.size()`: the reconciler's finalizer `Update`
+  carries the defaulted spec, so a naive comparison would have rejected the operator's
+  own first write and deadlocked every fresh instance. Removing the default removed the
+  hazard rather than working around it.) Admission is the right
+  layer here: a *runtime* detector would have to tell "a site was added" apart from "a
+  site is temporarily unobservable", and would therefore risk refusing during the very
+  site outage `recoverSiteLoss` exists to handle. The runtime LR-028 scale-down guard
+  stays as defence in depth for drift these rules cannot see (§10 item 7).
 - `kubeconfigSecretRef` names a Secret in the operator namespace holding a kubeconfig
   whose credentials are bound to a **namespaced Role** in the target site — workload
   CRUD + pod read in the instance namespace, not cluster-admin, and **nothing
@@ -403,6 +457,20 @@ Remaining field-shape details are settled in the ADR, not here.
    therefore **drain a site via a `sitesPerShard` reduction (or manual cleanup)
    *before* deleting its entry** from `spec.multiSite.sites`; removing the entry
    first strands that site's data silently.
+
+   **Superseded as the primary defence by LR-032; retained as defence in depth.**
+   All three shrink dimensions — and the *growth* dimensions this guard never covered
+   — are now rejected at **admission** by the CRD transition rules (§2 non-goal, §7),
+   so they cannot reach the reconciler at all. That closes the observability
+   limitation above as a practical matter (a site entry can no longer be removed) and,
+   more importantly, closes the asymmetry this guard had: it refused shrinks but
+   *permitted* an additive site growth (a CR with `sitesPerShard` unset defaults it to
+   `len(sites)`, so adding a site made the desired set a strict **superset** of the
+   observed one — zero orphans, guard passes, and the operator would happily half-build
+   an undesigned topology). The guard stays because admission rules cannot see
+   everything: hand-created or hand-edited StatefulSets, an instance whose CRD predates
+   these rules, or a cluster where CEL validation is unavailable. It is now a drift net,
+   not the topology-change policy.
 8. **Operator self-namespace for out-of-cluster runs.** The site-kubeconfig Secret
    lookup needs the operator's own namespace; in-cluster the ServiceAccount namespace
    file resolves it, but an out-of-cluster hub (e.g. during development before the

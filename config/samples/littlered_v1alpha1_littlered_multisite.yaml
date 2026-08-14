@@ -49,6 +49,11 @@ spec:
     # The workload Kubernetes clusters hosting this instance's Redis pods. Minimum 2; names
     # unique. Each kubeconfigSecretRef names a Secret in the operator namespace on the hub.
     # Omit kubeconfigSecretRef for a hub-local site (at most one).
+    #
+    # ORDER MATTERS: a site's position is its placement index (shard K is hosted by sites
+    # (K+j) mod S). The list, sitesPerShard and shards are IMMUTABLE for the instance's
+    # lifetime -- changing any of them would relocate live shard members across sites, and
+    # cluster storage is EmptyDir. To change the topology, create a new instance.
     sites:
       - name: alpha
         kubeconfigSecretRef:
@@ -57,7 +62,11 @@ spec:
         kubeconfigSecretRef:
           name: site-beta
     # How many sites host each shard (round-robin over the ordered site list).
-    # Must be 2 <= sitesPerShard <= len(sites). Defaults to the number of sites.
+    # REQUIRED -- deliberately not defaulted: this is the copy factor of an in-memory
+    # store (members per shard = sitesPerShard * (replicasPerShard + 1)), so it sets the
+    # memory bill and how many simultaneous site losses the data survives. 2 keeps the
+    # design's contract (survive one site loss) at the lowest cost and lets further sites
+    # scale capacity rather than copies. Must be 2 <= sitesPerShard <= len(sites).
     sitesPerShard: 2
     network:
       # Only "pod-routed" is supported (nodeport | multus are future transports).

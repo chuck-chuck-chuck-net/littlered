@@ -514,10 +514,10 @@ shard (1 master + 3 replicas), not 2.
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `multiSite` | `MultiSite` | No | `nil` | Stretch the cluster across sites. Cluster mode only. Absent = single-site. |
-| `multiSite.sites` | `[]Site` | Yes (if `multiSite` set) | — | The sites hosting this instance's Redis pods. Minimum 2; names unique; at most one hub-local. |
-| `multiSite.sites[].name` | `string` | Yes | — | Unique site name within the instance. |
+| `multiSite.sites` | `[]Site` | Yes (if `multiSite` set) | — | The sites hosting this instance's Redis pods. Minimum 2 (max 16); names unique; at most one hub-local. **Order is significant** — a site's position is its placement index (shard K → sites `(K+j) mod S`), so the list is `listType=atomic`. **Immutable** — sites cannot be added, removed, or reordered after creation. |
+| `multiSite.sites[].name` | `string` | Yes | — | Unique site name within the instance (1–63 chars). It is the operator's ground-truth key for everything observed in that site. |
 | `multiSite.sites[].kubeconfigSecretRef.name` | `string` | No | — | Name of a Secret in the operator namespace holding the site kubeconfig (`kubeconfig` key). Omit entirely for a hub-local site. |
-| `multiSite.sitesPerShard` | `int` | No | number of sites | How many sites host each shard (round-robin over the ordered site list). Must be `2 ≤ sitesPerShard ≤ len(sites)`. `sitesPerShard = N+1` tolerates N site losses without data loss. |
+| `multiSite.sitesPerShard` | `int` | **Yes** | — (deliberately no default) | How many sites host each shard (round-robin over the ordered site list). Must be `2 ≤ sitesPerShard ≤ len(sites)`. This is the **copy factor**: members per shard = `sitesPerShard × (replicasPerShard + 1)`, and `sitesPerShard = N+1` tolerates N site losses without data loss. Required rather than defaulted because it sets the memory bill of an in-memory store — `2` is the cheapest value satisfying the design's one-site-loss contract. **Immutable** after creation (changing it re-places every shard). |
 | `multiSite.network.mode` | `string` (enum: `pod-routed`) | No | `pod-routed` | Cross-site replication transport. Only `pod-routed` (routed pod CIDRs between all sites) is supported; `nodeport` and `multus` are future transports and are rejected. |
 | `multiSite.allowUnsafeSiteTakeover` | `bool` | No | `false` | Permit an operator-led site-loss takeover when the fence argument is unavailable (the lost side could hold a serving master majority). With it unset the operator refuses (drift-refusal) and waits for Kubernetes-confirmed death or a human. See ADR-012. |
 
@@ -1300,9 +1300,10 @@ type ConfigSpec struct {
 | `failover.replicas` must be ≥ 1; `failover.minReplicasToWrite` must be ≥ 0 | Enforced by the CRD schema, mirrored in controller validation |
 | `spec.placement.shardAntiAffinity` rejected unless `mode: cluster` (failover included) | Validation failure |
 | `spec.multiSite` only allowed with `mode: cluster` (CEL rule on the CRD, mirrored in controller validation) | Rejected at admission |
-| `spec.multiSite.sites` must have ≥ 2 entries; names unique and non-empty; a present `kubeconfigSecretRef` must name a non-empty Secret; at most one hub-local site | Enforced by the CRD schema (MinItems, listType=map, MinLength, CEL) and mirrored in controller validation |
-| `spec.multiSite.sitesPerShard` must be `2 ≤ sitesPerShard ≤ len(sites)` | CRD Minimum=2 + CEL upper bound, mirrored in controller validation |
+| `spec.multiSite.sites` must have 2–16 entries; names unique, non-empty and ≤ 63 chars; a present `kubeconfigSecretRef` must name a non-empty Secret; at most one hub-local site | Enforced by the CRD schema (MinItems/MaxItems, MinLength/MaxLength, CEL) and mirrored in controller validation. Uniqueness is an explicit CEL rule: the list is `listType=atomic` because its order is the placement input, so there is no map key to enforce it |
+| `spec.multiSite.sitesPerShard` is **required** and must be `2 ≤ sitesPerShard ≤ len(sites)` | CRD Required + Minimum=2 + CEL upper bound, mirrored in controller validation. Not defaulted: it is the copy factor of an in-memory store, so it must be chosen explicitly |
 | `spec.multiSite.network.mode` must be `pod-routed` | CRD enum (nodeport/multus rejected), mirrored in controller validation |
+| **Topology is immutable** (LR-032): `spec.multiSite.sites` (names *and* order), `spec.multiSite.sitesPerShard`, `spec.cluster.shards` while `multiSite` is set, and the presence of the `multiSite` block itself cannot change after creation | CRD CEL **transition rules** (`oldSelf`) — rejected at admission on update. Placement is index-based, so any change relocates live shard members across sites over EmptyDir storage. Create a new instance instead. A site's `kubeconfigSecretRef` stays mutable (Secret rotation) |
 | `cluster.shards` must be ≥ `3` | Enforced by the CRD schema (minimum 3, default 3) and mirrored in controller validation (`cluster mode requires at least 3 shards`) |
 | `cluster.replicasPerShard` must be `0` or `1` | Currently only 0 or 1 replica per shard supported |
 | `maxmemory` must parse as quantity | Invalid memory format |

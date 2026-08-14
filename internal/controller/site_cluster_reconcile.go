@@ -60,12 +60,18 @@ func multiSiteSiteNames(lr *littleredv1alpha1.LittleRed) []string {
 	return names
 }
 
-// multiSiteParams resolves the shard/replica/sitesPerShard triplet with defaults applied.
+// multiSiteParams resolves the shard/replica/sitesPerShard triplet. shards and
+// replicasPerShard carry CRD defaults; sitesPerShard is required (LR-033) and is read
+// as given, clamped only to the site count.
 func multiSiteParams(lr *littleredv1alpha1.LittleRed) (shards, replicasPerShard, sitesPerShard int) {
 	shards = clusterShardCount(lr)
 	replicasPerShard = clusterReplicasPerShard(lr.Spec.Cluster)
-	sitesPerShard = len(multiSiteSiteNames(lr))
-	if lr.Spec.MultiSite != nil && lr.Spec.MultiSite.SitesPerShard > 0 {
+	// sitesPerShard is required and never defaulted (LR-033) — read it, do not
+	// invent one. A zero here means a spec that never passed validation, and
+	// silently substituting len(sites) would be exactly the hidden copy-factor
+	// decision the field is required in order to avoid; the placement then yields
+	// no pods, which surfaces as an obvious failure rather than a silent topology.
+	if lr.Spec.MultiSite != nil {
 		sitesPerShard = lr.Spec.MultiSite.SitesPerShard
 	}
 	if sitesPerShard > len(multiSiteSiteNames(lr)) {
@@ -915,7 +921,8 @@ func (r *LittleRedReconciler) reconcileReducedResilienceCondition(lr *littleredv
 	})
 }
 
-// multiSiteSitesPerShard is the resolved sitesPerShard (defaults applied).
+// multiSiteSitesPerShard is the spec's sitesPerShard, clamped to the site count.
+// It is required and never defaulted (LR-033).
 func multiSiteSitesPerShard(lr *littleredv1alpha1.LittleRed) int {
 	_, _, sps := multiSiteParams(lr)
 	return sps
@@ -994,11 +1001,14 @@ func (r *LittleRedReconciler) reportMultiSiteScaleDown(ctx context.Context, lr *
 	}
 	sort.Strings(names) // stable message/event regardless of per-site List order
 	shards, _, sps := multiSiteParams(lr)
-	msg := fmt.Sprintf("Refusing multi-site topology shrink (shards=%d, sitesPerShard=%d): per-site "+
-		"shard StatefulSet(s) %s would be orphaned and their slots (and data) lost. Cluster storage "+
-		"is EmptyDir and there is no reshard-away path; LittleRed never deletes data by default. "+
-		"Restore spec.cluster.shards / spec.multiSite.sitesPerShard / the removed site(s), or migrate "+
-		"the data and delete the orphaned StatefulSet(s) manually.", shards, sps, strings.Join(names, ", "))
+	msg := fmt.Sprintf("Refusing multi-site topology change (shards=%d, sitesPerShard=%d): per-site "+
+		"shard StatefulSet(s) %s are not part of the desired placement and would be orphaned, losing "+
+		"their slots (and data). Cluster storage is EmptyDir and there is no member-relocation path; "+
+		"LittleRed never deletes data by default. The multi-site topology is fixed for an instance's "+
+		"lifetime (see docs/MULTI_SITE_DESIGN.md §2), so this is drift the CRD immutability rules did "+
+		"not catch: restore spec.cluster.shards / spec.multiSite.sites / spec.multiSite.sitesPerShard "+
+		"to the topology these StatefulSets belong to, or migrate the data and delete them manually.",
+		shards, sps, strings.Join(names, ", "))
 
 	log := r.getLogger(ctx, lr, LogCategoryRecon)
 	log.Info("Refusing multi-site scale-down", "orphans", names)

@@ -91,7 +91,10 @@ func clusterReplicasPerShard(cluster *littleredv1alpha1.ClusterSpec) int {
 func clusterRepairExpectedReplicas(lr *littleredv1alpha1.LittleRed) int {
 	if isMultiSite(lr) {
 		_, rps, sps := multiSiteParams(lr)
-		return sps*(rps+1) - 1
+		// sitesPerShard is required (LR-033); a zero is a spec that never passed
+		// validation. Clamp rather than return a negative expected-replica count,
+		// which would be a stranger input to the repair loop than "expect none".
+		return max(sps*(rps+1)-1, 0)
 	}
 	if lr.Spec.Cluster == nil || lr.Spec.Cluster.ReplicasPerShard == nil {
 		return 1

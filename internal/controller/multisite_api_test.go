@@ -74,7 +74,8 @@ var _ = Describe("MultiSite CRD validation", func() {
 
 	It("rejects multiSite outside cluster mode", func() {
 		lr := newMultiSiteCR(ModeStandalone, &littleredv1alpha1.MultiSiteSpec{
-			Sites: []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
 		})
 		err := k8sClient.Create(ctx, lr)
 		Expect(err).To(HaveOccurred())
@@ -83,14 +84,16 @@ var _ = Describe("MultiSite CRD validation", func() {
 
 	It("rejects fewer than 2 sites", func() {
 		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
-			Sites: []littleredv1alpha1.SiteSpec{remote("alpha", "a")},
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a")},
+			SitesPerShard: 2,
 		})
 		Expect(k8sClient.Create(ctx, lr)).NotTo(Succeed())
 	})
 
 	It("rejects duplicate site names", func() {
 		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
-			Sites: []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("alpha", "b")},
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("alpha", "b")},
+			SitesPerShard: 2,
 		})
 		Expect(k8sClient.Create(ctx, lr)).NotTo(Succeed())
 	})
@@ -113,23 +116,133 @@ var _ = Describe("MultiSite CRD validation", func() {
 
 	It("rejects a second hub-local site", func() {
 		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
-			Sites: []littleredv1alpha1.SiteSpec{hubLocal("alpha"), hubLocal("beta")},
+			Sites:         []littleredv1alpha1.SiteSpec{hubLocal("alpha"), hubLocal("beta")},
+			SitesPerShard: 2,
 		})
 		Expect(k8sClient.Create(ctx, lr)).NotTo(Succeed())
 	})
 
 	It("rejects the future network mode nodeport", func() {
 		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
-			Sites:   []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
-			Network: littleredv1alpha1.MultiSiteNetworkSpec{Mode: "nodeport"},
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+			Network:       littleredv1alpha1.MultiSiteNetworkSpec{Mode: "nodeport"},
 		})
 		Expect(k8sClient.Create(ctx, lr)).NotTo(Succeed())
 	})
 
 	It("rejects an empty kubeconfigSecretRef name", func() {
 		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
-			Sites: []littleredv1alpha1.SiteSpec{remote("alpha", ""), remote("beta", "b")},
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", ""), remote("beta", "b")},
+			SitesPerShard: 2,
 		})
 		Expect(k8sClient.Create(ctx, lr)).NotTo(Succeed())
+	})
+
+	// --- Topology immutability (LR-032) ---------------------------------------
+	//
+	// The multi-site topology is FIXED for an instance's lifetime. The round-robin
+	// placement (shard K -> sites (K+j) mod S) is INDEX-based, so adding, removing
+	// or reordering a site remaps shards onto different sites — a RELOCATION of
+	// live members, not an addition. Cluster storage is EmptyDir and there is no
+	// member-relocation mechanism (LR-025's replicate-then-failover primitive is
+	// wired for the legacy migration only), so a relocation can only orphan data.
+	// Topology growth was never a stated requirement (MULTI_SITE_DESIGN.md §4
+	// non-goal); these transition rules make that non-goal enforceable at
+	// ADMISSION, before the operator can half-build the new topology. The runtime
+	// LR-028 scale-down guard stays as defence in depth for drift it can observe.
+	create := func(ms *littleredv1alpha1.MultiSiteSpec) *littleredv1alpha1.LittleRed {
+		lr := newMultiSiteCR(ModeCluster, ms)
+		Expect(k8sClient.Create(ctx, lr)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, lr) })
+		return lr
+	}
+
+	It("rejects adding a site to an existing instance", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.MultiSite.Sites = append(lr.Spec.MultiSite.Sites, remote("gamma", "c"))
+		err := k8sClient.Update(ctx, lr)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("immutable"))
+	})
+
+	It("rejects removing a site from an existing instance", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b"), remote("gamma", "c")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.MultiSite.Sites = lr.Spec.MultiSite.Sites[:2]
+		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+	})
+
+	It("rejects reordering the site list (placement is index-based)", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.MultiSite.Sites = []littleredv1alpha1.SiteSpec{remote("beta", "b"), remote("alpha", "a")}
+		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+	})
+
+	It("rejects changing sitesPerShard", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b"), remote("gamma", "c")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.MultiSite.SitesPerShard = 3
+		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+	})
+
+	It("rejects changing cluster.shards while multiSite is set", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.Cluster.Shards = 6
+		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+	})
+
+	It("rejects adding multiSite to an existing single-site instance", func() {
+		lr := create(nil)
+		lr.Spec.MultiSite = &littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		}
+		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+	})
+
+	It("rejects removing multiSite from an existing stretched instance", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.MultiSite = nil
+		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+	})
+
+	// LR-033: sitesPerShard is REQUIRED, so there is no dynamic default for the
+	// operator to persist behind the user's back — the stored spec always equals the
+	// effective value, and the immutability rule above is plain equality.
+	It("rejects a CR without sitesPerShard", func() {
+		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
+			Sites: []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+		})
+		err := k8sClient.Create(ctx, lr)
+		Expect(err).To(HaveOccurred())
+		Expect(err.Error()).To(ContainSubstring("sitesPerShard"))
+	})
+
+	// Immutability pins the site NAMES and their ORDER — the placement inputs.
+	// Rotating a site's kubeconfig Secret is an operational necessity and stays open.
+	It("allows changing a site's kubeconfigSecretRef", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.MultiSite.Sites[1].KubeconfigSecretRef = &littleredv1alpha1.KubeconfigSecretRef{Name: "site-beta-rotated"}
+		Expect(k8sClient.Update(ctx, lr)).To(Succeed())
 	})
 })
