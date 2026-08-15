@@ -24,6 +24,7 @@ limitations under the License.
 //	lrharness rollup     --array A --total N        # NDJSON on stdin -> summary
 //	lrharness render-job --worklist F --namespace NS --image IMG [--parallelism P]
 //	lrharness images     --worklist F --driver-image I ...   # one ref per line
+//	lrharness check-parked --array A --worklist F            # `kubectl get ns -o json` on stdin
 package main
 
 import (
@@ -31,6 +32,7 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -53,6 +55,8 @@ func main() {
 		err = cmdRecord(os.Args[2:])
 	case "rollup":
 		err = cmdRollup(os.Args[2:])
+	case "check-parked":
+		err = cmdCheckParked(os.Args[2:])
 	case "images":
 		err = cmdImages(os.Args[2:])
 	case "render-job":
@@ -83,6 +87,9 @@ func usage() {
   render     --worklist F --namespace NS --image IMG [--parallelism P]
              (namespace + RBAC + work-list ConfigMap + Job, as one manifest)
   render-job --worklist F --namespace NS --image IMG   (the Job alone)
+  check-parked --array A --worklist F
+             (reads "kubectl get ns -o json" on stdin; exits 1, with the
+              refusal, if the array has PARKED namespaces from an earlier run)
   images     --worklist F [--driver-image I] [--operator-image O]
              [--chaos-client-image C]
              (every image ref the array pins, one per line — what a launch
@@ -220,6 +227,59 @@ func cmdRollup(args []string) error {
 	return nil
 }
 
+// cmdCheckParked refuses a launch that would clobber parked evidence. The
+// cluster lookup stays in the recipe; everything decided here comes from the
+// pure seam.
+func cmdCheckParked(args []string) error {
+	fs := flag.NewFlagSet("check-parked", flag.ExitOnError)
+	array := fs.String("array", "", "array name")
+	path := fs.String("worklist", "", "work list path, for the remediation command")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *array == "" {
+		return fmt.Errorf("--array is required")
+	}
+
+	// The shape of `kubectl get namespaces -o json`, reduced to the stamps.
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name        string            `json:"name"`
+				Labels      map[string]string `json:"labels"`
+				Annotations map[string]string `json:"annotations"`
+			} `json:"metadata"`
+		} `json:"items"`
+	}
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("reading the namespace list: %w", err)
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		// No namespaces at all is the normal case for a fresh array.
+		fmt.Printf("no parked namespaces for array %q\n", *array)
+		return nil
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return fmt.Errorf("parsing the namespace list: %w", err)
+	}
+
+	observed := make([]worklist.ObservedNamespace, 0, len(list.Items))
+	for _, it := range list.Items {
+		observed = append(observed, worklist.ObserveNamespace(
+			it.Metadata.Name, it.Metadata.Labels, it.Metadata.Annotations))
+	}
+
+	blockers := worklist.LaunchBlockers(*array, observed)
+	if len(blockers) == 0 {
+		fmt.Printf("no parked namespaces for array %q\n", *array)
+		return nil
+	}
+	fmt.Fprint(os.Stderr, worklist.RefusalMessage(*array, *path, blockers))
+	os.Exit(1)
+	return nil
+}
+
 // cmdImages lists every image reference the array pins. The Makefile feeds the
 // list to a registry lookup before applying the Job, so a missing ref is one
 // sentence at launch instead of N identical ImagePullBackOff timeouts mid-array.
@@ -261,6 +321,8 @@ func cmdRender(args []string, bundle bool) error {
 	hostPath := fs.String("artifacts-hostpath", "", "node path backing the artifact volume")
 	gitTag := fs.String("git-tag", "", "image tag the suite resolves its images from")
 	registry := fs.String("registry", "", "LITTLERED_REGISTRY override for the run")
+	clobber := fs.Bool("allow-parked-clobber", false,
+		"let the driver delete a PARKED namespace of this array (evidence loss; off by default)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -274,17 +336,18 @@ func cmdRender(args []string, bundle bool) error {
 	}
 
 	jp := worklist.JobParams{
-		List:              l,
-		Namespace:         *namespace,
-		Image:             *image,
-		ImagePullPolicy:   *pullPolicy,
-		Parallelism:       *parallelism,
-		ServiceAccount:    *sa,
-		WorkListName:      *cmName,
-		ArtifactsPVC:      *pvc,
-		ArtifactsHostPath: *hostPath,
-		GitTag:            *gitTag,
-		Registry:          *registry,
+		List:               l,
+		Namespace:          *namespace,
+		Image:              *image,
+		ImagePullPolicy:    *pullPolicy,
+		Parallelism:        *parallelism,
+		ServiceAccount:     *sa,
+		WorkListName:       *cmName,
+		ArtifactsPVC:       *pvc,
+		ArtifactsHostPath:  *hostPath,
+		GitTag:             *gitTag,
+		Registry:           *registry,
+		AllowParkedClobber: *clobber,
 	}
 
 	var out string

@@ -452,6 +452,10 @@ type JobParams struct {
 	// refs from. The driver image holds no .git, so the Makefile cannot derive
 	// it in-pod; the array pins one tag for every item (design §6).
 	GitTag string
+	// AllowParkedClobber lets the DRIVER delete a parked namespace of this array.
+	// Off by default and never implied: parked namespaces are the entire product
+	// of a failed item.
+	AllowParkedClobber bool
 	// Registry overrides LITTLERED_REGISTRY for the run — e.g. a LAN registry
 	// for a lab array — without touching the repo's committed public default.
 	Registry string
@@ -475,18 +479,19 @@ func RenderJob(p JobParams) (string, error) {
 	}
 
 	d := jobTemplateData{
-		Array:             p.List.Array,
-		Namespace:         p.Namespace,
-		Image:             p.Image,
-		ImagePullPolicy:   firstNonEmpty(p.ImagePullPolicy, "IfNotPresent"),
-		Completions:       len(p.List.Items),
-		Parallelism:       p.Parallelism,
-		ServiceAccount:    firstNonEmpty(p.ServiceAccount, "lr-e2e-harness"),
-		WorkListName:      firstNonEmpty(p.WorkListName, p.List.Array+"-worklist"),
-		ArtifactsPVC:      p.ArtifactsPVC,
-		ArtifactsHostPath: firstNonEmpty(p.ArtifactsHostPath, "/var/lib/lr-e2e-harness"),
-		GitTag:            p.GitTag,
-		Registry:          p.Registry,
+		Array:              p.List.Array,
+		AllowParkedClobber: p.AllowParkedClobber,
+		Namespace:          p.Namespace,
+		Image:              p.Image,
+		ImagePullPolicy:    firstNonEmpty(p.ImagePullPolicy, "IfNotPresent"),
+		Completions:        len(p.List.Items),
+		Parallelism:        p.Parallelism,
+		ServiceAccount:     firstNonEmpty(p.ServiceAccount, "lr-e2e-harness"),
+		WorkListName:       firstNonEmpty(p.WorkListName, p.List.Array+"-worklist"),
+		ArtifactsPVC:       p.ArtifactsPVC,
+		ArtifactsHostPath:  firstNonEmpty(p.ArtifactsHostPath, "/var/lib/lr-e2e-harness"),
+		GitTag:             p.GitTag,
+		Registry:           p.Registry,
 	}
 
 	var b strings.Builder
@@ -497,18 +502,19 @@ func RenderJob(p JobParams) (string, error) {
 }
 
 type jobTemplateData struct {
-	Array             string
-	Namespace         string
-	Image             string
-	ImagePullPolicy   string
-	Completions       int
-	Parallelism       int
-	ServiceAccount    string
-	WorkListName      string
-	ArtifactsPVC      string
-	ArtifactsHostPath string
-	GitTag            string
-	Registry          string
+	AllowParkedClobber bool
+	Array              string
+	Namespace          string
+	Image              string
+	ImagePullPolicy    string
+	Completions        int
+	Parallelism        int
+	ServiceAccount     string
+	WorkListName       string
+	ArtifactsPVC       string
+	ArtifactsHostPath  string
+	GitTag             string
+	Registry           string
 }
 
 var jobTemplate = template.Must(template.New("job").Parse(`apiVersion: batch/v1
@@ -555,6 +561,12 @@ spec:
 {{- if .Registry }}
             - name: LITTLERED_REGISTRY
               value: {{ .Registry }}
+{{- end }}
+{{- if .AllowParkedClobber }}
+            # Explicitly asked for: let the per-item clean-slate step delete a
+            # PARKED namespace of this array. Never defaulted on.
+            - name: LRH_ALLOW_PARKED_CLOBBER
+              value: "true"
 {{- end }}
             - name: LRH_HARNESS_NAMESPACE
               valueFrom:
@@ -654,4 +666,113 @@ func registryOf(ref string) string {
 		}
 	}
 	return v1alpha1.DefaultRegistry
+}
+
+// The stamps the driver puts on the namespaces it creates. They are the
+// contract between the driver (shell, writes them) and the launch gate (Go,
+// reads them); TestNamespaceStampsMatchTheDriver pins the two together.
+const (
+	LabelArray  = "lr-e2e-harness/array"
+	LabelParked = "lr-e2e-harness/parked"
+	LabelIndex  = "lr-e2e-harness/index"
+	LabelRole   = "lr-e2e-harness/role"
+
+	// RoleOperator is the LabelRole value on an item's operator namespace.
+	RoleOperator      = "operator"
+	AnnotationItem    = "lr-e2e-harness/item"
+	AnnotationVerdict = "lr-e2e-harness/verdict"
+)
+
+// ObserveNamespace maps a namespace's stamps into the launch gate's input.
+func ObserveNamespace(name string, labels, annotations map[string]string) ObservedNamespace {
+	return ObservedNamespace{
+		Name:    name,
+		Array:   labels[LabelArray],
+		Parked:  labels[LabelParked] == "true",
+		Index:   labels[LabelIndex],
+		Role:    labels[LabelRole],
+		Item:    annotations[AnnotationItem],
+		Verdict: annotations[AnnotationVerdict],
+	}
+}
+
+// ObservedNamespace is one namespace the harness stamped, as read back from the
+// cluster. The label/annotation keys below are the contract between the driver
+// (which writes them) and the launch gate (which reads them).
+type ObservedNamespace struct {
+	Name    string
+	Array   string
+	Parked  bool
+	Index   string
+	Item    string
+	Verdict string
+	Role    string
+}
+
+// LaunchBlockers returns the parked namespaces of `array` that a launch must
+// not touch, ordered by work-item index so a long array reads in run order.
+//
+// Only PARKED namespaces block. An ordinary leftover (an interrupted run that
+// never reached a verdict) carries no evidence anyone asked to keep, so the
+// driver still clears it — the guard is about evidence, not about tidiness.
+func LaunchBlockers(array string, observed []ObservedNamespace) []ObservedNamespace {
+	var blockers []ObservedNamespace
+	for _, ns := range observed {
+		// The Array check is defensive: the caller selects by label, but a
+		// mis-selected namespace of ANOTHER array is exactly the evidence this
+		// array has no business deleting either.
+		if ns.Parked && ns.Array == array {
+			blockers = append(blockers, ns)
+		}
+	}
+	sort.Slice(blockers, func(a, b int) bool {
+		ia, erra := strconv.Atoi(blockers[a].Index)
+		ib, errb := strconv.Atoi(blockers[b].Index)
+		if erra == nil && errb == nil && ia != ib {
+			return ia < ib
+		}
+		return blockers[a].Name < blockers[b].Name
+	})
+	return blockers
+}
+
+// RefusalMessage renders the launch refusal: what evidence is in the way, what
+// it was, and both ways forward. A refusal that does not say how to proceed
+// just moves the dead end.
+func RefusalMessage(array, workListPath string, blockers []ObservedNamespace) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "REFUSING TO LAUNCH: array %q has %d PARKED namespace(s) from an earlier run:\n\n",
+		array, len(blockers))
+	for _, ns := range blockers {
+		role := "test namespace"
+		if ns.Role == RoleOperator {
+			role = "operator"
+		}
+		item := ns.Item
+		if item == "" {
+			item = "?"
+		}
+		verdict := ns.Verdict
+		if verdict == "" {
+			verdict = "?"
+		}
+		fmt.Fprintf(&b, "    %-46s  item %s (%s), %s\n", ns.Name, item, verdict, role)
+	}
+	fmt.Fprintf(&b, `
+Those are the whole product of a failed item — debug artifacts on the volume and,
+for an operator namespace, a live operator kept for inspection. Launching would
+delete them as "leftovers", which is how a set of parked failures once vanished
+silently. Two ways forward:
+
+  1. Read them, then discard them deliberately:
+
+         make e2e-harness-clean E2E_HARNESS_WORKLIST=%s
+
+  2. Keep them and run under a different name: change 'array:' in the work list.
+
+Or, if you really mean "clobber my parked evidence" (tight dev loop):
+
+         make e2e-harness-launch E2E_HARNESS_ALLOW_PARKED_CLOBBER=true
+`, workListPath)
+	return b.String()
 }

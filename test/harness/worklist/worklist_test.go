@@ -17,6 +17,7 @@ limitations under the License.
 package worklist
 
 import (
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -905,5 +906,168 @@ func TestImageRefsSkipsUnsetRefs(t *testing.T) {
 	got := l.ImageRefs(ImageParams{DriverImage: testDriverImage})
 	if !slices.Equal(got, []string{testDriverImage}) {
 		t.Errorf("ImageRefs() = %v, want only the driver image", got)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// LaunchBlockers — the harness must never destroy forensic evidence unless it
+// is explicitly told to.
+//
+// Parking (Classify -> Result.Parked) already fails SAFE: a namespace is kept
+// unless the record explicitly says the item passed. Launch then threw the same
+// evidence away, silently, as a "leftover from an earlier run" — five parked
+// failures with their artifacts and live operators, gone, with the only warning
+// buried in a per-item driver log. Same principle, opposite behaviour; this
+// closes it at the same place the image check lives.
+// ---------------------------------------------------------------------------
+
+func TestLaunchBlockersOnlyBlocksOnParkedEvidence(t *testing.T) {
+	cases := []struct {
+		name     string
+		observed []ObservedNamespace
+		want     []string
+	}{
+		{
+			name:     "nothing observed",
+			observed: nil,
+		},
+		{
+			name: "an ordinary leftover is not evidence",
+			observed: []ObservedNamespace{
+				{Name: "lr-harness-a-0-x", Array: "a"},
+			},
+		},
+		{
+			name: "a parked pair blocks, ordered by name within an index",
+			observed: []ObservedNamespace{
+				{Name: parkedOpNS, Array: "a", Parked: true, Index: "2", Item: "x", Verdict: string(VerdictFail)},
+				{Name: parkedTestNS, Array: "a", Parked: true, Index: "2", Item: "x", Verdict: string(VerdictFail)},
+			},
+			want: []string{parkedTestNS, parkedOpNS},
+		},
+		{
+			name: "another array's parked evidence is none of this array's business",
+			observed: []ObservedNamespace{
+				{Name: "lr-harness-b-0-y", Array: "b", Parked: true, Verdict: string(VerdictFail)},
+			},
+		},
+		{
+			name: "ordered by index, so a 10-item array reads in run order",
+			observed: []ObservedNamespace{
+				{Name: "lr-harness-a-10-j", Array: "a", Parked: true, Index: "10", Verdict: string(VerdictFail)},
+				{Name: "lr-harness-a-2-b", Array: "a", Parked: true, Index: "2", Verdict: string(VerdictTimeout)},
+				{Name: "lr-harness-a-1-c", Array: "a", Parked: true, Index: "1", Verdict: string(VerdictFail)},
+			},
+			want: []string{"lr-harness-a-1-c", "lr-harness-a-2-b", "lr-harness-a-10-j"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var got []string
+			for _, b := range LaunchBlockers("a", tc.observed) {
+				got = append(got, b.Name)
+			}
+			if !slices.Equal(got, tc.want) {
+				t.Errorf("LaunchBlockers() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// The refusal has to be actionable on its own: which evidence is in the way,
+// what it was, and the two ways forward. A bare "refusing" would just move the
+// dead end.
+const (
+	doomedItem   = "pdb-standalone-doomed"
+	parkedOpNS   = "lr-harness-op-a-2-x"
+	parkedTestNS = "lr-harness-a-2-x"
+)
+
+func TestRefusalMessageNamesTheEvidenceAndBothWaysOut(t *testing.T) {
+	msg := RefusalMessage("m1smoke", "test/harness/manifests/worklist-m1-smoke.yaml", []ObservedNamespace{
+		{Name: "lr-harness-m1smoke-2-doomed", Array: "m1smoke", Parked: true, Index: "2",
+			Item: doomedItem, Verdict: string(VerdictFail)},
+		{Name: "lr-harness-op-m1smoke-2-doomed", Array: "m1smoke", Parked: true, Index: "2",
+			Item: doomedItem, Verdict: string(VerdictFail), Role: RoleOperator},
+	})
+
+	for _, want := range []string{
+		"lr-harness-m1smoke-2-doomed",
+		"lr-harness-op-m1smoke-2-doomed",
+		doomedItem,
+		string(VerdictFail),
+		RoleOperator,
+		"make e2e-harness-clean E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-m1-smoke.yaml",
+		"array:",
+		"E2E_HARNESS_ALLOW_PARKED_CLOBBER=true",
+	} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("RefusalMessage() is missing %q:\n%s", want, msg)
+		}
+	}
+}
+
+// The override has to reach the DRIVER, not just the launch gate: with the
+// per-item clean-slate step refusing parked namespaces too, a launch that
+// bypassed only the gate would make every affected item fail instead.
+func TestRenderJobCarriesTheParkedClobberOverride(t *testing.T) {
+	l, err := Parse([]byte("array: a\nitems:\n  - name: i\n    labelFilter: pdb\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	base := JobParams{List: l, Namespace: "ns", Image: "img", Parallelism: 1}
+
+	off, err := RenderJob(base)
+	if err != nil {
+		t.Fatalf("RenderJob: %v", err)
+	}
+	if strings.Contains(off, "LRH_ALLOW_PARKED_CLOBBER") {
+		t.Errorf("RenderJob() smuggles the clobber override into a default array:\n%s", off)
+	}
+
+	base.AllowParkedClobber = true
+	on, err := RenderJob(base)
+	if err != nil {
+		t.Fatalf("RenderJob: %v", err)
+	}
+	if !strings.Contains(on, "LRH_ALLOW_PARKED_CLOBBER") || !strings.Contains(on, `value: "true"`) {
+		t.Errorf("RenderJob() did not pass the clobber override to the driver:\n%s", on)
+	}
+}
+
+// The launch gate reads stamps that the DRIVER writes, in shell. Nothing in the
+// compiler connects the two, so a renamed label would silently turn the guard
+// into a no-op — it would observe nothing and cheerfully permit the clobber.
+// Read the script and assert every key it must write is there.
+func TestNamespaceStampsMatchTheDriver(t *testing.T) {
+	script, err := os.ReadFile("../driver/harness-entrypoint.sh")
+	if err != nil {
+		t.Fatalf("reading the driver script: %v", err)
+	}
+	for _, key := range []string{
+		LabelArray, LabelParked, LabelIndex, LabelRole, AnnotationItem, AnnotationVerdict,
+	} {
+		if !strings.Contains(string(script), key) {
+			t.Errorf("the driver never writes %q, so the launch gate cannot read it", key)
+		}
+	}
+}
+
+func TestObserveNamespaceReadsTheStamps(t *testing.T) {
+	got := ObserveNamespace(parkedOpNS,
+		map[string]string{LabelArray: "a", LabelParked: "true", LabelIndex: "2", LabelRole: RoleOperator},
+		map[string]string{AnnotationItem: "doomed", AnnotationVerdict: string(VerdictFail)})
+	want := ObservedNamespace{
+		Name: parkedOpNS, Array: "a", Parked: true,
+		Index: "2", Role: RoleOperator, Item: "doomed", Verdict: string(VerdictFail),
+	}
+	if got != want {
+		t.Errorf("ObserveNamespace() = %+v, want %+v", got, want)
+	}
+	// An unstamped namespace must read as "not parked", never as unknown-so-park:
+	// this side of the fence, a false positive would block every launch.
+	if ObserveNamespace("plain", nil, nil).Parked {
+		t.Error("an unstamped namespace must not read as parked")
 	}
 }

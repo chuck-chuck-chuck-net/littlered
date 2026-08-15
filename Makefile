@@ -540,6 +540,11 @@ E2E_HARNESS_PULL_POLICY ?= IfNotPresent
 # air-gapped host, a registry that refuses anonymous manifest reads, or a
 # deliberate "I know it is not there yet" run.
 E2E_HARNESS_SKIP_IMAGE_CHECK ?= false
+# Launching an array whose name still has PARKED namespaces would delete them as
+# "leftovers" — the evidence a failed item exists to produce. The launch refuses;
+# this is the "yes, clobber it" override, and it is passed through to the driver
+# so the per-item clean-slate step agrees with the decision made at launch.
+E2E_HARNESS_ALLOW_PARKED_CLOBBER ?= false
 # How long (SECONDS) `e2e-harness-watch` follows an array before giving up, and
 # how often it polls. Generous by design: a 20-item soak of the full suite is a
 # ~13-hour array, and a watch that gave up first would report a false
@@ -613,7 +618,8 @@ e2e-harness-render: lrharness ## Render the launch manifest (namespace, RBAC, wo
 		--image-pull-policy $(E2E_HARNESS_PULL_POLICY) \
 		--parallelism $(E2E_HARNESS_PARALLELISM) \
 		--git-tag $(GIT_TAG) \
-		--registry $(LITTLERED_REGISTRY)
+		--registry $(LITTLERED_REGISTRY) \
+		--allow-parked-clobber=$(E2E_HARNESS_ALLOW_PARKED_CLOBBER)
 
 .PHONY: e2e-harness-preflight
 e2e-harness-preflight: lrharness ## Verify every image the array pins actually resolves in its registry.
@@ -657,8 +663,21 @@ e2e-harness-preflight: lrharness ## Verify every image the array pins actually r
 	fi; \
 	echo "all pinned images resolve"
 
+# The evidence gate, symmetric with the image preflight above. The harness must
+# never destroy forensic evidence unless explicitly told to: parking already
+# fails safe (delete only on an explicit "parked":false), and this stops launch
+# from undoing that decision silently.
+.PHONY: e2e-harness-parked-check
+e2e-harness-parked-check: lrharness ## Refuse to launch over this array's PARKED namespaces.
+	@if [ "$(E2E_HARNESS_ALLOW_PARKED_CLOBBER)" = "true" ]; then \
+		echo "parked-namespace check SKIPPED (E2E_HARNESS_ALLOW_PARKED_CLOBBER=true)"; exit 0; \
+	fi; \
+	ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	kubectl $(KUBECTL_CTX_FLAGS) get ns -l "lr-e2e-harness/array=$$ARRAY" -o json 2>/dev/null \
+		| bin/lrharness check-parked --array "$$ARRAY" --worklist $(E2E_HARNESS_WORKLIST)
+
 .PHONY: e2e-harness-launch
-e2e-harness-launch: e2e-harness-validate e2e-harness-preflight ## Launch the work-list array on the current cluster.
+e2e-harness-launch: e2e-harness-validate e2e-harness-preflight e2e-harness-parked-check ## Launch the work-list array on the current cluster.
 	$(MAKE) --no-print-directory e2e-harness-render \
 		| kubectl $(KUBECTL_CTX_FLAGS) apply -f -
 	@echo "Array launched. Follow it with: make e2e-harness-watch"

@@ -158,17 +158,59 @@ ARTDIR="${ART_BASE}/$(printf '%03d' "$IDX")-${LRH_ITEM_NAME}"
 mkdir -p "$ARTDIR"
 
 # ---------------------------------------------------------------------------
-# 2. Clean slate. The suite refuses to start if its namespace already exists,
-#    so a leftover from an interrupted run of the SAME array is removed. Parked
-#    namespaces of OTHER arrays are untouched — the array name is the
-#    uniqueness knob (see test/harness/README.md).
+# 2. Clean slate — but NEVER over parked evidence. The suite refuses to start if
+#    its namespace already exists, so an ordinary leftover from an interrupted
+#    run of the SAME array is removed. A PARKED namespace is not a leftover: it
+#    is the whole product of a failed item (artifacts, and a live operator), and
+#    deleting it here is how a set of parked failures once vanished silently.
+#
+#    The launch gate (`make e2e-harness-parked-check`) already refuses to start
+#    an array in that state, so reaching this branch means either the launch was
+#    overridden — in which case LRH_ALLOW_PARKED_CLOBBER says so and we comply —
+#    or something parked this namespace after launch. Then we leave it standing
+#    and let the item fail loudly on the suite's own clean-slate guard: a visible
+#    FAIL beats a silent deletion.
+#
+#    Parked namespaces of OTHER arrays are untouched either way — the array name
+#    is the uniqueness knob (see test/harness/README.md).
 # ---------------------------------------------------------------------------
+BLOCKED=""
 for stale in "$LRH_NAMESPACE" "$LRH_OPERATOR_NAMESPACE"; do
-    if kubectl get ns "$stale" >/dev/null 2>&1; then
-        log "WARNING: ${stale} already exists (leftover from an earlier run of array '${LRH_ARRAY}') — deleting"
-        kubectl delete ns "$stale" --ignore-not-found --timeout=5m >>"${ARTDIR}/driver.log" 2>&1
+    kubectl get ns "$stale" >/dev/null 2>&1 || continue
+    parked="$(kubectl get ns "$stale" -o jsonpath='{.metadata.labels.lr-e2e-harness/parked}' 2>/dev/null)"
+    if [ "$parked" = "true" ] && [ "${LRH_ALLOW_PARKED_CLOBBER:-false}" != "true" ]; then
+        log "REFUSING to delete PARKED namespace ${stale} — it holds a previous item's evidence."
+        BLOCKED="${BLOCKED} ${stale}"
+        continue
     fi
+    if [ "$parked" = "true" ]; then
+        log "WARNING: deleting PARKED namespace ${stale} (LRH_ALLOW_PARKED_CLOBBER=true was set at launch)"
+    else
+        log "WARNING: ${stale} already exists (leftover from an earlier run of array '${LRH_ARRAY}') — deleting"
+    fi
+    kubectl delete ns "$stale" --ignore-not-found --timeout=5m >>"${ARTDIR}/driver.log" 2>&1
 done
+
+# A blocked item is not run AT ALL. Handing a parked namespace to the suite
+# would not help: its own clean-slate guard deletes a namespace that holds no
+# LittleRed CR and starts anyway, which is the same evidence loss one layer
+# down. So record the item as failed-because-blocked and move on — the array
+# keeps going, and nothing of the previous run is touched.
+if [ -n "$BLOCKED" ]; then
+    log "SKIPPING item '${LRH_ITEM_NAME}': parked namespace(s) block it:${BLOCKED}"
+    log "  Clear them deliberately with 'make e2e-harness-clean', or relaunch with"
+    log "  E2E_HARNESS_ALLOW_PARKED_CLOBBER=true to clobber them."
+    {
+        echo "Item not run: parked namespace(s) from an earlier run of array '${LRH_ARRAY}' hold evidence:"
+        for b in $BLOCKED; do echo "  $b"; done
+        echo ""
+        echo "Nothing was deleted. Clear them with 'make e2e-harness-clean', or relaunch with"
+        echo "E2E_HARNESS_ALLOW_PARKED_CLOBBER=true."
+    } > "${ARTDIR}/blocked.txt"
+    publish_result "$IDX" "$LRH_ITEM_NAME" "$LRH_NAMESPACE" 1 false \
+        "$STARTED_EPOCH" "$(date +%s)" "$ARTDIR" "$LRH_OPERATOR_NAMESPACE"
+    exit 0
+fi
 
 # Pre-create the operator's namespace LABELLED, rather than letting
 # `helm --create-namespace` make it bare. The label is what `make

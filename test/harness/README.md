@@ -223,6 +223,42 @@ work list needs it** — a fixture that only launches with the safety check off
 would teach the escape hatch as normal practice, so both lists' deliberate
 failures use a *pullable* image that simply is not redis.
 
+### Step 3 also refuses to launch over parked evidence
+
+A parked namespace pair *is* the product of a failed item: debug artifacts on
+the volume, and a live operator kept for inspection. Re-launching the same array
+name used to delete them as "leftovers from an earlier run" — silently, with the
+only warning inside a per-item driver log nobody reads until after the fact. One
+run lost five parked failures that way.
+
+That is the opposite of how parking itself behaves (a namespace is deleted only
+on an explicit `"parked":false` — an unknown outcome keeps the evidence), so the
+launch now applies the same rule:
+
+```
+REFUSING TO LAUNCH: array "parkguard" has 2 PARKED namespace(s) from an earlier run:
+
+    lr-harness-op-parkguard-0-doomed                item doomed (FAIL), operator
+    lr-harness-parkguard-0-doomed                   item doomed (FAIL), test namespace
+...
+  1. Read them, then discard them deliberately:
+
+         make e2e-harness-clean E2E_HARNESS_WORKLIST=<your work list>
+
+  2. Keep them and run under a different name: change 'array:' in the work list.
+```
+
+`E2E_HARNESS_ALLOW_PARKED_CLOBBER=true` means "yes, clobber my parked evidence".
+It is passed through to the driver, so the launch gate and the per-item
+clean-slate step always agree.
+
+**Defence in depth:** the driver refuses the same thing independently, because a
+Job applied by hand bypasses the Makefile. A blocked item is then **not run at
+all** — it records a `FAIL` naming the namespaces that blocked it (and writes
+`blocked.txt` beside its artifacts) rather than handing a parked namespace to the
+suite, whose own clean-slate guard would delete a CR-less one and start anyway.
+Ordinary (non-parked) leftovers are still cleared, as before.
+
 ### Step 4 follows verdicts, not pod phases
 
 **A driver pod always says `Completed`, even for a failed item** — it exits 0 by
@@ -329,8 +365,9 @@ shrinking the denominator.
 - **`FOCUS` cannot contain a single quote.** `run-test-e2e` interpolates it into
   `-ginkgo.focus='$(FOCUS)'` inside a shell recipe. That is pre-existing
   Makefile behaviour, not a harness constraint.
-- **Re-running the same array name clobbers its own parked namespaces.** The
-  array name is the uniqueness knob — use a fresh one, or
+- **Re-running an array name with parked namespaces is refused, not silently
+  clobbered** (see "Step 3 also refuses to launch over parked evidence" above). The
+  array name is still the uniqueness knob — use a fresh one, or
   `make e2e-harness-clean` first.
 - **No garbage budget.** N parked failures = N namespaces of Redis pods *plus* N
   idle operators resident (design §6 flags this as open).
