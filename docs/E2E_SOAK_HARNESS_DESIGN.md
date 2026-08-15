@@ -258,6 +258,32 @@ the driver cannot live on the thing it is killing. A15 (and any future hub-fault
 run interactively or needs a small external driver; everything else runs on the hub. Worth saying
 out loud rather than discovering at hour 3.
 
+**Autonomy propagates to every hard dependency in the run path** (added 2026-08-15, after the
+substrate proved this the hard way). "Not from a laptop" is not satisfied by moving the *driver*
+off the laptop: a resident in-cluster driver whose image pulls traverse a workstation is still a
+laptop-dependent system, with the dependency hidden one hop deeper. The lid closes at hour 3 and
+the array dies exactly the way this section exists to prevent. So the rule is not "the driver runs
+in-cluster" but **"every component the run *hard-depends* on must live in the same autonomous
+failure domain as the driver"** — registry, proxy/mirror, artifact store, fault agents. Audit the
+run path for workstation hops before trusting an unattended array.
+
+Corollary learned from a real four-day outage on the `s1` substrate: rootless container
+`RestartPolicy: always` is **not** durability — it holds only while the user session's systemd
+manager is alive, so a logout silently takes the container down and nothing restores it. Making
+such a component "restart reliably" (linger, a user unit) hardens the wrong thing; the fix is to
+move it into the autonomous domain, not to make its laptop-bound instance more persistent.
+
+**Prefer fail-open dependencies to fail-closed ones.** A MITM forward proxy (`HTTPS_PROXY` on the
+node + CA trust) **fails closed**: when it is down, pulls do not get slower, they stop entirely,
+cluster-wide and silently — including the operator's own image. A per-registry **mirror** in the
+container runtime's `registries.conf` **fails open**: the runtime falls back to upstream, so an
+outage costs throughput and rate-limit exposure rather than the run. For an unattended array that
+difference is the whole ballgame. A mirror additionally has **no CA to distribute or rotate** —
+whereas with the MITM design the CA key *is* the migration (nodes trust that specific key; move the
+container without its CA volume and every node silently stops pulling), and it is a single-copy
+secret. Weigh that against the mirror's one cost: it is configured per registry rather than
+catching everything at once.
+
 ### 9.4 Revised effort
 
 Most of §5 is done (see the status note at the top). What remains for *both* workloads:
