@@ -1,0 +1,30 @@
+# A two-item self-test of the harness mechanics themselves — not of the operator.
+#
+# Item 0 passes normally. Item 1 carries a per-item `timeout` far too short for
+# the spec, so it is killed mid-flight: it exercises the per-item deadline, the
+# TIMEOUT verdict (which is deliberately distinct from FAIL — a wedged item is a
+# different diagnosis from a failed assertion), and the parking of a namespace
+# that still holds live resources.
+#
+# Use this to check the harness after changing the driver, before spending a
+# real array on it:
+#   make e2e-harness-launch E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-selftest.yaml
+#
+# Expected rollup: "2 items, 1 green", with item 1 TIMEOUT and [PARKED].
+
+array: selftest
+
+defaults:
+  timeout: 8m
+
+items:
+  - name: passes
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+
+  # 20s lands after the namespace exists and the image preflight has started,
+  # but well before the spec can finish (~43s on a warm single-node cluster).
+  - name: times-out
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+    timeout: 20s

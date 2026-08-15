@@ -1,0 +1,58 @@
+# M1 acceptance work list (docs/E2E_SOAK_HARNESS_DESIGN.md §11).
+#
+# Five items, one of which is DELIBERATELY made to fail, to prove the array
+# mechanics: the failing item parks its namespace for forensics, the remaining
+# items still run, and the rollup reports "5 items, 4 green" at a glance.
+#
+# Every item is the same ~2-minute spec, which makes this simultaneously the
+# degenerate SOAK case (§9.1: "work list = [item] x N") and a fast harness
+# iteration — the second of §11's two disciplines.
+#
+# The deliberate failure is a per-item image override pointing at a tag that
+# does not exist, which the suite's BeforeSuite image preflight rejects.
+#
+# Why this mechanism: it is a GENUINE Ginkgo failure, so the item travels the
+# whole real failure path — the suite marks the run failed, collects its debug
+# artifacts, and (because the driver always sets DEBUG_ON_FAILURE=true) skips
+# its own namespace cleanup. That pairing between the suite's skip-cleanup and
+# the driver's parking is precisely what §4.2 relies on, so it is the thing
+# worth proving. A too-short per-item timeout would also park the namespace, but
+# by SIGKILL — bypassing the suite's failure handling entirely and proving less.
+# It is also deterministic, unlike hoping some spec is flaky, and it doubles as
+# live coverage of the per-item image override (§9.2.6).
+
+array: m1smoke
+
+defaults:
+  # The pdb standalone spec settles in well under two minutes; 8m is generous
+  # headroom for image pulls on a cold node without letting a wedged item eat
+  # the run.
+  timeout: 8m
+  env:
+    E2E_TOPOLOGY: single
+
+items:
+  - name: pdb-standalone-a
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+
+  - name: pdb-standalone-b
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+
+  # --- the deliberate failure -------------------------------------------------
+  # The tag is nonsense on purpose. The preflight gives it 2 minutes to become
+  # pullable and then fails the suite, so allow more than the 8m default here.
+  - name: pdb-standalone-doomed
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+    timeout: 10m
+    chaosClientImage: littlered-chaos-client:this-tag-does-not-exist
+
+  - name: pdb-standalone-c
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+
+  - name: pdb-standalone-d
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode

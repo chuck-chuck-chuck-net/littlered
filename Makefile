@@ -455,6 +455,112 @@ install-plugin: install-lrctl ## Install lrctl as a kubectl plugin (requires kub
 	@sudo ln -sf /usr/local/bin/lrctl /usr/local/bin/kubectl_complete-lr
 	@echo "Plugin installed: you can now use 'kubectl lr ...' with shell completion."
 
+##@ E2E harness (in-cluster work-list driver — test/harness/README.md)
+
+# The harness runs an Indexed Job of e2e work items inside a cluster
+# (docs/E2E_SOAK_HARNESS_DESIGN.md). It is deliberately NOT part of $(IMAGES):
+# `make build-images` is invoked by the e2e suite itself, and the driver image
+# is large, slow and needs a different build context.
+#
+# STRONGLY RECOMMENDED: point LITTLERED_REGISTRY at a local/LAN registry for
+# harness work — no pull rate limits mid-array, LAN-speed push/pull, and no
+# external dependency. The committed default stays the public registry.
+#   make e2e-harness-images LITTLERED_REGISTRY=registry.example.lan
+E2E_HARNESS_DIR         ?= test/harness
+E2E_HARNESS_IMAGE       ?= $(LITTLERED_REGISTRY)/littlered-e2e-driver:$(GIT_TAG)
+E2E_HARNESS_CTX         ?= dist/e2e-harness-context
+E2E_HARNESS_NAMESPACE   ?= lr-harness-system
+E2E_HARNESS_WORKLIST    ?= $(E2E_HARNESS_DIR)/manifests/worklist-m1-smoke.yaml
+E2E_HARNESS_PARALLELISM ?= 1
+# Pinned ref + IfNotPresent for a real array (the nodes are warm and every item
+# uses the same image). Override with Always while iterating on the driver
+# image, since re-pushing one mutable tag will otherwise serve the stale cache.
+E2E_HARNESS_PULL_POLICY ?= IfNotPresent
+
+.PHONY: lrharness
+lrharness: ## Build the lrharness helper binary (work-list seam CLI).
+	@# Quiet, and any noise goes to stderr: e2e-harness-render pipes its stdout
+	@# straight into `kubectl apply`, so a stray recipe echo would corrupt the
+	@# manifest.
+	@go build -o bin/lrharness ./$(E2E_HARNESS_DIR)/cmd/lrharness
+	@echo "built bin/lrharness" >&2
+
+.PHONY: e2e-harness-context
+e2e-harness-context: ## Stage the driver image build context (repo incl. test sources).
+	@rm -rf $(E2E_HARNESS_CTX)
+	@mkdir -p $(E2E_HARNESS_CTX)
+	@# The root .dockerignore drops **/*_test.go, which the driver needs at
+	@# runtime, so the context is staged instead of using the repo directly.
+	@# -c -o --exclude-standard == "the working tree minus ignored files", so an
+	@# uncommitted work-in-progress driver is picked up without a commit.
+	@git ls-files -c -o --exclude-standard -z \
+		| tar --null -T - -cf - \
+		| tar -xf - -C $(E2E_HARNESS_CTX)
+	@# The repo's own .dockerignore travels with the staged tree and the builder
+	@# would apply it AGAIN — re-excluding the very *_test.go sources this image
+	@# exists to run. Drop it; the staging step is already the filter.
+	@rm -f $(E2E_HARNESS_CTX)/.dockerignore
+	@test -f $(E2E_HARNESS_CTX)/test/e2e/e2e_suite_test.go \
+		|| { echo "FATAL: staged context is missing the e2e test sources"; exit 1; }
+	@echo "Staged driver build context in $(E2E_HARNESS_CTX)"
+
+.PHONY: e2e-harness-image
+e2e-harness-image: e2e-harness-context ## Build the e2e harness driver image.
+	$(CONTAINER_TOOL) build -t $(E2E_HARNESS_IMAGE) \
+		-f $(E2E_HARNESS_DIR)/driver/Dockerfile $(E2E_HARNESS_CTX)
+
+.PHONY: e2e-harness-push
+e2e-harness-push: ## Push the e2e harness driver image.
+	$(CONTAINER_TOOL) push $(E2E_HARNESS_IMAGE)
+
+.PHONY: e2e-harness-images
+e2e-harness-images: e2e-harness-image e2e-harness-push ## Build and push the driver image.
+
+.PHONY: e2e-harness-validate
+e2e-harness-validate: lrharness ## Validate the work list without launching anything.
+	bin/lrharness validate --worklist $(E2E_HARNESS_WORKLIST)
+
+.PHONY: e2e-harness-render
+e2e-harness-render: lrharness ## Render the launch manifest (namespace, RBAC, work list, Job).
+	@bin/lrharness render \
+		--worklist $(E2E_HARNESS_WORKLIST) \
+		--namespace $(E2E_HARNESS_NAMESPACE) \
+		--image $(E2E_HARNESS_IMAGE) \
+		--image-pull-policy $(E2E_HARNESS_PULL_POLICY) \
+		--parallelism $(E2E_HARNESS_PARALLELISM) \
+		--git-tag $(GIT_TAG) \
+		--registry $(LITTLERED_REGISTRY)
+
+.PHONY: e2e-harness-launch
+e2e-harness-launch: e2e-harness-validate ## Launch the work-list array on the current cluster.
+	$(MAKE) --no-print-directory e2e-harness-render \
+		| kubectl $(KUBECTL_CTX_FLAGS) apply -f -
+	@echo "Array launched. Follow it with: make e2e-harness-watch"
+
+.PHONY: e2e-harness-watch
+e2e-harness-watch: ## Watch the array's driver pods.
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get pods -w \
+		-l app.kubernetes.io/name=lr-e2e-harness
+
+.PHONY: e2e-harness-rollup
+e2e-harness-rollup: lrharness ## Print the one-glance array rollup ("5 items, 4 green").
+	@# Selecting on kind=result matters: the work-list ConfigMap carries the array
+	@# label too, and would otherwise render a "<no value>" line into the rollup.
+	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	TOTAL=$$(bin/lrharness validate --worklist $(E2E_HARNESS_WORKLIST) | sed -n 's/.* \([0-9]*\) item(s)/\1/p'); \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get configmap \
+		-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/kind=result" \
+		-o go-template='{{range .items}}{{index .data "result.json"}}{{end}}' \
+		| bin/lrharness rollup --array "$$ARRAY" --total "$$TOTAL"
+
+.PHONY: e2e-harness-clean
+e2e-harness-clean: ## Delete the array, its results and every namespace it parked.
+	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete job "$$ARRAY" --ignore-not-found; \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete configmap \
+		-l "lr-e2e-harness/array=$$ARRAY" --ignore-not-found; \
+	kubectl $(KUBECTL_CTX_FLAGS) delete ns -l "lr-e2e-harness/array=$$ARRAY" --ignore-not-found
+
 ##@ Dependencies
 
 ## Location to install dependencies to
