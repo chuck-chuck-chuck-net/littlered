@@ -159,24 +159,102 @@ is an environment variable you set, never a checked-in value.
 ## Running an array
 
 ```bash
-# 1. Build and push the driver image (tag = GIT_TAG, i.e. the git short hash).
+# 1. Build and push ALL THREE images the array needs — operator, chaos client
+#    and driver (tag = GIT_TAG, i.e. the git short hash).
 make e2e-harness-images LITTLERED_REGISTRY=registry.example.lan CONTAINER_TOOL=podman
 
 # 2. Sanity-check the work list without touching the cluster.
-make e2e-harness-validate E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-m1-smoke.yaml
+make e2e-harness-validate E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-m2-classic.yaml
 
-# 3. Launch. Renders namespace + RBAC + work-list ConfigMap + Job, and applies it.
+# 3. Launch. Verifies every pinned image resolves, then renders namespace + RBAC
+#    + work-list ConfigMap + Job and applies them.
 make e2e-harness-launch \
      LITTLERED_REGISTRY=registry.example.lan \
      KUBECONTEXT=<your-context>
 
-# 4. Watch, then read the rollup.
-make e2e-harness-watch  KUBECONTEXT=<your-context>
-make e2e-harness-rollup KUBECONTEXT=<your-context>
+# 4. Follow it. Prints each verdict as it lands, exits when the array ends, and
+#    finishes with the rollup (non-zero unless every item is green).
+make e2e-harness-watch KUBECONTEXT=<your-context>
 
 # 5. Tear down the array, its results and every namespace it parked.
-make e2e-harness-clean  KUBECONTEXT=<your-context>
+make e2e-harness-clean KUBECONTEXT=<your-context>
 ```
+
+Every step takes `E2E_HARNESS_WORKLIST=` — the default is the M1 smoke list.
+`make e2e-harness-rollup` re-prints the summary at any time and always exits 0.
+
+### Step 1 builds three images, not one
+
+An array pulls **the driver** (the Job), **the operator** (each item
+helm-installs its own from the pinned ref) and **the chaos client** (the suite's
+preflight refuses to start without it). `e2e-harness-images` covers all three;
+`make e2e-harness-image e2e-harness-push` is the driver-only fast path while you
+are iterating on the driver itself.
+
+### Step 3 refuses to launch on a missing image
+
+A pinned ref that does not exist is otherwise invisible until each item has
+deployed, waited out its own readiness timeout and failed — the design note's
+"ImagePullBackOff on item 47", except every item, identically. So the launch
+first resolves every ref the array pins:
+
+```
+image preflight (via skopeo):
+  ok       registry.example.lan/library/redis:8.4.2
+  MISSING  registry.example.lan/littlered:708ebce
+  ok       registry.example.lan/littlered-e2e-driver:708ebce
+  ok       registry.example.lan/oliver006/redis_exporter:v1.88.0
+
+REFUSING TO LAUNCH: the array pins image(s) that do not resolve:
+    registry.example.lan/littlered:708ebce
+...
+    make e2e-harness-images LITTLERED_REGISTRY=registry.example.lan CONTAINER_TOOL=podman
+```
+
+The redis and exporter refs are included whenever the work list pins
+`redisImage` — including the exporter's *inherited* registry, which is the trap
+described above. The lookup uses `skopeo` when present, otherwise
+`$(CONTAINER_TOOL) manifest inspect`; a plain `curl` is not enough, because
+`ghcr.io` demands a token even for public reads.
+
+`E2E_HARNESS_SKIP_IMAGE_CHECK=true` disables it for a genuine ad-hoc case (an
+air-gapped host, a registry that refuses anonymous manifest reads). **No shipped
+work list needs it** — a fixture that only launches with the safety check off
+would teach the escape hatch as normal practice, so both lists' deliberate
+failures use a *pullable* image that simply is not redis.
+
+### Step 4 follows verdicts, not pod phases
+
+**A driver pod always says `Completed`, even for a failed item** — it exits 0 by
+design (§4.2) so the array continues. Watching pod phase therefore shows a
+five-failure array as five clean successes, and `kubectl get -w` never returns.
+So `e2e-harness-watch` polls the result ConfigMaps instead, reprints the rollup
+whenever an item lands, stops when the Job does, and exits non-zero unless every
+item is green:
+
+```
+watching array 'm2watch' (2 items) — verdicts appear as items finish
+
+--- 12:42:14Z  1/2 items reported ---
+e2e harness array "m2watch": 2 items, 1 green
+  IDX  ITEM             VERDICT    DURATION  NAMESPACE
+  0    pdb-ok           PASS            59s  lr-harness-m2watch-0-pdb-ok
+  1    -                MISSING           -
+
+--- 12:44:57Z  2/2 items reported ---
+e2e harness array "m2watch": 2 items, 1 green
+  IDX  ITEM             VERDICT    DURATION  NAMESPACE
+  0    pdb-ok           PASS            59s  lr-harness-m2watch-0-pdb-ok
+  1    pdb-doomed       FAIL           151s  lr-harness-m2watch-1-pdb-doomed  [PARKED]
+
+=== array 'm2watch' finished ===
+exit 1: not every item is green (parked namespaces hold the evidence)
+```
+
+`E2E_HARNESS_WATCH_TIMEOUT` (seconds, default 86400) bounds it — deliberately
+long, since a 20-item soak of the full suite runs for hours and a watch that
+gave up first would report a false "incomplete". Hitting it exits **2** and says
+the array is still running; re-attaching is just running the target again.
 
 `make e2e-harness-render` prints the manifest without applying it — use it to
 review the RBAC and the Job before launching.

@@ -536,6 +536,16 @@ E2E_HARNESS_PARALLELISM ?= 1
 # uses the same image). Override with Always while iterating on the driver
 # image, since re-pushing one mutable tag will otherwise serve the stale cache.
 E2E_HARNESS_PULL_POLICY ?= IfNotPresent
+# The launch-time image check (e2e-harness-preflight). Escape hatch for an
+# air-gapped host, a registry that refuses anonymous manifest reads, or a
+# deliberate "I know it is not there yet" run.
+E2E_HARNESS_SKIP_IMAGE_CHECK ?= false
+# How long (SECONDS) `e2e-harness-watch` follows an array before giving up, and
+# how often it polls. Generous by design: a 20-item soak of the full suite is a
+# ~13-hour array, and a watch that gave up first would report a false
+# "incomplete" on a perfectly healthy run.
+E2E_HARNESS_WATCH_TIMEOUT ?= 86400
+E2E_HARNESS_WATCH_INTERVAL ?= 10
 
 .PHONY: lrharness
 lrharness: ## Build the lrharness helper binary (work-list seam CLI).
@@ -573,8 +583,22 @@ e2e-harness-image: e2e-harness-context ## Build the e2e harness driver image.
 e2e-harness-push: ## Push the e2e harness driver image.
 	$(CONTAINER_TOOL) push $(E2E_HARNESS_IMAGE)
 
+# An array needs THREE images, not one: the driver, the operator (each item
+# helm-installs its own from the pinned ref) and the chaos client (the suite's
+# preflight refuses to start without it). This target used to build only the
+# driver, which is how an array once ran ten minutes to fail five times on a
+# missing operator image. Build/push the product pair via the existing `images`
+# target rather than restating its logic.
 .PHONY: e2e-harness-images
-e2e-harness-images: e2e-harness-image e2e-harness-push ## Build and push the driver image.
+e2e-harness-images: ## Build and push EVERY image an array needs (operator + chaos client + driver).
+	$(MAKE) images
+	$(MAKE) e2e-harness-image e2e-harness-push
+	@echo "Pushed: $(IMG)"
+	@echo "        $(CHAOS_CLIENT_IMAGE)"
+	@echo "        $(E2E_HARNESS_IMAGE)"
+
+# Iterating on the driver alone? `make e2e-harness-image e2e-harness-push` is
+# still the fast path; it does not rebuild the operator.
 
 .PHONY: e2e-harness-validate
 e2e-harness-validate: lrharness ## Validate the work list without launching anything.
@@ -591,16 +615,89 @@ e2e-harness-render: lrharness ## Render the launch manifest (namespace, RBAC, wo
 		--git-tag $(GIT_TAG) \
 		--registry $(LITTLERED_REGISTRY)
 
+.PHONY: e2e-harness-preflight
+e2e-harness-preflight: lrharness ## Verify every image the array pins actually resolves in its registry.
+	@if [ "$(E2E_HARNESS_SKIP_IMAGE_CHECK)" = "true" ]; then \
+		echo "image preflight SKIPPED (E2E_HARNESS_SKIP_IMAGE_CHECK=true)"; exit 0; \
+	fi; \
+	if command -v $(SKOPEO) >/dev/null 2>&1; then \
+		probe() { $(SKOPEO) inspect --raw "docker://$$1" >/dev/null 2>&1; }; \
+		echo "image preflight (via $(SKOPEO)):"; \
+	elif command -v $(CONTAINER_TOOL) >/dev/null 2>&1; then \
+		probe() { $(CONTAINER_TOOL) manifest inspect "$$1" >/dev/null 2>&1; }; \
+		echo "image preflight (via $(CONTAINER_TOOL) manifest inspect):"; \
+	else \
+		echo "FATAL: need $(SKOPEO) or $(CONTAINER_TOOL) to verify the pinned images."; \
+		echo "       Install one, or re-run with E2E_HARNESS_SKIP_IMAGE_CHECK=true."; \
+		exit 1; \
+	fi; \
+	missing=""; \
+	for ref in $$(bin/lrharness images \
+			--worklist $(E2E_HARNESS_WORKLIST) \
+			--driver-image $(E2E_HARNESS_IMAGE) \
+			--operator-image $(IMG) \
+			--chaos-client-image $(CHAOS_CLIENT_IMAGE)); do \
+		if probe "$$ref"; then echo "  ok       $$ref"; \
+		else echo "  MISSING  $$ref"; missing="$$missing $$ref"; fi; \
+	done; \
+	if [ -n "$$missing" ]; then \
+		echo ""; \
+		echo "REFUSING TO LAUNCH: the array pins image(s) that do not resolve:"; \
+		for ref in $$missing; do echo "    $$ref"; done; \
+		echo ""; \
+		echo "Every work item would fail the same way, minutes apart, as an"; \
+		echo "ImagePullBackOff. Build and push the set first:"; \
+		echo ""; \
+		echo "    make e2e-harness-images LITTLERED_REGISTRY=$(LITTLERED_REGISTRY) CONTAINER_TOOL=$(CONTAINER_TOOL)"; \
+		echo ""; \
+		echo "A redis/exporter ref comes from the work list's redisImage — mirror it"; \
+		echo "with: skopeo copy docker://<upstream> docker://<your-registry>/<path>"; \
+		echo "(override the check with E2E_HARNESS_SKIP_IMAGE_CHECK=true)"; \
+		exit 1; \
+	fi; \
+	echo "all pinned images resolve"
+
 .PHONY: e2e-harness-launch
-e2e-harness-launch: e2e-harness-validate ## Launch the work-list array on the current cluster.
+e2e-harness-launch: e2e-harness-validate e2e-harness-preflight ## Launch the work-list array on the current cluster.
 	$(MAKE) --no-print-directory e2e-harness-render \
 		| kubectl $(KUBECTL_CTX_FLAGS) apply -f -
 	@echo "Array launched. Follow it with: make e2e-harness-watch"
 
+# Watching POD PHASE is actively misleading here: the driver always exits 0 by
+# design (§4.2), so every pod reads `Completed` — a five-item array that failed
+# five times looks like five clean successes. And `kubectl get -w` never
+# returns, so there is nothing to tell you the array is over. So this target
+# follows the VERDICTS (the result ConfigMaps the driver publishes), ends when
+# the Job does, and prints the rollup itself.
 .PHONY: e2e-harness-watch
-e2e-harness-watch: ## Watch the array's driver pods.
-	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get pods -w \
-		-l app.kubernetes.io/name=lr-e2e-harness
+e2e-harness-watch: lrharness ## Follow the array by VERDICT, exit when it ends, print the rollup.
+	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	TOTAL=$$(bin/lrharness validate --worklist $(E2E_HARNESS_WORKLIST) | sed -n 's/.* \([0-9]*\) item(s)/\1/p'); \
+	DEADLINE=$$(( $$(date +%s) + $(E2E_HARNESS_WATCH_TIMEOUT) )); \
+	echo "watching array '$$ARRAY' ($$TOTAL items) — verdicts appear as items finish"; \
+	SEEN=-1; \
+	while :; do \
+		DONE=$$(kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get configmap \
+			-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/kind=result" \
+			-o name 2>/dev/null | wc -l); \
+		if [ "$$DONE" -ne "$$SEEN" ]; then \
+			echo ""; echo "--- $$(date -u +%H:%M:%SZ)  $$DONE/$$TOTAL items reported ---"; \
+			$(MAKE) --no-print-directory e2e-harness-rollup 2>/dev/null; \
+			SEEN=$$DONE; \
+		fi; \
+		COMPLETE=$$(kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get job "$$ARRAY" \
+			-o jsonpath='{.status.conditions[?(@.type=="Complete")].status}{.status.conditions[?(@.type=="Failed")].status}' 2>/dev/null); \
+		case "$$COMPLETE" in *True*) break;; esac; \
+		if [ "$$(date +%s)" -ge "$$DEADLINE" ]; then \
+			echo "watch deadline reached after $(E2E_HARNESS_WATCH_TIMEOUT)s — the array is STILL RUNNING."; \
+			echo "Raise E2E_HARNESS_WATCH_TIMEOUT, or re-attach with: make e2e-harness-watch"; \
+			exit 2; \
+		fi; \
+		sleep $(E2E_HARNESS_WATCH_INTERVAL); \
+	done; \
+	echo ""; echo "=== array '$$ARRAY' finished ==="; \
+	$(MAKE) --no-print-directory e2e-harness-rollup-strict 2>/dev/null \
+		|| { echo "exit 1: not every item is green (parked namespaces hold the evidence)"; exit 1; }
 
 .PHONY: e2e-harness-rollup
 e2e-harness-rollup: lrharness ## Print the one-glance array rollup ("5 items, 4 green").
@@ -612,6 +709,17 @@ e2e-harness-rollup: lrharness ## Print the one-glance array rollup ("5 items, 4 
 		-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/kind=result" \
 		-o go-template='{{range .items}}{{index .data "result.json"}}{{end}}' \
 		| bin/lrharness rollup --array "$$ARRAY" --total "$$TOTAL"
+
+# Same rollup, but the exit code carries the verdict — for the watch and for CI.
+# Kept separate so `make e2e-harness-rollup` stays a plain, always-0 report.
+.PHONY: e2e-harness-rollup-strict
+e2e-harness-rollup-strict: lrharness ## Print the rollup and exit non-zero unless every item is green.
+	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	TOTAL=$$(bin/lrharness validate --worklist $(E2E_HARNESS_WORKLIST) | sed -n 's/.* \([0-9]*\) item(s)/\1/p'); \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get configmap \
+		-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/kind=result" \
+		-o go-template='{{range .items}}{{index .data "result.json"}}{{end}}' \
+		| bin/lrharness rollup --array "$$ARRAY" --total "$$TOTAL" --strict
 
 .PHONY: e2e-harness-clean
 e2e-harness-clean: ## Delete the array, its results and every namespace it parked.

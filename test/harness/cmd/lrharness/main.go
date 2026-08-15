@@ -23,6 +23,7 @@ limitations under the License.
 //	lrharness record     --array A --index N ...    # one Result as JSON
 //	lrharness rollup     --array A --total N        # NDJSON on stdin -> summary
 //	lrharness render-job --worklist F --namespace NS --image IMG [--parallelism P]
+//	lrharness images     --worklist F --driver-image I ...   # one ref per line
 package main
 
 import (
@@ -52,6 +53,8 @@ func main() {
 		err = cmdRecord(os.Args[2:])
 	case "rollup":
 		err = cmdRollup(os.Args[2:])
+	case "images":
+		err = cmdImages(os.Args[2:])
 	case "render-job":
 		err = cmdRender(os.Args[2:], false)
 	case "render":
@@ -80,6 +83,10 @@ func usage() {
   render     --worklist F --namespace NS --image IMG [--parallelism P]
              (namespace + RBAC + work-list ConfigMap + Job, as one manifest)
   render-job --worklist F --namespace NS --image IMG   (the Job alone)
+  images     --worklist F [--driver-image I] [--operator-image O]
+             [--chaos-client-image C]
+             (every image ref the array pins, one per line — what a launch
+              must be able to pull before it is worth starting)
 `)
 }
 
@@ -209,6 +216,32 @@ func cmdRollup(args []string) error {
 	fmt.Print(s.String())
 	if *strict && !s.AllGreen {
 		os.Exit(1)
+	}
+	return nil
+}
+
+// cmdImages lists every image reference the array pins. The Makefile feeds the
+// list to a registry lookup before applying the Job, so a missing ref is one
+// sentence at launch instead of N identical ImagePullBackOff timeouts mid-array.
+func cmdImages(args []string) error {
+	fs := flag.NewFlagSet("images", flag.ExitOnError)
+	path := fs.String("worklist", "", "path to the work list YAML")
+	driver := fs.String("driver-image", "", "the driver image the Job runs")
+	operator := fs.String("operator-image", "", "array-wide operator image")
+	chaos := fs.String("chaos-client-image", "", "array-wide chaos-client image")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	l, err := loadList(*path)
+	if err != nil {
+		return err
+	}
+	for _, ref := range l.ImageRefs(worklist.ImageParams{
+		DriverImage:      *driver,
+		OperatorImage:    *operator,
+		ChaosClientImage: *chaos,
+	}) {
+		fmt.Println(ref)
 	}
 	return nil
 }

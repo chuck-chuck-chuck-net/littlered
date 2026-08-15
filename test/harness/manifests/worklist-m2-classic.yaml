@@ -11,8 +11,9 @@
 #   1  standalone-suite    a real slice of the suite (the whole Standalone Mode
 #                          context: create, STS, Service, phase, PING, SET/GET,
 #                          metrics, pod-delete recovery, CR cleanup)
-#   2  standalone-doomed   the same slice with a redis image that is not redis,
-#                          so pods never become Ready and the phase spec FAILS
+#   2  standalone-doomed   the same slice with a redis image that is pullable
+#                          but is not redis, so pods never become Ready and a
+#                          spec FAILS — the same mechanism as the smoke list
 #   3  pdb-standalone-b    proves later items proceed unaffected
 #
 # Why the image trick for the failure: M1's deliberate failure hit in
@@ -21,18 +22,20 @@
 # gap). A wrong-but-pullable redis image passes the preflight and then fails a
 # real spec, which is the path that collects debug artifacts and skips cleanup.
 #
-# redisImage points every CR *and* the preflight probe at a mirrored copy, so a
-# run pulls nothing from Docker Hub (§9.3 autonomy). Replace the host with your
-# own registry. NOTE: the metrics exporter inherits this registry, so mirror
-# oliver006/redis_exporter into it as well — see test/harness/README.md.
+# The committed refs are the PUBLIC ones, so this list runs anywhere. For an
+# unattended array, set defaults.redisImage to a mirrored copy in your own
+# registry so the run pulls nothing from Docker Hub (§9.3 autonomy) — and mirror
+# oliver006/redis_exporter into that same registry, which the exporter inherits.
+# See test/harness/README.md. A LAN hostname is never a committed default.
 
 array: m2classic
 
 defaults:
   timeout: 12m
-  redisImage: registry.tanne3.de/library/redis:8.4.2
   env:
     E2E_TOPOLOGY: single
+  # For an autonomous run:
+  #   redisImage: myregistry.example/library/redis:8.4.2
 
 items:
   - name: pdb-standalone-a
@@ -48,7 +51,7 @@ items:
   # so the operator's pods never serve and the "status Running" spec fails.
   - name: standalone-doomed
     focus: Standalone Mode
-    redisImage: registry.tanne3.de/library/alpine:3.20
+    redisImage: docker.io/library/alpine:3.20
 
   - name: pdb-standalone-b
     labelFilter: pdb

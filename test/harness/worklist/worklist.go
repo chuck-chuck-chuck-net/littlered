@@ -45,6 +45,8 @@ import (
 	"time"
 
 	"sigs.k8s.io/yaml"
+
+	"github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
 const (
@@ -582,3 +584,74 @@ spec:
             type: DirectoryOrCreate
 {{- end }}
 `))
+
+// ImageParams carries the array-wide image refs the Makefile derives (from
+// LITTLERED_REGISTRY + GIT_TAG). A work item may override the operator and
+// chaos-client refs; the driver ref belongs to the Job.
+type ImageParams struct {
+	DriverImage      string
+	OperatorImage    string
+	ChaosClientImage string
+}
+
+// ImageRefs returns every image reference the array pins, deduplicated and
+// sorted — the set a launch must be able to pull.
+//
+// Checking this BEFORE applying the Job is the difference between one sentence
+// naming a missing ref and N identical mid-array readiness timeouts: a missing
+// operator image is not visible until each item has helm-installed it and
+// waited out its own 2-minute readiness poll (observed: a 5-item array spending
+// 10 minutes failing the same way five times).
+func (l List) ImageRefs(p ImageParams) []string {
+	seen := map[string]bool{}
+	add := func(ref string) {
+		if ref = strings.TrimSpace(ref); ref != "" {
+			seen[ref] = true
+		}
+	}
+
+	add(p.DriverImage)
+	for i := range l.Items {
+		r, err := l.Resolve(i)
+		if err != nil {
+			// Unresolvable items are Parse's business, not this function's; a
+			// caller that got here has already validated the list.
+			continue
+		}
+		add(firstNonEmpty(r.OperatorImage, p.OperatorImage))
+		add(firstNonEmpty(r.ChaosClientImage, p.ChaosClientImage))
+		if r.RedisImage != "" {
+			add(r.RedisImage)
+			// The metrics exporter INHERITS the main image's registry
+			// (api/v1alpha1 ExporterSpec.FullImage), so pinning redis at a
+			// mirror silently requires the exporter in that same mirror. The
+			// first M2 array died on exactly this, with "manifest unknown".
+			add(registryOf(r.RedisImage) + "/" + v1alpha1.DefaultExporterPath + ":" + v1alpha1.DefaultExporterTag)
+		}
+	}
+
+	refs := make([]string, 0, len(seen))
+	for ref := range seen {
+		refs = append(refs, ref)
+	}
+	sort.Strings(refs)
+	return refs
+}
+
+// registryOf returns the registry host of an image reference, defaulting to
+// docker.io for the short forms ("redis:8.4.2", "library/redis:8.4.2"). It
+// mirrors the registry half of the e2e suite's parseImageRef, which cannot be
+// imported (it lives behind the suite's build tag); TestRegistryOfMatchesTheAPIDefault
+// takes its default straight from the API package, so it cannot drift.
+func registryOf(ref string) string {
+	name := ref
+	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
+		name = ref[:i]
+	}
+	if first, _, ok := strings.Cut(name, "/"); ok {
+		if strings.ContainsAny(first, ".:") || first == "localhost" {
+			return first
+		}
+	}
+	return v1alpha1.DefaultRegistry
+}

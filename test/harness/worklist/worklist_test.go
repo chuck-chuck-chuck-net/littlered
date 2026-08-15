@@ -17,9 +17,12 @@ limitations under the License.
 package worklist
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
 // ---------------------------------------------------------------------------
@@ -788,5 +791,119 @@ func TestRenderBundleRejectsEmptyWorkListYAML(t *testing.T) {
 	})
 	if err == nil {
 		t.Error("RenderBundle with no work-list YAML = nil error, want rejection (the Job would mount an empty list)")
+	}
+}
+
+// ---------------------------------------------------------------------------
+// ImageRefs — what an array must be able to pull before it is worth launching.
+//
+// The design note's own warning is that image problems "fail in the least
+// helpful way — mid-run, as an ImagePullBackOff on item 47". The harness had
+// exactly that property against itself: a missing OPERATOR image turned a
+// 5-item array into five identical 2-minute readiness timeouts. Naming the set
+// is the decision; the shell only has to look each one up.
+// ---------------------------------------------------------------------------
+
+// The array-wide refs the Makefile derives, as the tables below spell them.
+const (
+	testDriverImage = "reg.lan/littlered-e2e-driver:t"
+	testOperImage   = "reg.lan/littlered:t"
+	testChaosImage  = "reg.lan/littlered-chaos-client:t"
+)
+
+func TestImageRefsNamesEveryPinnedImage(t *testing.T) {
+	l, err := Parse([]byte(`
+array: a
+items:
+  - name: plain
+    labelFilter: pdb
+  - name: same-again
+    labelFilter: pdb
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := l.ImageRefs(ImageParams{
+		DriverImage:      testDriverImage,
+		OperatorImage:    testOperImage,
+		ChaosClientImage: testChaosImage,
+	})
+	want := []string{
+		testChaosImage,
+		testDriverImage,
+		testOperImage,
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("ImageRefs() = %v, want %v (deduplicated across identical items, sorted)", got, want)
+	}
+}
+
+// A per-item override (design §9.2.6, matrix cell G9) is a ref the array must
+// also be able to pull — and it does NOT replace the array-wide one, which the
+// other items still use.
+func TestImageRefsIncludesPerItemOverrides(t *testing.T) {
+	l, err := Parse([]byte(`
+array: a
+items:
+  - name: current
+    labelFilter: pdb
+  - name: older-operator
+    labelFilter: pdb
+    operatorImage: reg.lan/littlered:old
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := l.ImageRefs(ImageParams{
+		DriverImage:      testDriverImage,
+		OperatorImage:    testOperImage,
+		ChaosClientImage: testChaosImage,
+	})
+	for _, want := range []string{"reg.lan/littlered:old", testOperImage} {
+		if !slices.Contains(got, want) {
+			t.Errorf("ImageRefs() = %v, missing %q", got, want)
+		}
+	}
+}
+
+// The one that repaid itself immediately: ExporterSpec.Registry INHERITS the
+// main image's registry, so pinning redisImage at a mirror silently requires
+// the exporter in that same mirror. The first M2 array died on exactly this
+// (ImagePullBackOff, "manifest unknown"), so the preflight must derive it.
+func TestImageRefsDerivesTheExporterFromThePinnedRedisRegistry(t *testing.T) {
+	l, err := Parse([]byte(`
+array: a
+defaults:
+  redisImage: reg.lan/library/redis:8.4.2
+items:
+  - name: mirrored
+    labelFilter: pdb
+  - name: official
+    labelFilter: pdb
+    redisImage: redis:7.4.0
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := l.ImageRefs(ImageParams{DriverImage: testDriverImage})
+
+	exporter := "reg.lan/" + v1alpha1.DefaultExporterPath + ":" + v1alpha1.DefaultExporterTag
+	official := "docker.io/" + v1alpha1.DefaultExporterPath + ":" + v1alpha1.DefaultExporterTag
+	for _, want := range []string{"reg.lan/library/redis:8.4.2", exporter, "redis:7.4.0", official} {
+		if !slices.Contains(got, want) {
+			t.Errorf("ImageRefs() = %v, missing %q", got, want)
+		}
+	}
+}
+
+// An unset ref must not become an empty entry the shell then tries to inspect.
+func TestImageRefsSkipsUnsetRefs(t *testing.T) {
+	l, err := Parse([]byte("array: a\nitems:\n  - name: i\n    labelFilter: pdb\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	got := l.ImageRefs(ImageParams{DriverImage: testDriverImage})
+	if !slices.Equal(got, []string{testDriverImage}) {
+		t.Errorf("ImageRefs() = %v, want only the driver image", got)
 	}
 }
