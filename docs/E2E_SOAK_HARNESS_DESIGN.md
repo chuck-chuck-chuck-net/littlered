@@ -562,6 +562,24 @@ parked for forensics.
 > any cluster. It also composes with the `Always` policy instead of fighting it, since the pull is
 > real but local.
 >
+> **Scoped precisely (measured 2026-08-15).** The exposure is smaller than "every redis pod":
+> CR-created redis pods default to `pullPolicy: IfNotPresent` (`littlered_defaults.go:41`), so they
+> pull once per node and then cache. The **only** guaranteed-uncacheable public pull per work item
+> is the **preflight** probe, which hardcodes `defaultRedis = "docker.io/library/redis:8.4.2"`
+> (`preflight_test.go:19`). So one small change captures nearly all of the benefit: have the
+> preflight resolve its image the same way the CRs do.
+>
+> **Half the mechanism already exists.** `E2E_REDIS_IMAGE` + `redisImageSpecFields()` +
+> `parseImageRef()` already render a `spec.image` block from an image ref — but they live in
+> `cluster_migration_test.go` and are used by that file alone, for version-regression fidelity
+> (pinning 7.4.0). Generalising them is *promoting an existing helper*, not inventing a knob:
+> (1) resolve `defaultRedis` from `E2E_REDIS_IMAGE`, and (2) if full independence is wanted, move
+> the helper somewhere shared and have every CR builder emit the block. Step 1 is a few lines and
+> removes the recurring hit; step 2 is broader (many builders carry inline YAML) and optional.
+>
+> The mirrored copy exists and is verified pullable with `Always` from both a workstation-VM
+> cluster and a lab site.
+>
 > **Do not "fix" this by setting `IfNotPresent`** on the preflight or the chaos client: that policy
 > is a deliberate check that the image is genuinely pullable, not an oversight.
 >
