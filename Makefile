@@ -286,6 +286,16 @@ helm-lint: ## Lint the Helm chart and render it in every scoping mode.
 		--set metrics.enabled=true \
 		--set metrics.serviceMonitor.enabled=true \
 		--set networkPolicy.enabled=true > /dev/null
+	@# Allow-list mode drops the ClusterRole, so the operator's OWN namespace must
+	@# still get `get secrets` for the multi-site kubeconfig read (uncached BY
+	@# DESIGN — the manager cache holds only the declared watch scope).
+	@$(HELM) template littlered charts/littlered --namespace littlered-system --set 'scope.watchNamespaces={ns-a}' | python3 -c 'import sys,yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d and "site-secrets" in d["metadata"]["name"]]; kinds=sorted(d["kind"] for d in docs); assert kinds==["Role","RoleBinding"], "allow mode must render a site-secrets Role AND RoleBinding in the operator namespace, got "+repr(kinds); role=[d for d in docs if d["kind"]=="Role"][0]; assert role["metadata"]["namespace"]=="littlered-system", "the site-secrets Role must live in the operator namespace"; assert role["rules"]==[{"apiGroups":[""],"resources":["secrets"],"verbs":["get"]}], "the site-secrets Role must grant exactly get on secrets, got "+repr(role["rules"])'
+	@for mode in "" "--set scope.ignoreNamespaces={kube-system}"; do \
+		if $(HELM) template littlered charts/littlered --namespace littlered-system $$mode \
+			| grep -q 'littlered-site-secrets'; then \
+			echo "FAIL: deny/none modes keep the ClusterRole and must NOT render the site-secrets Role"; exit 1; \
+		fi; \
+	done
 	@echo "Helm chart lints and renders in all scoping modes."
 
 ##@ Build

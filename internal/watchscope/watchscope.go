@@ -114,6 +114,18 @@ func Parse(watchNamespace, ignoreNamespace string) (Config, error) {
 //   - allow: DefaultNamespaces with one entry per namespace.
 //   - deny:  DefaultFieldSelector = AND of metadata.namespace != ns, applied
 //     uniformly to every watched namespaced type (CRs + owned STS/Svc/CM/Pod).
+//
+// Invariant: the cache holds EXACTLY the declared scope — the operator's own
+// namespace is not added, not even for its own bookkeeping objects. The manager's
+// client is cache-backed for every type (client.CacheOptions.DisableFor is empty
+// in cmd/littlered), so any operator read of an object OUTSIDE this scope — e.g.
+// the multi-site site kubeconfig Secrets, which live in the operator's own
+// namespace — must go through an uncached reader, never the manager client.
+// Widening the cache instead would be wrong twice over: in allow mode it extends
+// the cache for every type including the LittleRed CR, so the operator would
+// start reconciling CRs in its own namespace (a silent widening of the declared
+// scope); in deny mode the scope is one global metadata.namespace!=... field
+// selector with no room for a per-namespace exemption at all.
 func (c Config) CacheOptions() cache.Options {
 	switch c.Mode {
 	case ModeAllow:

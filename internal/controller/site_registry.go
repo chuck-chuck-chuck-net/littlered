@@ -63,6 +63,28 @@ type siteClientRegistry struct {
 	hubScheme *runtime.Scheme
 	events    chan event.GenericEvent
 
+	// secretReader reads the site kubeconfig Secrets from the operator's OWN
+	// namespace. It is the manager's APIReader — uncached, and deliberately NOT
+	// hubClient: under ADR-014 namespace scoping the manager's client is
+	// cache-backed for every type including Secrets, and its cache holds exactly
+	// the declared watch scope, which the operator's own namespace need not be
+	// part of. Reading them through hubClient therefore fails under both scoping
+	// modes (allow-list: "unknown namespace for the cache"; deny-list: a silent
+	// NotFound), and the failure surfaces as "site unreachable", so a scoped
+	// operator never resolves any site and never says why.
+	//
+	// Uncached rather than cache-widened on purpose: adding the operator's own
+	// namespace to the manager cache would extend it for EVERY type, including
+	// the LittleRed CR the controller watches, so a scoped operator would start
+	// reconciling CRs in its own namespace — a silent widening of the very scope
+	// ADR-014 exists to declare. It is also not expressible in deny mode, whose
+	// scope is one global metadata.namespace!=... field selector with no room for
+	// a per-namespace exemption. RBAC-wise a direct Get needs only `get` on
+	// secrets there (charts/littlered: the allow-mode `-site-secrets` Role),
+	// where a cache would need `list`+`watch` and would hold every Secret of that
+	// namespace in memory.
+	secretReader client.Reader
+
 	// operatorNamespace resolves the namespace holding the site kubeconfig
 	// Secrets (the operator's own namespace). Injectable for tests.
 	operatorNamespace func() (string, error)
@@ -72,10 +94,12 @@ type siteClientRegistry struct {
 	entries map[siteKey]*siteEntry
 }
 
-// newSiteClientRegistry builds the production registry.
-func newSiteClientRegistry(hubClient client.Client, scheme *runtime.Scheme, events chan event.GenericEvent) *siteClientRegistry {
+// newSiteClientRegistry builds the production registry. secretReader must be an
+// UNCACHED reader (the manager's APIReader) — see the field comment.
+func newSiteClientRegistry(hubClient client.Client, secretReader client.Reader, scheme *runtime.Scheme, events chan event.GenericEvent) *siteClientRegistry {
 	return &siteClientRegistry{
 		hubClient:         hubClient,
+		secretReader:      secretReader,
 		hubScheme:         scheme,
 		events:            events,
 		operatorNamespace: detectOperatorNamespace,
@@ -112,7 +136,7 @@ func (reg *siteClientRegistry) siteClient(ctx context.Context, lr *littleredv1al
 	}
 
 	secret := &corev1.Secret{}
-	if err := reg.hubClient.Get(ctx, types.NamespacedName{Namespace: opNS, Name: site.KubeconfigSecretRef.Name}, secret); err != nil {
+	if err := reg.secretReader.Get(ctx, types.NamespacedName{Namespace: opNS, Name: site.KubeconfigSecretRef.Name}, secret); err != nil {
 		return nil, fmt.Errorf("site %q: reading kubeconfig secret %s/%s: %w", site.Name, opNS, site.KubeconfigSecretRef.Name, err)
 	}
 	kubeconfig, err := kubeconfigFromSecret(secret)

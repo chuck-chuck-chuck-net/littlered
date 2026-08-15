@@ -97,7 +97,9 @@ func newTestRegistry(t *testing.T, objs ...client.Object) (*siteClientRegistry, 
 	}
 	hub := fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build()
 
-	reg := newSiteClientRegistry(hub, scheme, make(chan event.GenericEvent))
+	// Production passes the manager's APIReader as the secret reader; the
+	// (unscoped) fake stands in for it here.
+	reg := newSiteClientRegistry(hub, hub, scheme, make(chan event.GenericEvent))
 	reg.operatorNamespace = func() (string, error) { return testOperatorNS, nil }
 
 	var built []*fakeSiteClient
@@ -193,6 +195,61 @@ func TestSiteRegistryRemoteLifecycle(t *testing.T) {
 	reg.drop(types.NamespacedName{Namespace: lr.Namespace, Name: lr.Name})
 	if !(*built)[1].stopped {
 		t.Fatal("drop() must stop the CR's site clients")
+	}
+}
+
+// scopedCacheClient mimics the manager's cache-backed client under ADR-014
+// namespace scoping: a read whose namespace is outside the cache's scope fails
+// exactly as controller-runtime's multi-namespace cache fails it
+// (multi_namespace_cache.go: "unable to get: %v because of unknown namespace for
+// the cache"), and is counted so a test can assert the read never went there.
+type scopedCacheClient struct {
+	client.Client
+	scope      map[string]struct{}
+	outOfScope int
+}
+
+func (c *scopedCacheClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error {
+	if _, ok := c.scope[key.Namespace]; !ok {
+		c.outOfScope++
+		return fmt.Errorf("unable to get: %v because of unknown namespace for the cache", key)
+	}
+	return c.Client.Get(ctx, key, obj, opts...)
+}
+
+// TestSiteRegistryReadsKubeconfigOutsideTheWatchScope is the fast guard for the
+// namespace-scoping defect: the site kubeconfig Secrets live in the OPERATOR's
+// own namespace, which is not part of its declared watch scope, so they must not
+// be read through the scoped, cache-backed manager client. The envtest sibling
+// (site_registry_scope_envtest_test.go) proves the same against a real scoped
+// cache; this one keeps the guard cheap and always-runnable.
+func TestSiteRegistryReadsKubeconfigOutsideTheWatchScope(t *testing.T) {
+	secret := kubeconfigSecret("site-beta-kubeconfig", []byte("kubeconfig-v1"))
+	reg, built := newTestRegistry(t, secret)
+
+	// The operator watches only the CR's namespace; testOperatorNS (holding the
+	// site kubeconfig Secrets) is deliberately absent from the scope.
+	scoped := &scopedCacheClient{
+		Client: reg.hubClient,
+		scope:  map[string]struct{}{testNamespaceDefault: {}},
+	}
+	reg.hubClient = scoped
+
+	lr := multiSiteCR()
+	c, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
+		Name:                siteBeta,
+		KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: secret.Name},
+	})
+	if err != nil {
+		t.Fatalf("siteClient() under a scoped cache: %v; the operator must read its own "+
+			"namespace's kubeconfig Secret regardless of the watch scope", err)
+	}
+	if c == nil || len(*built) != 1 {
+		t.Fatalf("expected one remote site client, got %v / %d built", c, len(*built))
+	}
+	if scoped.outOfScope != 0 {
+		t.Errorf("the site kubeconfig Secret was read through the scoped cache client "+
+			"(%d out-of-scope Gets); it must go through the uncached reader", scoped.outOfScope)
 	}
 }
 

@@ -66,7 +66,10 @@ func RunOneShotGather(ctx context.Context, cfg *rest.Config, scheme *runtime.Sch
 		return fmt.Errorf("building hub client: %w", err)
 	}
 
-	reg := newSiteClientRegistry(hubClient, scheme, nil)
+	// hubClient is already uncached (no manager, no cache), so it doubles as the
+	// site-kubeconfig Secret reader — the one-shot gather has no watch scope to
+	// read outside of, and building a second client would be pure waste.
+	reg := newSiteClientRegistry(hubClient, hubClient, scheme, nil)
 	r := &LittleRedReconciler{Client: hubClient, Scheme: scheme, sites: reg}
 
 	lr := &littleredv1alpha1.LittleRed{}

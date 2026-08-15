@@ -42,6 +42,10 @@ scope:
   # RBAC (a Role + RoleBinding in each listed namespace) instead of the
   # ClusterRole, and sets WATCH_NAMESPACE on the operator. Mutually exclusive
   # with ignoreNamespaces (setting both fails the render).
+  # You do NOT need to list the operator's own namespace here: multi-site reads
+  # its site kubeconfig Secrets there with a separate `get secrets` Role, and
+  # deliberately outside the watch cache — listing it would also make the
+  # operator reconcile any LittleRed CR that happens to live in it.
   watchNamespaces: []
   # Deny-list. Watch all namespaces EXCEPT these. Inherently cluster-wide, so it
   # keeps the ClusterRole and sets IGNORE_NAMESPACE on the operator.

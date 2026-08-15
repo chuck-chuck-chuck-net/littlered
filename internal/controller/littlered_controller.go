@@ -1483,7 +1483,10 @@ func (r *LittleRedReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	r.monitorEvents = make(chan event.GenericEvent)
 	r.monitors = make(map[types.NamespacedName]func())
 	r.failoverMonitors = make(map[types.NamespacedName]func())
-	r.sites = newSiteClientRegistry(r.Client, r.Scheme, r.monitorEvents)
+	// The registry reads the site kubeconfig Secrets from the OPERATOR's own
+	// namespace, which is outside the declared watch scope under ADR-014 — hence
+	// the manager's APIReader (uncached), never r.Client (cache-backed).
+	r.sites = newSiteClientRegistry(r.Client, mgr.GetAPIReader(), r.Scheme, r.monitorEvents)
 
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&littleredv1alpha1.LittleRed{}, builder.WithPredicates(predicate.GenerationChangedPredicate{})).

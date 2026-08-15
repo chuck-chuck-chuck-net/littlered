@@ -84,7 +84,7 @@ var _ = Describe("MultiSite finalizer teardown", func() {
 		// Non-nil registry so the sweep is not short-circuited by the
 		// `r.sites == nil` guard — this drives execution into the loop that
 		// dereferences the nil MultiSite spec.
-		reconciler.sites = newSiteClientRegistry(k8sClient, k8sClient.Scheme(), nil)
+		reconciler.sites = newSiteClientRegistry(k8sClient, k8sClient, k8sClient.Scheme(), nil)
 
 		var done bool
 		var err error
