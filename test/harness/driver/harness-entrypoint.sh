@@ -31,7 +31,112 @@ set -uo pipefail   # NOT -e: a failing work item is an expected outcome here.
 
 log() { printf '[harness %s] %s\n' "$(date -u +%H:%M:%S)" "$*" >&2; }
 
-# --- always exit 0, whatever happens below ----------------------------------
+# ---------------------------------------------------------------------------
+# PHASES (design §9.2.4). The same image runs three of them, selected by
+# LRH_PHASE:
+#
+#   item      (default) — one work item, the M1/M2 path. ALWAYS exits 0.
+#   setup     — run-scoped, once, BEFORE any item. Every item waits for it.
+#   teardown  — run-scoped, once, after the array. REPORT-ONLY.
+#
+# The run-scoped phases exist now, before M5's resident split-brain monitor
+# needs them, so that monitor slots in without restructuring. Unlike a work
+# item they do NOT swallow their exit code: there is no verdict to record and
+# nothing downstream that can carry on regardless, so a failed setup must be a
+# failed Job.
+# ---------------------------------------------------------------------------
+LRH_PHASE="${LRH_PHASE:-item}"
+
+: "${LRH_ARRAY:?LRH_ARRAY must be set}"
+: "${LRH_WORKLIST:=/worklist/worklist.yaml}"
+: "${LRH_ARTIFACTS_ROOT:=/artifacts}"
+: "${LRH_REPO:=/workspace/littlered}"
+: "${LRH_HARNESS_NAMESPACE:=lr-harness-system}"
+: "${LRH_LAB:=/lab/lab.yaml}"
+: "${LRH_SITE_CREDS:=/site-creds}"
+
+# assemble_kubeconfig <outfile>
+#
+# Builds the driver pod's multi-context kubeconfig — the hub from this pod's own
+# in-cluster ServiceAccount, one context per site from the mounted credential
+# Secret — and points KUBECONFIG at it. Prints the site context names.
+#
+# This is not optional plumbing: the multi-site e2e helpers drive sites BY
+# KUBECONTEXT (`kctl` prepends --context), so there is no in-cluster-config
+# shortcut for anything but the hub. M0 proved the mechanism; the validation
+# lives in `lrharness kubeconfig`.
+assemble_kubeconfig() {
+    local out="$1"
+    lrharness kubeconfig --lab "$LRH_LAB" --creds "$LRH_SITE_CREDS" --out "$out"
+}
+
+# --- run-scoped SETUP -------------------------------------------------------
+if [ "$LRH_PHASE" = "setup" ]; then
+    log "run-scoped SETUP for array '${LRH_ARRAY}'"
+    KUBECONFIG=/tmp/kubeconfig
+    if ! SITES="$(assemble_kubeconfig "$KUBECONFIG")"; then
+        log "FATAL: could not assemble the lab kubeconfig"
+        exit 1
+    fi
+    export KUBECONFIG
+    # Reach every site ONCE, for the whole array. Without this each item burns
+    # its own timeout rediscovering the same unreachable site — the array
+    # equivalent of the launch-time image preflight.
+    rc=0
+    for site in $SITES; do
+        if out="$(kubectl --context "$site" get ns --request-timeout=20s -o name 2>&1)"; then
+            log "  ok       site ${site} reachable ($(printf '%s' "$out" | wc -l) namespaces)"
+        else
+            log "  UNREACHABLE  site ${site}: ${out}"
+            rc=1
+        fi
+    done
+    if [ "$rc" -ne 0 ]; then
+        log "REFUSING TO RUN THE ARRAY: at least one site is unreachable from this pod."
+        log "  Check the site endpoints in the lab inventory — they must be routable FROM"
+        log "  HUB PODS, not from a workstation — and re-run 'make e2e-harness-sites-setup'."
+        exit 1
+    fi
+    log "setup complete: ${LRH_ARRAY} may proceed"
+    exit 0
+fi
+
+# --- run-scoped TEARDOWN ----------------------------------------------------
+# REPORT-ONLY, deliberately. A Job cannot schedule a successor, so this one is
+# fired by `make e2e-harness-watch` when the array ends (or by hand); that
+# trigger is not guaranteed, and a phase that deleted things would therefore be
+# a phase that sometimes silently did not. It also keeps the standing rule: the
+# harness never destroys forensic evidence unless explicitly told to.
+if [ "$LRH_PHASE" = "teardown" ]; then
+    log "run-scoped TEARDOWN for array '${LRH_ARRAY}' (report-only, deletes nothing)"
+    KUBECONFIG=/tmp/kubeconfig
+    if ! SITES="$(assemble_kubeconfig "$KUBECONFIG")"; then
+        log "FATAL: could not assemble the lab kubeconfig"
+        exit 1
+    fi
+    export KUBECONFIG
+    left=0
+    for site in $SITES; do
+        # Site-side namespaces are created by the suite (msSetupSites) and carry
+        # no harness labels, so they are matched by the reserved name prefix.
+        found="$(kubectl --context "$site" get ns -o name --request-timeout=20s 2>/dev/null \
+                 | sed -n 's#^namespace/\(lr-harness-.*\)$#\1#p')"
+        if [ -n "$found" ]; then
+            log "site ${site} still holds harness namespaces (a parked item, or an interrupted run):"
+            for ns in $found; do log "    ${ns}"; left=$((left + 1)); done
+        else
+            log "site ${site}: clean"
+        fi
+    done
+    if [ "$left" -gt 0 ]; then
+        log "${left} namespace(s) left standing on the sites. Nothing was deleted — read them,"
+        log "  then remove them deliberately: kubectl --context <site> delete ns <name>"
+    fi
+    exit 0
+fi
+
+# --- the work-item phase ----------------------------------------------------
+# From here on: ALWAYS exit 0.
 finish() {
     log "driver finished for index ${JOB_COMPLETION_INDEX:-?} (always exit 0)"
     exit 0
@@ -126,16 +231,46 @@ publish_result() {
     fi
 }
 
-: "${LRH_ARRAY:?LRH_ARRAY must be set}"
-: "${LRH_WORKLIST:=/worklist/worklist.yaml}"
-: "${LRH_ARTIFACTS_ROOT:=/artifacts}"
-: "${LRH_REPO:=/workspace/littlered}"
-: "${LRH_HARNESS_NAMESPACE:=lr-harness-system}"
 IDX="${JOB_COMPLETION_INDEX:?JOB_COMPLETION_INDEX must be set (this must run as an Indexed Job)}"
 
 STARTED_EPOCH="$(date +%s)"
 ART_BASE="${LRH_ARTIFACTS_ROOT}/${LRH_ARRAY}"
 mkdir -p "$ART_BASE"
+
+# ---------------------------------------------------------------------------
+# 0. Wait for the run-scoped setup phase, when the array declares one.
+#
+#    Enforced HERE rather than by whoever launched the array: a Kubernetes Job
+#    cannot depend on another Job, and putting the wait in the Makefile would
+#    put a workstation back in the run path — the exact coupling §9.3 exists to
+#    remove.
+# ---------------------------------------------------------------------------
+setup_phase_state() {
+    local job="$1" type="$2"
+    kubectl -n "$LRH_HARNESS_NAMESPACE" get job "$job" \
+        -o "jsonpath={.status.conditions[?(@.type==\"${type}\")].status}" 2>/dev/null
+}
+
+SETUP_BLOCKED=""
+if [ -n "${LRH_SETUP_JOB:-}" ]; then
+    log "waiting for the run-scoped setup Job '${LRH_SETUP_JOB}' to complete"
+    SETUP_DEADLINE=$(( $(date +%s) + ${LRH_SETUP_TIMEOUT:-900} ))
+    while :; do
+        if [ "$(setup_phase_state "$LRH_SETUP_JOB" Complete)" = "True" ]; then
+            log "run-scoped setup completed"
+            break
+        fi
+        if [ "$(setup_phase_state "$LRH_SETUP_JOB" Failed)" = "True" ]; then
+            SETUP_BLOCKED="the run-scoped setup Job '${LRH_SETUP_JOB}' FAILED"
+            break
+        fi
+        if [ "$(date +%s)" -ge "$SETUP_DEADLINE" ]; then
+            SETUP_BLOCKED="the run-scoped setup Job '${LRH_SETUP_JOB}' did not complete in time"
+            break
+        fi
+        sleep 5
+    done
+fi
 
 # ---------------------------------------------------------------------------
 # 1. Resolve this index to one concrete work item.
@@ -156,6 +291,55 @@ log "index ${IDX} -> item '${LRH_ITEM_NAME}' (ns=${LRH_NAMESPACE}, operator ns=$
 
 ARTDIR="${ART_BASE}/$(printf '%03d' "$IDX")-${LRH_ITEM_NAME}"
 mkdir -p "$ARTDIR"
+
+# A failed run-scoped setup blocks every item: the sites it checked are the
+# sites the items need. Record the item rather than letting it discover the
+# same failure slowly and separately.
+if [ -n "$SETUP_BLOCKED" ]; then
+    log "SKIPPING item '${LRH_ITEM_NAME}': ${SETUP_BLOCKED}"
+    printf '%s\nSee the setup Job log: kubectl -n %s logs job/%s\n' \
+        "$SETUP_BLOCKED" "$LRH_HARNESS_NAMESPACE" "${LRH_SETUP_JOB:-?}" > "${ARTDIR}/blocked.txt"
+    publish_result "$IDX" "$LRH_ITEM_NAME" "" 1 false "$STARTED_EPOCH" "$(date +%s)" "$ARTDIR"
+    exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 1b. Multi-site items: assemble the lab kubeconfig and resolve the fixture.
+#
+#     KUBECONFIG has to be a real FILE with real CONTEXT NAMES, because the
+#     multi-site e2e helpers drive sites by kubecontext.
+#
+#     MS_CONFIG is rendered PER ITEM, not mounted whole. That is forced, not
+#     chosen: the operator reads its site kubeconfig Secrets from its OWN
+#     namespace (site_registry.go), and every item deploys its own operator into
+#     its own namespace (M2) — so `operatorNamespace` cannot be a launch-time
+#     constant. The lab inventory IS mounted; only the item-specific field is
+#     filled in here. The suite re-reads MS_CONFIG on every call, so a rendered
+#     file needs no suite change.
+# ---------------------------------------------------------------------------
+if [ -n "${LRH_FIXTURE:-}" ]; then
+    log "multi-site item: fixture '${LRH_FIXTURE}'"
+    if ! assemble_kubeconfig "${ARTDIR}/kubeconfig" >/dev/null; then
+        log "FATAL: could not assemble the lab kubeconfig for item '${LRH_ITEM_NAME}'"
+        publish_result "$IDX" "$LRH_ITEM_NAME" "" 1 false "$STARTED_EPOCH" "$(date +%s)" "$ARTDIR"
+        exit 0
+    fi
+    export KUBECONFIG="${ARTDIR}/kubeconfig"
+
+    if ! FIXTURE_ENV="$(lrharness fixture \
+            --name "$LRH_FIXTURE" \
+            --lab "$LRH_LAB" \
+            --operator-namespace "$LRH_OPERATOR_NAMESPACE" \
+            --msconfig-out "${ARTDIR}/ms-config.yaml" 2>&1 1>"${ARTDIR}/fixture-env.sh")"; then
+        log "FATAL: could not resolve fixture '${LRH_FIXTURE}': ${FIXTURE_ENV}"
+        printf '%s\n' "$FIXTURE_ENV" > "${ARTDIR}/fixture-error.log"
+        publish_result "$IDX" "$LRH_ITEM_NAME" "" 1 false "$STARTED_EPOCH" "$(date +%s)" "$ARTDIR"
+        exit 0
+    fi
+    log "$FIXTURE_ENV"
+    # shellcheck disable=SC1090  # generated, validated by `lrharness fixture`
+    . "${ARTDIR}/fixture-env.sh"
+fi
 
 # ---------------------------------------------------------------------------
 # 2. Clean slate — but NEVER over parked evidence. The suite refuses to start if
@@ -249,8 +433,26 @@ MAKE_ARGS=(
     "TEST_NAMESPACE=${LRH_NAMESPACE}"
     E2E_OPERATOR_DEPLOY_MODE=pinned
     "E2E_OPERATOR_NAMESPACE=${LRH_OPERATOR_NAMESPACE}"
-    E2E_OPERATOR_SCOPED=true
 )
+
+# Watch scope. Single-site is the M2 shorthand: watch exactly this item's test
+# namespace.
+#
+# MULTI-SITE NEEDS ONE MORE NAMESPACE, and leaving it out is a silent deadlock
+# rather than an error. A scoped operator's cache is restricted to its watched
+# namespaces (WATCH_NAMESPACE -> cache DefaultNamespaces, ADR-014), but the site
+# kubeconfig Secrets live in the operator's OWN namespace (site_registry.go
+# resolves them there) — outside that cache. The operator then cannot read the
+# credential for any site, and the stretched cluster never comes up. So a
+# multi-site item watches its test namespace AND its operator namespace.
+if [ -n "${LRH_FIXTURE:-}" ]; then
+    MAKE_ARGS+=("E2E_WATCH_NAMESPACES=${LRH_NAMESPACE},${LRH_OPERATOR_NAMESPACE}")
+else
+    MAKE_ARGS+=(E2E_OPERATOR_SCOPED=true)
+fi
+# The suite pins its kubeconfig to this context. With MS_CONFIG set it keeps the
+# sibling site contexts rather than --minify-ing them away.
+[ -n "${KUBECONTEXT:-}" ] && MAKE_ARGS+=("KUBECONTEXT=${KUBECONTEXT}")
 [ -n "${LRH_GIT_TAG:-}" ]            && MAKE_ARGS+=("GIT_TAG=${LRH_GIT_TAG}")
 [ -n "${LITTLERED_REGISTRY:-}" ]     && MAKE_ARGS+=("LITTLERED_REGISTRY=${LITTLERED_REGISTRY}")
 [ -n "${LRH_LABEL_FILTER:-}" ]       && MAKE_ARGS+=("LABEL_FILTER=${LRH_LABEL_FILTER}")

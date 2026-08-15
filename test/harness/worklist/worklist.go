@@ -47,6 +47,7 @@ import (
 	"sigs.k8s.io/yaml"
 
 	"github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	"github.com/littlered-operator/littlered-operator/test/harness/fixture"
 )
 
 const (
@@ -93,6 +94,16 @@ type Item struct {
 	// mirrored copy so the run never depends on Docker Hub, and per-item version
 	// coverage (the migration tier pins 7.4.0 for regression fidelity).
 	RedisImage string `json:"redisImage,omitempty"`
+	// Fixture names a multi-site topology from matrix §3 ("F2-K4"). Setting it
+	// makes this a multi-site item: the driver assembles the four-context
+	// kubeconfig, renders the item's own MS_CONFIG, and exports the fixture's
+	// topology to the suite. Empty = a single-site item, unchanged from M2.
+	//
+	// A NAME rather than four numbers, deliberately: a work item that stands up
+	// the wrong topology is not a failing test but a passing test that measured
+	// something else, and only a named, validated fixture makes that catchable
+	// at launch. See package test/harness/fixture.
+	Fixture string `json:"fixture,omitempty"`
 	// Env is passed through to the suite, layered over the array defaults.
 	Env map[string]string `json:"env,omitempty"`
 }
@@ -131,6 +142,7 @@ type ResolvedItem struct {
 	OperatorImage     string
 	ChaosClientImage  string
 	RedisImage        string
+	Fixture           string
 	Env               map[string]string
 }
 
@@ -230,6 +242,18 @@ func Parse(data []byte) (List, error) {
 				return List{}, fmt.Errorf("item %d (%q): timeout %q is not a duration: %w", i, it.Name, it.Timeout, err)
 			}
 		}
+		// Resolve the fixture HERE, at launch: an unknown name would otherwise
+		// surface as a work item that quietly ran the default topology, or as a
+		// driver error at item 37 of an overnight array.
+		if it.Fixture != "" {
+			f, err := fixture.Lookup(it.Fixture)
+			if err != nil {
+				return List{}, fmt.Errorf("item %d (%q): %w", i, it.Name, err)
+			}
+			if err := f.Validate(); err != nil {
+				return List{}, fmt.Errorf("item %d (%q): %w", i, it.Name, err)
+			}
+		}
 	}
 	return l, nil
 }
@@ -268,6 +292,7 @@ func (l List) Resolve(index int) (ResolvedItem, error) {
 		OperatorImage:     firstNonEmpty(it.OperatorImage, l.Defaults.OperatorImage),
 		ChaosClientImage:  firstNonEmpty(it.ChaosClientImage, l.Defaults.ChaosClientImage),
 		RedisImage:        firstNonEmpty(it.RedisImage, l.Defaults.RedisImage),
+		Fixture:           it.Fixture,
 		Env:               env,
 	}, nil
 }
@@ -317,6 +342,9 @@ func (r ResolvedItem) ShellExport() string {
 	put("LRH_TIMEOUT_SECONDS", strconv.FormatInt(int64(r.Timeout.Seconds()), 10))
 	put("LRH_OPERATOR_IMAGE", r.OperatorImage)
 	put("LRH_CHAOS_CLIENT_IMAGE", r.ChaosClientImage)
+	// Always emitted, even when empty: the driver branches on it under `set -u`,
+	// where an UNSET variable is a hard error and an empty one is a decision.
+	put("LRH_FIXTURE", r.Fixture)
 	// The redis image crosses as the suite's OWN env var, not an LRH_ one: it is
 	// consumed by the e2e suite (preflight probe + every CR's spec.image), which
 	// inherits the driver's environment. Emitting it before the item's `env` map
@@ -413,7 +441,12 @@ func (s Summary) String() string {
 			dur = strconv.FormatInt(int64(r.DurationSeconds), 10) + "s"
 		}
 		ns := r.Namespace
-		if r.Parked {
+		// Only mark parking when there is a namespace TO park. An item blocked
+		// before it created anything (the run-scoped-setup gate, an unresolved
+		// index) records a FAIL with no namespace, and printing "[PARKED]" there
+		// would claim evidence was kept when none exists — the one direction the
+		// parking story must never lie in.
+		if r.Parked && ns != "" {
 			ns += "  [PARKED]"
 		}
 		fmt.Fprintf(&b, "  %-3d  %-28s  %-8s  %9s  %s\n", r.Index, r.Name, r.Verdict, dur, ns)
@@ -478,7 +511,29 @@ func RenderJob(p JobParams) (string, error) {
 		return "", fmt.Errorf("driver image is required")
 	}
 
-	d := jobTemplateData{
+	d, err := jobData(p)
+	if err != nil {
+		return "", err
+	}
+
+	var b strings.Builder
+	if err := jobTemplate.Execute(&b, d); err != nil {
+		return "", fmt.Errorf("rendering Job manifest: %w", err)
+	}
+	return b.String(), nil
+}
+
+// jobData is the shared parameter resolution behind the array Job and the two
+// run-scoped phase Jobs, so a defaulting decision (service account, artifact
+// path, whether the lab is mounted) cannot be made differently in three places.
+func jobData(p JobParams) (jobTemplateData, error) {
+	if p.Namespace == "" {
+		return jobTemplateData{}, fmt.Errorf("namespace is required")
+	}
+	if p.Image == "" {
+		return jobTemplateData{}, fmt.Errorf("driver image is required")
+	}
+	return jobTemplateData{
 		Array:              p.List.Array,
 		AllowParkedClobber: p.AllowParkedClobber,
 		Namespace:          p.Namespace,
@@ -492,13 +547,11 @@ func RenderJob(p JobParams) (string, error) {
 		ArtifactsHostPath:  firstNonEmpty(p.ArtifactsHostPath, "/var/lib/lr-e2e-harness"),
 		GitTag:             p.GitTag,
 		Registry:           p.Registry,
-	}
-
-	var b strings.Builder
-	if err := jobTemplate.Execute(&b, d); err != nil {
-		return "", fmt.Errorf("rendering Job manifest: %w", err)
-	}
-	return b.String(), nil
+		NeedsLab:           p.List.NeedsLab(),
+		LabConfigMap:       LabConfigMapName,
+		SiteCredSecret:     SiteCredentialSecretName,
+		SetupJob:           SetupJobName(p.List.Array),
+	}, nil
 }
 
 type jobTemplateData struct {
@@ -515,6 +568,13 @@ type jobTemplateData struct {
 	ArtifactsHostPath  string
 	GitTag             string
 	Registry           string
+	// NeedsLab gates the multi-site substrate mounts AND the run-scoped setup
+	// phase. False for a classic array, which must stay runnable on a plain
+	// workload cluster where neither object exists.
+	NeedsLab       bool
+	LabConfigMap   string
+	SiteCredSecret string
+	SetupJob       string
 }
 
 var jobTemplate = template.Must(template.New("job").Parse(`apiVersion: batch/v1
@@ -554,6 +614,14 @@ spec:
               value: /worklist/worklist.yaml
             - name: LRH_ARTIFACTS_ROOT
               value: /artifacts
+{{- if .NeedsLab }}
+            # Multi-site: block until the run-scoped setup phase has completed.
+            # A Job cannot depend on another Job, so the ordering is enforced by
+            # the driver itself rather than by whoever launched the array — the
+            # whole point of §9.3 is that no workstation is in the run path.
+            - name: LRH_SETUP_JOB
+              value: {{ .SetupJob }}
+{{- end }}
 {{- if .GitTag }}
             - name: LRH_GIT_TAG
               value: {{ .GitTag }}
@@ -582,6 +650,14 @@ spec:
               readOnly: true
             - name: artifacts
               mountPath: /artifacts
+{{- if .NeedsLab }}
+            - name: lab
+              mountPath: /lab
+              readOnly: true
+            - name: site-creds
+              mountPath: /site-creds
+              readOnly: true
+{{- end }}
       volumes:
         - name: worklist
           configMap:
@@ -594,6 +670,14 @@ spec:
           hostPath:
             path: {{ .ArtifactsHostPath }}
             type: DirectoryOrCreate
+{{- end }}
+{{- if .NeedsLab }}
+        - name: lab
+          configMap:
+            name: {{ .LabConfigMap }}
+        - name: site-creds
+          secret:
+            secretName: {{ .SiteCredSecret }}
 {{- end }}
 `))
 

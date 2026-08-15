@@ -243,7 +243,11 @@ var _ = Describe("Cluster Behaviour Matrix [multi-site]", Ordered, ContinueOnFai
 	if !topologyEnabled("multi") {
 		return
 	}
-	const ns = "ms-behaviour"
+	// The instance namespace follows TEST_NAMESPACE when a run sets one, so the
+	// in-cluster harness can give every work item its own (and so a scoped
+	// operator, whose watch list the harness derives from the same value,
+	// actually reconciles it). Unset => the historical name.
+	ns := msInstanceNamespace("ms-behaviour")
 	reg := msRegistryFromEnv()
 	h := newMultiSiteHarness(reg, ns)
 

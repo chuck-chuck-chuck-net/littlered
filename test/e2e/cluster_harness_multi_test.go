@@ -35,11 +35,12 @@ import (
 // cross-site peer live in two DIFFERENT sites, so the shard survives a single-pod (or, in the
 // takeover suite, a whole-site) loss — the multi-site analogue of single-site's 1 replica/shard.
 type multiSiteHarness struct {
-	reg           *msRegistry
-	ns            string
-	sitesPerShard int
-	nodeTimeoutMs int
-	siteNames     []string
+	reg              *msRegistry
+	ns               string
+	sitesPerShard    int
+	replicasPerShard int
+	nodeTimeoutMs    int
+	siteNames        []string
 }
 
 func newMultiSiteHarness(reg *msRegistry, ns string) *multiSiteHarness {
@@ -48,11 +49,19 @@ func newMultiSiteHarness(reg *msRegistry, ns string) *multiSiteHarness {
 		names = append(names, s.name)
 	}
 	return &multiSiteHarness{
-		reg:           reg,
-		ns:            ns,
-		sitesPerShard: 2,
-		nodeTimeoutMs: 15000,
-		siteNames:     names,
+		reg: reg,
+		ns:  ns,
+		// The topology is a knob so the harness can drive a NAMED fixture
+		// (matrix §3) rather than one hardcoded shape. Defaults are the values
+		// this harness always used, so an unset environment is unchanged.
+		//
+		// Note MS_REPLICAS_PER_SHARD is deliberately NOT the suite-wide
+		// CLUSTER_REPLICAS_PER_SHARD: that one defaults to 1, while multi-site's
+		// cross-site peer IS the redundancy, so 0 is the right default here.
+		sitesPerShard:    msEnvInt("MS_SITES_PER_SHARD", 2),
+		replicasPerShard: msEnvInt("MS_REPLICAS_PER_SHARD", 0),
+		nodeTimeoutMs:    15000,
+		siteNames:        names,
 	}
 }
 
@@ -60,7 +69,8 @@ func (h *multiSiteHarness) topology() string   { return "multi" }
 func (h *multiSiteHarness) instanceNS() string { return h.ns }
 
 func (h *multiSiteHarness) applyRedundantCR(crName string) error {
-	cr := msClusterCR(h.reg, h.ns, crName, h.siteNames, clusterShards, 0, h.sitesPerShard, h.nodeTimeoutMs)
+	cr := msClusterCR(h.reg, h.ns, crName, h.siteNames, clusterShards,
+		h.replicasPerShard, h.sitesPerShard, h.nodeTimeoutMs)
 	_, err := kctlIn(h.reg.hubContext, cr, "apply", "-f", "-")
 	return err
 }
@@ -85,9 +95,18 @@ func (h *multiSiteHarness) deleteCR(crName string) {
 	}
 }
 
-func (h *multiSiteHarness) expectedMasters() int  { return clusterShards }
-func (h *multiSiteHarness) expectedReplicas() int { return clusterShards * (h.sitesPerShard - 1) }
-func (h *multiSiteHarness) expectedTotal() int    { return clusterShards * h.sitesPerShard }
+// Members per shard = sitesPerShard x (replicasPerShard + 1) — every hosting site runs a shard
+// StatefulSet of replicasPerShard+1 pods (pillar 3.15). One of them is the shard's master, so
+// the rest are replicas. Stated as the formula, not as literals, because the reading trap
+// ("replicasPerShard: 1 dual-site = 4 members, not 2") is exactly what a hardcoded count gets
+// wrong once the fixture stops being the one it was written for.
+func (h *multiSiteHarness) expectedMasters() int { return clusterShards }
+func (h *multiSiteHarness) expectedReplicas() int {
+	return h.expectedTotal() - h.expectedMasters()
+}
+func (h *multiSiteHarness) expectedTotal() int {
+	return clusterShards * h.sitesPerShard * (h.replicasPerShard + 1)
+}
 
 // primarySiteOf returns the ordered-site index that hosts shard K's initial master (K mod numSites).
 func (h *multiSiteHarness) primarySiteOf(shard int) msSite {

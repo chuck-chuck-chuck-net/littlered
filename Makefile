@@ -715,6 +715,12 @@ e2e-harness-watch: lrharness ## Follow the array by VERDICT, exit when it ends, 
 		sleep $(E2E_HARNESS_WATCH_INTERVAL); \
 	done; \
 	echo ""; echo "=== array '$$ARRAY' finished ==="; \
+	if bin/lrharness render-teardown --worklist $(E2E_HARNESS_WORKLIST) \
+			--namespace $(E2E_HARNESS_NAMESPACE) --image $(E2E_HARNESS_IMAGE) >/dev/null 2>&1; then \
+		echo ""; echo "--- run-scoped teardown phase (report-only) ---"; \
+		$(MAKE) --no-print-directory e2e-harness-teardown || true; \
+		echo ""; \
+	fi; \
 	$(MAKE) --no-print-directory e2e-harness-rollup-strict 2>/dev/null \
 		|| { echo "exit 1: not every item is green (parked namespaces hold the evidence)"; exit 1; }
 
@@ -743,7 +749,8 @@ e2e-harness-rollup-strict: lrharness ## Print the rollup and exit non-zero unles
 .PHONY: e2e-harness-clean
 e2e-harness-clean: ## Delete the array, its results and every namespace it parked.
 	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
-	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete job "$$ARRAY" --ignore-not-found; \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete job \
+		"$$ARRAY" "$$ARRAY-setup" "$$ARRAY-teardown" --ignore-not-found; \
 	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete configmap \
 		-l "lr-e2e-harness/array=$$ARRAY" --ignore-not-found; \
 	echo "Deleting the TEST namespaces first: their LittleRed CRs hold the operator's"; \
@@ -752,6 +759,127 @@ e2e-harness-clean: ## Delete the array, its results and every namespace it parke
 		-l "lr-e2e-harness/array=$$ARRAY,!lr-e2e-harness/role" --ignore-not-found --timeout=5m; \
 	kubectl $(KUBECTL_CTX_FLAGS) delete ns \
 		-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/role=operator" --ignore-not-found --wait=false
+
+# ---------------------------------------------------------------------------
+# Multi-site substrate (docs/E2E_SOAK_HARNESS_DESIGN.md §11 M3).
+#
+# A multi-site array needs two things a classic array does not: a per-site
+# credential the driver pod can use, and a lab inventory saying where the sites
+# are. Both are LAB infrastructure — bootstrapped once, reused by every array —
+# and both are set up by `e2e-harness-sites-setup` from the workstation's admin
+# kubecontexts, which is the only vantage that can create them.
+#
+# E2E_HARNESS_LAB has NO default and never will: it names lab addresses, which
+# are configuration, not a shipped value. Start from
+# test/harness/manifests/lab.sample.yaml.
+E2E_HARNESS_LAB ?=
+
+define require_lab
+	@test -n "$(E2E_HARNESS_LAB)" || { \
+		echo "E2E_HARNESS_LAB is not set. It names your lab inventory YAML:"; \
+		echo "    make $@ E2E_HARNESS_LAB=/path/to/lab.yaml"; \
+		echo "Start from test/harness/manifests/lab.sample.yaml. A lab address is"; \
+		echo "configuration, never a committed default."; \
+		exit 1; }
+endef
+
+.PHONY: e2e-harness-lab-validate
+e2e-harness-lab-validate: lrharness ## Validate the lab inventory without touching a cluster.
+	$(require_lab)
+	@bin/lrharness lab-validate --lab $(E2E_HARNESS_LAB)
+
+# Idempotent and re-runnable: every step is an apply or a recreate, so running
+# it again after adding a site, rotating a token or losing the hub Secret simply
+# converges. It is deliberately SEPARATE from the suite's msSetupSites, which
+# provisions the OPERATOR's namespaced per-site Role for one instance namespace;
+# this provisions the TEST DRIVER's cluster-scoped credential, once per site.
+.PHONY: e2e-harness-sites-setup
+e2e-harness-sites-setup: lrharness ## Bootstrap the per-site harness credential + the hub lab objects.
+	$(require_lab)
+	@set -e; \
+	eval "$$(bin/lrharness site-credential --names)"; \
+	bin/lrharness lab-validate --lab $(E2E_HARNESS_LAB); \
+	HUB=$$(bin/lrharness lab-validate --lab $(E2E_HARNESS_LAB) --print hub); \
+	TMP=$$(mktemp -d); trap 'rm -rf "$$TMP"' EXIT; \
+	echo ""; \
+	echo "hub: $$HUB (namespace $(E2E_HARNESS_NAMESPACE))"; \
+	kubectl --context "$$HUB" get ns $(E2E_HARNESS_NAMESPACE) >/dev/null 2>&1 \
+		|| kubectl --context "$$HUB" create ns $(E2E_HARNESS_NAMESPACE); \
+	bin/lrharness lab-validate --lab $(E2E_HARNESS_LAB) --print sites > "$$TMP/sites"; \
+	FROMFILE=""; \
+	while IFS="$$(printf '\t')" read -r NAME CTX EP; do \
+		echo ""; \
+		echo "site $$NAME: applying the harness credential via admin context $$CTX"; \
+		bin/lrharness site-credential | kubectl --context "$$CTX" apply -f - ; \
+		echo "site $$NAME: waiting for the ServiceAccount token controller"; \
+		TOKEN=""; \
+		for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do \
+			TOKEN=$$(kubectl --context "$$CTX" -n "$$LRH_SITE_NAMESPACE" get secret \
+				"$$LRH_SITE_TOKEN_SECRET" -o jsonpath='{.data.token}' 2>/dev/null || true); \
+			[ -n "$$TOKEN" ] && break; sleep 2; \
+		done; \
+		test -n "$$TOKEN" || { echo "site $$NAME: token was never populated"; exit 1; }; \
+		printf '%s' "$$TOKEN" | base64 -d > "$$TMP/$$NAME.token"; \
+		kubectl --context "$$CTX" -n "$$LRH_SITE_NAMESPACE" get secret "$$LRH_SITE_TOKEN_SECRET" \
+			-o jsonpath='{.data.ca\.crt}' | base64 -d > "$$TMP/$$NAME.ca"; \
+		test -s "$$TMP/$$NAME.ca" || { echo "site $$NAME: empty cluster CA"; exit 1; }; \
+		FROMFILE="$$FROMFILE --from-file=$$NAME.token=$$TMP/$$NAME.token --from-file=$$NAME.ca=$$TMP/$$NAME.ca"; \
+		echo "site $$NAME: credential harvested ($$EP)"; \
+	done < "$$TMP/sites"; \
+	echo ""; \
+	echo "hub: publishing the per-site credential Secret $$LRH_SITE_CRED_SECRET"; \
+	kubectl --context "$$HUB" -n $(E2E_HARNESS_NAMESPACE) create secret generic \
+		"$$LRH_SITE_CRED_SECRET" $$FROMFILE --dry-run=client -o yaml \
+		| kubectl --context "$$HUB" apply -f - ; \
+	echo "hub: publishing the lab inventory ConfigMap $$LRH_LAB_CONFIGMAP"; \
+	kubectl --context "$$HUB" -n $(E2E_HARNESS_NAMESPACE) create configmap \
+		"$$LRH_LAB_CONFIGMAP" --from-file=lab.yaml=$(E2E_HARNESS_LAB) --dry-run=client -o yaml \
+		| kubectl --context "$$HUB" apply -f - ; \
+	echo ""; \
+	echo "Bootstrapped. A multi-site array can now launch: make e2e-harness-launch \\"; \
+	echo "    E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-m3-multisite.yaml KUBECONTEXT=$$HUB"
+
+.PHONY: e2e-harness-sites-clean
+e2e-harness-sites-clean: lrharness ## Remove the per-site harness credential and the hub lab objects.
+	$(require_lab)
+	@set -e; \
+	eval "$$(bin/lrharness site-credential --names)"; \
+	HUB=$$(bin/lrharness lab-validate --lab $(E2E_HARNESS_LAB) --print hub); \
+	bin/lrharness lab-validate --lab $(E2E_HARNESS_LAB) --print sites \
+	| while IFS="$$(printf '\t')" read -r NAME CTX EP; do \
+		echo "site $$NAME: removing the harness credential"; \
+		bin/lrharness site-credential | kubectl --context "$$CTX" delete --ignore-not-found -f - ; \
+	done; \
+	kubectl --context "$$HUB" -n $(E2E_HARNESS_NAMESPACE) delete secret "$$LRH_SITE_CRED_SECRET" --ignore-not-found; \
+	kubectl --context "$$HUB" -n $(E2E_HARNESS_NAMESPACE) delete configmap "$$LRH_LAB_CONFIGMAP" --ignore-not-found
+
+# The run-scoped TEARDOWN phase (§9.2.4). Report-only: it says what the array
+# left behind on each site and deletes nothing, so firing it is always safe and
+# a run that ends without it loses nothing.
+.PHONY: e2e-harness-teardown
+e2e-harness-teardown: lrharness ## Run the array's run-scoped teardown phase (report-only).
+	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	: "The teardown inherits the image the ARRAY actually pinned, rather than"; \
+	: "re-deriving it. It is the same run, so it must be the same image — and"; \
+	: "e2e-harness-watch fires this target without carrying LITTLERED_REGISTRY,"; \
+	: "so re-deriving silently fell back to the public default and the teardown"; \
+	: "sat in ImagePullBackOff (found on the first M3 array)."; \
+	IMG=$$(kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get job "$$ARRAY" \
+		-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null); \
+	POL=$$(kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) get job "$$ARRAY" \
+		-o jsonpath='{.spec.template.spec.containers[0].imagePullPolicy}' 2>/dev/null); \
+	[ -n "$$IMG" ] || IMG='$(E2E_HARNESS_IMAGE)'; \
+	[ -n "$$POL" ] || POL='$(E2E_HARNESS_PULL_POLICY)'; \
+	bin/lrharness render-teardown \
+		--worklist $(E2E_HARNESS_WORKLIST) \
+		--namespace $(E2E_HARNESS_NAMESPACE) \
+		--image "$$IMG" \
+		--image-pull-policy "$$POL" 2>/dev/null \
+	| { kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete job "$$ARRAY-teardown" \
+			--ignore-not-found >/dev/null; kubectl $(KUBECTL_CTX_FLAGS) apply -f -; } ; \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) wait --for=condition=complete \
+		job/"$$ARRAY-teardown" --timeout=5m >/dev/null 2>&1 || true; \
+	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) logs job/"$$ARRAY-teardown" 2>/dev/null || true
 
 ##@ Dependencies
 

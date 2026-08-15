@@ -1,0 +1,54 @@
+# Lab inventory (E2E_HARNESS_LAB) — SAMPLE.
+#
+# The one place the harness writes down WHERE your lab is. Copy it, fill in your
+# own contexts and endpoints, keep it OUT of the repository, and point the
+# bootstrap at it:
+#
+#     make e2e-harness-sites-setup E2E_HARNESS_LAB=/path/to/your-lab.yaml
+#
+# That target is idempotent: re-run it after adding a site, rotating a token, or
+# losing the hub objects, and it converges.
+#
+# There is deliberately NO default for E2E_HARNESS_LAB and no lab address in the
+# repository. A lab address is configuration; a committed one would be wrong for
+# everybody but its author, and littlered is public OSS.
+#
+# This file is NOT the multi-site e2e's MS_CONFIG. It is the superset the
+# harness bootstraps from; each work item's MS_CONFIG is rendered from it at run
+# time, because the operator namespace in that file is per item (each work item
+# deploys its own operator, and the operator reads its site kubeconfig Secrets
+# from its own namespace). See docs/multisite-e2e-config.sample.yaml for the
+# MS_CONFIG schema itself.
+
+# The WORKSTATION's admin kubecontext for the hub — the cluster that runs the
+# operator, holds the LittleRed CRs and hosts the harness Job.
+hubContext: my-hub
+
+sites:
+    # `name`     the logical site name. It is the operator's ground-truth key, the
+    #            CR's spec.multiSite.sites[].name, AND the context name the driver
+    #            pod uses. Must be a DNS label.
+    #
+    # `context`  the WORKSTATION's admin kubecontext for this site. Used ONLY by
+    #            `make e2e-harness-sites-setup`, which needs cluster-admin there to
+    #            create the harness's ClusterRole. The driver pod never uses it —
+    #            it holds a ServiceAccount token instead.
+    #
+    # `endpoint` the site's API server URL as routable FROM HUB PODS, not from
+    #            your workstation. On a routed-pod-network lab this is the
+    #            repl-net API VIP. Getting the vantage wrong is the classic
+    #            multi-site setup mistake: it works from your terminal and fails
+    #            in the pod.
+    #
+    # ORDER MATTERS. Multi-site placement is index-based (shard K -> sites
+    # (K+j) mod S), so this sequence is part of the topology, and a fixture that
+    # needs 2 sites takes the first two. Reordering re-places every shard.
+  - name: site-a
+    context: my-site-a-admin
+    endpoint: https://10.1.1.10:6443
+  - name: site-b
+    context: my-site-b-admin
+    endpoint: https://10.1.2.10:6443
+  - name: site-c
+    context: my-site-c-admin
+    endpoint: https://10.1.3.10:6443

@@ -1,0 +1,67 @@
+# M3 acceptance work list (docs/E2E_SOAK_HARNESS_DESIGN.md §11 M3).
+#
+# What M3 adds over M2: the driver moves to the HUB and drives a STRETCHED Redis
+# Cluster across real workload clusters. Each item names a topology FIXTURE from
+# the matrix (docs/MULTI_SITE_E2E_TEST_MATRIX.md §3); the driver then assembles
+# the four-context kubeconfig, renders that item's own MS_CONFIG, and hands the
+# suite the fixture's topology.
+#
+# DELIBERATELY NO FAULTS. M3 proves the driver can DRIVE multi-site; breaking it
+# is M4. Nothing here powers anything off, installs a network policy, or touches
+# the disruption ledger — and the rendered MS_CONFIG omits both fields that
+# would arm those (`vms`, `hubPodCIDR`).
+#
+# Two items, both F2-K4, and that is the acceptance criterion rather than
+# padding: an item that passes once may still have left state that breaks the
+# next one — a site namespace, a hub Secret, a half-swept CR. Running the same
+# item twice in one array is what proves it did not.
+#
+#   F2-K4  2 sites, K=4 shards, sitesPerShard=2, replicasPerShard=0
+#          => 8 pods, initial master split 2+2, quorum 3.
+#          The recommended dual-site (ADR-012 D3): the even split sits exactly
+#          on the takeover floor in both directions, so a loss either way is
+#          fence-safe.
+#
+# PREREQUISITE — the lab substrate must be bootstrapped once:
+#
+#     make e2e-harness-sites-setup E2E_HARNESS_LAB=/path/to/your-lab.yaml
+#
+# and the images pushed at the array's tag:
+#
+#     make e2e-harness-images LITTLERED_REGISTRY=<your registry>
+#
+# For an UNATTENDED array, add a mirrored redis image below so the run does not
+# depend on Docker Hub (§9.3 autonomy) — and mirror oliver006/redis_exporter
+# into the same registry, which the exporter inherits. A mirror hostname is
+# never a committed default, so the shipped list keeps the public one.
+
+array: msbring
+
+defaults:
+  # Bring-up of 8 cross-site pods plus a per-item operator install. Generous
+  # enough for a cold node's image pulls, tight enough that a wedged item cannot
+  # eat the evening.
+  timeout: 25m
+  # For an autonomous run:
+  #   redisImage: myregistry.example/library/redis:8.4.2
+
+items:
+    # `focus` selects the fixture-independent bring-up context of the shared
+    # cluster behaviour matrix: forms a healthy cluster serving all 16384 slots,
+    # stores and retrieves data across shards, and converges to a healthy end
+    # state — which for the multi-site harness IS the cross-site placement
+    # assertion (msVerifyCrossSiteTopology: every shard's master and its
+    # replica in DIFFERENT sites). The pod-failure/chaos contexts of that same
+    # matrix are deliberately not selected: they are faults, and faults are M4.
+    #
+    # E2E_TOPOLOGY=multi comes from the fixture, and it is what stops the
+    # single-site half of the matrix from registering at all.
+  - name: f2k4-a
+    fixture: F2-K4
+    labelFilter: cluster-behaviour
+    focus: Bring-up and basic operations
+
+  - name: f2k4-b
+    fixture: F2-K4
+    labelFilter: cluster-behaviour
+    focus: Bring-up and basic operations

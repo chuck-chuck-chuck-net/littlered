@@ -49,6 +49,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -194,6 +195,47 @@ func msRegistryFromEnv() *msRegistry {
 
 func cfgOr(v, def string) string {
 	if strings.TrimSpace(v) != "" {
+		return v
+	}
+	return def
+}
+
+// --- Harness-driven overrides -------------------------------------------------------------
+//
+// Every knob below keeps its historical value when unset, so a hand-run `make test-e2e
+// LABEL_FILTER=multisite` is unchanged. They exist because the in-cluster work-list harness
+// (test/harness, design §11 M3) runs the SAME specs as one work item among many, and a work
+// item owns its namespace and its topology rather than inheriting a hardcoded one.
+
+// msInstanceNamespace is the namespace a multi-site instance lives in, on the hub and in every
+// site. It follows TEST_NAMESPACE when the run sets one.
+//
+// Following it is not cosmetic. A namespace-scoped operator (E2E_WATCH_NAMESPACES) only
+// reconciles what it watches, and the harness derives that scope from the item's TEST_NAMESPACE
+// — so an instance in a differently-named namespace would simply never be reconciled. Reading
+// the environment directly, rather than the suite's `testNamespace` var, is required because a
+// Ginkgo container body runs at TREE-CONSTRUCTION time, before BeforeSuite has loaded it.
+func msInstanceNamespace(def string) string {
+	if ns := strings.TrimSpace(os.Getenv("TEST_NAMESPACE")); ns != "" {
+		return ns
+	}
+	return def
+}
+
+// msEnvInt / msEnvStr read a harness-supplied topology knob, defaulting to the value the suite
+// used before it was a knob at all.
+func msEnvInt(key string, def int) int {
+	raw := strings.TrimSpace(os.Getenv(key))
+	if raw == "" {
+		return def
+	}
+	n, err := strconv.Atoi(raw)
+	Expect(err).NotTo(HaveOccurred(), "%s must be an integer, got %q", key, raw)
+	return n
+}
+
+func msEnvStr(key, def string) string {
+	if v := strings.TrimSpace(os.Getenv(key)); v != "" {
 		return v
 	}
 	return def
@@ -351,6 +393,10 @@ func msClusterCR(reg *msRegistry, ns, name string, siteNames []string, shards, r
 		sites.WriteString(fmt.Sprintf("    - name: %s\n      kubeconfigSecretRef:\n        name: %s\n",
 			sn, msSiteSecretName(ns, sn)))
 	}
+	// Frugal sizing is what makes a fixture cheap enough to repeat (matrix §3
+	// sizes them at 100m/128Mi). The defaults preserve the historical values.
+	cpu := msEnvStr("MS_REDIS_CPU", "128m")
+	mem := msEnvStr("MS_REDIS_MEMORY", "256Mi")
 	return withRedisImage(fmt.Sprintf(`apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -368,11 +414,11 @@ spec:
       mode: pod-routed
     sites:
 %s  resources:
-    requests: {memory: 256Mi, cpu: 128m}
-    limits: {memory: 256Mi}
+    requests: {memory: %s, cpu: %s}
+    limits: {memory: %s}
   config:
     maxmemoryPolicy: noeviction
-`, name, ns, shards, replicasPerShard, nodeTimeoutMs, sitesPerShard, sites.String()))
+`, name, ns, shards, replicasPerShard, nodeTimeoutMs, sitesPerShard, sites.String(), mem, cpu, mem))
 }
 
 // --- Ground-truth readers (context-aware) ------------------------------------------------

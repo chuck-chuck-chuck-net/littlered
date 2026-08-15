@@ -55,6 +55,23 @@ func RenderBundle(p BundleParams) (string, error) {
 	if err := bundleTemplate.Execute(&b, d); err != nil {
 		return "", fmt.Errorf("rendering bundle: %w", err)
 	}
+
+	// The run-scoped SETUP phase (design §9.2.4), when the array declares one.
+	// Emitted BEFORE the array Job so a plain `kubectl apply` creates it first;
+	// the ordering that actually matters is still enforced in-cluster, by every
+	// item waiting on this Job's completion.
+	//
+	// The TEARDOWN Job is deliberately NOT in the bundle: applying it at launch
+	// would run it immediately, before the array it is supposed to follow.
+	if p.List.NeedsLab() {
+		setup, serr := RenderSetupJob(p.JobParams)
+		if serr != nil {
+			return "", serr
+		}
+		b.WriteString("---\n")
+		b.WriteString(setup)
+	}
+
 	b.WriteString("---\n")
 	b.WriteString(job)
 	return b.String(), nil

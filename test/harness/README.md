@@ -11,7 +11,9 @@ generalization, §9.2 what the matrix forces, §11 the milestone plan).
 image. That pairing is the point (§3): N parked failures can only sit side by
 side if each operator is blind to the others' namespaces — otherwise they
 double-reconcile each other's CRs and corrupt the very forensic state parking
-exists to preserve.
+exists to preserve. **M3** moved the driver to the **hub** and made a work item
+stand up a stretched **multi-site** Redis Cluster across real workload clusters
+(see "Multi-site arrays" below).
 
 ## Why a work LIST and not a repeat counter
 
@@ -30,10 +32,13 @@ calls out (§11).
 | Path | What |
 |---|---|
 | `worklist/` | The **pure seam**: parse, resolve index→item, classify a verdict, fold a rollup, render the manifests. No I/O; unit-tested. |
-| `cmd/lrharness/` | Thin CLI over that seam. Lives in the driver image and builds to `bin/lrharness` on the host. |
+| `fixture/` | The named multi-site topologies of matrix §3 (`F2-K4`, …) as data, plus the arithmetic derived from them: pods, the initial master split, the quorum, LR-031's two thresholds. |
+| `lab/` | The multi-site **substrate** seam: the lab inventory, the harness's per-site credential, the in-pod kubeconfig, the per-item `MS_CONFIG`. |
+| `cmd/lrharness/` | Thin CLI over those seams. Lives in the driver image and builds to `bin/lrharness` on the host. |
 | `driver/Dockerfile` | The driver image: Go toolchain + make + kubectl + helm + the repo, **alive at runtime**. |
-| `driver/harness-entrypoint.sh` | The per-index driver. Deliberately only plumbing — every decision is delegated to `lrharness`. |
-| `manifests/worklist-*.yaml` | Sample work lists. `worklist-m2-classic.yaml` is the M2 acceptance list (per-item operators, a deliberate spec-level failure); `worklist-soak.yaml` is the classic "N runs of the suite". |
+| `driver/harness-entrypoint.sh` | The driver. Three phases (`item`, `setup`, `teardown`), selected by `LRH_PHASE`. Deliberately only plumbing — every decision is delegated to `lrharness`. |
+| `manifests/worklist-*.yaml` | Sample work lists. `worklist-m2-classic.yaml` is the M2 acceptance list (per-item operators, a deliberate spec-level failure); `worklist-m3-multisite.yaml` is the M3 one (a stretched cluster, twice); `worklist-soak.yaml` is the classic "N runs of the suite". |
+| `manifests/lab.sample.yaml` | Template for the **lab inventory** (`E2E_HARNESS_LAB`). Copy it; never commit yours. |
 
 ## The work-list schema
 
@@ -57,6 +62,8 @@ items:                      # required, >= 1
     chaosClientImage: ...   #   matrix cell G9 starts on an older operator)
     redisImage: ...         # optional -> E2E_REDIS_IMAGE: the redis image the
                             #   CRs AND the preflight probe use
+    fixture: F2-K4          # optional: a MULTI-SITE topology from matrix §3.
+                            #   Setting it makes the item multi-site.
     env:                    # optional, merged over defaults.env
       SOME_KNOB: "value"
 ```
@@ -360,6 +367,132 @@ The rollup counts against the **work-list length**, not the number of results
 found, so an index whose pod died is reported `MISSING` rather than quietly
 shrinking the denominator.
 
+## Multi-site arrays (M3)
+
+A work item that names a **fixture** stands up a stretched Redis Cluster across
+several workload Kubernetes clusters, driven from a Job on the **hub**. Nothing
+about the array mechanics changes — same Indexed Job, same always-`exit 0`, same
+parking, same rollup.
+
+```yaml
+items:
+  - name: f2k4-a
+    fixture: F2-K4                       # matrix §3
+    labelFilter: cluster-behaviour
+    focus: Bring-up and basic operations
+```
+
+The fixtures are the whole matrix §3 table (`lrharness fixture --name ...` prints
+one). `F2-K4` is 2 sites, `shards: 4`, `sitesPerShard: 2`, `replicasPerShard: 0`
+⇒ **8 pods**, initial master split **2+2**, quorum 3 — the recommended dual-site,
+whose even split sits exactly on the takeover floor in both directions.
+
+The fixture is a **name**, not four numbers, on purpose: an item that stands up
+the wrong topology is not a failing test but a passing test that measured
+something else. An unknown name is refused at launch, before any cluster is
+touched.
+
+### Bootstrap the lab once
+
+```bash
+cp test/harness/manifests/lab.sample.yaml ~/my-lab.yaml   # fill in, do NOT commit
+make e2e-harness-lab-validate E2E_HARNESS_LAB=~/my-lab.yaml
+make e2e-harness-sites-setup  E2E_HARNESS_LAB=~/my-lab.yaml
+```
+
+That applies the harness's own per-site credential to each site (using your
+admin kubecontexts), harvests the ServiceAccount tokens and CAs, and publishes
+them on the hub as a Secret plus the inventory as a ConfigMap. Idempotent:
+re-run it after adding a site or rotating a token. `make e2e-harness-sites-clean`
+removes it all again.
+
+Each site's `endpoint` must be routable **from hub pods**, not from your
+workstation — different network positions. Verify from a pod.
+
+### Why the harness site credential is a `ClusterRole`
+
+Because `namespaces` is a **cluster-scoped resource**: a namespaced `Role`
+cannot grant `create` on it at any rule content, and the harness creates one
+fresh namespace per work item on every site. Pre-provisioning cannot serve that
+either — the names are derived from array+index+item, and the e2e suite refuses
+to start if its test namespace already exists.
+
+**This is not the operator's credential and must never be merged with it.**
+ADR-012's "multi-site keeps the namespaced per-site Role — no cluster-scoped
+RBAC" is a property of the **operator**, whose per-site `littlered-site` Role is
+untouched and stays namespaced. The harness is a *test driver*: it execs into
+redis pods (the operator never does — it reaches Redis over TCP) and it creates
+namespaces (the operator never does). Separate objects, separate names
+(`lr-e2e-harness-driver`), so a later reader cannot "simplify" the two together.
+
+### The run-scoped setup / teardown phases
+
+The same image runs three phases, selected by `LRH_PHASE`:
+
+| Phase | When | What |
+|---|---|---|
+| `setup` | once, before any item | assembles the kubeconfig and reaches **every** site. Every item waits for it. |
+| `item` | per index | the work item (always `exit 0`). |
+| `teardown` | once, after the array | reports what the run left on each site. **Deletes nothing.** |
+
+The ordering is enforced **in-cluster** — the driver blocks on the setup Job's
+completion — rather than by whoever launched the array, because a workstation in
+the run path is exactly what §9.3 exists to remove. A failed setup blocks every
+item with a recorded `FAIL` that names it, and no namespaces are created:
+
+```
+[harness 20:54:36]   ok       site scm-s1 reachable (8 namespaces)
+[harness 20:54:36]   UNREACHABLE  site scm-s2: ... Client.Timeout exceeded ...
+[harness 20:54:36] REFUSING TO RUN THE ARRAY: at least one site is unreachable from this pod.
+...
+[harness 20:54:39] SKIPPING item 'f2k4-a': the run-scoped setup Job 'msgate-setup' FAILED
+```
+
+Teardown is **report-only** by design. A Kubernetes Job cannot schedule a
+successor, so it is fired by `e2e-harness-watch` when the array ends (or by
+`make e2e-harness-teardown`); that trigger is not guaranteed, and a phase that
+deleted things would be a phase that sometimes silently did not. It also keeps
+the standing rule: the harness never destroys forensic evidence unless
+explicitly told to.
+
+Nothing needs the phases until M5's resident split-brain monitor; they exist now
+so that monitor slots in without restructuring.
+
+### `MS_CONFIG` is rendered per item, not mounted whole
+
+The **lab inventory** is mounted (a ConfigMap). Each item's `MS_CONFIG` is
+rendered from it at run time, into the item's artifact directory. That is forced
+rather than chosen: the operator resolves its site kubeconfig Secrets from its
+**own** namespace, and every item deploys its own operator into its own
+namespace — so `operatorNamespace` cannot be a launch-time constant. The suite
+re-reads `MS_CONFIG` on every call, so a rendered file needs no suite change.
+
+The rendered file deliberately omits `vms` and `hubPodCIDR`: those arm the
+whole-site power-off and the data-plane cut respectively, and **M3 injects no
+faults**.
+
+### A multi-site item watches TWO namespaces
+
+A scoped operator's cache is restricted to its watched namespaces, but the site
+kubeconfig Secrets live in the operator's **own** namespace — outside that
+cache. So a multi-site item passes `E2E_WATCH_NAMESPACES=<test>,<operator>`
+instead of the single-site `E2E_OPERATOR_SCOPED=true` shorthand. Leaving the
+operator namespace out is a silent deadlock, not an error: the operator simply
+never reads a site credential and the stretched cluster never comes up.
+
+### Running one
+
+```bash
+make e2e-harness-images LITTLERED_REGISTRY=<your registry> CONTAINER_TOOL=podman
+make e2e-harness-launch E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-m3-multisite.yaml \
+     LITTLERED_REGISTRY=<your registry> KUBECONTEXT=<hub>
+make e2e-harness-watch  E2E_HARNESS_WORKLIST=test/harness/manifests/worklist-m3-multisite.yaml \
+     KUBECONTEXT=<hub>
+```
+
+**Scale any cluster-scoped operator on the hub to zero first** — it watches every
+namespace, including each item's, and would double-reconcile the CRs.
+
 ## Known limitations
 
 - **`FOCUS` cannot contain a single quote.** `run-test-e2e` interpolates it into
@@ -374,3 +507,15 @@ shrinking the denominator.
 - **`hostPath` artifacts** assume a single-node cluster, or that you only ever
   read artifacts from the node that ran the item. Use `--artifacts-pvc` where a
   StorageClass exists.
+- **A parked multi-site item leaves namespaces on the SITES too**, and neither
+  `e2e-harness-clean` (which only reaches the hub) nor the report-only teardown
+  phase removes them. The teardown phase names them; delete them deliberately
+  with `kubectl --context <site> delete ns <name>`.
+- **The run-scoped teardown only fires if something fires it** —
+  `e2e-harness-watch`, `e2e-harness-teardown`, or a human. A Job cannot schedule
+  a successor. Harmless today (the phase is report-only); a phase that must run
+  unattended — M5's monitor shutdown — will need a small controller or a
+  wrapping workflow rather than this hook.
+- **No launch-time guard against a cluster-scoped operator on the hub.** It
+  would fight the per-item operators, and the only current defence is the
+  sentence above.

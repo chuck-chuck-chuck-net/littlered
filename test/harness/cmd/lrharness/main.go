@@ -63,6 +63,16 @@ func main() {
 		err = cmdRender(os.Args[2:], false)
 	case "render":
 		err = cmdRender(os.Args[2:], true)
+	case "render-teardown":
+		err = cmdRenderTeardown(os.Args[2:])
+	case "site-credential":
+		err = cmdSiteCredential(os.Args[2:])
+	case "lab-validate":
+		err = cmdLabValidate(os.Args[2:])
+	case "kubeconfig":
+		err = cmdKubeconfig(os.Args[2:])
+	case "fixture":
+		err = cmdFixture(os.Args[2:])
 	case "-h", "--help", "help":
 		usage()
 		return
@@ -94,6 +104,24 @@ func usage() {
              [--chaos-client-image C]
              (every image ref the array pins, one per line — what a launch
               must be able to pull before it is worth starting)
+
+multi-site (design §11 M3):
+
+  site-credential
+             (the harness's OWN per-site credential manifest: namespace, SA,
+              ClusterRole, binding and a long-lived token. A ClusterRole because
+              namespaces is a cluster-scoped resource. Applied once per site by the
+              bootstrap; deliberately SEPARATE from the operator's Role.)
+  lab-validate   --lab F
+  kubeconfig     --lab F --creds DIR --out FILE
+             (the driver pod's four-context kubeconfig: the hub from its own
+              in-cluster ServiceAccount, one context per site from the mounted
+              credential Secret)
+  fixture        --name N --lab F --operator-namespace NS --msconfig-out FILE
+             (resolve a matrix §3 topology: writes the item's MS_CONFIG, prints
+              the suite environment as POSIX exports)
+  render-teardown --worklist F --namespace NS --image IMG
+             (the run-scoped teardown Job; NOT part of the launch bundle)
 `)
 }
 
