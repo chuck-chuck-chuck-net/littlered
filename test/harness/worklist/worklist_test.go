@@ -297,6 +297,137 @@ func TestResolveNamespaceIsDeterministicAndLegal(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
+// M2: the per-item OPERATOR namespace (design §3, §11 M2).
+//
+// N parked items can only coexist if each carries its own operator, blind to
+// the others' namespaces. So every item needs a SECOND namespace, derived by
+// the same rules as the first: deterministic, legal, collision-free — and
+// never equal to any item's test namespace, since a shared name would make the
+// operator's own workload live inside the namespace it reconciles.
+// ---------------------------------------------------------------------------
+
+func TestResolveOperatorNamespaceIsDistinctDeterministicAndLegal(t *testing.T) {
+	var long strings.Builder
+	long.WriteString("array: " + strings.Repeat("a", 40) + "\nitems:\n")
+	for i := range 3 {
+		long.WriteString("  - name: " + strings.Repeat("b", 40) + string(rune('0'+i)) + "\n    labelFilter: pdb\n")
+	}
+	l, err := Parse([]byte(long.String()))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	seen := map[string]int{}
+	for i := range 3 {
+		r, err := l.Resolve(i)
+		if err != nil {
+			t.Fatalf("Resolve(%d): %v", i, err)
+		}
+		if r.OperatorNamespace == "" {
+			t.Fatalf("Resolve(%d): OperatorNamespace is empty — every item needs its own operator (design §3)", i)
+		}
+		if len(r.OperatorNamespace) > 63 {
+			t.Errorf("OperatorNamespace %q is %d chars, want <=63 (DNS-1123 label)",
+				r.OperatorNamespace, len(r.OperatorNamespace))
+		}
+		if !dnsLabel.MatchString(r.OperatorNamespace) {
+			t.Errorf("OperatorNamespace %q is not a legal DNS-1123 label", r.OperatorNamespace)
+		}
+		if !strings.HasPrefix(r.OperatorNamespace, NamespacePrefix) {
+			t.Errorf("OperatorNamespace %q must start with %q so a parked operator is identifiable and reapable",
+				r.OperatorNamespace, NamespacePrefix)
+		}
+		if r.OperatorNamespace == r.Namespace {
+			t.Errorf("item %d: operator namespace equals the test namespace (%q) — the operator would "+
+				"live inside the namespace it reconciles", i, r.Namespace)
+		}
+		if prev, dup := seen[r.OperatorNamespace]; dup {
+			t.Errorf("OperatorNamespace %q collides with item %d", r.OperatorNamespace, prev)
+		}
+		seen[r.OperatorNamespace] = i
+		if prev, dup := seen[r.Namespace]; dup {
+			t.Errorf("test namespace %q collides with the operator namespace of item %d", r.Namespace, prev)
+		}
+		seen[r.Namespace] = i
+
+		again, err := l.Resolve(i)
+		if err != nil {
+			t.Fatalf("Resolve(%d) again: %v", i, err)
+		}
+		if again.OperatorNamespace != r.OperatorNamespace {
+			t.Errorf("OperatorNamespace not deterministic: %q then %q", r.OperatorNamespace, again.OperatorNamespace)
+		}
+	}
+}
+
+// The redis image is a work-list knob so a whole array can be pointed at a
+// mirrored copy (design §11 M2: the preflight's public pull is the one
+// guaranteed-uncacheable pull per item) and so a single item can pin an older
+// version. It layers like every other field: item over defaults.
+func TestResolveRedisImageLayersLikeTheOtherImages(t *testing.T) {
+	l, err := Parse([]byte(`
+array: images
+defaults:
+  redisImage: registry.example.lan/library/redis:8.4.2
+items:
+  - name: inherits
+    labelFilter: pdb
+  - name: overrides
+    labelFilter: pdb
+    redisImage: redis:7.4.0
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+
+	inherited, err := l.Resolve(0)
+	if err != nil {
+		t.Fatalf("Resolve(0): %v", err)
+	}
+	if got, want := inherited.RedisImage, "registry.example.lan/library/redis:8.4.2"; got != want {
+		t.Errorf("item 0 RedisImage = %q, want the array default %q", got, want)
+	}
+
+	overridden, err := l.Resolve(1)
+	if err != nil {
+		t.Fatalf("Resolve(1): %v", err)
+	}
+	if got, want := overridden.RedisImage, "redis:7.4.0"; got != want {
+		t.Errorf("item 1 RedisImage = %q, want its own override %q", got, want)
+	}
+}
+
+// The driver is shell: whatever the seam decides has to cross that boundary, or
+// it is not actually wired. Both M2 decisions do.
+func TestShellExportCarriesTheM2Decisions(t *testing.T) {
+	l, err := Parse([]byte(`
+array: smoke
+defaults:
+  redisImage: registry.example.lan/library/redis:8.4.2
+items:
+  - name: item-a
+    labelFilter: pdb
+`))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	r, err := l.Resolve(0)
+	if err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+	out := r.ShellExport()
+
+	for _, want := range []string{
+		"export LRH_OPERATOR_NAMESPACE='" + r.OperatorNamespace + "'",
+		"export E2E_REDIS_IMAGE='registry.example.lan/library/redis:8.4.2'",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("ShellExport() is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// ---------------------------------------------------------------------------
 // ShellExport — the driver is shell; the resolved item crosses that boundary.
 // A focus string is arbitrary spec text and WILL contain spaces and quotes.
 // ---------------------------------------------------------------------------
@@ -619,6 +750,31 @@ func TestRenderBundleIsSelfConsistent(t *testing.T) {
 	// hostPath artifacts need a namespace that is not PSS-baseline.
 	if !strings.Contains(out, "pod-security.kubernetes.io/enforce: privileged") {
 		t.Errorf("harness namespace must be PSS-privileged (hostPath artifact volume); got:\n%s", out)
+	}
+}
+
+// The driver helm-installs a per-item operator (M2), which creates that
+// operator's leader-election Role. Kubernetes forbids granting permissions the
+// creator does not itself hold, so a rule missing here does not degrade the
+// driver — it makes every single work item fail at `helm upgrade --install`
+// with "attempt to grant extra privileges".
+func TestRenderBundleGrantsWhatThePerItemOperatorNeeds(t *testing.T) {
+	l, err := Parse([]byte("array: a\nitems:\n  - name: i\n    labelFilter: pdb\n"))
+	if err != nil {
+		t.Fatalf("Parse: %v", err)
+	}
+	out, err := RenderBundle(BundleParams{
+		JobParams:    JobParams{List: l, Namespace: "ns", Image: "img", Parallelism: 1},
+		WorkListYAML: "array: a\n",
+	})
+	if err != nil {
+		t.Fatalf("RenderBundle: %v", err)
+	}
+	// The operator's own leader-election Role holds leases; the driver must be
+	// able to grant that.
+	if !strings.Contains(out, "coordination.k8s.io") {
+		t.Errorf("driver ClusterRole does not cover coordination.k8s.io/leases, so creating the "+
+			"operator's leader-election Role would be an RBAC escalation:\n%s", out)
 	}
 }
 

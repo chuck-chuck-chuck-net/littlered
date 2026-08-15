@@ -38,15 +38,16 @@ finish() {
 }
 trap finish EXIT
 
-# publish_result <idx> <name> <ns> <rc> <timed_out> <started> <finished> <artdir>
+# publish_result <idx> <name> <ns> <rc> <timed_out> <started> <finished> <artdir> [opns]
 #
 # Writes the item's result record, publishes it as a labelled ConfigMap for the
-# rollup to collect, and then parks or cleans the item's namespace. The
-# park/clean decision follows the `parked` field of the record, so the recorded
-# verdict and the actual cleanup can never disagree.
+# rollup to collect, and then parks or cleans the item's namespaces — BOTH of
+# them: the test namespace and (M2) the namespace holding this item's own
+# operator. The park/clean decision follows the `parked` field of the record, so
+# the recorded verdict and the actual cleanup can never disagree.
 publish_result() {
     local idx="$1" name="$2" ns="$3" rc="$4" timed_out="$5"
-    local started="$6" finished="$7" artdir="$8"
+    local started="$6" finished="$7" artdir="$8" opns="${9:-}"
 
     local timeout_flag=""
     [ "$timed_out" = "true" ] && timeout_flag="--timed-out"
@@ -77,7 +78,7 @@ publish_result() {
       | kubectl apply -f - >>"${artdir}/driver.log" 2>&1 \
       || log "WARNING: could not publish result ConfigMap ${cm} (see driver.log)"
 
-    [ -z "$ns" ] && return 0
+    [ -z "$ns" ] && [ -z "$opns" ] && return 0
 
     # Fail SAFE, not open: delete only on an explicit "parked":false. If the
     # record could not be written or parsed, `parked` is empty and we must park
@@ -86,22 +87,42 @@ publish_result() {
         if [ "$parked" != "true" ]; then
             log "WARNING: no verdict could be read from the result record — parking defensively"
         fi
-        # Failure handling is "do nothing" (design §4.2): leave the namespace
-        # and everything the operator built in it standing for inspection.
-        log "PARKING namespace ${ns} for forensics"
-        kubectl label ns "$ns" --overwrite \
-            "lr-e2e-harness/parked=true" \
-            "lr-e2e-harness/array=${LRH_ARRAY}" \
-            "lr-e2e-harness/index=${idx}" >>"${artdir}/driver.log" 2>&1
-        kubectl annotate ns "$ns" --overwrite \
-            "lr-e2e-harness/item=${name}" \
-            "lr-e2e-harness/verdict=${verdict}" \
-            "lr-e2e-harness/artifacts=${artdir}" >>"${artdir}/driver.log" 2>&1
+        # Failure handling is "do nothing" (design §4.2): leave the namespaces
+        # and everything in them standing for inspection — including this item's
+        # OWN operator, still running and still reconciling only its own test
+        # namespace (design §3: that is why it is namespace-scoped).
+        for parkns in "$ns" "$opns"; do
+            [ -z "$parkns" ] && continue
+            log "PARKING namespace ${parkns} for forensics"
+            kubectl label ns "$parkns" --overwrite \
+                "lr-e2e-harness/parked=true" \
+                "lr-e2e-harness/array=${LRH_ARRAY}" \
+                "lr-e2e-harness/index=${idx}" >>"${artdir}/driver.log" 2>&1
+            kubectl annotate ns "$parkns" --overwrite \
+                "lr-e2e-harness/item=${name}" \
+                "lr-e2e-harness/verdict=${verdict}" \
+                "lr-e2e-harness/artifacts=${artdir}" >>"${artdir}/driver.log" 2>&1
+        done
     else
-        # The suite's own AfterSuite already deletes the namespace on success;
-        # this is the idempotent belt-and-braces for a crash before AfterSuite.
-        log "cleaning namespace ${ns}"
-        kubectl delete ns "$ns" --ignore-not-found --wait=false >>"${artdir}/driver.log" 2>&1
+        # The suite's own AfterSuite already deletes the test namespace and
+        # uninstalls the release on success; this is the idempotent
+        # belt-and-braces for a crash before AfterSuite, and it is what actually
+        # reaps the operator namespace (helm uninstall does not delete it).
+        #
+        # ORDER IS LOAD-BEARING: a LittleRed CR carries the operator's finalizer,
+        # so the test namespace can only finish terminating while its operator is
+        # still alive. Kill the operator first and the namespace hangs in
+        # Terminating forever, needing a manual finalizer edit. So: test
+        # namespace first, WAITING, then the operator's.
+        if [ -n "$ns" ]; then
+            log "cleaning namespace ${ns} (waiting: its CRs need the operator to release their finalizer)"
+            kubectl delete ns "$ns" --ignore-not-found --timeout=3m >>"${artdir}/driver.log" 2>&1 \
+              || log "WARNING: ${ns} did not finish terminating in time — leaving ${opns} standing so its finalizer can still be released"
+        fi
+        if [ -n "$opns" ] && ! kubectl get ns "$ns" >/dev/null 2>&1; then
+            log "cleaning operator namespace ${opns}"
+            kubectl delete ns "$opns" --ignore-not-found --wait=false >>"${artdir}/driver.log" 2>&1
+        fi
     fi
 }
 
@@ -131,7 +152,7 @@ if ! PLAN="$(lrharness plan --worklist "$LRH_WORKLIST" --index "$IDX" 2>&1)"; th
 fi
 
 eval "$PLAN"
-log "index ${IDX} -> item '${LRH_ITEM_NAME}' (ns=${LRH_NAMESPACE}, timeout=${LRH_TIMEOUT_SECONDS}s)"
+log "index ${IDX} -> item '${LRH_ITEM_NAME}' (ns=${LRH_NAMESPACE}, operator ns=${LRH_OPERATOR_NAMESPACE}, timeout=${LRH_TIMEOUT_SECONDS}s)"
 
 ARTDIR="${ART_BASE}/$(printf '%03d' "$IDX")-${LRH_ITEM_NAME}"
 mkdir -p "$ARTDIR"
@@ -142,17 +163,36 @@ mkdir -p "$ARTDIR"
 #    namespaces of OTHER arrays are untouched — the array name is the
 #    uniqueness knob (see test/harness/README.md).
 # ---------------------------------------------------------------------------
-if kubectl get ns "$LRH_NAMESPACE" >/dev/null 2>&1; then
-    log "WARNING: ${LRH_NAMESPACE} already exists (leftover from an earlier run of array '${LRH_ARRAY}') — deleting"
-    kubectl delete ns "$LRH_NAMESPACE" --ignore-not-found --timeout=5m >>"${ARTDIR}/driver.log" 2>&1
-fi
+for stale in "$LRH_NAMESPACE" "$LRH_OPERATOR_NAMESPACE"; do
+    if kubectl get ns "$stale" >/dev/null 2>&1; then
+        log "WARNING: ${stale} already exists (leftover from an earlier run of array '${LRH_ARRAY}') — deleting"
+        kubectl delete ns "$stale" --ignore-not-found --timeout=5m >>"${ARTDIR}/driver.log" 2>&1
+    fi
+done
+
+# Pre-create the operator's namespace LABELLED, rather than letting
+# `helm --create-namespace` make it bare. The label is what `make
+# e2e-harness-clean` reaps by, so a driver pod that dies mid-item still leaves a
+# namespace the array knows how to collect.
+kubectl create ns "$LRH_OPERATOR_NAMESPACE" >>"${ARTDIR}/driver.log" 2>&1
+kubectl label ns "$LRH_OPERATOR_NAMESPACE" --overwrite \
+    "app.kubernetes.io/name=lr-e2e-harness" \
+    "lr-e2e-harness/array=${LRH_ARRAY}" \
+    "lr-e2e-harness/index=${IDX}" \
+    "lr-e2e-harness/role=operator" >>"${ARTDIR}/driver.log" 2>&1
 
 # ---------------------------------------------------------------------------
 # 3. Run the work item, bounded by its own deadline.
 #
 #    SKIP_KIND_SETUP=true      — run against this pre-existing cluster.
-#    SKIP_OPERATOR_DEPLOY=true — M1 runs against a pre-deployed, cluster-scoped
-#                                operator. Per-item operators are M2.
+#    E2E_OPERATOR_DEPLOY_MODE  — M2: helm-install this item's OWN operator from
+#      = pinned                  the array's pre-built, pre-pushed image. NOT a
+#                                rebuild (design §1) and NOT the shared
+#                                cluster-scoped operator of M1 (design §3).
+#    E2E_OPERATOR_NAMESPACE    — that operator's own namespace, one per item.
+#    E2E_OPERATOR_SCOPED=true  — and it watches ONLY this item's test namespace,
+#                                which is what makes N parked operators able to
+#                                coexist without reconciling each other's CRs.
 #    DEBUG_ON_FAILURE=true     — makes the suite collect artifacts AND skip its
 #                                own cleanup on failure: exactly the
 #                                "leave the broken one standing" half of §4.2.
@@ -163,9 +203,11 @@ fi
 MAKE_ARGS=(
     -C "$LRH_REPO" run-test-e2e
     SKIP_KIND_SETUP=true
-    SKIP_OPERATOR_DEPLOY=true
     DEBUG_ON_FAILURE=true
     "TEST_NAMESPACE=${LRH_NAMESPACE}"
+    E2E_OPERATOR_DEPLOY_MODE=pinned
+    "E2E_OPERATOR_NAMESPACE=${LRH_OPERATOR_NAMESPACE}"
+    E2E_OPERATOR_SCOPED=true
 )
 [ -n "${LRH_GIT_TAG:-}" ]            && MAKE_ARGS+=("GIT_TAG=${LRH_GIT_TAG}")
 [ -n "${LITTLERED_REGISTRY:-}" ]     && MAKE_ARGS+=("LITTLERED_REGISTRY=${LITTLERED_REGISTRY}")
@@ -202,6 +244,6 @@ shopt -u nullglob
 # 5. Record the verdict, then park (on failure) or clean (on success).
 # ---------------------------------------------------------------------------
 publish_result "$IDX" "$LRH_ITEM_NAME" "$LRH_NAMESPACE" "$RC" "$TIMED_OUT" \
-    "$STARTED_EPOCH" "$FINISHED_EPOCH" "$ARTDIR"
+    "$STARTED_EPOCH" "$FINISHED_EPOCH" "$ARTDIR" "$LRH_OPERATOR_NAMESPACE"
 
 exit 0

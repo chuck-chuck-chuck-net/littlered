@@ -321,7 +321,7 @@ var _ = Describe("Cluster Mode Functional Testing", Ordered, func() {
 		BeforeAll(func() {
 			AddReportEntry("cr:" + crName)
 			By("Creating an empty cluster with debug-skip-slot-assignment annotation")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -334,7 +334,7 @@ spec:
   cluster:
     shards: %d
     replicasPerShard: 0
-`, crName, testNamespace, clusterShards)
+`, crName, testNamespace, clusterShards))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)

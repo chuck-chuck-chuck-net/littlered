@@ -107,7 +107,8 @@ func cmdValidate(args []string) error {
 		if err != nil {
 			return err
 		}
-		fmt.Printf("  %d  %-28s  timeout=%-6s  ns=%s\n", i, it.Name, r.Timeout, r.Namespace)
+		fmt.Printf("  %d  %-28s  timeout=%-6s  ns=%s  operator-ns=%s\n",
+			i, it.Name, r.Timeout, r.Namespace, r.OperatorNamespace)
 	}
 	return nil
 }

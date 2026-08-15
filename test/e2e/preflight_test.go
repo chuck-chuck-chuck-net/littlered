@@ -10,13 +10,10 @@ import (
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
-	. "github.com/onsi/gomega"     //nolint:revive
+	. "github.com/onsi/gomega"    //nolint:revive
 
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
-
-// defaultRedis is the image used by LittleRed when no image is specified in the CR.
-const defaultRedis = "docker.io/library/redis:8.4.2"
 
 // preflightImageChecks verifies that all required container images are pullable
 // before running any tests. Called from BeforeSuite so a missing image fails the
@@ -29,7 +26,11 @@ func preflightImageChecks() {
 	// Using IfNotPresent here would mask issues where the image is cached locally
 	// but not actually pullable from the registry.
 	verifyImagePullable("chaos-client", getChaosClientImage())
-	verifyImagePullable("redis", defaultRedis)
+	// Probe the image this run will ACTUALLY use (redisImageRef): with
+	// E2E_REDIS_IMAGE pointing at a mirror, probing the public default instead
+	// would both mis-report and keep the per-item public pull this knob exists
+	// to remove.
+	verifyImagePullable("redis", redisImageRef())
 }
 
 func verifyImagePullable(label, img string) {
@@ -65,7 +66,7 @@ spec:
 			"PREFLIGHT FAILURE: image %q (%s) is not pullable.\n"+
 				"  Chaos client: make build-images && make push-images (or make kind-load)\n"+
 				"  Redis:        verify %s is accessible from the cluster",
-			img, label, defaultRedis)
+			img, label, redisImageRef())
 	}, 2*time.Minute, 5*time.Second).Should(Succeed(),
 		"PREFLIGHT FAILURE: image %q (%s) could not be pulled within 2 minutes. "+
 			"Build and push it before running e2e tests.", img, label)

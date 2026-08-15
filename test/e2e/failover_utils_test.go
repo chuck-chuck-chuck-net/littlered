@@ -63,7 +63,7 @@ func failoverCR(name string, replicas, downAfterMs int, metaAnnotations map[stri
 			ann += fmt.Sprintf("    %s: %q\n", k, v)
 		}
 	}
-	return fmt.Sprintf(`
+	return withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -87,7 +87,7 @@ metadata:
   failover:
     replicas: %d
     downAfterMilliseconds: %d
-%s`, name, testNamespace, ann, replicas, downAfterMs, extraFailoverFields)
+%s`, name, testNamespace, ann, replicas, downAfterMs, extraFailoverFields))
 }
 
 // deployFailover applies a failover-mode CR and waits for phase Running.

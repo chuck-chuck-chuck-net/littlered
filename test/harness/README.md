@@ -1,4 +1,4 @@
-# In-cluster e2e work-list harness (M1)
+# In-cluster e2e work-list harness
 
 Runs e2e work items **inside a cluster** as a Kubernetes **Indexed Job**: one item
 per index, a concurrency cap, always `exit 0`, a recorded per-item verdict,
@@ -6,9 +6,12 @@ failed items parked for forensics, and a one-glance rollup.
 
 Design: `docs/E2E_SOAK_HARNESS_DESIGN.md` (§4 the sketch, §9.1 the work-list
 generalization, §9.2 what the matrix forces, §11 the milestone plan).
-**This is M1** — the array mechanics, proven on a ~2-minute work item against a
-pre-existing cluster-scoped operator. Per-item, namespace-scoped operators are
-**M2** and are not implemented here.
+**M1** built the array mechanics; **M2** gave every item its own test namespace
+*and* its own namespace-scoped operator, deployed from the array's pre-built
+image. That pairing is the point (§3): N parked failures can only sit side by
+side if each operator is blind to the others' namespaces — otherwise they
+double-reconcile each other's CRs and corrupt the very forensic state parking
+exists to preserve.
 
 ## Why a work LIST and not a repeat counter
 
@@ -30,7 +33,7 @@ calls out (§11).
 | `cmd/lrharness/` | Thin CLI over that seam. Lives in the driver image and builds to `bin/lrharness` on the host. |
 | `driver/Dockerfile` | The driver image: Go toolchain + make + kubectl + helm + the repo, **alive at runtime**. |
 | `driver/harness-entrypoint.sh` | The per-index driver. Deliberately only plumbing — every decision is delegated to `lrharness`. |
-| `manifests/worklist-*.yaml` | Sample work lists. |
+| `manifests/worklist-*.yaml` | Sample work lists. `worklist-m2-classic.yaml` is the M2 acceptance list (per-item operators, a deliberate spec-level failure); `worklist-soak.yaml` is the classic "N runs of the suite". |
 
 ## The work-list schema
 
@@ -52,6 +55,8 @@ items:                      # required, >= 1
     timeout: 45s            # optional, overrides defaults.timeout
     operatorImage: ...      # optional per-item override (design §9.2.6:
     chaosClientImage: ...   #   matrix cell G9 starts on an older operator)
+    redisImage: ...         # optional -> E2E_REDIS_IMAGE: the redis image the
+                            #   CRs AND the preflight probe use
     env:                    # optional, merged over defaults.env
       SOME_KNOB: "value"
 ```
@@ -64,16 +69,64 @@ launch, so a typo fails immediately rather than at item 37 of an overnight run.
 `no`, `on`, `off` are booleans: `EXTRA: yes` becomes the string `"true"`. Write
 `EXTRA: "yes"`.
 
-Each item gets its own namespace, derived deterministically as
-`lr-harness-<array>-<index>-<name>`, truncated to the 63-char DNS-label limit.
-The index precedes the name so truncating a long name can never collide.
+Each item gets TWO namespaces, both derived deterministically and truncated to
+the 63-char DNS-label limit:
+
+| | Holds |
+|---|---|
+| `lr-harness-<array>-<index>-<name>` | the test namespace: CRs, Redis pods |
+| `lr-harness-op-<array>-<index>-<name>` | that item's own operator, watching only the namespace above |
+
+The index precedes the name so truncating a long name can never collide, and the
+two families differ in a segment truncation never reaches.
+
+### `redisImage` — why an array should set it
+
+The suite's image preflight probes with `imagePullPolicy: Always` **on purpose**
+(it is checking the image is genuinely pullable, not cached), so it is the one
+guaranteed-uncacheable public pull *per work item*. Over a long array that is
+exactly the anonymous-Docker-Hub rate-limit exposure. Point `redisImage` at a
+copy in your own registry and the run pulls nothing public — the CRs use it too,
+so it is one knob, not two. The committed manifests keep the operator default;
+a mirror hostname is never a shipped default.
+
+**Mirror the metrics exporter as well.** `ExporterSpec.Registry` *inherits* the
+main image's registry (`api/v1alpha1` `FullImage`), so pinning `redisImage` to
+`myreg.lan/library/redis:8.4.2` also makes every pod pull
+`myreg.lan/oliver006/redis_exporter:<tag>`. Mirror both or the pods sit in
+`ImagePullBackOff` with `manifest unknown` (found the hard way on the first M2
+array):
+
+```bash
+skopeo copy docker://docker.io/library/redis:8.4.2 \
+            docker://myreg.lan/library/redis:8.4.2
+skopeo copy docker://docker.io/oliver006/redis_exporter:v1.88.0 \
+            docker://myreg.lan/oliver006/redis_exporter:v1.88.0
+```
+
+### Namespace teardown order is load-bearing
+
+A `LittleRed` CR carries the operator's finalizer, so a test namespace can only
+finish terminating **while its own operator is still running**. Both cleanup
+paths (the driver's green-path cleanup and `make e2e-harness-clean`) therefore
+delete the test namespace first, waiting, and only then the operator namespace.
+If one does get stranded in `Terminating`, the escape hatch is the usual one:
+
+```bash
+kubectl -n <test-ns> patch littlered <name> --type=json \
+    -p='[{"op":"remove","path":"/metadata/finalizers"}]'
+```
 
 ## Prerequisites
 
-- A cluster with the LittleRed **CRD installed and an operator running** (M1 uses
-  `SKIP_OPERATOR_DEPLOY=true`).
-- The `littlered-chaos-client` image pushed at the array's tag — the suite's
-  `BeforeSuite` preflight refuses to start without it.
+- A cluster reachable from the driver pod. **No operator needs to be running** —
+  each item installs its own. The CRD is applied by each item's `make deploy`
+  (`install-crd`, no codegen); it is cluster-scoped and shared, deliberately.
+- The **operator** and **chaos-client** images pushed at the array's tag: the
+  driver deploys the operator from that pinned ref and builds nothing, and the
+  suite's `BeforeSuite` preflight refuses to start without the chaos client.
+- A **cluster-scoped operator running beside the array will fight it** — it
+  watches every namespace, including the items'. Scale it to zero first.
 - A node path for artifacts (default `hostPath: /var/lib/lr-e2e-harness`), or a
   PVC via `lrharness render --artifacts-pvc`.
 
@@ -144,15 +197,20 @@ not take effect.
 ## What the driver does per index
 
 1. `lrharness plan --index $JOB_COMPLETION_INDEX` resolves the item.
-2. Deletes any leftover namespace from an earlier run of the **same array**.
+2. Deletes any leftover namespaces from an earlier run of the **same array**,
+   then creates the operator namespace *labelled* (so a driver pod that dies
+   mid-item still leaves something `e2e-harness-clean` can reap).
 3. Runs, under the item's own `timeout`:
-   `make run-test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true
-   DEBUG_ON_FAILURE=true TEST_NAMESPACE=… LABEL_FILTER=… FOCUS=…`
+   `make run-test-e2e SKIP_KIND_SETUP=true DEBUG_ON_FAILURE=true
+   TEST_NAMESPACE=… E2E_OPERATOR_DEPLOY_MODE=pinned E2E_OPERATOR_NAMESPACE=…
+   E2E_OPERATOR_SCOPED=true LABEL_FILTER=… FOCUS=…`
+   The suite then helm-installs the operator itself, from the pinned image,
+   scoped to this item's test namespace. Nothing is rebuilt.
 4. Moves the suite's `debug-artifacts-*` directories onto the artifact volume.
 5. `lrharness record` classifies the outcome and writes `result.json`; the
    result is published as a labelled ConfigMap.
-6. **Green** → deletes the namespace. **Not green** → leaves it standing and
-   labels it `lr-e2e-harness/parked=true`.
+6. **Green** → deletes both namespaces. **Not green** → leaves both standing
+   (operator still running) labelled `lr-e2e-harness/parked=true`.
 7. **Always exits 0.**
 
 Step 7 is the load-bearing one (§4.2). A driver that propagated a failing exit
@@ -188,19 +246,16 @@ The rollup counts against the **work-list length**, not the number of results
 found, so an index whose pod died is reported `MISSING` rather than quietly
 shrinking the denominator.
 
-## Known limitations (M1)
+## Known limitations
 
-- **One shared, cluster-scoped operator.** Parked namespaces are still watched
-  and reconciled by it, so a parked run is not fully frozen. Per-item
-  namespace-scoped operators are M2 (design §3, §5.3).
 - **`FOCUS` cannot contain a single quote.** `run-test-e2e` interpolates it into
   `-ginkgo.focus='$(FOCUS)'` inside a shell recipe. That is pre-existing
   Makefile behaviour, not a harness constraint.
 - **Re-running the same array name clobbers its own parked namespaces.** The
   array name is the uniqueness knob — use a fresh one, or
   `make e2e-harness-clean` first.
-- **No garbage budget.** N parked failures = N namespaces of Redis pods resident
-  (design §6 flags this as open).
+- **No garbage budget.** N parked failures = N namespaces of Redis pods *plus* N
+  idle operators resident (design §6 flags this as open).
 - **`hostPath` artifacts** assume a single-node cluster, or that you only ever
   read artifacts from the node that ran the item. Use `--artifacts-pvc` where a
   StorageClass exists.

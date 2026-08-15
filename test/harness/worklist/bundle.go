@@ -137,7 +137,13 @@ rules:
   - apiGroups: ["monitoring.coreos.com"]
     resources: ["servicemonitors"]
     verbs: ["*"]
-  # M2 will helm-install a per-item operator, which needs its RBAC and CRDs.
+  # M2 helm-installs a per-item operator, which needs its RBAC and CRDs. The
+  # leases rule is not for the driver's own use: RBAC forbids granting rights
+  # the grantor lacks, and the operator's leader-election Role holds leases, so
+  # without this every item would fail at "helm upgrade --install".
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["*"]
   - apiGroups: ["rbac.authorization.k8s.io"]
     resources: ["roles", "rolebindings", "clusterroles", "clusterrolebindings"]
     verbs: ["*"]

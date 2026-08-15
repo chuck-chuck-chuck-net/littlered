@@ -43,7 +43,7 @@ var _ = Describe("Sentinel and Standalone Chaos Testing", Ordered, func() {
 				const testDuration = 120 * time.Second
 
 				By(fmt.Sprintf("creating Sentinel cluster %s and chaos client simultaneously", crName))
-				cr := fmt.Sprintf(`
+				cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -55,7 +55,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 				cmd := exec.Command("kubectl", "apply", "-f", "-")
 				cmd.Stdin = strings.NewReader(cr)
 				_, err := utils.Run(cmd)
@@ -211,7 +211,7 @@ spec:
 			const testDuration = 60 * time.Second
 
 			By("creating standalone and chaos client simultaneously")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -219,7 +219,7 @@ metadata:
   namespace: %s
 spec:
   mode: standalone
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)

@@ -49,7 +49,7 @@ var _ = Describe("LittleRed", Ordered, func() {
 		It("should create a standalone Redis instance", func() {
 			AddReportEntry("cr:" + crName)
 			By("Test ID: STAN-001 - applying the LittleRed CR")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -64,7 +64,7 @@ spec:
     limits:
       cpu: "100m"
       memory: "128Mi"
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -202,7 +202,7 @@ spec:
 		BeforeAll(func() {
 			AddReportEntry("cr:" + crName)
 			By("Test ID: SEN-001 - applying the LittleRed CR with sentinel mode")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -221,7 +221,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -375,7 +375,7 @@ spec:
 
 		It("should create a standalone Redis instance for rolling update testing", func() {
 			By("applying the LittleRed CR")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -390,7 +390,7 @@ spec:
     limits:
       cpu: "100m"
       memory: "128Mi"
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -424,7 +424,7 @@ spec:
 			Expect(oldUID).NotTo(BeEmpty())
 
 			By("updating the resource limits")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -439,7 +439,7 @@ spec:
     limits:
       cpu: "150m"
       memory: "192Mi"
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err = utils.Run(cmd)
@@ -526,7 +526,7 @@ spec:
 			Expect(oldHash).NotTo(BeEmpty(), "Pod should have config hash annotation")
 
 			By("updating the config (maxmemory policy)")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -543,7 +543,7 @@ spec:
       memory: "192Mi"
   config:
     maxmemoryPolicy: volatile-lru
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd = exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err = utils.Run(cmd)
@@ -593,7 +593,7 @@ spec:
 
 		It("should create a sentinel cluster for rolling update testing", func() {
 			By("applying the LittleRed CR with sentinel mode")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -612,7 +612,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -655,7 +655,7 @@ spec:
 			}
 
 			By("updating the sentinel resources")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -681,7 +681,7 @@ spec:
       limits:
         cpu: "50m"
         memory: "48Mi"
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -760,7 +760,7 @@ spec:
 
 		It("should create a sentinel cluster for failover testing", func() {
 			By("applying the LittleRed CR with fast failover settings")
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -779,7 +779,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 3000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)

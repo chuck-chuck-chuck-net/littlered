@@ -447,7 +447,12 @@ func migrationOperatorImage() string {
 // deployOperator() in e2e_suite_test.go but targets an explicit image.
 func deployOperatorImage(imageRef string) {
 	By("deploying operator image " + imageRef)
-	cmd := exec.Command("make", "deploy", "IMG="+imageRef)
+	// Reuse the run's own deploy plan (namespace + watch scope + codegen mode)
+	// and override only the image, so a two-image handoff lands in the SAME
+	// release the suite deployed rather than silently in littlered-system.
+	p := operatorDeploy
+	p.Image = imageRef
+	cmd := exec.Command("make", p.deployArgs()...)
 	_, err := utils.Run(cmd)
 	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "failed to deploy operator image %s", imageRef)
 	waitForOperatorImage(imageRef)
@@ -529,7 +534,10 @@ func bootstrapLegacyCluster(crName string, expectedNodes int) {
 
 	By(fmt.Sprintf("creating a %d-shard / %d-replica cluster CR (%d nodes)%s",
 		clusterShards, clusterReplicasPerShard, expectedNodes, redisImageDescription()))
-	cr := clusterCR(crName, clusterReplicasPerShard, "", redisImageSpecFields()+`  resources:
+	// clusterCR now pins the run's redis image itself (redis_image.go), so this
+	// tier no longer prepends the block by hand — E2E_REDIS_IMAGE=redis:7.4.0
+	// reaches exactly the same CR.
+	cr := clusterCR(crName, clusterReplicasPerShard, "", `  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -551,69 +559,11 @@ func bootstrapLegacyCluster(crName string, expectedNodes int) {
 	expectLegacyLayout(crName, expectedNodes)
 }
 
-// redisImageSpecFields returns a `spec.image` YAML block for E2E_REDIS_IMAGE, or "" when the
-// env var is unset (in which case the operator default — Redis 8.4.2 — applies). spec.image
-// flows to BOTH the pre-split bootstrap pods AND the migration per-shard pods (the migration
-// operator redeploys over the SAME CR with no spec change), so source and destination nodes
-// run the intended version.
-//
-// LR-025 note: replicate-then-failover is VERSION-AGNOSTIC — it uses only MEET/REPLICATE/
-// coordinated FAILOVER/FORGET, with no slot move, so there is no ASM-vs-dance capability
-// branch to exercise (unlike the superseded reshard path). E2E_REDIS_IMAGE is retained for
-// REGRESSION FIDELITY: pin it to redis:7.4.0 to reproduce the exact version that deadlocked
-// and lost data under the old mechanism on s1 (the environment that drove this redesign). The
-// operator-default 8.4.2 run is a cheap cross-version confirmation.
-//
-//	Regression run: E2E_REDIS_IMAGE=redis:7.4.0
-//	Default run:    E2E_REDIS_IMAGE unset (redis:8.4.2)
-func redisImageSpecFields() string {
-	ref := os.Getenv("E2E_REDIS_IMAGE")
-	if ref == "" {
-		return ""
-	}
-	reg, path, tag := parseImageRef(ref)
-	return fmt.Sprintf("  image:\n    registry: %s\n    path: %s\n    tag: %q\n    pullPolicy: IfNotPresent\n",
-		reg, path, tag)
-}
-
-// redisImageDescription is a short suffix for the CR-creation By() line noting the redis image.
-func redisImageDescription() string {
-	if ref := os.Getenv("E2E_REDIS_IMAGE"); ref != "" {
-		return " with redis image " + ref
-	}
-	return " with the operator-default redis image"
-}
-
-// parseImageRef splits a Docker-style image reference into (registry, path, tag) using the same
-// defaults as api/v1alpha1.ImageSpec (docker.io / library/redis / 8.4.2). It handles the two
-// forms this suite uses — a bare "redis:TAG" (→ docker.io/library/redis:TAG) and an explicit
-// "host[:port]/path:TAG" — so E2E_REDIS_IMAGE can name either an official image tag or a full ref.
-func parseImageRef(ref string) (registry, path, tag string) {
-	registry, path, tag = "docker.io", "library/redis", "8.4.2"
-
-	name := ref
-	// A ':' that comes AFTER the last '/' delimits the tag (a ':' before it is a registry port).
-	if i := strings.LastIndex(ref, ":"); i > strings.LastIndex(ref, "/") {
-		name = ref[:i]
-		tag = ref[i+1:]
-	}
-
-	if i := strings.Index(name, "/"); i >= 0 {
-		first := name[:i]
-		// A leading segment that looks like a hostname (contains '.' or ':') or is "localhost"
-		// is the registry; otherwise the whole thing is the image path (e.g. "library/redis").
-		if strings.ContainsAny(first, ".:") || first == "localhost" {
-			registry = first
-			path = name[i+1:]
-		} else {
-			path = name
-		}
-	} else {
-		// Bare official image name (e.g. "redis") → docker.io library namespace.
-		path = "library/" + name
-	}
-	return registry, path, tag
-}
+// The redis-image helpers this tier depends on (redisImageSpecFields /
+// redisImageDescription / parseImageRef) moved to redis_image.go, where they are
+// unit-tested and shared with every other CR builder. Behaviour is unchanged:
+// E2E_REDIS_IMAGE=redis:7.4.0 still reproduces the version that deadlocked and
+// lost data under the pre-LR-025 mechanism.
 
 // expectLegacyLayout asserts the pre-0.3 shape: one {crName}-cluster StatefulSet with all
 // nodes Ready, legacy pods {crName}-cluster-N present, and NO per-shard {crName}-shard-K STS.

@@ -510,5 +510,8 @@ spec:
 	if extraSpecFields != "" {
 		cr += extraSpecFields
 	}
-	return cr
+	// Pinned LAST, not inside the Sprintf: extraClusterFields continues the
+	// spec.cluster mapping, so a spec-level `image:` spliced before it would
+	// re-parent those fields.
+	return withRedisImage(cr)
 }

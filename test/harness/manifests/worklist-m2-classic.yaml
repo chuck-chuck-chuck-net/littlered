@@ -1,0 +1,56 @@
+# M2 acceptance work list (docs/E2E_SOAK_HARNESS_DESIGN.md §11 M2).
+#
+# What M2 adds over M1: every item gets its own TEST namespace *and* its own
+# namespace-scoped OPERATOR, deployed from the array's pre-built, pre-pushed
+# image. That is what makes a parked failure inspectable — its operator is still
+# running, and it is blind to every other item's namespace (§3).
+#
+# Four items, one DELIBERATELY failing at SPEC level:
+#
+#   0  pdb-standalone-a    fast (~1 min), proves the per-item operator works
+#   1  standalone-suite    a real slice of the suite (the whole Standalone Mode
+#                          context: create, STS, Service, phase, PING, SET/GET,
+#                          metrics, pod-delete recovery, CR cleanup)
+#   2  standalone-doomed   the same slice with a redis image that is not redis,
+#                          so pods never become Ready and the phase spec FAILS
+#   3  pdb-standalone-b    proves later items proceed unaffected
+#
+# Why the image trick for the failure: M1's deliberate failure hit in
+# BeforeSuite, where the suite's AfterEach artifact collector never runs — so
+# artifact RELOCATION was never actually proven (M1's stated carried-forward
+# gap). A wrong-but-pullable redis image passes the preflight and then fails a
+# real spec, which is the path that collects debug artifacts and skips cleanup.
+#
+# redisImage points every CR *and* the preflight probe at a mirrored copy, so a
+# run pulls nothing from Docker Hub (§9.3 autonomy). Replace the host with your
+# own registry. NOTE: the metrics exporter inherits this registry, so mirror
+# oliver006/redis_exporter into it as well — see test/harness/README.md.
+
+array: m2classic
+
+defaults:
+  timeout: 12m
+  redisImage: registry.tanne3.de/library/redis:8.4.2
+  env:
+    E2E_TOPOLOGY: single
+
+items:
+  - name: pdb-standalone-a
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+    timeout: 8m
+
+  - name: standalone-suite
+    focus: Standalone Mode
+
+  # --- the deliberate SPEC-LEVEL failure --------------------------------------
+  # alpine is pullable (so the BeforeSuite preflight passes) but is not redis,
+  # so the operator's pods never serve and the "status Running" spec fails.
+  - name: standalone-doomed
+    focus: Standalone Mode
+    redisImage: registry.tanne3.de/library/alpine:3.20
+
+  - name: pdb-standalone-b
+    labelFilter: pdb
+    focus: should never create a PDB in standalone mode
+    timeout: 8m

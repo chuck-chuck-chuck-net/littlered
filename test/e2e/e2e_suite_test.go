@@ -37,7 +37,15 @@ import (
 
 var (
 	// operatorNamespace is where the operator is deployed.
-	operatorNamespace = "littlered-system"
+	// Override with E2E_OPERATOR_NAMESPACE. Deliberately NOT named
+	// OPERATOR_NAMESPACE: that variable is already read by the OPERATOR ITSELF
+	// (site_registry.go) to discover its own namespace at runtime, which is a
+	// different question from "where should this test run deploy it".
+	operatorNamespace = defaultOperatorNamespace
+
+	// operatorDeploy is what BeforeSuite decided to do about the operator
+	// (resolved once, from the environment — see operator_deploy.go).
+	operatorDeploy operatorDeployPlan
 
 	// testNamespace is the namespace used for all e2e test resources.
 	// Override with TEST_NAMESPACE env var. Must not be "default".
@@ -114,9 +122,16 @@ var _ = BeforeSuite(func() {
 	if ns := os.Getenv("TEST_NAMESPACE"); ns != "" {
 		testNamespace = ns
 	}
-	if os.Getenv("SKIP_OPERATOR_DEPLOY") == "true" {
-		skipOperatorDeploy = true
-	}
+	// The operator-deployment decision (mode, namespace, watch scope) is a pure
+	// function of the environment; resolving it here means an incoherent request
+	// fails at BeforeSuite with a sentence, not 20 minutes later as a Deployment
+	// that cannot pull.
+	var deployErr error
+	operatorDeploy, deployErr = resolveOperatorDeploy(os.Getenv, testNamespace)
+	Expect(deployErr).NotTo(HaveOccurred())
+	operatorNamespace = operatorDeploy.Namespace
+	skipOperatorDeploy = operatorDeploy.Skip
+
 	if os.Getenv("SKIP_KIND_SETUP") == "true" {
 		skipKindSetup = true
 	}
@@ -137,6 +152,10 @@ var _ = BeforeSuite(func() {
 	}
 
 	_, _ = fmt.Fprintf(GinkgoWriter, "Test namespace: %s\n", testNamespace)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Operator namespace: %s\n", operatorNamespace)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Operator watch scope: %v (empty = cluster-scoped)\n",
+		operatorDeploy.WatchNamespaces)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Redis image: %s\n", redisImageRef())
 	_, _ = fmt.Fprintf(GinkgoWriter, "Skip operator deploy: %v\n", skipOperatorDeploy)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Skip Kind setup: %v\n", skipKindSetup)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Debug on failure: %v\n", debugOnFailure)
@@ -274,42 +293,38 @@ var _ = AfterSuite(func() {
 })
 
 func deployOperator() {
-	By("building the operator images")
-	cmd := exec.Command("make", "build-images")
-	_, err := utils.Run(cmd)
-	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the operator images")
+	p := operatorDeploy
 
-	if !skipKindSetup {
-		By("loading images into Kind")
-		cmd = exec.Command("make", "kind-load")
-		_, err = utils.Run(cmd)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load images into Kind")
-
-		By("deploying the operator via Helm (Kind mode)")
-		// We use PULL_POLICY=Never to ensure Kind uses the local image we just loaded
-		cmd = exec.Command("make", "deploy", "PULL_POLICY=Never")
-		_, err = utils.Run(cmd)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the operator via Helm")
-	} else {
-		By("pushing images to registry")
-		cmd = exec.Command("make", "push-images")
-		_, err = utils.Run(cmd)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to push images to registry")
-
-		By("deploying the operator via Helm (Registry mode)")
-		// Use default PULL_POLICY (Always) from Makefile for generic clusters
-		cmd = exec.Command("make", "deploy")
-		_, err = utils.Run(cmd)
-		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the operator via Helm")
+	if p.Build {
+		By("building the operator images")
+		_, err := utils.Run(exec.Command("make", "build-images"))
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to build the operator images")
 	}
+	if p.KindLoad {
+		By("loading images into Kind")
+		_, err := utils.Run(exec.Command("make", "kind-load"))
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to load images into Kind")
+	}
+	if p.Push {
+		By("pushing images to registry")
+		_, err := utils.Run(exec.Command("make", "push-images"))
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to push images to registry")
+	}
+
+	// The pinned mode builds nothing at all: the array pre-built and pre-pushed
+	// ONE image and every work item deploys that same ref (design §1).
+	By(fmt.Sprintf("deploying the operator via Helm into %s (watch scope: %v)",
+		p.Namespace, p.WatchNamespaces))
+	_, err := utils.Run(exec.Command("make", p.deployArgs()...))
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(), "Failed to deploy the operator via Helm")
 
 	By("waiting for operator to be ready")
 	waitForOperator()
 }
 
 func undeployOperator() {
-	By("undeploying the operator")
-	cmd := exec.Command("make", "undeploy")
+	By("undeploying the operator from " + operatorDeploy.Namespace)
+	cmd := exec.Command("make", operatorDeploy.undeployArgs()...)
 	_, _ = utils.Run(cmd)
 }
 

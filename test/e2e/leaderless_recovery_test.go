@@ -40,7 +40,7 @@ var _ = Describe("Sentinel Leaderless Bootstrap Deadlock Recovery", func() {
 
 	deploySentinel := func(crName string, allowUnsafe bool) {
 		AddReportEntry("cr:" + crName)
-		cr := fmt.Sprintf(`
+		cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -53,7 +53,7 @@ spec:
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
     allowUnsafeRebootstrapOnDeadlock: %t
-`, crName, testNamespace, allowUnsafe)
+`, crName, testNamespace, allowUnsafe))
 		cmd := exec.Command("kubectl", "apply", "-f", "-")
 		cmd.Stdin = strings.NewReader(cr)
 		_, err := utils.Run(cmd)
@@ -100,7 +100,10 @@ spec:
 	// --- Tier 2: a single surviving replica still holds the data ----------
 	Context("Single-survivor deadlock", Ordered, func() {
 		var crName string
-		BeforeAll(func() { crName = fmt.Sprintf("leaderless-survivor-%d", time.Now().Unix()); deploySentinel(crName, false) })
+		BeforeAll(func() {
+			crName = fmt.Sprintf("leaderless-survivor-%d", time.Now().Unix())
+			deploySentinel(crName, false)
+		})
 		AfterAll(func() { cleanup(crName) })
 
 		It("promotes the sole data holder and preserves its data (no opt-in required)", func() {

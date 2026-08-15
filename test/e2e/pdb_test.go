@@ -79,7 +79,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 	newStandaloneCR := func(name string) *littleredv1alpha1.LittleRed {
 		return &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
-			Spec:       littleredv1alpha1.LittleRedSpec{Mode: "standalone"},
+			Spec:       littleredv1alpha1.LittleRedSpec{Mode: "standalone", Image: redisImageSpec()},
 		}
 	}
 
@@ -88,7 +88,8 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 		return &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 			Spec: littleredv1alpha1.LittleRedSpec{
-				Mode: "sentinel",
+				Mode:  "sentinel",
+				Image: redisImageSpec(),
 				Sentinel: &littleredv1alpha1.SentinelSpec{
 					Quorum:                2,
 					DownAfterMilliseconds: 5000,
@@ -119,7 +120,8 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 		return &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 			Spec: littleredv1alpha1.LittleRedSpec{
-				Mode: "cluster",
+				Mode:  "cluster",
+				Image: redisImageSpec(),
 				Cluster: &littleredv1alpha1.ClusterSpec{
 					Shards:           clusterShards,
 					ReplicasPerShard: &replicas,
@@ -175,7 +177,8 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 			cr := &littleredv1alpha1.LittleRed{
 				ObjectMeta: metav1.ObjectMeta{Name: crName, Namespace: testNamespace},
 				Spec: littleredv1alpha1.LittleRedSpec{
-					Mode: "cluster",
+					Mode:  "cluster",
+					Image: redisImageSpec(),
 					Cluster: &littleredv1alpha1.ClusterSpec{
 						Shards:           clusterShards,
 						ReplicasPerShard: &zero,

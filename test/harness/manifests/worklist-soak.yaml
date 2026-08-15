@@ -4,10 +4,12 @@
 # In a work-list driver that is not a special mode — it is the degenerate list
 # where every item is identical. Add or remove items to change N.
 #
-# NOTE: as shipped this still runs against a PRE-DEPLOYED, cluster-scoped
-# operator (M1). A per-item, namespace-scoped operator — which is what makes
-# parked runs safe to leave standing side by side (§3) — is M2. Until then,
-# parked namespaces of a failed run are still watched by the shared operator.
+# Since M2 every item gets its own test namespace AND its own namespace-scoped
+# operator, deployed from the array's pinned image — so a parked failure keeps a
+# live operator for forensics and later items cannot be reconciled by it (§3).
+#
+# Set `redisImage` to a mirrored copy of the redis image if the run must not
+# depend on Docker Hub (§9.3); see worklist-m2-classic.yaml.
 #
 # Each item is a full suite run, so size the timeout accordingly: a full run is
 # ~40 minutes and the suite's own `go test` deadline is 120m.

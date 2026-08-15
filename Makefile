@@ -94,6 +94,11 @@ vet: ## Run go vet against code.
 .PHONY: test
 test: manifests generate fmt vet setup-envtest ## Run tests.
 	KUBEBUILDER_ASSETS="$(shell "$(ENVTEST)" use $(ENVTEST_K8S_VERSION) --bin-dir "$(LOCALBIN)" -p path)" go test $$(go list ./... | grep -v /e2e) -coverprofile cover.out
+	@# The e2e package is excluded above because its SPECS need a cluster (build
+	@# tag `e2e`). Its untagged helpers — image-ref resolution, the operator
+	@# deploy plan — are plain unit tests with no cluster dependency, and they
+	@# only guard anything if they are in the gate.
+	go test ./test/e2e/
 
 # TODO(user): To use a different vendor for e2e tests, modify the setup under 'tests/e2e'.
 # The default setup assumes Kind is pre-installed and builds/loads the Manager Docker image locally.
@@ -152,6 +157,18 @@ ifeq ($(SKIP_OPERATOR_DEPLOY),true)
   E2E_CODEGEN_DEP =
 else
   E2E_CODEGEN_DEP = manifests generate fmt vet
+endif
+
+# The same reasoning covers E2E_OPERATOR_DEPLOY_MODE=pinned: the run deploys an
+# already-built image, so codegen produces nothing it uses. It is also load-
+# bearing, not just an optimisation — the e2e harness driver runs this inside a
+# pod with no .git and no controller-gen, where a codegen step would have to
+# download a toolchain mid-array.
+ifeq ($(E2E_OPERATOR_DEPLOY_MODE),pinned)
+  SKIP_CODEGEN := true
+endif
+ifeq ($(SKIP_CODEGEN),true)
+  E2E_CODEGEN_DEP =
 endif
 
 E2E_VARS = KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) SKIP_OPERATOR_DEPLOY=$(SKIP_OPERATOR_DEPLOY) SKIP_KIND_SETUP=$(SKIP_KIND_SETUP)
@@ -348,11 +365,20 @@ push-images: $(PUSH_TARGETS)
 # If you wish to build the manager image targeting other platforms you can use the --platform flag.
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
+# Per-image ref, honouring the canonical override knobs. Without this, build/push
+# always tagged $(LITTLERED_REGISTRY)/<img>:$(GIT_TAG) while `deploy` DID honour
+# IMG — so `make build-images push-images deploy IMG=...` deployed an image that
+# was never built. The defaults are unchanged (IMG defaults to OPERATOR_IMAGE,
+# which defaults to registry/littlered:$(GIT_TAG)).
+IMAGE_REF_littlered = $(IMG)
+IMAGE_REF_littlered-chaos-client = $(CHAOS_CLIENT_IMAGE)
+image_ref = $(or $(IMAGE_REF_$(1)),$(LITTLERED_REGISTRY)/$(1):$(GIT_TAG))
+
 $(BUILD_TARGETS): %.build_image:
-	$(CONTAINER_TOOL) build -t $(LITTLERED_REGISTRY)/$*:$(GIT_TAG) -f cmd/$*/Dockerfile .
+	$(CONTAINER_TOOL) build -t $(call image_ref,$*) -f cmd/$*/Dockerfile .
 
 $(PUSH_TARGETS): %.push_image:
-	$(CONTAINER_TOOL) push $(LITTLERED_REGISTRY)/$*:$(GIT_TAG)
+	$(CONTAINER_TOOL) push $(call image_ref,$*)
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/littlered:0.0.1). To use this option you need to:
@@ -395,25 +421,59 @@ endif
 IMG_REPOSITORY = $(shell printf '%s' '$(IMG)' | sed 's/:[^:/]*$$//')
 IMG_TAG        = $(shell printf '%s' '$(IMG)' | sed 's/.*://')
 
-.PHONY: install
-install: manifests ## Install CRDs into the cluster.
+# DEPLOY_NAMESPACE is where the operator's Helm release lives. It used to be the
+# literal "littlered-system" in both deploy and undeploy; the e2e harness needs a
+# per-work-item operator, so it is a variable. (Named DEPLOY_NAMESPACE, not
+# OPERATOR_NAMESPACE: the latter is already read by the operator PROCESS to
+# discover its own namespace — internal/controller/site_registry.go.)
+DEPLOY_NAMESPACE ?= littlered-system
+
+# WATCH_NAMESPACES scopes the operator to a comma-separated allow-list (ADR-014):
+# a namespaced Role+RoleBinding per listed namespace instead of the ClusterRole,
+# plus WATCH_NAMESPACE on the manager. Empty (the default) = cluster-scoped.
+# Note the operator's OWN namespace does not need to be listed — only namespaces
+# holding LittleRed CRs do.
+WATCH_NAMESPACES ?=
+ifneq ($(WATCH_NAMESPACES),)
+HELM_SCOPE_FLAGS := --set 'scope.watchNamespaces={$(WATCH_NAMESPACES)}'
+endif
+
+# SKIP_CODEGEN=true deploys WITHOUT regenerating manifests first (same reasoning
+# as E2E_CODEGEN_DEP above): a run that deploys a pre-built, pinned image uses
+# nothing that codegen would produce, and running controller-gen would need a
+# toolchain download wherever the deploy happens to run — e.g. inside the e2e
+# harness driver pod, which has no .git either.
+DEPLOY_CRD_DEP = install
+ifeq ($(SKIP_CODEGEN),true)
+DEPLOY_CRD_DEP = install-crd
+endif
+
+.PHONY: install-crd
+install-crd: ## Apply the committed CRDs (no codegen).
 	kubectl $(KUBECTL_CTX_FLAGS) apply -f charts/littlered/crds/
+
+.PHONY: install
+install: manifests ## Regenerate manifests and install CRDs into the cluster.
+	@# Invoked, not listed as a prerequisite: `manifests` must finish BEFORE the
+	@# apply, and prerequisites carry no ordering under `make -j`.
+	@$(MAKE) --no-print-directory install-crd
 
 .PHONY: uninstall
 uninstall: ## Uninstall CRDs from the cluster (use ignore-not-found=true to ignore missing).
 	kubectl $(KUBECTL_CTX_FLAGS) delete -f charts/littlered/crds/ --ignore-not-found=$(ignore-not-found)
 
 .PHONY: deploy
-deploy: install ## Deploy the operator to the cluster via Helm (override image with IMG=).
+deploy: $(DEPLOY_CRD_DEP) ## Deploy the operator via Helm (IMG=, DEPLOY_NAMESPACE=, WATCH_NAMESPACES=).
 	helm $(HELM_CTX_FLAGS) upgrade --install littlered ./charts/littlered \
-		-n littlered-system --create-namespace \
+		-n $(DEPLOY_NAMESPACE) --create-namespace \
 		--set image.repository=$(IMG_REPOSITORY) \
 		--set image.tag=$(IMG_TAG) \
-		--set image.pullPolicy=$(PULL_POLICY)
+		--set image.pullPolicy=$(PULL_POLICY) \
+		$(HELM_SCOPE_FLAGS)
 
 .PHONY: undeploy
-undeploy: ## Uninstall the operator's Helm release from the cluster.
-	-helm $(HELM_CTX_FLAGS) uninstall -n littlered-system littlered 2>/dev/null
+undeploy: ## Uninstall the operator's Helm release (DEPLOY_NAMESPACE=).
+	-helm $(HELM_CTX_FLAGS) uninstall -n $(DEPLOY_NAMESPACE) littlered 2>/dev/null
 
 .PHONY: helm-push
 helm-push: helm-package ## Push the Helm chart to the OCI registry (run 'helm registry login ghcr.io' first).
@@ -559,7 +619,12 @@ e2e-harness-clean: ## Delete the array, its results and every namespace it parke
 	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete job "$$ARRAY" --ignore-not-found; \
 	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete configmap \
 		-l "lr-e2e-harness/array=$$ARRAY" --ignore-not-found; \
-	kubectl $(KUBECTL_CTX_FLAGS) delete ns -l "lr-e2e-harness/array=$$ARRAY" --ignore-not-found
+	echo "Deleting the TEST namespaces first: their LittleRed CRs hold the operator's"; \
+	echo "finalizer, so they can only terminate while their own operator still runs."; \
+	kubectl $(KUBECTL_CTX_FLAGS) delete ns \
+		-l "lr-e2e-harness/array=$$ARRAY,!lr-e2e-harness/role" --ignore-not-found --timeout=5m; \
+	kubectl $(KUBECTL_CTX_FLAGS) delete ns \
+		-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/role=operator" --ignore-not-found --wait=false
 
 ##@ Dependencies
 

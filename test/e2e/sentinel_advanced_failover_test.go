@@ -50,7 +50,7 @@ var _ = Describe("Sentinel Advanced Failover", func() {
 			crName = fmt.Sprintf("event-driven-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s with polling disabled", crName))
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -64,7 +64,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -147,7 +147,7 @@ spec:
 			crName = fmt.Sprintf("polling-only-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s with events disabled", crName))
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -161,7 +161,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			utils.Run(cmd)
@@ -212,7 +212,7 @@ spec:
 			By("Step 4: Verify logs show event monitoring was disabled")
 			Eventually(func(g Gomega) {
 				since := startTime.Format(time.RFC3339Nano)
-				cmd = exec.Command("sh", "-c", fmt.Sprintf("kubectl logs -n littlered-system -l control-plane=controller-manager --tail=-1 --since-time=%s | grep %s", since, crName))
+				cmd = exec.Command("sh", "-c", fmt.Sprintf("kubectl logs -n %s -l control-plane=controller-manager --tail=-1 --since-time=%s | grep %s", operatorNamespace, since, crName))
 				logs, _ := utils.Run(cmd)
 				g.Expect(logs).To(ContainSubstring("Sentinel event monitoring disabled via annotation"))
 				g.Expect(logs).NotTo(ContainSubstring("Triggering reconciliation via Sentinel event"))
@@ -237,7 +237,7 @@ spec:
 			crName = fmt.Sprintf("hybrid-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s with standard settings", crName))
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -249,7 +249,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			utils.Run(cmd)
@@ -312,7 +312,7 @@ spec:
 			crName = fmt.Sprintf("sentinel-death-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s for sentinel death testing", crName))
-			cr := fmt.Sprintf(`
+			cr := withRedisImage(fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -324,7 +324,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			utils.Run(cmd)

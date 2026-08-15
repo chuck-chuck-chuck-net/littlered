@@ -498,6 +498,34 @@ namespace-scoped operator. Runs on a plain workload cluster, never the control p
 **Done when:** this note's original requirement is met — "20 runs, 17 green" unattended, failures
 parked for forensics.
 
+> **LANDED 2026-08-15** on the `s1` authoring substrate: 4 items, 3 green, each with its **own**
+> namespace-scoped operator deployed from one pinned image set (no rebuild per item — verified 0
+> build invocations). The spec-level failure parked **both** its namespaces with its operator still
+> `Running`, and that parked operator logged **0** mentions of the next item's namespaces against
+> 186 of its own — the §3 isolation property measured rather than assumed. Item 3 then passed
+> normally. Debug artifacts survived the pod, closing **M1's honest gap** (M1's failure was in
+> `BeforeSuite`, where the collector never runs).
+>
+> Naming, resolving the collision: **`E2E_OPERATOR_NAMESPACE`** (suite) and **`DEPLOY_NAMESPACE`**
+> (Make, "where helm installs"), chosen so neither can be mistaken for `OPERATOR_NAMESPACE`, which
+> the operator *process* reads for its own multi-site self-namespace detection. Watch scope reuses
+> `WATCH_NAMESPACE` semantics, so no new name there.
+>
+> **Two findings from first contact:**
+>
+> 1. **The metrics exporter inherits the main image's registry** (`ExporterSpec.FullImage`). Pinning
+>    redis to a mirror silently redirects the sidecar to `<mirror>/oliver006/redis_exporter` →
+>    `ImagePullBackOff`; this killed the first array run. Mirroring the exporter alongside redis is
+>    therefore **part of the mirror recipe**, not optional. The behaviour is arguably correct, but it
+>    is a sharp edge for *any* user mirroring images, not only this harness — an `E2E_EXPORTER_IMAGE`
+>    knob, or decoupling the exporter's registry from the main one, would remove the coupling.
+> 2. **Teardown order is load-bearing.** A `LittleRed` CR carries the operator's finalizer, so a test
+>    namespace can only finish terminating while *its own* operator still runs. Deleting the operator
+>    namespace first strands it in `Terminating` until someone edits a finalizer by hand. Both
+>    cleanup paths now delete the test namespace first and wait, and remove the operator namespace
+>    only once the test namespace is confirmed gone — leaving it standing with a warning otherwise,
+>    so the finalizer can still be released.
+
 > **Scope corrections from the 2026-08-14 code survey.** M2 is bigger than "§5.3, a rename". Four
 > findings, all verified against the tree:
 >

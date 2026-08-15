@@ -351,7 +351,7 @@ func msClusterCR(reg *msRegistry, ns, name string, siteNames []string, shards, r
 		sites.WriteString(fmt.Sprintf("    - name: %s\n      kubeconfigSecretRef:\n        name: %s\n",
 			sn, msSiteSecretName(ns, sn)))
 	}
-	return fmt.Sprintf(`apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+	return withRedisImage(fmt.Sprintf(`apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
   name: %s
@@ -372,7 +372,7 @@ spec:
     limits: {memory: 256Mi}
   config:
     maxmemoryPolicy: noeviction
-`, name, ns, shards, replicasPerShard, nodeTimeoutMs, sitesPerShard, sites.String())
+`, name, ns, shards, replicasPerShard, nodeTimeoutMs, sitesPerShard, sites.String()))
 }
 
 // --- Ground-truth readers (context-aware) ------------------------------------------------

@@ -52,6 +52,11 @@ const (
 	// (deliberately not cleaned up) namespace is trivially identifiable.
 	NamespacePrefix = "lr-harness-"
 
+	// OperatorNamespacePrefix prefixes the item's OWN operator namespace (M2,
+	// design §3). It extends NamespacePrefix rather than replacing it, so one
+	// label-free `lr-harness-*` glob still finds everything the harness made.
+	OperatorNamespacePrefix = NamespacePrefix + "op-"
+
 	// DefaultItemTimeout bounds a work item that names no timeout and belongs to
 	// an array that declares no default. It sits just under the e2e suite's own
 	// 120m `go test` timeout so the driver, not `go test`, owns the deadline.
@@ -81,6 +86,11 @@ type Item struct {
 	OperatorImage string `json:"operatorImage,omitempty"`
 	// ChaosClientImage overrides the array's chaos-client image for this item.
 	ChaosClientImage string `json:"chaosClientImage,omitempty"`
+	// RedisImage overrides the redis image the suite pins into its CRs and its
+	// preflight probe (E2E_REDIS_IMAGE). Two uses: pointing a whole array at a
+	// mirrored copy so the run never depends on Docker Hub, and per-item version
+	// coverage (the migration tier pins 7.4.0 for regression fidelity).
+	RedisImage string `json:"redisImage,omitempty"`
 	// Env is passed through to the suite, layered over the array defaults.
 	Env map[string]string `json:"env,omitempty"`
 }
@@ -90,6 +100,7 @@ type Defaults struct {
 	Timeout          string            `json:"timeout,omitempty"`
 	OperatorImage    string            `json:"operatorImage,omitempty"`
 	ChaosClientImage string            `json:"chaosClientImage,omitempty"`
+	RedisImage       string            `json:"redisImage,omitempty"`
 	Env              map[string]string `json:"env,omitempty"`
 }
 
@@ -103,16 +114,22 @@ type List struct {
 // ResolvedItem is item N with the array defaults applied — one concrete unit of
 // work, ready to hand to the shell.
 type ResolvedItem struct {
-	Index            int
-	Name             string
-	Array            string
-	Namespace        string
-	LabelFilter      string
-	Focus            string
-	Timeout          time.Duration
-	OperatorImage    string
-	ChaosClientImage string
-	Env              map[string]string
+	Index int
+	Name  string
+	Array string
+	// Namespace is the item's test namespace (where the CRs and Redis pods live).
+	Namespace string
+	// OperatorNamespace is where the item's OWN operator is deployed (M2, design
+	// §3): N parked items can only coexist if each has its own operator, and each
+	// operator is blind to the others' namespaces.
+	OperatorNamespace string
+	LabelFilter       string
+	Focus             string
+	Timeout           time.Duration
+	OperatorImage     string
+	ChaosClientImage  string
+	RedisImage        string
+	Env               map[string]string
 }
 
 // Verdict is the outcome of one work item.
@@ -238,24 +255,31 @@ func (l List) Resolve(index int) (ResolvedItem, error) {
 	maps.Copy(env, it.Env)
 
 	return ResolvedItem{
-		Index:            index,
-		Name:             it.Name,
-		Array:            l.Array,
-		Namespace:        itemNamespace(l.Array, index, it.Name),
-		LabelFilter:      it.LabelFilter,
-		Focus:            it.Focus,
-		Timeout:          timeout,
-		OperatorImage:    firstNonEmpty(it.OperatorImage, l.Defaults.OperatorImage),
-		ChaosClientImage: firstNonEmpty(it.ChaosClientImage, l.Defaults.ChaosClientImage),
-		Env:              env,
+		Index:             index,
+		Name:              it.Name,
+		Array:             l.Array,
+		Namespace:         itemNamespace(NamespacePrefix, l.Array, index, it.Name),
+		OperatorNamespace: itemNamespace(OperatorNamespacePrefix, l.Array, index, it.Name),
+		LabelFilter:       it.LabelFilter,
+		Focus:             it.Focus,
+		Timeout:           timeout,
+		OperatorImage:     firstNonEmpty(it.OperatorImage, l.Defaults.OperatorImage),
+		ChaosClientImage:  firstNonEmpty(it.ChaosClientImage, l.Defaults.ChaosClientImage),
+		RedisImage:        firstNonEmpty(it.RedisImage, l.Defaults.RedisImage),
+		Env:               env,
 	}, nil
 }
 
-// itemNamespace derives the item's namespace deterministically. The index sits
-// BEFORE the item name so that truncating an over-long name to fit the 63-char
-// DNS label limit can never make two items collide.
-func itemNamespace(array string, index int, name string) string {
-	head := NamespacePrefix + array + "-" + strconv.Itoa(index) + "-"
+// itemNamespace derives one of the item's namespaces deterministically. The
+// index sits BEFORE the item name so that truncating an over-long name to fit
+// the 63-char DNS label limit can never make two items collide.
+//
+// The prefix is what separates the two families: an item's test namespace and
+// its operator namespace differ in a segment that truncation never touches, so
+// no amount of name truncation can make one item's operator namespace equal
+// another item's test namespace.
+func itemNamespace(prefix, array string, index int, name string) string {
+	head := prefix + array + "-" + strconv.Itoa(index) + "-"
 	budget := max(maxDNSLabel-len(head), 0)
 	if len(name) > budget {
 		name = name[:budget]
@@ -285,11 +309,19 @@ func (r ResolvedItem) ShellExport() string {
 	put("LRH_INDEX", strconv.Itoa(r.Index))
 	put("LRH_ITEM_NAME", r.Name)
 	put("LRH_NAMESPACE", r.Namespace)
+	put("LRH_OPERATOR_NAMESPACE", r.OperatorNamespace)
 	put("LRH_LABEL_FILTER", r.LabelFilter)
 	put("LRH_FOCUS", r.Focus)
 	put("LRH_TIMEOUT_SECONDS", strconv.FormatInt(int64(r.Timeout.Seconds()), 10))
 	put("LRH_OPERATOR_IMAGE", r.OperatorImage)
 	put("LRH_CHAOS_CLIENT_IMAGE", r.ChaosClientImage)
+	// The redis image crosses as the suite's OWN env var, not an LRH_ one: it is
+	// consumed by the e2e suite (preflight probe + every CR's spec.image), which
+	// inherits the driver's environment. Emitting it before the item's `env` map
+	// keeps that map the last word, so an item can still override it by hand.
+	if r.RedisImage != "" {
+		put("E2E_REDIS_IMAGE", r.RedisImage)
+	}
 
 	keys := make([]string, 0, len(r.Env))
 	for k := range r.Env {
