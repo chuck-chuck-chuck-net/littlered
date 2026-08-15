@@ -500,14 +500,30 @@ parked for forensics.
 > hostname as the shipped default would break every other user. This is an environment variable
 > you set, never a checked-in value.
 >
-> **Rejected: a pull-through registry cache.** A different answer to the same problem, and not
-> needed here. Such a cache pays off when clusters are torn down and rebuilt constantly, so every
-> node is cold and re-pulls everything. Our targets are **long-lived clusters that already hold the
-> fixed images** (redis, chaos client), and an array pins one operator/driver ref for its whole run
-> — so with `IfNotPresent` there is almost nothing left to pull. Wiring it up would additionally
-> mean pushing proxy env + a MITM CA into each node's machine config. The private registry above
-> gets the same benefits for a fraction of the setup. Revisit only if the harness ever grows a
-> rebuild-the-cluster-per-item mode.
+> **Partly rejected: a pull-through registry cache.** A different answer to the same problem. The
+> rejection holds for the images *we* control — driver, operator and chaos client are pinned, live
+> in the private registry, and are pulled `IfNotPresent`, so a cache adds nothing and would cost
+> proxy env plus a MITM CA in every node's machine config.
+>
+> **It does not hold for the fixed public images, and the reason is not obvious** (corrected
+> 2026-08-15; an earlier version of this section asserted the opposite). That premise was
+> "long-lived clusters already hold the fixed images, so with `IfNotPresent` there is almost
+> nothing left to pull." **The suite deliberately defeats it.** `preflightImageChecks` and the
+> chaos client both set **`imagePullPolicy: Always`** (`preflight_test.go:26,48`,
+> `chaos_utils_test.go:84`) — on purpose, because `IfNotPresent` *"would mask issues where the
+> image is cached locally but not actually pullable."* So a warm node cache never helps, and
+> **every work item pays a real registry round-trip for `docker.io/library/redis:8.4.2`** (the CR
+> default, `littlered_defaults.go:39-40`). Across a long array that is exactly the
+> anonymous-Docker-Hub rate-limit exposure described above — an `ImagePullBackOff` on item 47.
+>
+> **Preferred remedy — mirror, don't cache.** Copy the fixed public images into the private
+> registry and point the work item's CR at them (`spec.image` is configurable). That removes the
+> external dependency outright instead of caching around it, needs no proxy and no node config, and
+> composes with the `Always` policy rather than fighting it. A pull-through cache is the fallback
+> for cases where the image reference cannot be changed.
+>
+> **Do not "fix" this by setting `IfNotPresent`** on the preflight or the chaos client: that policy
+> is a deliberate check that the image is genuinely pullable, not an oversight.
 >
 > Two traps worth carrying into the implementation: **`OPERATOR_NAMESPACE` is already taken** —
 > `site_registry.go:159-179` reads it for the operator's *own* multi-site self-namespace
