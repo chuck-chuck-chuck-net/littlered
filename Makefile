@@ -545,6 +545,11 @@ E2E_HARNESS_SKIP_IMAGE_CHECK ?= false
 # this is the "yes, clobber it" override, and it is passed through to the driver
 # so the per-item clean-slate step agrees with the decision made at launch.
 E2E_HARNESS_ALLOW_PARKED_CLOBBER ?= false
+# An operator already running on the target cluster whose watch scope overlaps
+# the array would double-reconcile the items' CRs, corrupting the very parked
+# state the harness exists to preserve. The launch refuses; this is the
+# "yes, I know, that overlap is harmless" override.
+E2E_HARNESS_ALLOW_OPERATOR_CONFLICT ?= false
 # How long (SECONDS) `e2e-harness-watch` follows an array before giving up, and
 # how often it polls. Generous by design: a 20-item soak of the full suite is a
 # ~13-hour array, and a watch that gave up first would report a false
@@ -676,8 +681,36 @@ e2e-harness-parked-check: lrharness ## Refuse to launch over this array's PARKED
 	kubectl $(KUBECTL_CTX_FLAGS) get ns -l "lr-e2e-harness/array=$$ARRAY" -o json 2>/dev/null \
 		| bin/lrharness check-parked --array "$$ARRAY" --worklist $(E2E_HARNESS_WORKLIST)
 
+# The third launch gate, beside the image preflight and the parked-evidence
+# guard. An operator whose watch scope overlaps the array double-reconciles the
+# items' CRs alongside their own per-item operators — the failure design §3
+# exists to prevent — and it keeps acting on a PARKED namespace long after the
+# item stopped, so it corrupts the evidence rather than failing cleanly.
+#
+# WHAT THIS CAN AND CANNOT SEE (stated, because a guard with unstated blind
+# spots is worse than one with known limits):
+#   - it finds Deployments labelled `control-plane=controller-manager`, which is
+#     what the chart stamps. An operator deployed by other means, with that
+#     label removed, or running as a bare Pod/StatefulSet, is invisible to it.
+#   - it reads WATCH_NAMESPACE / IGNORE_NAMESPACE as literal env VALUES. Scope
+#     supplied via envFrom or a ConfigMap/Secret reference is not resolved, and
+#     such an operator is classified by whatever literals it does carry.
+#   - it looks only at the cluster the array launches on. That is the right
+#     scope: multi-site CRs live on the hub, so an operator on a SITE has no
+#     LittleRed to reconcile there and cannot fight the array.
+#   - a kubectl that cannot list Deployments cluster-wide yields an empty list,
+#     which reads as "no conflict". The launch continues rather than blocking on
+#     a permissions problem.
+.PHONY: e2e-harness-operator-check
+e2e-harness-operator-check: lrharness ## Refuse to launch beside an operator that would reconcile this array.
+	@if [ "$(E2E_HARNESS_ALLOW_OPERATOR_CONFLICT)" = "true" ]; then \
+		echo "conflicting-operator check SKIPPED (E2E_HARNESS_ALLOW_OPERATOR_CONFLICT=true)"; exit 0; \
+	fi; \
+	kubectl $(KUBECTL_CTX_FLAGS) get deploy -A -l control-plane=controller-manager -o json 2>/dev/null \
+		| bin/lrharness check-operators --worklist $(E2E_HARNESS_WORKLIST)
+
 .PHONY: e2e-harness-launch
-e2e-harness-launch: e2e-harness-validate e2e-harness-preflight e2e-harness-parked-check ## Launch the work-list array on the current cluster.
+e2e-harness-launch: e2e-harness-validate e2e-harness-preflight e2e-harness-parked-check e2e-harness-operator-check ## Launch the work-list array on the current cluster.
 	$(MAKE) --no-print-directory e2e-harness-render \
 		| kubectl $(KUBECTL_CTX_FLAGS) apply -f -
 	@echo "Array launched. Follow it with: make e2e-harness-watch"
@@ -746,19 +779,62 @@ e2e-harness-rollup-strict: lrharness ## Print the rollup and exit non-zero unles
 		-o go-template='{{range .items}}{{index .data "result.json"}}{{end}}' \
 		| bin/lrharness rollup --array "$$ARRAY" --total "$$TOTAL" --strict
 
+# `e2e-harness-clean` is THE explicit instruction to discard an array, so it is
+# the one path allowed to delete evidence — and since M3 it must reach the SITES
+# too, or a multi-site array's instance namespaces are stranded there forever.
+#
+# The ORDER is decided in the pure seam (List.CleanupPlan), not here, because it
+# is load-bearing rather than cosmetic: the per-item operator holds the
+# multisite-teardown finalizer that sweeps the spoke workloads, so it has to
+# outlive everything it owns — hub CRs first, then each site, then the operator
+# namespaces. Reversing it strands namespaces in Terminating until someone edits
+# a finalizer by hand.
+#
+# Site steps delete by EXACT NAME. A prefix sweep on a shared lab site would
+# match another array's parked evidence, which is the opposite of the rule this
+# whole target is the sanctioned exception to.
 .PHONY: e2e-harness-clean
-e2e-harness-clean: ## Delete the array, its results and every namespace it parked.
-	@ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+e2e-harness-clean: lrharness ## Delete the array, its results and every namespace it parked (hub AND sites).
+	@set -e; \
+	ARRAY=$$(sed -n 's/^array:[[:space:]]*//p' $(E2E_HARNESS_WORKLIST) | head -1); \
+	LABARG=""; \
+	[ -n "$(E2E_HARNESS_LAB)" ] && LABARG="--lab $(E2E_HARNESS_LAB)"; \
+	PLAN=$$(bin/lrharness cleanup-plan --worklist $(E2E_HARNESS_WORKLIST) $$LABARG); \
 	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete job \
 		"$$ARRAY" "$$ARRAY-setup" "$$ARRAY-teardown" --ignore-not-found; \
 	kubectl $(KUBECTL_CTX_FLAGS) -n $(E2E_HARNESS_NAMESPACE) delete configmap \
 		-l "lr-e2e-harness/array=$$ARRAY" --ignore-not-found; \
-	echo "Deleting the TEST namespaces first: their LittleRed CRs hold the operator's"; \
-	echo "finalizer, so they can only terminate while their own operator still runs."; \
-	kubectl $(KUBECTL_CTX_FLAGS) delete ns \
-		-l "lr-e2e-harness/array=$$ARRAY,!lr-e2e-harness/role" --ignore-not-found --timeout=5m; \
-	kubectl $(KUBECTL_CTX_FLAGS) delete ns \
-		-l "lr-e2e-harness/array=$$ARRAY,lr-e2e-harness/role=operator" --ignore-not-found --wait=false
+	printf '%s\n' "$$PLAN" | while IFS="$$(printf '\037')" read -r SITE SITECTX WAIT SELECTOR NAMES GONE WHY; do \
+		[ -z "$$SELECTOR$$NAMES" ] && continue; \
+		if [ -n "$$SITE" ]; then \
+			if [ -z "$$SITECTX" ]; then \
+				echo "    SKIPPING site $$SITE: no admin kubecontext in the lab inventory"; continue; fi; \
+			CTX="--context $$SITECTX"; WHERE="site $$SITE (context $$SITECTX)"; \
+		else CTX="$(KUBECTL_CTX_FLAGS)"; WHERE="hub"; fi; \
+		echo ""; echo "==> $$WHERE: $$WHY"; \
+		if [ -n "$$GONE" ]; then \
+			LEFT=$$(kubectl $(KUBECTL_CTX_FLAGS) get ns -l "$$GONE" -o name 2>/dev/null); \
+			if [ -n "$$LEFT" ]; then \
+				echo "    SKIPPED — these namespaces have NOT finished terminating:"; \
+				printf '        %s\n' $$LEFT; \
+				echo "    Their LittleRed CRs still hold the operator's finalizer, and this"; \
+				echo "    operator is the only thing that can release it. Deleting it now would"; \
+				echo "    strand them in Terminating forever. Left running on purpose."; \
+				echo "    Wait, then re-run this target; or release the finalizer by hand:"; \
+				echo "        kubectl -n <ns> patch littlered <name> --type=json \\"; \
+				echo "            -p='[{\"op\":\"remove\",\"path\":\"/metadata/finalizers\"}]'"; \
+				continue; \
+			fi; \
+		fi; \
+		if [ "$$WAIT" = "true" ]; then WAITARG="--timeout=5m"; else WAITARG="--wait=false"; fi; \
+		if [ -n "$$SELECTOR" ]; then \
+			kubectl $$CTX delete ns -l "$$SELECTOR" --ignore-not-found $$WAITARG \
+				|| echo "    WARNING: did not finish in time — later steps continue, but read the output above"; \
+		else \
+			kubectl $$CTX delete ns $$NAMES --ignore-not-found $$WAITARG \
+				|| echo "    WARNING: did not finish in time — later steps continue, but read the output above"; \
+		fi; \
+	done
 
 # ---------------------------------------------------------------------------
 # Multi-site substrate (docs/E2E_SOAK_HARNESS_DESIGN.md §11 M3).

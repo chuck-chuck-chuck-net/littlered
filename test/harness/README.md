@@ -117,6 +117,50 @@ A `LittleRed` CR carries the operator's finalizer, so a test namespace can only
 finish terminating **while its own operator is still running**. Both cleanup
 paths (the driver's green-path cleanup and `make e2e-harness-clean`) therefore
 delete the test namespace first, waiting, and only then the operator namespace.
+
+**Multi-site extends that rule one cluster further out.** A multi-site item also
+creates an instance namespace on every hosting **site**, and the same operator
+holds the `multisite-teardown` finalizer that sweeps those spoke workloads. So
+the operator has to outlive *everything* it owns, on both sides, and
+`e2e-harness-clean` runs an ordered plan (decided in `List.CleanupPlan`, not in
+the recipe):
+
+| # | Where | What | Wait? |
+|---|---|---|---|
+| 1 | hub | the item **instance** namespaces (`array=X,!role`) | yes — their CRs hold the finalizer, and deleting the CR is what triggers the spoke sweep |
+| 2 | each site | the item instance namespaces, **by exact name** | yes — and this is what *unblocks* a hub namespace stuck because a site was unreachable: once the site namespace is gone the sweep succeeds trivially |
+| 3 | hub | the per-item **operator** namespaces (`role=operator`) | no — nothing holds a finalizer on them |
+
+Step 3 is **conditional, not merely last**. If the instance namespaces did not
+finish terminating, it is SKIPPED and the operator is left running — because it
+is the only process that can release their finalizers, and deleting it would
+strand them in `Terminating` forever:
+
+```
+==> hub: the per-item operator namespaces, last of all: ...
+    SKIPPED — these namespaces have NOT finished terminating:
+        namespace/lr-harness-guardtest-0-x
+    ...
+    Left running on purpose. Wait, then re-run this target; or release the
+    finalizer by hand.
+```
+
+Re-running the target once the instance namespaces are gone completes the
+cleanup. (Ordering alone was not enough — this was found by cleaning a real
+parked multi-site array and stranding its namespace.)
+
+Site steps delete by exact **name**, never by prefix: those namespaces are
+created by the e2e suite and carry no harness labels, and a `lr-harness-*` glob
+on a shared lab site would match another array's parked evidence — the opposite
+of the rule this target is the sanctioned exception to.
+
+Cleaning a multi-site array therefore needs the lab inventory, and **refuses
+without it** rather than silently leaving the sites dirty:
+
+```bash
+make e2e-harness-clean E2E_HARNESS_WORKLIST=<list> E2E_HARNESS_LAB=~/my-lab.yaml
+```
+
 If one does get stranded in `Terminating`, the escape hatch is the usual one:
 
 ```bash
@@ -229,6 +273,51 @@ air-gapped host, a registry that refuses anonymous manifest reads). **No shipped
 work list needs it** — a fixture that only launches with the safety check off
 would teach the escape hatch as normal practice, so both lists' deliberate
 failures use a *pullable* image that simply is not redis.
+
+### Step 3 also refuses to launch beside a conflicting operator
+
+Every work item deploys its **own** namespace-scoped operator. A second operator
+watching the same namespaces double-reconciles the items' CRs — exactly the
+failure mode the per-item operator exists to prevent (§3) — and it keeps acting
+on a **parked** namespace long after the item stopped, so what you eventually
+inspect is not what failed. It corrupts the evidence rather than failing
+cleanly, which is why this is a refusal:
+
+```
+REFUSING TO LAUNCH: array "mscleanup" would run beside 1 operator(s) that reconcile its namespaces:
+
+    littlered-system/littlered
+        cluster-scoped (no WATCH_NAMESPACE / IGNORE_NAMESPACE), so it watches every namespace this array creates
+...
+  1. Scale it to zero for the run, and back afterwards:
+
+         kubectl -n littlered-system scale deploy littlered --replicas=0
+```
+
+The check reads each operator's `WATCH_NAMESPACE` / `IGNORE_NAMESPACE` and
+intersects its scope with the namespaces this array will create — **both**
+families, test and operator. A **scaled-to-zero** operator is not a conflict
+(that is the documented fix, so the gate has to be satisfiable), and neither is
+a parked operator of *this* array, whose namespace the driver clears anyway.
+An operator with **both** scope variables set is refused rather than reasoned
+about: it cannot start, but "it is crash-looping" is a guess about another
+binary, and this gate fails closed.
+
+**What it cannot see** — a guard with unstated blind spots is worse than one
+with known limits:
+
+- only Deployments labelled `control-plane=controller-manager` (what the chart
+  stamps). An operator deployed by other means, relabelled, or running as a bare
+  Pod/StatefulSet — or out-of-cluster from a workstation — is invisible.
+- only literal env **values**; scope supplied through `envFrom` or a ConfigMap
+  reference is not resolved.
+- only the cluster the array launches on. That is the right scope: multi-site
+  CRs live on the hub, so an operator on a *site* has no `LittleRed` to
+  reconcile there and cannot fight the array.
+- if `kubectl` cannot list Deployments cluster-wide the list is empty, which
+  reads as "no conflict" and the launch proceeds.
+
+`E2E_HARNESS_ALLOW_OPERATOR_CONFLICT=true` overrides it.
 
 ### Step 3 also refuses to launch over parked evidence
 
@@ -448,11 +537,23 @@ item with a recorded `FAIL` that names it, and no namespaces are created:
 [harness 20:54:39] SKIPPING item 'f2k4-a': the run-scoped setup Job 'msgate-setup' FAILED
 ```
 
-Teardown is **report-only** by design. A Kubernetes Job cannot schedule a
-successor, so it is fired by `e2e-harness-watch` when the array ends (or by
-`make e2e-harness-teardown`); that trigger is not guaranteed, and a phase that
-deleted things would be a phase that sometimes silently did not. It also keeps
-the standing rule: the harness never destroys forensic evidence unless
+Teardown stays **report-only**, deliberately, and it is worth saying why it was
+not promoted to a deleting phase once `e2e-harness-clean` learned to reach the
+sites. Three reasons, in increasing sharpness:
+
+1. A Kubernetes Job cannot schedule a successor, so this phase is fired by
+   `e2e-harness-watch` (or by hand) and that trigger is **not guaranteed**. A
+   phase that deletes would be a phase that sometimes silently does not — the
+   worst property a cleanup can have, because you stop checking.
+2. It runs **immediately after the array**, when a parked namespace is the
+   freshest evidence there is. Deleting there would race the very inspection
+   parking exists for.
+3. There is now a deliberate path that does reach the sites —
+   `e2e-harness-clean` — so nothing is lost by keeping this one honest.
+
+So the division is: the teardown phase **names** what the run left behind on
+each site; `e2e-harness-clean` is the explicit instruction that removes it. The
+standing rule is unchanged — the harness never destroys forensic evidence unless
 explicitly told to.
 
 Nothing needs the phases until M5's resident split-brain monitor; they exist now
@@ -507,15 +608,21 @@ namespace, including each item's, and would double-reconcile the CRs.
 - **`hostPath` artifacts** assume a single-node cluster, or that you only ever
   read artifacts from the node that ran the item. Use `--artifacts-pvc` where a
   StorageClass exists.
-- **A parked multi-site item leaves namespaces on the SITES too**, and neither
-  `e2e-harness-clean` (which only reaches the hub) nor the report-only teardown
-  phase removes them. The teardown phase names them; delete them deliberately
-  with `kubectl --context <site> delete ns <name>`.
+- **A parked multi-site item leaves namespaces on the SITES too.** The
+  report-only teardown phase names them; `make e2e-harness-clean
+  E2E_HARNESS_LAB=<inventory>` removes them, in the order above. Without the
+  inventory that target now refuses rather than half-cleaning.
 - **The run-scoped teardown only fires if something fires it** —
   `e2e-harness-watch`, `e2e-harness-teardown`, or a human. A Job cannot schedule
   a successor. Harmless today (the phase is report-only); a phase that must run
   unattended — M5's monitor shutdown — will need a small controller or a
   wrapping workflow rather than this hook.
-- **No launch-time guard against a cluster-scoped operator on the hub.** It
-  would fight the per-item operators, and the only current defence is the
-  sentence above.
+- **The conflicting-operator gate is a Deployment check**, with the blind spots
+  listed under "Step 3 also refuses to launch beside a conflicting operator". It
+  cannot see an operator that is not a labelled Deployment on the target
+  cluster — an out-of-cluster one run from a workstation being the realistic
+  case.
+- **`e2e-harness-clean` reaches every site in the inventory**, not only the ones
+  a fixture actually used. Deleting a namespace that was never created is a
+  harmless no-op, and it is the safer direction: an array whose fixture list
+  changed still gets fully cleaned.

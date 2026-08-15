@@ -57,6 +57,10 @@ func main() {
 		err = cmdRollup(os.Args[2:])
 	case "check-parked":
 		err = cmdCheckParked(os.Args[2:])
+	case "check-operators":
+		err = cmdCheckOperators(os.Args[2:])
+	case "cleanup-plan":
+		err = cmdCleanupPlan(os.Args[2:])
 	case "images":
 		err = cmdImages(os.Args[2:])
 	case "render-job":
@@ -100,6 +104,13 @@ func usage() {
   check-parked --array A --worklist F
              (reads "kubectl get ns -o json" on stdin; exits 1, with the
               refusal, if the array has PARKED namespaces from an earlier run)
+  check-operators --worklist F
+             (reads "kubectl get deploy -A -l control-plane=controller-manager
+              -o json" on stdin; exits 1, with the refusal, if an operator on
+              the cluster would also reconcile this array's namespaces)
+  cleanup-plan --worklist F [--lab L]
+             (the ORDERED cleanup steps across hub and sites, TAB-separated:
+              site, wait, selector, names, why)
   images     --worklist F [--driver-image I] [--operator-image O]
              [--chaos-client-image C]
              (every image ref the array pins, one per line — what a launch

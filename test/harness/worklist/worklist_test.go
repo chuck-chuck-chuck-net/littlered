@@ -1056,7 +1056,7 @@ func TestNamespaceStampsMatchTheDriver(t *testing.T) {
 
 func TestObserveNamespaceReadsTheStamps(t *testing.T) {
 	got := ObserveNamespace(parkedOpNS,
-		map[string]string{LabelArray: "a", LabelParked: "true", LabelIndex: "2", LabelRole: RoleOperator},
+		map[string]string{LabelArray: "a", LabelParked: LabelValueTrue, LabelIndex: "2", LabelRole: RoleOperator},
 		map[string]string{AnnotationItem: "doomed", AnnotationVerdict: string(VerdictFail)})
 	want := ObservedNamespace{
 		Name: parkedOpNS, Array: "a", Parked: true,

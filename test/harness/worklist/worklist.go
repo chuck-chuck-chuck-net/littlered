@@ -762,7 +762,9 @@ const (
 	LabelRole   = "lr-e2e-harness/role"
 
 	// RoleOperator is the LabelRole value on an item's operator namespace.
-	RoleOperator      = "operator"
+	RoleOperator = "operator"
+	// LabelValueTrue is the stamped value of the boolean labels above.
+	LabelValueTrue    = "true"
 	AnnotationItem    = "lr-e2e-harness/item"
 	AnnotationVerdict = "lr-e2e-harness/verdict"
 )
@@ -772,7 +774,7 @@ func ObserveNamespace(name string, labels, annotations map[string]string) Observ
 	return ObservedNamespace{
 		Name:    name,
 		Array:   labels[LabelArray],
-		Parked:  labels[LabelParked] == "true",
+		Parked:  labels[LabelParked] == LabelValueTrue,
 		Index:   labels[LabelIndex],
 		Role:    labels[LabelRole],
 		Item:    annotations[AnnotationItem],

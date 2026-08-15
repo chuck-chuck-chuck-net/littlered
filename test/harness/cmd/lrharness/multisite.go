@@ -21,8 +21,10 @@ package main
 // this file is only the I/O around them: read files, write files, print shell.
 
 import (
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -333,5 +335,137 @@ func cmdRenderTeardown(args []string) error {
 		return err
 	}
 	fmt.Print(out)
+	return nil
+}
+
+// cmdCheckOperators refuses a launch that would run beside an operator whose
+// watch scope overlaps the array. The cluster lookup stays in the recipe; the
+// decision comes from the pure seam, exactly like check-parked.
+func cmdCheckOperators(args []string) error {
+	fs := flag.NewFlagSet("check-operators", flag.ExitOnError)
+	path := fs.String("worklist", "", "path to the work list YAML")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	l, err := loadList(*path)
+	if err != nil {
+		return err
+	}
+
+	// The shape of `kubectl get deployments -A -o json`, reduced to what the
+	// scope decision needs.
+	var list struct {
+		Items []struct {
+			Metadata struct {
+				Name      string `json:"name"`
+				Namespace string `json:"namespace"`
+			} `json:"metadata"`
+			Spec struct {
+				Replicas *int32 `json:"replicas"`
+				Template struct {
+					Spec struct {
+						Containers []struct {
+							Env []struct {
+								Name  string `json:"name"`
+								Value string `json:"value"`
+							} `json:"env"`
+						} `json:"containers"`
+					} `json:"spec"`
+				} `json:"template"`
+			} `json:"spec"`
+		} `json:"items"`
+	}
+	raw, err := io.ReadAll(os.Stdin)
+	if err != nil {
+		return fmt.Errorf("reading the deployment list: %w", err)
+	}
+	if len(strings.TrimSpace(string(raw))) == 0 {
+		fmt.Printf("no operator on this cluster conflicts with array %q\n", l.Array)
+		return nil
+	}
+	if err := json.Unmarshal(raw, &list); err != nil {
+		return fmt.Errorf("parsing the deployment list: %w", err)
+	}
+
+	observed := make([]worklist.ObservedOperator, 0, len(list.Items))
+	for _, it := range list.Items {
+		op := worklist.ObservedOperator{
+			Namespace: it.Metadata.Namespace,
+			Name:      it.Metadata.Name,
+			Replicas:  1, // a Deployment with no explicit replicas defaults to 1
+		}
+		if it.Spec.Replicas != nil {
+			op.Replicas = *it.Spec.Replicas
+		}
+		// Scan every container: the scope env lives on the manager, but the
+		// container name is not something this check should depend on.
+		for _, c := range it.Spec.Template.Spec.Containers {
+			for _, e := range c.Env {
+				switch e.Name {
+				case "WATCH_NAMESPACE":
+					op.WatchNamespace = e.Value
+				case "IGNORE_NAMESPACE":
+					op.IgnoreNamespace = e.Value
+				}
+			}
+		}
+		observed = append(observed, op)
+	}
+
+	conflicts := l.ConflictingOperators(observed)
+	if len(conflicts) == 0 {
+		fmt.Printf("no operator on this cluster conflicts with array %q (%d checked)\n",
+			l.Array, len(observed))
+		return nil
+	}
+	fmt.Fprint(os.Stderr, worklist.OperatorRefusalMessage(l.Array, conflicts))
+	os.Exit(1)
+	return nil
+}
+
+// cmdCleanupPlan prints the ordered cleanup steps as shell-consumable lines, so
+// the ORDER and the WAITING — the load-bearing parts — are decided here and not
+// re-derived in a recipe.
+//
+// The record format is worklist.CleanupTarget.Line — six fields separated by
+// ASCII unit separator, NOT tab: several fields are legitimately empty, and tab
+// is IFS whitespace, so a shell `read` would collapse runs of it and shift every
+// field after the first empty one.
+//
+// The seam names the SITE (its logical name, which is what the operator and the
+// CR use); reaching it from a workstation needs the lab inventory's admin
+// kubecontext, which is I/O configuration and so is resolved here.
+func cmdCleanupPlan(args []string) error {
+	fs := flag.NewFlagSet("cleanup-plan", flag.ExitOnError)
+	path := fs.String("worklist", "", "path to the work list YAML")
+	labPath := fs.String("lab", "", "lab inventory (required when the array has multi-site items)")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	l, err := loadList(*path)
+	if err != nil {
+		return err
+	}
+
+	var sites []string
+	adminContext := map[string]string{}
+	if strings.TrimSpace(*labPath) != "" {
+		lb, lerr := loadLab(*labPath)
+		if lerr != nil {
+			return lerr
+		}
+		for _, s := range lb.Sites {
+			sites = append(sites, s.Name)
+			adminContext[s.Name] = s.Context
+		}
+	}
+
+	plan, err := l.CleanupPlan(sites)
+	if err != nil {
+		return err
+	}
+	for _, s := range plan {
+		fmt.Println(s.Line(adminContext[s.Site]))
+	}
 	return nil
 }
