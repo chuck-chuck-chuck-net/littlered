@@ -273,16 +273,13 @@ manager is alive, so a logout silently takes the container down and nothing rest
 such a component "restart reliably" (linger, a user unit) hardens the wrong thing; the fix is to
 move it into the autonomous domain, not to make its laptop-bound instance more persistent.
 
-**Prefer fail-open dependencies to fail-closed ones.** A MITM forward proxy (`HTTPS_PROXY` on the
-node + CA trust) **fails closed**: when it is down, pulls do not get slower, they stop entirely,
-cluster-wide and silently — including the operator's own image. A per-registry **mirror** in the
-container runtime's `registries.conf` **fails open**: the runtime falls back to upstream, so an
-outage costs throughput and rate-limit exposure rather than the run. For an unattended array that
-difference is the whole ballgame. A mirror additionally has **no CA to distribute or rotate** —
-whereas with the MITM design the CA key *is* the migration (nodes trust that specific key; move the
-container without its CA volume and every node silently stops pulling), and it is a single-copy
-secret. Weigh that against the mirror's one cost: it is configured per registry rather than
-catching everything at once.
+**Applied to images, this rule needs no Kubernetes changes at all.** Every image the run pulls
+should come from a registry in the autonomous domain — see §11, "mirror the fixed public images".
+That is achieved purely by *parameterising image references* (`LITTLERED_REGISTRY`, the work item's
+`spec.image`), never by reconfiguring clusters. Approaches that push a MITM proxy or a
+`registries.conf` mirror into every node's runtime config were considered and are **not** used:
+they buy the same thing at the price of node-level configuration and, in the MITM case, a CA that
+must be distributed, rotated, and kept — and whose loss silently stops all pulls cluster-wide.
 
 ### 9.4 Revised effort
 
@@ -365,6 +362,31 @@ three reasons:
 The split costs no duplication. Both workloads run the same work-list driver container (§9.1),
 differing only in: which cluster hosts the Job, whether the restricted-`command=` fault-agent
 credentials are mounted (§9.3), and the work list. Nothing forks.
+
+### 10.5 Development substrate vs run substrate — a distinction worth naming
+
+There are **two loops**, with opposite requirements, and nearly every confusion during this work
+came from conflating them:
+
+| | **Authoring loop** (building the harness) | **Run loop** (executing an array) |
+|---|---|---|
+| Goal | fast iteration | autonomy over hours |
+| Duration | seconds to minutes | 90 min – 24 h |
+| Attended? | yes | no |
+| Image refs | mutable, rebuilt often ⇒ needs `Always` or a fresh dev tag | pinned for the whole array |
+| Substrate | anything convenient, **a laptop VM is fine** | must satisfy §9.3 autonomy |
+
+A single-node cluster in a workstation VM (the `s1` context used to build M1) is an excellent
+**authoring** substrate: disposable, private, zero lab contention, and its failures cost nobody
+else. It is **disqualified as a run substrate** — hosting a real soak array or any matrix cell
+there re-imports the exact laptop dependency §9.3 exists to remove, and hides it behind a
+kubecontext name.
+
+So: `s1` is where the harness is *built*, never where it *runs*. The matrix does not involve it at
+all (hub `scm-cp` + sites `scm-s1..3`; note `s1` ≠ `scm-s1` — two different clusters whose names
+differ by four characters, an easy and expensive confusion). Real classic-soak arrays likewise
+belong on lab infrastructure. Anything that outlives the person watching it moves into the
+autonomous domain.
 
 ## 11. Implementation plan — substrate first, in thin vertical slices (2026-08-14)
 
@@ -526,27 +548,19 @@ parked for forensics.
 > hostname as the shipped default would break every other user. This is an environment variable
 > you set, never a checked-in value.
 >
-> **Partly rejected: a pull-through registry cache.** A different answer to the same problem. The
-> rejection holds for the images *we* control — driver, operator and chaos client are pinned, live
-> in the private registry, and are pulled `IfNotPresent`, so a cache adds nothing and would cost
-> proxy env plus a MITM CA in every node's machine config.
+> **Mirror the fixed public images too, and point the CR at the mirror.** The same rule extends
+> past the images we build. `docker.io/library/redis:8.4.2` is the CR default
+> (`littlered_defaults.go:39-40`), and it is **re-pulled on every work item**: the suite sets
+> `imagePullPolicy: Always` deliberately (`preflight_test.go:26,48`, `chaos_utils_test.go:84`)
+> because `IfNotPresent` *"would mask issues where the image is cached locally but not actually
+> pullable."* Warm node caches therefore never help, and across a long array that is exactly the
+> anonymous-Docker-Hub rate-limit exposure above.
 >
-> **It does not hold for the fixed public images, and the reason is not obvious** (corrected
-> 2026-08-15; an earlier version of this section asserted the opposite). That premise was
-> "long-lived clusters already hold the fixed images, so with `IfNotPresent` there is almost
-> nothing left to pull." **The suite deliberately defeats it.** `preflightImageChecks` and the
-> chaos client both set **`imagePullPolicy: Always`** (`preflight_test.go:26,48`,
-> `chaos_utils_test.go:84`) — on purpose, because `IfNotPresent` *"would mask issues where the
-> image is cached locally but not actually pullable."* So a warm node cache never helps, and
-> **every work item pays a real registry round-trip for `docker.io/library/redis:8.4.2`** (the CR
-> default, `littlered_defaults.go:39-40`). Across a long array that is exactly the
-> anonymous-Docker-Hub rate-limit exposure described above — an `ImagePullBackOff` on item 47.
->
-> **Preferred remedy — mirror, don't cache.** Copy the fixed public images into the private
-> registry and point the work item's CR at them (`spec.image` is configurable). That removes the
-> external dependency outright instead of caching around it, needs no proxy and no node config, and
-> composes with the `Always` policy rather than fighting it. A pull-through cache is the fallback
-> for cases where the image reference cannot be changed.
+> The fix is a one-line parameter, not infrastructure: keep a copy of the image in the same
+> registry and set the work item's `spec.image` to it. **Nothing about Kubernetes changes** — no
+> proxy, no CA to distribute or rotate, no `registries.conf` mirror, no node or runtime config on
+> any cluster. It also composes with the `Always` policy instead of fighting it, since the pull is
+> real but local.
 >
 > **Do not "fix" this by setting `IfNotPresent`** on the preflight or the chaos client: that policy
 > is a deliberate check that the image is genuinely pullable, not an oversight.
