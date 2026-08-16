@@ -98,6 +98,21 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 		}
 	}
 
+	// newFailoverCR returns a minimal failover-mode LittleRed CR (ADR-011).
+	//
+	// spec.failover is deliberately left unset. The CRD only forbids the block in
+	// OTHER modes (rule: self.mode == 'failover' || !has(self.failover)), it never
+	// requires it here, and failoverSpecOrDefault supplies the defaults — so this
+	// also exercises the nil-spec.failover path. The default of 2 replicas means
+	// 3 data pods, so a failover instance is redundant by construction and always
+	// qualifies for a PDB (unlike standalone or a 0-replica cluster above).
+	newFailoverCR := func(name string) *littleredv1alpha1.LittleRed {
+		return &littleredv1alpha1.LittleRed{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
+			Spec:       littleredv1alpha1.LittleRedSpec{Mode: "failover"},
+		}
+	}
+
 	// newClusterCR returns a minimal cluster LittleRed CR.
 	newClusterCR := func(name string) *littleredv1alpha1.LittleRed {
 		replicas := clusterReplicasPerShard
@@ -201,6 +216,12 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 				timeout:  3 * time.Minute,
 			},
 			{
+				// Failover mode has data pods only, so exactly one PDB name is in play.
+				mode:     "failover",
+				pdbNames: []string{"pdb-off-failover-redis-pdb"},
+				timeout:  3 * time.Minute,
+			},
+			{
 				mode:     "cluster",
 				pdbNames: clusterPDBNames("pdb-off-cluster"),
 				timeout:  5 * time.Minute,
@@ -218,6 +239,8 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 				switch tc.mode {
 				case "sentinel":
 					cr = newSentinelCR(crName)
+				case "failover":
+					cr = newFailoverCR(crName)
 				case "cluster":
 					cr = newClusterCR(crName)
 				}
@@ -248,13 +271,24 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 		type modeCase struct {
 			mode     string
 			pdbNames []string
-			timeout  time.Duration
+			// absentPDBNames must NOT exist. Used by failover mode to pin the
+			// ADR-011 invariant at the PDB layer: the mode reuses the sentinel
+			// data-pod PDB builder, so a regression that also emitted the
+			// sentinel-process PDB would otherwise pass unnoticed.
+			absentPDBNames []string
+			timeout        time.Duration
 		}
 		cases := []modeCase{
 			{
 				mode:     "sentinel",
 				pdbNames: []string{"pdb-on-sentinel-redis-pdb", "pdb-on-sentinel-sentinel-pdb"},
 				timeout:  3 * time.Minute,
+			},
+			{
+				mode:           "failover",
+				pdbNames:       []string{"pdb-on-failover-redis-pdb"},
+				absentPDBNames: []string{"pdb-on-failover-sentinel-pdb"},
+				timeout:        3 * time.Minute,
 			},
 			{
 				mode:     "cluster",
@@ -274,6 +308,8 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 				switch tc.mode {
 				case "sentinel":
 					cr = newSentinelCR(crName)
+				case "failover":
+					cr = newFailoverCR(crName)
 				case "cluster":
 					cr = newClusterCR(crName)
 				}
@@ -298,6 +334,13 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 						g.Expect(pdb.Spec.MinAvailable).To(BeNil(),
 							"PDB %q MinAvailable should not be set by default", pdbName)
 					}, 30*time.Second, 5*time.Second).Should(Succeed())
+				}
+
+				By("verifying no PDB exists for any name this mode must not emit")
+				for _, pdbName := range tc.absentPDBNames {
+					_, found, err := getPDB(pdbName)
+					Expect(err).NotTo(HaveOccurred())
+					Expect(found).To(BeFalse(), "PDB %q must not exist in %s mode", pdbName, tc.mode)
 				}
 			})
 		}

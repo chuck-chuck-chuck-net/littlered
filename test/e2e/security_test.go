@@ -29,7 +29,13 @@ var _ = Describe("LittleRed Security Features", Label("security"), func() {
 		Expect(err).NotTo(HaveOccurred())
 	})
 
-	modes := []string{"standalone", "sentinel", "cluster"}
+	// Failover mode (ADR-011) needs no mode-specific arm below: its data pods are
+	// {crName}-redis-N like standalone/sentinel, so the shared `-redis-0` branch
+	// addresses the right pod, and spec.failover may be omitted entirely (the CRD
+	// only forbids the block in other modes; failoverSpecOrDefault defaults it).
+	// The sentinel-only arm is skipped by its own mode guard — correctly, as this
+	// mode has no sentinel processes to authenticate against.
+	modes := []string{"standalone", "sentinel", "failover", "cluster"}
 
 	for _, mode := range modes {
 		mode := mode // capture range variable
