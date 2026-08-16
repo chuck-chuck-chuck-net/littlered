@@ -340,7 +340,12 @@ Remaining field-shape details are settled in the ADR, not here.
   CR admission time from the kubeconfig Secrets; controller-runtime has no mature
   multi-cluster layer, so this is explicit plumbing behind `SiteClient` (the
   cluster-api "remote cluster client" pattern). Watches on spoke pods feed the same
-  event stream as local watches do today.
+  event stream as local watches do today. The kubeconfig Secret itself is read
+  **uncached** (the manager's `APIReader`) and its failures are classified as
+  *configuration*, not reachability — see ADR-012 and LR-034. A **fully** unmanaged
+  instance (every remote site config-faulted) is distinguishable from a **partially**
+  unmanaged one in the condition message; a site with no `kubeconfigSecretRef` is
+  hub-local, needs no kubeconfig, and is never counted as unmanaged.
 - **Gather:** unchanged in shape — concurrent, per-probe `ProbeTimeout`-bounded dials
   (LR-017) already tolerate unreachable addresses; cross-site RTT sits well inside
   the 3s bound. Pod↔node correlation uses the union of all sites' pod lists.

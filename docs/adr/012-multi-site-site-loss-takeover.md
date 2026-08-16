@@ -379,6 +379,35 @@ degrades to Tier A (human), never to an unsafe guess.
   balance thresholds' health are surfaced (`lrctl verify`, a condition). A breach of
   the floor is an actionable availability exposure; sitting between floor and target
   is a recovery downgrade, reported but not alarming. Neither is silent drift.
+- **Unreadable configuration is not an unreachable site** (LR-034). Site resolution
+  fails in two ways that call for opposite responses. A site whose Kubernetes API does
+  not answer is *unmanaged, not broken* (pillar 3.2), may heal itself, and the operator
+  deliberately does nothing. A **configuration** fault — the operator's own namespace
+  unresolvable, or the site's kubeconfig Secret unreadable or malformed — is the
+  operator failing to read its **own hub-local inputs**, and never heals without a
+  human. The two differ in *whether someone must act*, so reporting both as
+  "unreachable" makes the actionable alert impossible to write. The tell is hub-local
+  vs remote: everything up to and **including parsing the kubeconfig** is
+  configuration; only what follows touches the site. Surfaced as
+  `status.multiSite.sites[].reason` (alert on any value other than `Unreachable`) plus
+  a `MultiSiteConfigInvalid` condition with a one-shot Warning event. `reachable`
+  deliberately keeps its broad meaning — *"did not answer, or we could not ask"* —
+  because the observability arithmetic must treat both identically: a config-faulted
+  site suppresses ghost FORGET, which is the safe direction. **Before anything is built
+  the operator refuses** (phase `Failed`); nothing is running to protect, and
+  proceeding would half-build an undesigned topology across whichever sites resolved.
+  **On an existing instance it never refuses and never changes phase** — the condition
+  carries the state and the healthy sites keep being reconciled, since one deleted
+  Secret must not become an instance-wide management outage. The refusal is a state,
+  not a latch: fix the Secret and the next reconcile proceeds.
+- **The site kubeconfig Secret is read *uncached*** (LR-034), so scoping cannot hide it.
+  Reading it through the manager's cache made a namespace-scoped operator (ADR-014)
+  unable to see its own credentials. Widening the cache is **not** the fix:
+  `DefaultNamespaces` is not per-type, so it would widen the `LittleRed` **watch** as
+  well — re-opening the class ADR-014 exists to prevent — and `deny` mode cannot express
+  the exemption at all. Consequence for deployers: an **allow-list-scoped** operator
+  additionally needs a `get secrets` Role in its own namespace, which the chart now
+  renders; `deny` and `none` keep the ClusterRole and need nothing.
 - New status: `status.multiSite.takeoverPendingSince`, a refusal condition. New spec
   knob: `multiSite.allowUnsafeSiteTakeover` (default false).
 - **Reduced-resilience warning** (a surfaced condition, *not* an admission refusal):
