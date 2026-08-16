@@ -170,6 +170,12 @@ spec:
 
 				metrics, err := getChaosClientMetrics(testNamespace, chaosPodName)
 				Expect(err).NotTo(HaveOccurred())
+				// Printed so this tier can be compared against the failover-mode mirror
+				// in failover_chaos_test.go. Without it the numbers are computed, asserted
+				// against a deliberately loose bar, and discarded — which is how a 20-point
+				// graceful-vs-crash spread in the other mode had no baseline to be read
+				// against. Every other chaos tier already prints.
+				GinkgoWriter.Printf("Sentinel Rapid-Double-Failover Metrics (%s):\n%s\n", mode.Name, metrics.String())
 
 				Expect(metrics.DataCorruptions).To(Equal(int64(0)), "Data corruption detected!")
 				Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.40))
