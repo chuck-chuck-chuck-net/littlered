@@ -169,6 +169,15 @@ ifneq ($(E2E_LABEL_FILTER),)
 E2E_LABELS = --ginkgo.label-filter='$(E2E_LABEL_FILTER)'
 endif
 
+# Suite deadline. Ginkgo v2's own --timeout defaults to 1h, and THAT is what interrupts a
+# long full-matrix run (E2E_ALL=true) — go test's -timeout is only the outer watchdog and
+# never got a say. Both now come from knobs, and the go one keeps a margin so Ginkgo
+# interrupts and writes its report (cleanup nodes still run) instead of go panicking the
+# process first.
+#   make test-e2e E2E_ALL=true E2E_TIMEOUT=4h
+E2E_TIMEOUT ?= 2h
+E2E_GO_TIMEOUT ?= 3h
+
 # DEBUG_ON_FAILURE=true ginkgo --fail-fast ./test/e2e/...
 ifeq ($(DEBUG_ON_FAILURE),true)
 FAIL_FAST = --ginkgo.fail-fast
@@ -211,7 +220,7 @@ test-e2e-all: ## Run ALL e2e tests, including 'extended'/opt-in tiers.
 
 .PHONY: run-test-e2e
 run-test-e2e: manifests generate fmt vet
-	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout 120m $(FAIL_FAST) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
+	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
