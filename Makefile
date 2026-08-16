@@ -222,6 +222,21 @@ test-e2e-all: ## Run ALL e2e tests, including 'extended'/opt-in tiers.
 run-test-e2e: manifests generate fmt vet
 	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
 
+# list-e2e previews the spec selection of an e2e run WITHOUT running anything. It reuses the
+# same FOCUS/LABEL_FILTER/E2E_ALL knobs as test-e2e, so `make list-e2e <flags>` answers exactly
+# "what would `make test-e2e <flags>` execute?" — the point is that the two cannot drift.
+#   make list-e2e                             # the default tier set (everything but 'extended')
+#   make list-e2e E2E_ALL=true                # every spec
+#   make list-e2e LABEL_FILTER='failover-mode'
+#   make list-e2e FOCUS='Standalone'
+# --ginkgo.dry-run executes no nodes at all (not even BeforeSuite), so this needs no cluster and
+# no kubecontext. Both -v flags are required: go's (or go test buffers the output away) and
+# Ginkgo's (or the report is just dots). Deliberately has no codegen prerequisites — listing
+# specs must never rewrite source.
+.PHONY: list-e2e
+list-e2e: ## List the specs an e2e run would select, without touching a cluster (honors FOCUS/LABEL_FILTER/E2E_ALL).
+	@go test -tags=e2e ./test/e2e/ -v -timeout 5m --ginkgo.dry-run --ginkgo.v --ginkgo.no-color --ginkgo.seed=1 $(E2E_FOCUS) $(E2E_LABELS) 2>&1 | awk '/^Will run /{hdr=$$0} /^\/.*_test\.go:[0-9]+$$/{ if (prev !~ /^\[/ && prev != "") { loc=$$0; sub(/.*\/test\/e2e\//,"",loc); printf "%4d  %s\n        %s\n", ++n, prev, loc } } {prev=$$0} END{ if (n == 0) { print "no specs selected"; exit 1 } printf "\n%s (dry run -- nothing was executed)\n", hdr }'
+
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@echo "Deleting Kind cluster '$(KIND_CLUSTER)'..."
