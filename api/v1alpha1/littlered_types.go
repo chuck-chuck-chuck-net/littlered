@@ -815,6 +815,18 @@ const (
 	// (spec-level) only; transient master drift within a resilient topology is owned by the
 	// rebalancer, not this condition. False records a resilient topology.
 	ConditionReducedSiteLossResilience = "ReducedSiteLossResilience"
+	// ConditionMultiSiteConfigInvalid is a surfaced WARNING for a site the operator cannot
+	// CONFIGURE (cluster mode with spec.multiSite): its own namespace was unresolvable, or
+	// the site's kubeconfig Secret is missing, unreadable or malformed. This is a different
+	// state from an unreachable site, and the difference is whether a human must act: an
+	// unreachable site may heal itself and is treated as normal (an unreachable site is
+	// unmanaged, not broken), whereas the operator failing to read its own hub-local inputs
+	// never heals on its own. Both previously surfaced only as "site unreachable", which
+	// made the actionable alert impossible to write. True means at least one site is
+	// unmanaged until the configuration is fixed — before anything is built the operator
+	// refuses outright (phase Failed); on an existing instance the phase is left alone and
+	// the healthy sites keep being reconciled. False records readable configuration.
+	ConditionMultiSiteConfigInvalid = "MultiSiteConfigInvalid"
 )
 
 // LittleRedStatus defines the observed state of LittleRed
@@ -1012,10 +1024,32 @@ type SiteStatus struct {
 	// Name is the site name from spec.multiSite.sites.
 	Name string `json:"name"`
 
-	// Reachable reports whether the site's Kubernetes API was reachable at the
-	// last probe.
+	// Reachable reports whether the operator obtained this site's observed state at
+	// the last probe. False means "did not answer, OR we could not ask": both a site
+	// whose Kubernetes API did not respond and a site the operator could not
+	// configure (unresolvable operator namespace, missing/unreadable/malformed
+	// kubeconfig Secret) are false here. The two are NOT the same state — only the
+	// first may heal itself — so read Reason to tell them apart. The boolean keeps
+	// this deliberately broad meaning because it feeds the multi-site observability
+	// arithmetic (allSitesObservable), where "we could not ask" must count exactly
+	// like "did not answer".
 	// +optional
 	Reachable bool `json:"reachable,omitempty"`
+
+	// Reason is a short, machine-readable classification of why this site is not
+	// reachable; empty when it is. "Unreachable" means the site's Kubernetes API did
+	// not answer — normal, possibly transient, and no action is implied (an
+	// unreachable site is unmanaged, not broken). Any other value is a CONFIGURATION
+	// fault that will never heal on its own and needs a human:
+	// "OperatorNamespaceUnresolvable", "KubeconfigSecretUnreadable" or
+	// "KubeconfigSecretMalformed". This is the field to alert on.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message is the human-readable detail behind Reason (the underlying error),
+	// empty when the site is reachable.
+	// +optional
+	Message string `json:"message,omitempty"`
 
 	// Pods counts this instance's Redis pods observed in the site.
 	// +optional

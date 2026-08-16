@@ -2571,6 +2571,11 @@ spec:
                             the site.
                           format: date-time
                           type: string
+                        message:
+                          description: |-
+                            Message is the human-readable detail behind Reason (the underlying error),
+                            empty when the site is reachable.
+                          type: string
                         name:
                           description: Name is the site name from spec.multiSite.sites.
                           type: string
@@ -2592,9 +2597,26 @@ spec:
                           type: object
                         reachable:
                           description: |-
-                            Reachable reports whether the site's Kubernetes API was reachable at the
-                            last probe.
+                            Reachable reports whether the operator obtained this site's observed state at
+                            the last probe. False means "did not answer, OR we could not ask": both a site
+                            whose Kubernetes API did not respond and a site the operator could not
+                            configure (unresolvable operator namespace, missing/unreadable/malformed
+                            kubeconfig Secret) are false here. The two are NOT the same state — only the
+                            first may heal itself — so read Reason to tell them apart. The boolean keeps
+                            this deliberately broad meaning because it feeds the multi-site observability
+                            arithmetic (allSitesObservable), where "we could not ask" must count exactly
+                            like "did not answer".
                           type: boolean
+                        reason:
+                          description: |-
+                            Reason is a short, machine-readable classification of why this site is not
+                            reachable; empty when it is. "Unreachable" means the site's Kubernetes API did
+                            not answer — normal, possibly transient, and no action is implied (an
+                            unreachable site is unmanaged, not broken). Any other value is a CONFIGURATION
+                            fault that will never heal on its own and needs a human:
+                            "OperatorNamespaceUnresolvable", "KubeconfigSecretUnreadable" or
+                            "KubeconfigSecretMalformed". This is the field to alert on.
+                          type: string
                       required:
                       - name
                       type: object

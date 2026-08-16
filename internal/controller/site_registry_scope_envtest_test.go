@@ -158,6 +158,24 @@ var _ = Describe("site kubeconfig Secret read under a scoped cache (envtest)", f
 		Expect(got.Data).To(HaveKey(siteKubeconfigSecretKey))
 	})
 
+	// A genuinely absent Secret must classify as CONFIGURATION, not reachability —
+	// against a real apiserver's NotFound, not a fake client's. The fix above turned
+	// the scoped-cache error into this one; it must not be laundered back into "site
+	// unreachable", which is the state that reads as self-healing and needs no human.
+	It("classifies a missing kubeconfig Secret as a configuration fault, not unreachability", func() {
+		cfgScope, err := watchscope.Parse(tenantNS, "")
+		Expect(err).NotTo(HaveOccurred())
+
+		absent := site
+		absent.KubeconfigSecretRef = &littleredv1alpha1.KubeconfigSecretRef{Name: "no-such-secret"}
+
+		_, err = registryOverScope(cfgScope.CacheOptions()).siteClient(ctx, lr, absent)
+		Expect(err).To(HaveOccurred())
+		sce, ok := siteConfigFaultOf(err)
+		Expect(ok).To(BeTrue(), "a missing kubeconfig Secret needs a human, so it must not read as unreachable: %v", err)
+		Expect(sce.reason).To(Equal(siteFaultSecretUnreadable))
+	})
+
 	// Control: the unscoped (default) operator was never broken. Green from birth;
 	// it exists so a fix that broke the cluster-scoped path could not pass.
 	It("resolves the site unscoped (control)", func() {

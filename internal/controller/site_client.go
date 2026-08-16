@@ -209,9 +209,14 @@ type remoteSiteClient struct {
 // so an unreachable site surfaces as bounded per-call errors, not as a stuck
 // constructor.
 func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, owner types.NamespacedName, events chan<- event.GenericEvent) (SiteClient, error) {
+	// Parsing the kubeconfig is still hub-local — it reads the Secret's bytes and
+	// never touches the site — so an unparseable kubeconfig is a CONFIGURATION
+	// fault, not an unreachable site (site_config_fault.go). Everything below this
+	// point is site-side and stays unclassified.
 	cfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
-		return nil, fmt.Errorf("site %q: parsing kubeconfig: %w", siteName, err)
+		return nil, siteConfigFault(siteName, siteFaultSecretMalformed,
+			fmt.Errorf("parsing kubeconfig: %w", err))
 	}
 	// Bound every direct HTTP call to the site's API server.
 	cfg.Timeout = siteAPICallTimeout

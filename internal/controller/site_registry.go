@@ -130,18 +130,24 @@ func (reg *siteClientRegistry) siteClient(ctx context.Context, lr *littleredv1al
 		return reg.entries[key].client, nil
 	}
 
+	// Everything from here to the parsed kubeconfig is the operator reading its OWN
+	// hub-local inputs, so a failure is a CONFIGURATION fault, not the site failing
+	// to answer — classified with siteConfigFault so callers can tell the two apart
+	// (an unreachable site may heal itself; this never will). See site_config_fault.go.
 	opNS, err := reg.operatorNamespace()
 	if err != nil {
-		return nil, fmt.Errorf("site %q: resolving the operator namespace (holding site kubeconfig Secrets): %w", site.Name, err)
+		return nil, siteConfigFault(site.Name, siteFaultOperatorNamespace,
+			fmt.Errorf("resolving the operator namespace (holding site kubeconfig Secrets): %w", err))
 	}
 
 	secret := &corev1.Secret{}
 	if err := reg.secretReader.Get(ctx, types.NamespacedName{Namespace: opNS, Name: site.KubeconfigSecretRef.Name}, secret); err != nil {
-		return nil, fmt.Errorf("site %q: reading kubeconfig secret %s/%s: %w", site.Name, opNS, site.KubeconfigSecretRef.Name, err)
+		return nil, siteConfigFault(site.Name, siteFaultSecretUnreadable,
+			fmt.Errorf("reading kubeconfig secret %s/%s: %w", opNS, site.KubeconfigSecretRef.Name, err))
 	}
 	kubeconfig, err := kubeconfigFromSecret(secret)
 	if err != nil {
-		return nil, fmt.Errorf("site %q: %w", site.Name, err)
+		return nil, siteConfigFault(site.Name, siteFaultSecretMalformed, err)
 	}
 	hash := contentHash(kubeconfig)
 

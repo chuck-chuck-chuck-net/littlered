@@ -88,9 +88,14 @@ func multiSiteTotalMembers(lr *littleredv1alpha1.LittleRed) int {
 }
 
 // resolvedSite pairs a spec site with its (possibly unavailable) SiteClient. A site whose
-// client cannot be constructed — misconfigured or unreachable Kubernetes API — is returned
-// with err set and client nil; callers treat it as unreachable and never fatal (design
-// §3.2: an unreachable site is unmanaged, not broken).
+// client cannot be constructed is returned with err set and client nil; callers treat it as
+// unreachable and never fatal (design §3.2: an unreachable site is unmanaged, not broken).
+//
+// err carries TWO distinguishable states, because they call for opposite responses: a site
+// whose Kubernetes API did not answer (self-healing, no action) and a hub-local CONFIGURATION
+// fault the operator cannot recover from without a human. Classify with configFault (an
+// errors.As on siteConfigError) rather than treating every err the same — that conflation is
+// the bug site_config_fault.go exists to fix.
 type resolvedSite struct {
 	idx    int
 	name   string
@@ -98,9 +103,14 @@ type resolvedSite struct {
 	err    error
 }
 
+// configFault reports whether this site failed to resolve because the operator could not read
+// its own configuration (unresolvable namespace, missing/unreadable/malformed kubeconfig
+// Secret), as opposed to the site not answering.
+func (rs resolvedSite) configFault() (*siteConfigError, bool) { return siteConfigFaultOf(rs.err) }
+
 // resolveSites obtains a SiteClient for every spec site, in spec order. Never fails: a
-// site whose client cannot be built is returned unreachable (err set). Returns nil when
-// the registry is absent (unit/envtest without a manager).
+// site whose client cannot be built is returned unreachable (err set, classified — see
+// resolvedSite). Returns nil when the registry is absent (unit/envtest without a manager).
 func (r *LittleRedReconciler) resolveSites(ctx context.Context, lr *littleredv1alpha1.LittleRed) []resolvedSite {
 	if r.sites == nil || lr.Spec.MultiSite == nil {
 		return nil
@@ -234,7 +244,22 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 
 	sites := r.resolveSites(ctx, lr)
 
-	// 0. Scale-down / topology-shrink refusal guard (LR-028, MULTI_SITE_DESIGN.md §10 item 7).
+	// 0a. Unreadable-configuration guard. A site the operator cannot CONFIGURE (its own
+	// namespace unresolvable, or the kubeconfig Secret missing/unreadable/malformed) is not
+	// an unreachable site: it never heals on its own. Before anything is built, refuse rather
+	// than half-build a topology across only the sites that resolved. On an existing instance
+	// this never fires — the warning condition carries it and the healthy sites keep being
+	// reconciled (one deleted Secret must not become an instance-wide management outage).
+	if refused, res := r.enforceSiteConfigGuard(lr, sites); refused {
+		if err := r.Status().Update(ctx, lr); err != nil && !apierrors.IsConflict(err) {
+			return ctrl.Result{}, err
+		}
+		log.Info("Refusing multi-site bringup: site configuration unreadable",
+			"sites", summarizeSiteConfigFaults(siteConfigObservationsFrom(lr, sites)).Faulted)
+		return res, nil
+	}
+
+	// 0b. Scale-down / topology-shrink refusal guard (LR-028, MULTI_SITE_DESIGN.md §10 item 7).
 	// Before creating the new topology beside orphaned data, detect per-site shard StatefulSets
 	// the desired placement no longer includes — reducing shards, lowering sitesPerShard, or
 	// removing a still-observable site — and REFUSE (surface a condition, wait), never delete
@@ -458,11 +483,20 @@ func hostsShard(shardsBySite map[int][]int, si, k int) bool {
 	return slices.Contains(shardsBySite[si], k)
 }
 
-// allSitesObservable reports whether every observed site's Kubernetes API answered this pass.
+// allSitesObservable reports whether the operator obtained every site's observed state this
+// pass — "answered, and we were able to ask". A site the operator could not CONFIGURE (see
+// site_config_fault.go) counts as unobservable exactly like one that did not answer, and that
+// is deliberate: in both cases its nodes are unknown.
+//
 // It is the multi-site FORGET-safety signal (ghostForgetPlan): only when every hosting site is
 // observable can a gossip-known node with no backing pod be treated as confirmed gone; if any
 // site is unobservable, its nodes are "unknown, not gone" (pillar 3.4) and no ghost is
 // forgotten this pass. Empty obs (no sites) is not observable.
+//
+// So an unreadable site configuration SUPPRESSES ghost FORGET, which is the correct direction
+// and worth stating rather than leaving to accident: FORGET is cosmetic cleanup, safe to defer
+// until the state is healed and stable, and never doing it costs nothing. (The name keeps its
+// broad meaning on purpose — renaming would churn call sites for no gain.)
 func allSitesObservable(obs []siteObservation) bool {
 	if len(obs) == 0 {
 		return false
@@ -769,9 +803,15 @@ func (r *LittleRedReconciler) updateMultiSiteClusterStatus(ctx context.Context, 
 			}
 		}
 		ready += siteReady
+		// Reachable stays a single broad boolean ("did not answer, or we could not ask")
+		// because the observability arithmetic depends on it; Reason/Message carry the
+		// distinction a human needs — only a configuration reason demands action.
+		reason, message := siteStatusReason(o)
 		ss := littleredv1alpha1.SiteStatus{
 			Name:          o.site.name,
 			Reachable:     o.reachable,
+			Reason:        reason,
+			Message:       message,
 			LastProbeTime: &now,
 			Pods: &littleredv1alpha1.RedisStatus{
 				Ready: siteReady,
@@ -832,6 +872,12 @@ func (r *LittleRedReconciler) updateMultiSiteClusterStatus(ctx context.Context, 
 	// It is a surfaced warning + one-shot event, never a refusal (the opt-in-not-block norm);
 	// transient master drift within a resilient topology is the rebalancer's concern, not this.
 	r.reconcileReducedResilienceCondition(lr)
+
+	// Unreadable-configuration warning: a site the operator cannot configure is unmanaged
+	// until a human acts, which an unreachable site is not. Condition + one-shot event only —
+	// the phase is deliberately left alone (the data plane is healthy, and phase cannot carry
+	// two orthogonal facts); the bootstrap case is refused earlier, in enforceSiteConfigGuard.
+	r.reconcileSiteConfigCondition(lr, siteConfigObservationsFrom(lr, resolvedFromObs(obs)))
 
 	if lr.Status.Redis.Ready == lr.Status.Redis.Total && clusterOK {
 		lr.Status.Phase = littleredv1alpha1.PhaseRunning

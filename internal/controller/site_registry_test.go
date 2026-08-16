@@ -80,6 +80,15 @@ const (
 	volDownward       = "downward"
 )
 
+// secretWithoutKubeconfigKey is a site kubeconfig Secret that exists but carries
+// no "kubeconfig" key — the malformed-configuration fixture.
+func secretWithoutKubeconfigKey() *corev1.Secret {
+	return &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: testOperatorNS},
+		Data:       map[string][]byte{"value": []byte("x")},
+	}
+}
+
 func kubeconfigSecret(name string, content []byte) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testOperatorNS},
@@ -267,10 +276,7 @@ func TestSiteRegistryErrors(t *testing.T) {
 	})
 
 	t.Run("secret without kubeconfig key", func(t *testing.T) {
-		secret := &corev1.Secret{
-			ObjectMeta: metav1.ObjectMeta{Name: "bad", Namespace: testOperatorNS},
-			Data:       map[string][]byte{"value": []byte("x")},
-		}
+		secret := secretWithoutKubeconfigKey()
 		reg, _ := newTestRegistry(t, secret)
 		lr := multiSiteCR()
 		_, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
