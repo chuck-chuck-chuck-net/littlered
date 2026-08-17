@@ -435,21 +435,26 @@ MAKE_ARGS=(
     "E2E_OPERATOR_NAMESPACE=${LRH_OPERATOR_NAMESPACE}"
 )
 
-# Watch scope. Single-site is the M2 shorthand: watch exactly this item's test
-# namespace.
+# Watch scope: watch exactly this item's test namespace. One rule for BOTH
+# single-site and multi-site items — which is the point, not a simplification.
 #
-# MULTI-SITE NEEDS ONE MORE NAMESPACE, and leaving it out is a silent deadlock
-# rather than an error. A scoped operator's cache is restricted to its watched
-# namespaces (WATCH_NAMESPACE -> cache DefaultNamespaces, ADR-014), but the site
-# kubeconfig Secrets live in the operator's OWN namespace (site_registry.go
-# resolves them there) — outside that cache. The operator then cannot read the
-# credential for any site, and the stretched cluster never comes up. So a
-# multi-site item watches its test namespace AND its operator namespace.
-if [ -n "${LRH_FIXTURE:-}" ]; then
-    MAKE_ARGS+=("E2E_WATCH_NAMESPACES=${LRH_NAMESPACE},${LRH_OPERATOR_NAMESPACE}")
-else
-    MAKE_ARGS+=(E2E_OPERATOR_SCOPED=true)
-fi
+# Multi-site used to need a second namespace here. A scoped operator's cache
+# holds only its watched namespaces (WATCH_NAMESPACE -> cache DefaultNamespaces,
+# ADR-014), but the site kubeconfig Secrets live in the operator's OWN namespace,
+# outside that cache; the operator read them THROUGH the cache, so it could not
+# resolve any site credential and the stretched cluster never came up. Worse, it
+# was a silent deadlock: the failure was laundered into "site unreachable", which
+# multi-site treats as unmanaged-not-broken. So the harness passed
+# E2E_WATCH_NAMESPACES=<test>,<operator> to widen the scope around the bug.
+#
+# LR-034 fixed the operator instead: site_registry.go reads that one Secret with
+# an UNCACHED reader (the manager's APIReader), and the chart renders a
+# `-site-secrets` Role granting `get secrets` in the release namespace, which
+# allow mode previously left uncovered. The workaround is therefore removed, and
+# removing it is deliberate rather than tidying: a multi-site item under
+# allow-mode scoping is exactly the live validation LR-034's own Verification
+# notes list as its remaining gap. An array staying green here IS that evidence.
+MAKE_ARGS+=(E2E_OPERATOR_SCOPED=true)
 # The suite pins its kubeconfig to this context. With MS_CONFIG set it keeps the
 # sibling site contexts rather than --minify-ing them away.
 [ -n "${KUBECONTEXT:-}" ] && MAKE_ARGS+=("KUBECONTEXT=${KUBECONTEXT}")

@@ -210,7 +210,7 @@ func cfgOr(v, def string) string {
 // msInstanceNamespace is the namespace a multi-site instance lives in, on the hub and in every
 // site. It follows TEST_NAMESPACE when the run sets one.
 //
-// Following it is not cosmetic. A namespace-scoped operator (E2E_WATCH_NAMESPACES) only
+// Following it is not cosmetic. A namespace-scoped operator (E2E_OPERATOR_SCOPED) only
 // reconciles what it watches, and the harness derives that scope from the item's TEST_NAMESPACE
 // — so an instance in a differently-named namespace would simply never be reconciled. Reading
 // the environment directly, rather than the suite's `testNamespace` var, is required because a

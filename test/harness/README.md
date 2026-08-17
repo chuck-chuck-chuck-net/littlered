@@ -572,14 +572,24 @@ The rendered file deliberately omits `vms` and `hubPodCIDR`: those arm the
 whole-site power-off and the data-plane cut respectively, and **M3 injects no
 faults**.
 
-### A multi-site item watches TWO namespaces
+### A multi-site item is scoped exactly like a single-site one
 
-A scoped operator's cache is restricted to its watched namespaces, but the site
-kubeconfig Secrets live in the operator's **own** namespace — outside that
-cache. So a multi-site item passes `E2E_WATCH_NAMESPACES=<test>,<operator>`
-instead of the single-site `E2E_OPERATOR_SCOPED=true` shorthand. Leaving the
-operator namespace out is a silent deadlock, not an error: the operator simply
-never reads a site credential and the stretched cluster never comes up.
+Both pass `E2E_OPERATOR_SCOPED=true`, so the per-item operator watches exactly
+its own test namespace. That uniformity is load-bearing: it means a multi-site
+array exercises the *shipped* scoping mode rather than a harness-widened one.
+
+It was not always so. A scoped operator's cache holds only its watched
+namespaces, but the site kubeconfig Secrets live in the operator's **own**
+namespace — outside it — and the operator read them through that cache. Every
+site then resolved as unreachable, which multi-site treats as
+unmanaged-not-broken, so the stretched cluster silently never came up. The
+harness worked around it with `E2E_WATCH_NAMESPACES=<test>,<operator>`.
+
+**LR-034 fixed the operator, and the workaround is gone.** The Secret is now read
+with an uncached reader, and the chart grants `get secrets` in the release
+namespace, which allow mode had left uncovered. Running a multi-site array under
+plain `E2E_OPERATOR_SCOPED=true` is the live validation of that fix — the one
+item LR-034's Verification notes list as still open.
 
 ### Running one
 
