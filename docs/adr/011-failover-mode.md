@@ -213,6 +213,16 @@ that gate excludes, at the one moment it matters, so it is best-effort and idemp
 it is skipped when the outgoing master is unreachable (the crash path leaves nothing to
 fence), already demoted, or is itself the pod being promoted.
 
+Verified on t3e: **202 of 1171 acknowledged writes lost → 0 of 990**, with the conversion
+visible almost one-for-one (write availability 97.66% → 82.50%, i.e. ~210 *visible*
+failures where ~202 writes used to vanish; read availability 78.05% → 99.17%, since those
+"read failures" *were* the lost keys). Fencing keys off the **pod list**, not the gathered
+Redis state: the gather deliberately omits terminating pods, so a first attempt keyed on it
+was silently inert — and widening the gather would be worse than inert, because a
+reachable, still-mastering terminating pod would then read as a *live* master to
+`determineFailoverLiveMaster` (no failover at all) and as a candidate to `BestDataHolder`
+(a dying pod could be elected). Fencing is an actuation, never a decision input.
+
 This is a **data-safety** property, and it cut the other way from the availability
 numbers: failover mode *beat* sentinel mode on write availability in both variants while
 being the only one of the two that lost acknowledged writes. Sentinel's pod-led preStop
