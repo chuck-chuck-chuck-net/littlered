@@ -76,7 +76,13 @@ metadata:
       cpu: "100m"
       memory: "128Mi"
     limits:
-      cpu: "100m"
+      # NO CPU limit — pillar 3.3 (a CPU limit can only throttle Redis; size the
+      # request to the thread budget instead). It also broke the one thing the
+      # chaos tier exists for: the sentinel chaos CR sets no resources and so
+      # takes the product defaults, which have no CPU limit, while this pinned
+      # 100m — a replica throttled to 0.1 core lags, and lag is exactly what the
+      # durability numbers measure. A "mirror" tier must not differ from its
+      # twin in a dimension that moves the metric.
       memory: "128Mi"
   failover:
     replicas: %d
