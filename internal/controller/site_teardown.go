@@ -68,10 +68,11 @@ type siteTeardownBlock struct {
 	cause  string
 }
 
-// classifySiteClientBlock classifies a failure to obtain a site's client. Every
-// step up to and including parsing the kubeconfig is the operator reading its
-// OWN inputs, and siteClient already marks those with siteConfigFault — so this
-// only has to stop throwing that classification away.
+// classifySiteClientBlock classifies a failure to obtain a site's client. The
+// whole of site-client construction is the operator reading and using its OWN
+// hub-local inputs — nothing dials until the cache starts — and siteClient
+// already marks those failures with siteConfigFault, so this only has to stop
+// throwing that classification away.
 func classifySiteClientBlock(site string, err error) siteTeardownBlock {
 	if _, ok := siteConfigFaultOf(err); ok {
 		return siteTeardownBlock{site: site, reason: reasonTeardownConfigFault, cause: err.Error()}

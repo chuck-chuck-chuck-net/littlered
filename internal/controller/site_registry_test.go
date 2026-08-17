@@ -89,6 +89,43 @@ func secretWithoutKubeconfigKey() *corev1.Secret {
 	}
 }
 
+// Kubeconfigs that PARSE but yield an unusable client. Both are realistic
+// hand-editing mistakes, and both fail only after clientcmd has accepted the
+// document — which is why the classification line cannot stop at the parse.
+const (
+	// certificate-authority-data is valid base64 but not a PEM certificate (a
+	// truncated or wrongly-encoded CA bundle).
+	kubeconfigBadCAData = `apiVersion: v1
+kind: Config
+clusters:
+- name: c
+  cluster:
+    server: https://10.2.1.10:6443
+    certificate-authority-data: bm90LWEtcGVtLWNlcnRpZmljYXRl
+contexts:
+- name: c
+  context: {cluster: c, user: u}
+current-context: c
+users:
+- name: u
+  user: {token: t}
+`
+	// server is not a parseable URL.
+	kubeconfigBadServerURL = `apiVersion: v1
+kind: Config
+clusters:
+- name: c
+  cluster: {server: "ht tp://not a url"}
+contexts:
+- name: c
+  context: {cluster: c, user: u}
+current-context: c
+users:
+- name: u
+  user: {token: t}
+`
+)
+
 func kubeconfigSecret(name string, content []byte) *corev1.Secret {
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testOperatorNS},

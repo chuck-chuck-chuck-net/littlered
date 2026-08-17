@@ -82,6 +82,32 @@ func TestSiteConfigFaultClassification(t *testing.T) {
 		assertSiteConfigFault(t, err, siteFaultSecretMalformed)
 	})
 
+	// Building the client from the parsed kubeconfig is STILL hub-local: no call
+	// leaves the process (the REST mapper is lazy). A kubeconfig can parse as YAML
+	// and still be unusable — a CA bundle that is valid base64 but not PEM, or a
+	// server that is not a URL — and those never heal without a human either.
+	// Driven through the REAL newRemoteSiteClient, since that is where the
+	// distinction has to be drawn.
+	t.Run("unusable TLS material is configuration", func(t *testing.T) {
+		reg, _ := newTestRegistry(t, kubeconfigSecret("kc", []byte(kubeconfigBadCAData)))
+		reg.newRemote = newRemoteSiteClient
+		_, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
+			Name:                siteBeta,
+			KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "kc"},
+		})
+		assertSiteConfigFault(t, err, siteFaultClientUnbuildable)
+	})
+
+	t.Run("unusable server URL is configuration", func(t *testing.T) {
+		reg, _ := newTestRegistry(t, kubeconfigSecret("kc", []byte(kubeconfigBadServerURL)))
+		reg.newRemote = newRemoteSiteClient
+		_, err := reg.siteClient(context.Background(), lr, littleredv1alpha1.SiteSpec{
+			Name:                siteBeta,
+			KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "kc"},
+		})
+		assertSiteConfigFault(t, err, siteFaultClientUnbuildable)
+	})
+
 	// Anything past the kubeconfig is site-side: it must NOT be laundered into a
 	// config fault, or an ordinary unreachable site would demand human action.
 	t.Run("site-side failure is not a config fault", func(t *testing.T) {

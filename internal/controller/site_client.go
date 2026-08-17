@@ -209,10 +209,12 @@ type remoteSiteClient struct {
 // so an unreachable site surfaces as bounded per-call errors, not as a stuck
 // constructor.
 func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, owner types.NamespacedName, events chan<- event.GenericEvent) (SiteClient, error) {
-	// Parsing the kubeconfig is still hub-local — it reads the Secret's bytes and
-	// never touches the site — so an unparseable kubeconfig is a CONFIGURATION
-	// fault, not an unreachable site (site_config_fault.go). Everything below this
-	// point is site-side and stays unclassified.
+	// EVERYTHING in this function is hub-local: it reads the Secret's bytes and
+	// builds objects, and no call leaves the process — controller-runtime's REST
+	// mapper is lazy, so discovery happens on first use, not here. So every failure
+	// below is a CONFIGURATION fault, never an unreachable site
+	// (site_config_fault.go). The first site-side moment is c.run() starting the
+	// cache, which is deliberately fire-and-forget.
 	cfg, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
 	if err != nil {
 		return nil, siteConfigFault(siteName, siteFaultSecretMalformed,
@@ -221,9 +223,14 @@ func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, o
 	// Bound every direct HTTP call to the site's API server.
 	cfg.Timeout = siteAPICallTimeout
 
+	// A separate reason from siteFaultSecretMalformed: the kubeconfig DID parse, so
+	// telling the reader it is unparseable would send them looking for the wrong
+	// thing. What fails here is using it — unusable TLS material (a CA bundle that
+	// is valid base64 but not PEM) or a server that is not a parseable URL.
 	scheme := runtime.NewScheme()
 	if err := clientgoscheme.AddToScheme(scheme); err != nil {
-		return nil, fmt.Errorf("site %q: building scheme: %w", siteName, err)
+		return nil, siteConfigFault(siteName, siteFaultClientUnbuildable,
+			fmt.Errorf("building scheme: %w", err))
 	}
 
 	ca, err := cache.New(cfg, cache.Options{
@@ -231,7 +238,8 @@ func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, o
 		DefaultNamespaces: map[string]cache.Config{namespace: {}},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("site %q: building cache: %w", siteName, err)
+		return nil, siteConfigFault(siteName, siteFaultClientUnbuildable,
+			fmt.Errorf("building cache: %w", err))
 	}
 
 	cl, err := client.New(cfg, client.Options{
@@ -239,7 +247,8 @@ func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, o
 		Cache:  &client.CacheOptions{Reader: ca},
 	})
 	if err != nil {
-		return nil, fmt.Errorf("site %q: building client: %w", siteName, err)
+		return nil, siteConfigFault(siteName, siteFaultClientUnbuildable,
+			fmt.Errorf("building client: %w", err))
 	}
 
 	bctx, cancel := context.WithCancel(context.Background())

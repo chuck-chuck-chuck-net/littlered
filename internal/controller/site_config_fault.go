@@ -35,14 +35,18 @@ import (
 //   - REACHABILITY — the site's Kubernetes API did not answer. Normal, often
 //     transient, self-healing; the design treats it as "unmanaged, not broken"
 //     (pillar 3.2) and deliberately does nothing about it.
-//   - CONFIGURATION — the operator could not read or parse its OWN hub-local
-//     inputs: its namespace was unresolvable, or the site's kubeconfig Secret is
-//     missing, unreadable, or malformed. This never heals without a human.
+//   - CONFIGURATION — the operator could not read, parse, or USE its OWN hub-local
+//     inputs: its namespace was unresolvable, the site's kubeconfig Secret is
+//     missing, unreadable or malformed, or the kubeconfig parsed but no client
+//     could be built from it. This never heals without a human.
 //
 // The difference is exactly "must someone act?", so conflating them makes the
 // alert an operator actually wants impossible to write. The tell is hub-local vs
-// remote: everything up to and including parsing the kubeconfig is the operator
-// reading its own configuration; only what follows touches the site.
+// remote — and the line sits lower than it looks: the WHOLE of site-client
+// construction is hub-local, since controller-runtime's REST mapper is lazy and
+// nothing dials until the cache starts (LR-036; the first version of this comment
+// drew the line at the kubeconfig parse, leaving three permanent faults reading as
+// "unreachable"). The first site-side moment is remoteSiteClient.run().
 const (
 	// siteFaultOperatorNamespace: the operator cannot determine its own namespace
 	// (no OPERATOR_NAMESPACE, no POD_NAMESPACE, no serviceaccount namespace file),
@@ -56,6 +60,14 @@ const (
 	// siteFaultSecretMalformed: the Secret exists but does not carry a usable
 	// kubeconfig — the "kubeconfig" key is missing/empty, or its bytes do not parse.
 	siteFaultSecretMalformed = "KubeconfigSecretMalformed"
+	// siteFaultClientUnbuildable: the kubeconfig parsed, but no client could be
+	// built from it. Still hub-local — nothing here leaves the process, because the
+	// REST mapper is lazy — and still permanent. In practice this is unusable TLS
+	// material (a CA bundle that is valid base64 but not PEM) or a server that is
+	// not a parseable URL: mistakes that survive clientcmd and surface one layer
+	// down. Deliberately NOT folded into siteFaultSecretMalformed, which promises
+	// the reader the kubeconfig itself is unparseable; here it parsed fine.
+	siteFaultClientUnbuildable = "SiteClientUnbuildable"
 
 	// siteReasonUnreachable is the non-actionable counterpart published in
 	// SiteStatus.Reason: the site's Kubernetes API simply did not answer.
@@ -173,8 +185,10 @@ func describeSiteConfigFaults(s siteConfigFaultSummary) string {
 	b.WriteString(" This is the operator failing to read its OWN hub-local inputs, not a site failing to " +
 		"answer: unlike an unreachable site it will NOT heal on its own. Check the site kubeconfig Secret " +
 		"in the operator's namespace (it must exist, be readable — allow-list scoping needs an explicit " +
-		"`get secrets` Role there — and hold a parseable \"kubeconfig\" key), and that the operator can " +
-		"resolve its own namespace (OPERATOR_NAMESPACE / POD_NAMESPACE). Details: " +
+		"`get secrets` Role there — and hold a parseable \"kubeconfig\" key whose contents are actually " +
+		"usable: a PEM certificate-authority-data and a valid server URL), and that the operator can " +
+		"resolve its own namespace (OPERATOR_NAMESPACE / POD_NAMESPACE). The per-site reason says which " +
+		"of these it is. Details: " +
 		strings.Join(s.Details, "; "))
 	return b.String()
 }

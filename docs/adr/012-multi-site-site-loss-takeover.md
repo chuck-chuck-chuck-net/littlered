@@ -383,12 +383,16 @@ degrades to Tier A (human), never to an unsafe guess.
   fails in two ways that call for opposite responses. A site whose Kubernetes API does
   not answer is *unmanaged, not broken* (pillar 3.2), may heal itself, and the operator
   deliberately does nothing. A **configuration** fault — the operator's own namespace
-  unresolvable, or the site's kubeconfig Secret unreadable or malformed — is the
-  operator failing to read its **own hub-local inputs**, and never heals without a
-  human. The two differ in *whether someone must act*, so reporting both as
-  "unreachable" makes the actionable alert impossible to write. The tell is hub-local
-  vs remote: everything up to and **including parsing the kubeconfig** is
-  configuration; only what follows touches the site. Surfaced as
+  unresolvable, the site's kubeconfig Secret unreadable or malformed, or the
+  kubeconfig parseable but **unusable** — is the operator failing to read its **own
+  hub-local inputs**, and never heals without a human. The two differ in *whether
+  someone must act*, so reporting both as "unreachable" makes the actionable alert
+  impossible to write. The tell is hub-local vs remote, and the line sits lower than
+  it first appears (LR-036): **the whole of site-client construction is hub-local**,
+  because controller-runtime's REST mapper is lazy, so nothing dials until the cache
+  starts. A kubeconfig that parses can still carry a CA bundle that is not PEM or a
+  server that is not a URL — permanent faults that used to read as "unreachable".
+  Surfaced as
   `status.multiSite.sites[].reason` (alert on any value other than `Unreachable`) plus
   a `MultiSiteConfigInvalid` condition with a one-shot Warning event. `reachable`
   deliberately keeps its broad meaning — *"did not answer, or we could not ask"* —
