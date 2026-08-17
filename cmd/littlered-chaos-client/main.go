@@ -17,6 +17,7 @@ limitations under the License.
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
@@ -137,6 +138,20 @@ loop:
 
 	// Stop client and collect final metrics
 	client.Stop()
+
+	// Exact durability verdict: re-read every acknowledged write once. The
+	// in-flight counters sample randomly, so they can only approximate how many
+	// writes were actually lost; this counts them.
+	fmt.Println("\nVerifying every acknowledged write...")
+	verification := client.VerifyAll(context.Background())
+	if verification.Missing > 0 {
+		fmt.Printf("LOST %d of %d acknowledged writes (sample: %v)\n",
+			verification.Missing, verification.Checked, verification.MissingSample)
+	}
+	if verification.Unreadable > 0 {
+		fmt.Printf("WARNING: %d keys were unreadable — not counted as lost\n", verification.Unreadable)
+	}
+
 	finalMetrics := client.GetMetrics()
 
 	fmt.Println("\n========== FINAL RESULTS ==========")

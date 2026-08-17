@@ -175,6 +175,36 @@ var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered,
 				// because the point is comparability between the modes, not an SLO.
 				Expect(metrics.DataCorruptions).To(Equal(int64(0)), "Data corruption detected!")
 				Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.40))
+
+				// The sweep must actually have run, or FinalMissing == 0 is vacuous.
+				Expect(metrics.FinalChecked).To(BeNumerically(">", 500),
+					"final verification sweep did not check a meaningful number of keys")
+				Expect(metrics.FinalUnreadable).To(BeNumerically("<", metrics.FinalChecked/10),
+					"too many keys unreadable at sweep time to trust the durability verdict")
+
+				// DURABILITY, on the graceful path only.
+				//
+				// A graceful master delete is a PLANNED handover, so an acknowledged
+				// write should not silently vanish. The only writes a correct handover
+				// can lose are those ACKed within the replication lag of the promotion
+				// instant — at 10 writes/s that is ~1 per failover, so ~2 for this
+				// spec's two failovers. The bound is 5, generous against that and
+				// tight against the failure mode: today the dying master keeps serving
+				// writes for its whole ~10s preStop window (resources_failover.go:408)
+				// while its replica is never repointed away (the !anyTerminating gate,
+				// failover_reconcile.go:454), and an established TCP connection through
+				// the master Service is not re-routed by the label flip. That is
+				// ~10s x 10 writes/s x 2 failovers = ~200 lost keys, not 5.
+				//
+				// The crash path is deliberately NOT bounded here: a kill -9 loses the
+				// unreplicated tail by construction (async replication), and asserting
+				// a number we have not measured would be tuning, not a check.
+				if mode.Graceful {
+					Expect(metrics.FinalMissing).To(BeNumerically("<=", 5),
+						"acknowledged writes were lost on a PLANNED handover: %d of %d. "+
+							"DataCorruptions cannot catch this — the writes are gone, not wrong.",
+						metrics.FinalMissing, metrics.FinalChecked)
+				}
 			})
 		}
 	})

@@ -45,6 +45,15 @@ type Metrics struct {
 	LostKeys         atomic.Int64
 	DataCorruptions  atomic.Int64
 	HighestConfirmed atomic.Int64
+
+	// Final* hold the result of the post-traffic VerifyAll sweep. The counters
+	// above are sampled — reads pick a random confirmed key, so one lost key
+	// read five times looks like five, and a lost key never sampled looks like
+	// none. These are exact: every acknowledged write, checked once.
+	FinalChecked    atomic.Int64
+	FinalMissing    atomic.Int64
+	FinalCorrupt    atomic.Int64
+	FinalUnreadable atomic.Int64
 }
 
 // MetricsSnapshot is a point-in-time snapshot of metrics
@@ -58,6 +67,12 @@ type MetricsSnapshot struct {
 	LostKeys         int64 `json:"lostKeys"`
 	DataCorruptions  int64 `json:"dataCorruptions"`
 	HighestConfirmed int64 `json:"highestConfirmed"`
+
+	// Exact durability verdict from the VerifyAll sweep (0 if it never ran).
+	FinalChecked    int64 `json:"finalChecked"`
+	FinalMissing    int64 `json:"finalMissing"`
+	FinalCorrupt    int64 `json:"finalCorrupt"`
+	FinalUnreadable int64 `json:"finalUnreadable"`
 }
 
 // WriteAvailability returns the ratio of successful writes to attempted writes
@@ -97,13 +112,15 @@ func (m MetricsSnapshot) String() string {
 	return fmt.Sprintf(
 		"Writes: %d attempted, %d succeeded, %d failed (%.2f%% availability)\n"+
 			"Reads: %d attempted, %d succeeded, %d failed (%.2f%% availability)\n"+
-			"Lost keys (ACKed write, key absent): %d (%.2f%% of reads)\n"+
+			"Lost keys (sampled: ACKed write, key absent): %d (%.2f%% of reads)\n"+
 			"Data corruptions: %d\n"+
+			"Final sweep (exact): %d checked, %d MISSING, %d corrupt, %d unreadable\n"+
 			"Highest confirmed key: %d",
 		m.WriteAttempts, m.WriteSuccesses, m.WriteFailures, m.WriteAvailability()*100,
 		m.ReadAttempts, m.ReadSuccesses, m.ReadFailures, m.ReadAvailability()*100,
 		m.LostKeys, m.KeyLossRate()*100,
 		m.DataCorruptions,
+		m.FinalChecked, m.FinalMissing, m.FinalCorrupt, m.FinalUnreadable,
 		m.HighestConfirmed,
 	)
 }
@@ -376,6 +393,89 @@ func (tc *TestClient) doRead() {
 	}
 }
 
+// FinalVerification is the exact durability verdict of a VerifyAll sweep.
+type FinalVerification struct {
+	// Checked is the number of acknowledged writes re-read.
+	Checked int64
+	// Missing is the number of acknowledged writes that are gone. This is the
+	// number the sampled LostKeys counter can only approximate.
+	Missing int64
+	// Corrupt is the number of keys present with the wrong value.
+	Corrupt int64
+	// Unreadable is the number of keys the sweep could not check because the
+	// store kept erroring. Deliberately NOT counted as missing — an
+	// unreachable store is an availability problem, and blaming durability for
+	// it is exactly the conflation this sweep exists to end.
+	Unreadable int64
+	// MissingSample holds the first few missing keys, for the failure message.
+	MissingSample []int64
+}
+
+// verifySweepAttempts is how often the sweep retries a key that errors before
+// giving up and calling it unreadable. The sweep runs after the traffic window,
+// so the instance should be settled; a straggler still resyncing is the case
+// worth retrying through.
+const verifySweepAttempts = 3
+
+// VerifyAll re-reads every acknowledged write exactly once and returns the
+// exact durability verdict, also recording it into the metrics so it rides the
+// existing snapshot/JSON path.
+//
+// This is the measurement that turns "acknowledged writes appear to have
+// vanished" into a count. Run it after the traffic window closes.
+func (tc *TestClient) VerifyAll(ctx context.Context) FinalVerification {
+	tc.sliceMu.Lock()
+	keys := make([]int64, len(tc.confirmedSlice))
+	copy(keys, tc.confirmedSlice)
+	tc.sliceMu.Unlock()
+
+	const maxSample = 10
+	var v FinalVerification
+
+	for _, n := range keys {
+		expected := expectedValue(n)
+		key := tc.keyName(n)
+
+		outcome := readFailed
+		for attempt := 0; attempt < verifySweepAttempts; attempt++ {
+			opCtx, cancel := context.WithTimeout(ctx, tc.operationTimeout)
+			result, err := tc.client.Get(opCtx, key).Result()
+			cancel()
+
+			outcome = classifyRead(result, err, expected)
+			if outcome != readFailed {
+				break
+			}
+			select {
+			case <-ctx.Done():
+				attempt = verifySweepAttempts
+			case <-time.After(50 * time.Millisecond):
+			}
+		}
+
+		v.Checked++
+		switch outcome {
+		case readLost:
+			v.Missing++
+			if len(v.MissingSample) < maxSample {
+				v.MissingSample = append(v.MissingSample, n)
+			}
+		case readCorrupt:
+			v.Corrupt++
+		case readFailed:
+			v.Unreadable++
+		case readOK:
+		}
+	}
+
+	tc.metrics.FinalChecked.Store(v.Checked)
+	tc.metrics.FinalMissing.Store(v.Missing)
+	tc.metrics.FinalCorrupt.Store(v.Corrupt)
+	tc.metrics.FinalUnreadable.Store(v.Unreadable)
+
+	return v
+}
+
 // Start begins the test client operations
 func (tc *TestClient) Start() {
 	tc.wg.Go(func() {
@@ -432,6 +532,10 @@ func (tc *TestClient) GetMetrics() MetricsSnapshot {
 		ReadFailures:     tc.metrics.ReadFailures.Load(),
 		LostKeys:         tc.metrics.LostKeys.Load(),
 		DataCorruptions:  tc.metrics.DataCorruptions.Load(),
+		FinalChecked:     tc.metrics.FinalChecked.Load(),
+		FinalMissing:     tc.metrics.FinalMissing.Load(),
+		FinalCorrupt:     tc.metrics.FinalCorrupt.Load(),
+		FinalUnreadable:  tc.metrics.FinalUnreadable.Load(),
 		HighestConfirmed: tc.metrics.HighestConfirmed.Load(),
 	}
 }
