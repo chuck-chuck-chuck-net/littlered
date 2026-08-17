@@ -22,6 +22,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -95,6 +96,57 @@ var _ = Describe("MultiSite finalizer teardown", func() {
 		Expect(done).To(BeTrue(), "with no per-site spec to sweep, teardown is done")
 		Expect(controllerutil.ContainsFinalizer(lr, multiSiteFinalizerName)).To(BeFalse(),
 			"the spoke-teardown finalizer must be released so deletion can complete")
+	})
+
+	// LR-034 taught resolveSites that a hub-local configuration fault is not site
+	// unreachability. The DELETE path never learned it: both a config fault and a
+	// genuine timeout land in one slice named `unreachable`, and the condition
+	// hardcodes Reason "SiteUnreachable". Here it costs more than diagnosability —
+	// deletion is wedged forever, because a missing Secret will never come back on
+	// its own, and the message sends the reader to the remote site instead of to
+	// the thing they deleted locally a minute ago.
+	It("blames the operator's own configuration, not the site, when the kubeconfig Secret is unreadable", func() {
+		lr := &littleredv1alpha1.LittleRed{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:       resourceName,
+				Namespace:  testNamespaceDefault,
+				Finalizers: []string{finalizerName, multiSiteFinalizerName},
+			},
+			Spec: littleredv1alpha1.LittleRedSpec{
+				Mode:    ModeCluster,
+				Cluster: &littleredv1alpha1.ClusterSpec{Shards: 3},
+				MultiSite: &littleredv1alpha1.MultiSiteSpec{
+					Sites: []littleredv1alpha1.SiteSpec{
+						{Name: siteAlpha},
+						{Name: siteBeta, KubeconfigSecretRef: &littleredv1alpha1.KubeconfigSecretRef{Name: "does-not-exist"}},
+					},
+					SitesPerShard: 2,
+				},
+			},
+		}
+		Expect(k8sClient.Create(ctx, lr)).To(Succeed())
+		Expect(k8sClient.Get(ctx, nn, lr)).To(Succeed())
+
+		reconciler.sites = newSiteClientRegistry(k8sClient, k8sClient, k8sClient.Scheme(), nil)
+		// Pin the operator namespace so the fault under test is the MISSING SECRET,
+		// not an unresolvable namespace (which is a config fault too, and would let
+		// the assertion pass for the wrong reason).
+		reconciler.sites.operatorNamespace = func() (string, error) { return testNamespaceDefault, nil }
+
+		done, err := reconciler.handleMultiSiteDeletion(ctx, lr)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(done).To(BeFalse(), "an unswept site must retain the finalizer")
+
+		c := meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionMultiSiteTeardown)
+		Expect(c).NotTo(BeNil(), "a blocked teardown must surface a condition")
+		Expect(c.Reason).To(Equal(reasonTeardownConfigFault),
+			"an unreadable Secret is a hub-local configuration fault; reporting it as "+
+				"SiteUnreachable points the reader at the wrong machine and implies it may self-heal")
+		Expect(c.Message).To(ContainSubstring("kubeconfig"),
+			"the message must name the real cause, not just the site")
+		Expect(c.Message).To(ContainSubstring("will NOT clear on its own"),
+			"the reader must learn that waiting is futile here, unlike an unreachable site")
+		Expect(c.Message).To(ContainSubstring(siteBeta))
 	})
 
 	It("adds the spoke-teardown finalizer and releases both on deletion", func() {

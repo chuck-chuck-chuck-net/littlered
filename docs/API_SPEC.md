@@ -535,9 +535,25 @@ clusters, so spoke-side children are created **without** owner references
 (hub-local children keep the ordinary controller owner reference). Instead a
 multi-site CR carries the `redis.chuck-chuck-chuck.net/multisite-teardown`
 finalizer, whose delete path sweeps the instance-labeled workload objects
-through each site before the CR is released. A site unreachable at deletion time
+through each site before the CR is released. Any site whose sweep cannot finish
 keeps the finalizer (bounded retries) and surfaces the `MultiSiteTeardown`
 condition; the documented escape hatch is removing the finalizer manually.
+
+The operator **always retains** the finalizer here, even for the blockers that
+will never clear by themselves. Releasing it would complete the deletion while
+stranding this instance's pods on the site, unowned and unfindable — this sweep
+is the only garbage collection there is. But the condition distinguishes the
+three ways it can block, because they differ in whether waiting helps at all:
+
+| `MultiSiteTeardown` reason | Meaning | Does waiting help? |
+|---|---|---|
+| `SiteConfigurationUnreadable` | The operator cannot read its **own** hub-local inputs for that site: the kubeconfig Secret is missing, unreadable or malformed, or the operator's namespace is unresolvable | **No.** Restore the Secret, or remove the finalizer and clean the site by hand |
+| `SiteSweepFailed` | The site answered, but deleting the workloads failed — RBAC, an admission webhook, a stuck object | **No.** Fix the cause, or remove the finalizer and clean up by hand |
+| `SiteUnreachable` | The site's Kubernetes API did not answer | **Possibly.** It is retried; if the site is permanently gone, remove the finalizer manually |
+
+A mixed pass reports the most actionable of these, so a partly-permanent block is
+never advertised as the one that might fix itself. Deleting the site kubeconfig
+Secrets *before* deleting the CR is the common way to land in the first row.
 
 ### 2.15 Requeue Intervals
 
@@ -759,7 +775,7 @@ status:
 | `LeaderlessRecovery` | ✅ | Sentinel mode only: reflects a leaderless bootstrap deadlock (every Sentinel bare, no master) and the operator's response — `True` means the instance is deadlocked and needs attention (in cooldown, or refusing because data is present); `False` records a completed recovery |
 | `GhostMasterRecovery` | ✅ | Sentinel mode only: reflects a ghost-master failover deadlock — a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so failover aborts `no-good-slave` while living survivors hold the data — and the operator's recovery of it. `True` means deadlocked/needs attention (in cooldown, or refusing because divergent data is present); `False` records a completed recovery |
 | `FailoverRecovery` | ✅ | Failover mode only: `True` means the instance needs attention — most importantly the refuse-and-wait state, where the surviving data holders span divergent replication lineages and electing any one would discard independent writes (set `failover.allowUnsafeRebootstrapOnDeadlock` to authorize); `False` records a completed recovery |
-| `MultiSiteTeardown` | ✅ | Multi-site cluster mode only: `True` while the deletion sweep is blocked — a site was unreachable or its sweep failed — so the `redis.chuck-chuck-chuck.net/multisite-teardown` finalizer is retained and the operator retries. Escape hatch: remove the finalizer manually |
+| `MultiSiteTeardown` | ✅ | Multi-site cluster mode only: `True` while the deletion sweep is blocked, so the `redis.chuck-chuck-chuck.net/multisite-teardown` finalizer is retained and the operator retries. The reason says which of three blockers it is — `SiteConfigurationUnreadable`, `SiteSweepFailed` or `SiteUnreachable` — and only the last may clear on its own (see §2.14a). Escape hatch: remove the finalizer manually |
 | `MultiSiteTakeover` | ✅ | Multi-site cluster mode only (ADR-012): the operator-owned recovery of a whole site's loss that native Redis failover cannot resolve. `True` means the instance needs attention — the takeover cooldown is armed, or the operator is **refusing** because the fence is unavailable (the unreachable side could hold a serving master majority, so an automatic takeover risks a live split-brain; set `multiSite.allowUnsafeSiteTakeover` to authorize, or act manually). `False` records a completed takeover or that no site-loss recovery is needed. Event reasons: `SiteLossDetected` / `SiteTakeoverExecuted` / `RefusedSiteTakeover` |
 | `TLSReady` | — | Reserved for future use (defined but not currently set) |
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |

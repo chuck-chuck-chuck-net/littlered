@@ -18,7 +18,10 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"net"
+	"strings"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -36,6 +39,158 @@ import (
 // isMultiSite reports whether lr is a multi-site instance.
 func isMultiSite(lr *littleredv1alpha1.LittleRed) bool {
 	return lr.Spec.MultiSite != nil
+}
+
+// Condition reasons for a blocked spoke sweep. The split exists for one reason:
+// only ONE of these three states clears without a human, and a reader deciding
+// whether to wait or to act needs to know which one they are in.
+const (
+	// reasonTeardownConfigFault: the operator could not read its OWN hub-local
+	// inputs for a site (Secret missing/unreadable/malformed, own namespace
+	// unresolvable). Never self-heals. Deleting the site kubeconfig Secrets while
+	// tearing an instance down is a natural thing to do, and it is exactly what
+	// wedges deletion here — so this must not point at the remote site.
+	reasonTeardownConfigFault = "SiteConfigurationUnreadable"
+	// reasonTeardownSweepFailed: the site answered, but deleting its workloads
+	// failed (RBAC, admission webhook, a stuck object). Does not self-heal either,
+	// but the cause is remote and distinct from the above.
+	reasonTeardownSweepFailed = "SiteSweepFailed"
+	// reasonTeardownSiteUnreachable: the site's Kubernetes API did not answer. The
+	// only one of the three that may clear on its own, and the only one the
+	// original single label described correctly.
+	reasonTeardownSiteUnreachable = "SiteUnreachable"
+)
+
+// siteTeardownBlock is one site's reason for blocking the spoke sweep this pass.
+type siteTeardownBlock struct {
+	site   string
+	reason string // one of the reasonTeardown* constants
+	cause  string
+}
+
+// classifySiteClientBlock classifies a failure to obtain a site's client. Every
+// step up to and including parsing the kubeconfig is the operator reading its
+// OWN inputs, and siteClient already marks those with siteConfigFault — so this
+// only has to stop throwing that classification away.
+func classifySiteClientBlock(site string, err error) siteTeardownBlock {
+	if _, ok := siteConfigFaultOf(err); ok {
+		return siteTeardownBlock{site: site, reason: reasonTeardownConfigFault, cause: err.Error()}
+	}
+	return siteTeardownBlock{site: site, reason: reasonTeardownSiteUnreachable, cause: err.Error()}
+}
+
+// classifySweepBlock classifies a sweep failure.
+//
+// "The sweep failed" is NOT the same as "the site answered and refused": the
+// client is built from a cached kubeconfig, so the very first List can still die
+// in the transport. Saying "the site answered but the delete failed" about a
+// dial timeout would be the same species of false statement this change exists
+// to remove, so the two are split on whether the API server was actually
+// reached.
+func classifySweepBlock(site string, err error) siteTeardownBlock {
+	return siteTeardownBlock{site: site, reason: sweepBlockReason(err), cause: err.Error()}
+}
+
+// sweepBlockReason reports whether a sweep error means the site never answered.
+func sweepBlockReason(err error) string {
+	// Transport-level: the request never reached an API server.
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return reasonTeardownSiteUnreachable
+	}
+	// Answered, but with "ask again later" — indistinguishable in kind from not
+	// answering, for the only question this label decides (does waiting help?).
+	if apierrors.IsTimeout(err) || apierrors.IsServerTimeout(err) || apierrors.IsServiceUnavailable(err) {
+		return reasonTeardownSiteUnreachable
+	}
+	return reasonTeardownSweepFailed
+}
+
+// siteTeardownSummary aggregates one pass's blocks, split by whether waiting
+// helps. Pure.
+type siteTeardownSummary struct {
+	// Blocked names every blocked site, in spec order — what the sweep still owes.
+	Blocked []string
+	// The three classes, each in spec order.
+	ConfigFaulted []string
+	SweepFailed   []string
+	Unreachable   []string
+	// Details is one "site: Reason — cause" line per block, in spec order.
+	Details []string
+}
+
+// Any reports whether the sweep is blocked at all.
+func (s siteTeardownSummary) Any() bool { return len(s.Blocked) > 0 }
+
+// Reason picks the condition reason by ACTIONABILITY, most-actionable first. A
+// mixed pass must not advertise the one class that might resolve itself while a
+// permanent fault is also present: that combination is exactly the wait-forever
+// trap, and the permanent fault is the one a human has to act on.
+func (s siteTeardownSummary) Reason() string {
+	switch {
+	case len(s.ConfigFaulted) > 0:
+		return reasonTeardownConfigFault
+	case len(s.SweepFailed) > 0:
+		return reasonTeardownSweepFailed
+	default:
+		return reasonTeardownSiteUnreachable
+	}
+}
+
+// summarizeSiteTeardownBlocks aggregates per-site blocks. Pure.
+func summarizeSiteTeardownBlocks(in []siteTeardownBlock) siteTeardownSummary {
+	out := siteTeardownSummary{}
+	for _, b := range in {
+		out.Blocked = append(out.Blocked, b.site)
+		out.Details = append(out.Details, fmt.Sprintf("%s: %s — %s", b.site, b.reason, b.cause))
+		switch b.reason {
+		case reasonTeardownConfigFault:
+			out.ConfigFaulted = append(out.ConfigFaulted, b.site)
+		case reasonTeardownSweepFailed:
+			out.SweepFailed = append(out.SweepFailed, b.site)
+		default:
+			out.Unreachable = append(out.Unreachable, b.site)
+		}
+	}
+	return out
+}
+
+// describeSiteTeardownBlocks renders the human-facing condition message. Pure.
+//
+// The policy it encodes: RETAIN the finalizer in every case — releasing it would
+// complete the deletion while stranding Redis pods on the site forever and
+// invisibly, since owner references do not cross Kubernetes clusters and this
+// sweep is the only garbage collection there is. But say the true thing, because
+// a message that blames the remote site for a Secret the reader deleted locally
+// a minute ago actively prevents them from fixing it.
+func describeSiteTeardownBlocks(s siteTeardownSummary) string {
+	if !s.Any() {
+		return ""
+	}
+	const finalizer = multiSiteFinalizerName
+	var b strings.Builder
+	fmt.Fprintf(&b, "Deletion is blocked: the spoke sweep could not complete for site(s) %s.",
+		strings.Join(s.Blocked, ", "))
+
+	if len(s.ConfigFaulted) > 0 {
+		fmt.Fprintf(&b, " For %s the operator cannot read its OWN hub-local configuration — the site "+
+			"kubeconfig Secret in the operator's namespace (missing, unreadable, or malformed), or the "+
+			"operator's own namespace. This will NOT clear on its own, however long it retries. Restore "+
+			"the kubeconfig Secret, or remove the %q finalizer and delete this instance's workloads on "+
+			"those sites by hand.", strings.Join(s.ConfigFaulted, ", "), finalizer)
+	}
+	if len(s.SweepFailed) > 0 {
+		fmt.Fprintf(&b, " For %s the site answered but deleting the workloads failed (RBAC, an admission "+
+			"webhook, or a stuck object). This will NOT clear on its own either: fix the cause, or remove "+
+			"the %q finalizer and clean up by hand.", strings.Join(s.SweepFailed, ", "), finalizer)
+	}
+	if len(s.Unreachable) > 0 {
+		fmt.Fprintf(&b, " Site(s) %s did not answer; this is the one case that may clear on its own, and "+
+			"it is being retried. If such a site is permanently gone, remove the %q finalizer manually and "+
+			"clean it up by hand.", strings.Join(s.Unreachable, ", "), finalizer)
+	}
+	fmt.Fprintf(&b, " Details: %s", strings.Join(s.Details, "; "))
+	return b.String()
 }
 
 // ensureMultiSiteFinalizer adds the spoke-teardown finalizer to a multi-site CR
@@ -66,12 +221,20 @@ func multiSiteTeardownKinds() []client.ObjectList {
 }
 
 // handleMultiSiteDeletion sweeps the instance-labeled workload objects through
-// every site's SiteClient, then removes the spoke-teardown finalizer. A site
-// unreachable at deletion time keeps the finalizer (bounded implicitly by
-// reconcile requeue) and surfaces the MultiSiteTeardown condition; the
-// documented escape hatch is manual finalizer removal. Returns (done, error):
-// done=false means the caller must requeue and NOT remove the standard
-// finalizer yet.
+// every site's SiteClient, then removes the spoke-teardown finalizer. Any site
+// the sweep cannot finish keeps the finalizer (bounded implicitly by reconcile
+// requeue) and surfaces the MultiSiteTeardown condition; the documented escape
+// hatch is manual finalizer removal. Returns (done, error): done=false means the
+// caller must requeue and NOT remove the standard finalizer yet.
+//
+// Blocks are classified rather than lumped together, because the three ways this
+// can block differ in the only respect that matters to whoever is waiting for
+// `kubectl delete` to return: a hub-local configuration fault and a failed delete
+// never clear by themselves, an unreachable site may. Reporting all three as
+// "site unreachable" (as this path did before) is worse here than on the
+// reconcile path LR-034 fixed — there the instance kept serving, whereas here the
+// CR can never be deleted, and the natural trigger is a human tidying up the site
+// kubeconfig Secrets just before deleting the instance.
 func (r *LittleRedReconciler) handleMultiSiteDeletion(ctx context.Context, lr *littleredv1alpha1.LittleRed) (bool, error) {
 	if !controllerutil.ContainsFinalizer(lr, multiSiteFinalizerName) {
 		return true, nil
@@ -96,25 +259,31 @@ func (r *LittleRedReconciler) handleMultiSiteDeletion(ctx context.Context, lr *l
 	}
 
 	owner := types.NamespacedName{Namespace: lr.Namespace, Name: lr.Name}
-	var unreachable []string
+	var blocks []siteTeardownBlock
 	for _, site := range lr.Spec.MultiSite.Sites {
 		sc, err := r.sites.siteClient(ctx, lr, site)
 		if err != nil {
-			log.Info("Multi-site teardown: site client unavailable, retaining finalizer", "site", site.Name, "err", err.Error())
-			unreachable = append(unreachable, site.Name)
+			blk := classifySiteClientBlock(site.Name, err)
+			log.Info("Multi-site teardown: site client unavailable, retaining finalizer",
+				"site", site.Name, "reason", blk.reason, "err", err.Error())
+			blocks = append(blocks, blk)
 			continue
 		}
 		if err := sweepSite(ctx, sc, lr); err != nil {
-			log.Info("Multi-site teardown: sweep failed, retaining finalizer", "site", site.Name, "err", err.Error())
-			unreachable = append(unreachable, site.Name)
+			blk := classifySweepBlock(site.Name, err)
+			log.Info("Multi-site teardown: sweep failed, retaining finalizer",
+				"site", site.Name, "reason", blk.reason, "err", err.Error())
+			blocks = append(blocks, blk)
 		}
 	}
 
-	if len(unreachable) > 0 {
-		r.setMultiSiteTeardownCondition(ctx, lr, unreachable)
-		// Not done: keep the finalizer, requeue. Bounded by the reconcile loop;
-		// the escape hatch for a permanently dead site is manual finalizer
-		// removal (documented).
+	if summary := summarizeSiteTeardownBlocks(blocks); summary.Any() {
+		r.setMultiSiteTeardownCondition(ctx, lr, summary)
+		// Not done: keep the finalizer, requeue. Retaining is the deliberate
+		// policy even for the two classes that will never clear by themselves —
+		// releasing would complete the deletion while stranding this instance's
+		// pods on the site, unowned and unfindable. The condition now says which
+		// class this is, so "wait" versus "act" is the reader's call to make.
 		return false, nil
 	}
 
@@ -161,15 +330,16 @@ func (r *LittleRedReconciler) removeMultiSiteFinalizer(ctx context.Context, lr *
 }
 
 // setMultiSiteTeardownCondition surfaces a blocked teardown as a status
-// condition naming the unreachable sites. Best-effort (status update errors are
-// logged, not fatal — the teardown retries regardless).
-func (r *LittleRedReconciler) setMultiSiteTeardownCondition(ctx context.Context, lr *littleredv1alpha1.LittleRed, unreachable []string) {
+// condition, naming the blocked sites AND which of the three classes each is in
+// — because only one of them clears by waiting. Best-effort (status update errors
+// are logged, not fatal — the teardown retries regardless).
+func (r *LittleRedReconciler) setMultiSiteTeardownCondition(ctx context.Context, lr *littleredv1alpha1.LittleRed, summary siteTeardownSummary) {
 	log := r.getLogger(ctx, lr, LogCategoryRecon)
 	meta.SetStatusCondition(&lr.Status.Conditions, metav1.Condition{
 		Type:               littleredv1alpha1.ConditionMultiSiteTeardown,
 		Status:             metav1.ConditionTrue,
-		Reason:             "SiteUnreachable",
-		Message:            fmt.Sprintf("Deletion blocked: sweep pending for unreachable site(s) %v; retrying. Escape hatch: remove the %q finalizer manually.", unreachable, multiSiteFinalizerName),
+		Reason:             summary.Reason(),
+		Message:            describeSiteTeardownBlocks(summary),
 		LastTransitionTime: metav1.Now(),
 	})
 	if err := r.Status().Update(ctx, lr); err != nil && !apierrors.IsConflict(err) {

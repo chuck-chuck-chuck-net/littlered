@@ -400,6 +400,20 @@ degrades to Tier A (human), never to an unsafe guess.
   carries the state and the healthy sites keep being reconciled, since one deleted
   Secret must not become an instance-wide management outage. The refusal is a state,
   not a latch: fix the Secret and the next reconcile proceeds.
+- **The delete path draws the same distinction, and still refuses to abandon**
+  (LR-035). The spoke sweep can be blocked three ways, and they differ in whether
+  waiting helps: a hub-local **configuration** fault (as above) and a **failed
+  delete** (RBAC, admission, a stuck object) never clear by themselves, while an
+  **unreachable** site may. The finalizer is retained in all three cases — releasing
+  it would complete the deletion while stranding the instance's pods on the site,
+  unowned and unfindable, since owner references do not cross clusters and this
+  sweep is the only GC there is. Silently stranding workloads is worse than an
+  honest block. What changes is that `MultiSiteTeardown` now says *which* class it
+  is, and a mixed pass reports the most actionable one, so a partly-permanent block
+  is never advertised as the one that might fix itself. The stakes are higher here
+  than on the reconcile path: a mislabelled blocker means `kubectl delete` hangs
+  forever while the condition blames the wrong machine — and the common trigger is
+  a human tidying up the site kubeconfig Secrets just before deleting the instance.
 - **The site kubeconfig Secret is read *uncached*** (LR-034), so scoping cannot hide it.
   Reading it through the manager's cache made a namespace-scoped operator (ADR-014)
   unable to see its own credentials. Widening the cache is **not** the fix:
