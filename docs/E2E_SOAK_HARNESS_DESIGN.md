@@ -641,6 +641,50 @@ M3**, before any fault agent exists, because their "fault" is an API call or a p
 Landing these here means real matrix coverage exists before the expensive infrastructure work
 starts, and it exercises the driver on varied items while the array mechanics are still fresh.
 
+> **LANDED 2026-08-17 — authored and static-checked; NOT yet run on the lab.** Seven specs across
+> three files plus `worklist-m35-cells.yaml` wiring them as one 7-item array (sequential — they
+> share the lab). `go vet -tags e2e` and `make lint` clean; the work list renders to
+> `completions: 7`.
+>
+> - **F1** (`multisite_immutability_test.go`), four contexts. **Needed three fixtures, not one.**
+>   Matrix §2.1 says a fixture invalid for two reasons proves nothing about either, and three CRD
+>   bounds collide with the obvious edits (`sites` MinItems=2, `sitesPerShard` Minimum=2, and the
+>   CEL rule `sitesPerShard <= sites.size()`). **Measured against a real API server** rather than
+>   argued: all eight designed cases fire exactly one rule, while `sps 2→3` on a 2-site instance
+>   fires **two** and removing a site from a 2-site instance fires **three**. The sharp part is
+>   that `ContainSubstring` still *passes* on both, because the wanted message is among the others
+>   — so §2.1 compliance is invisible to the assertion and enforced only by the choice of fixture.
+>   That mapping is spelled out in the file header so nobody "simplifies" a 3-site fixture to 2.
+> - **I1 / I3** (`multisite_bringup_test.go`). I1's fault is a Secret rewrite pointing the site at
+>   `192.0.2.1` (TEST-NET-1) — no network primitive. Syntactic validity is load-bearing: LR-036
+>   classifies an *unparseable* server URL as a configuration fault, which refuses at bootstrap
+>   and would make the cell pass for the wrong reason, so it first asserts the published site
+>   reason is exactly `Unreachable`. **I3 turned out not to be covered by the M3 bringup item at
+>   all**, contrary to appearances: `msVerifyCrossSiteTopology` iterates the replicas it *finds*,
+>   so with zero replicas the loop body never executes and it passes **vacuously** — while
+>   `cluster_state` stays `ok` with all 16384 slots assigned. I3 asserts the member census
+>   instead (masters, replicas, and zero slotless masters).
+> - **G1 / G4 / G5 + G2-short** (`multisite_rebalance_test.go`) — first contact with the
+>   rebalancer's executor. Drift is induced by one force-deleted master, so Redis's own native
+>   failover creates the imbalance and the operator only corrects it. G2 is sequenced **first** in
+>   the array: if the rebalancer churns spontaneously, every other G assertion is meaningless.
+>
+> **One operator change came out of writing these (LR-037).** The rebalancer emitted **no event**,
+> so "exactly one graceful `CLUSTER FAILOVER` per reconcile" could only be counted by grepping
+> audit prose — a surface that silently reports zero when someone rewords the message, i.e.
+> unfalsifiable in the most dangerous direction. It now emits one Normal `MasterRebalanced` event
+> per move, and a `gracefulFailover` seam makes its firing branch testable (previously disclosed
+> as "untested plumbing, left to e2e" — the wrong branch to leave uncovered, being the one that
+> actuates against live data and the one LR-031 switched on for the recommended dual-site).
+>
+> **G9 deferred deliberately, and in the right order:** it needs a second operator image built
+> from a pre-LR-031 commit with the CRD pinned at the current version, and it validates the
+> *upgrade* path — worth little until G1/G4/G5 show the executor works at all.
+>
+> **Remaining to call M3.5 done: run the array.** Everything above is in the state M3 was in
+> before *its* first run — which produced two real operator bugs (LR-034). Authoring is not
+> evidence.
+
 ### M4 — Fault agents + the 15-minute smoke (~1–1.5 days)
 
 Restricted-`command=` SSH agents on the hypervisors (§9.3), starting with **virsh only** — netem
