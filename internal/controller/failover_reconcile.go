@@ -551,7 +551,13 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 		// (measured: 202 of 1171 lost, silently). Best-effort and idempotent: it
 		// is a convergence step the straggler repoint would eventually perform
 		// anyway, so a failure here is retried by the next pass, never fatal.
-		if fenceIP := planFailoverFence(state, intent.masterIP, plan.masterIP); fenceIP != "" {
+		//
+		// Views are built with a nil state ON PURPOSE. The gather omits
+		// terminating pods, so the outgoing master is missing from state.RedisNodes
+		// exactly when it needs fencing; keying the fence on the gather made it
+		// silently inert. Widening the gather is not the answer either — the dying
+		// master would then feed determineFailoverLiveMaster and BestDataHolder.
+		if fenceIP := planFailoverFence(buildFailoverPodViews(podList, nil), intent.masterIP, plan.masterIP); fenceIP != "" {
 			auditLog.Info("Fencing outgoing master: demoting it so it can no longer accept writes",
 				"outgoingMaster", fenceIP, "outgoingPod", podNameForIP(podList, fenceIP), "newMaster", plan.masterIP)
 			if err := r.slaveOfBounded(ctx, lr, fenceIP, plan.masterIP, password); err != nil {

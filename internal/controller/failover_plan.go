@@ -274,17 +274,36 @@ func planFailover(
 // (settled && !anyTerminating) excludes, at the one moment it matters. The
 // healthy stragglers keep that gate; only the master being replaced is fenced.
 //
-// Nothing to fence when the outgoing master is unreachable (the crash path — and
-// no dial is wasted on a dead or blackholing IP, LR-017), already demoted (so
-// re-entry is idempotent), absent from the gather, or IS the pod being promoted
-// (a resumed half-applied promotion — fencing it would demote the new master).
-func planFailoverFence(state *redisclient.ReplicationState, outgoingIP, newMasterIP string) string {
+// It keys off the K8s pod views, NOT the gathered Redis state, and that is the
+// whole point: reconcileFailoverAssignments deliberately omits terminating pods
+// from the gather, so the outgoing master is absent from state.RedisNodes exactly
+// when it needs fencing (a first attempt keyed on the gather was inert in the
+// field for precisely this reason — 196 of 1163 writes still lost). Widening the
+// gather instead would be far worse than inert: the dying master would then feed
+// determineFailoverLiveMaster (the operator would see a live master and never
+// fail over at all) and BestDataHolder (it could be *elected*). Fencing is an
+// actuation, not a decision input, so it stays out of the ground truth.
+//
+// The consequence is that reachability and role are unknown here, and neither is
+// needed: SLAVEOF is idempotent (Redis no-ops a REPLICAOF to the master a node
+// already follows), the dial is bounded by ProbeTimeout (LR-017), and a repoint
+// of an outgoing master that is somehow still a healthy straggler is what Rule R
+// would do anyway.
+//
+// Nothing to fence when there is no prior intent (the seed path), when the
+// outgoing master IS the pod being promoted (a resumed half-applied promotion —
+// fencing it would demote the new master), or when no pod holds that IP any more:
+// the crash path, where the pod is already gone, so no dial is wasted on a dead
+// or blackholing address, and the ADR-001 replaced-pod case, where a same-named
+// pod came back with a different IP and the old IP must not be dialed.
+func planFailoverFence(views []failoverPodView, outgoingIP, newMasterIP string) string {
 	if outgoingIP == "" || outgoingIP == newMasterIP {
 		return ""
 	}
-	rn := state.RedisNodes[outgoingIP]
-	if rn == nil || !rn.Reachable || rn.Role != RoleMaster {
-		return ""
+	for _, v := range views {
+		if v.ip == outgoingIP {
+			return outgoingIP
+		}
 	}
-	return outgoingIP
+	return ""
 }

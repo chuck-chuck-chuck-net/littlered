@@ -19,8 +19,6 @@ package controller
 import (
 	"testing"
 	"time"
-
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
 const linkStatusUp = "up" // test-side counterpart of linkStatusDown
@@ -317,53 +315,57 @@ func TestPlanFailover(t *testing.T) {
 // answering -READONLY: the loss becomes VISIBLE write failures instead of silent
 // data loss (pillar 3.2's principle, applied to failover).
 //
-// This is not a new mechanism — it is the existing straggler repoint applied to
-// the one pod the secondary-healing gate (settled && !anyTerminating) excludes,
-// at the one moment it matters. Hence the narrow seam: fence exactly the outgoing
-// master, never the healthy stragglers, which keep their conservative gate.
+// The input is the POD VIEWS, not the gathered Redis state. A first attempt keyed
+// on state.RedisNodes was inert in the field (196 of 1163 still lost) because
+// reconcileFailoverAssignments omits terminating pods from the gather — so the
+// outgoing master is missing from the ground truth exactly when it needs fencing.
+// Reachability and role are therefore unknown here and are not needed: SLAVEOF is
+// idempotent and the dial is bounded (LR-017).
 func TestPlanFailoverFence(t *testing.T) {
-	const oldIP, newIP, otherIP = "10.0.0.1", "10.0.0.2", "10.0.0.3"
-
-	node := func(role string, reachable bool) *redisclient.RedisNodeState {
-		return &redisclient.RedisNodeState{Role: role, Reachable: reachable}
-	}
+	const (
+		oldIP, newIP   = "10.0.0.1", "10.0.0.2"
+		podOld, podNew = "redis-0", "redis-1"
+		podNoIP        = "redis-3"
+	)
 
 	tests := []struct {
 		name       string
-		nodes      map[string]*redisclient.RedisNodeState
+		views      []failoverPodView
 		outgoingIP string
 		newIP      string
 		want       string
 	}{
 		{
-			// The graceful window: terminating, but redis is alive and still
-			// mastering, so it can still accept a write. THE case this exists for.
-			name: "outgoing master still reachable and mastering -> fence it",
-			nodes: map[string]*redisclient.RedisNodeState{
-				oldIP: node(RoleMaster, true),
-				newIP: node(RoleReplica, true),
+			// The graceful window: the pod is terminating, but redis is alive and
+			// still mastering, so it can still ACK a write. THE case this exists
+			// for — and the case the gather cannot see.
+			name: "outgoing master still present and terminating -> fence it",
+			views: []failoverPodView{
+				{name: podOld, ip: oldIP, terminating: true},
+				{name: podNew, ip: newIP},
 			},
 			outgoingIP: oldIP,
 			newIP:      newIP,
 			want:       oldIP,
 		},
 		{
-			// Crash path: nothing to fence, and no dial to waste on a dead or
-			// blackholing IP (LR-017).
-			name: "outgoing master unreachable -> nothing to fence",
-			nodes: map[string]*redisclient.RedisNodeState{
-				oldIP: node(RoleMaster, false),
-				newIP: node(RoleReplica, true),
+			// Crash path: the pod is already gone, so there is nothing alive to
+			// accept a write and no dial to waste on a dead or blackholing IP.
+			name: "outgoing master pod gone -> nothing to fence, no wasted dial",
+			views: []failoverPodView{
+				{name: podNew, ip: newIP},
 			},
 			outgoingIP: oldIP,
 			newIP:      newIP,
 			want:       "",
 		},
 		{
-			name: "outgoing master already demoted -> nothing to fence (idempotent re-entry)",
-			nodes: map[string]*redisclient.RedisNodeState{
-				oldIP: node(RoleReplica, true),
-				newIP: node(RoleReplica, true),
+			// ADR-001 strict IP identity: a same-named pod that came back with a
+			// new IP is a different node. The old IP must not be dialed.
+			name: "outgoing master pod replaced with a new IP -> nothing to fence",
+			views: []failoverPodView{
+				{name: podOld, ip: "10.0.0.9"},
+				{name: podNew, ip: newIP},
 			},
 			outgoingIP: oldIP,
 			newIP:      newIP,
@@ -373,8 +375,8 @@ func TestPlanFailoverFence(t *testing.T) {
 			// Resume of a half-applied promotion: the intent already names the pod
 			// being promoted. Fencing it would demote the new master.
 			name: "outgoing is the pod being promoted -> never fence the new master",
-			nodes: map[string]*redisclient.RedisNodeState{
-				newIP: node(RoleMaster, true),
+			views: []failoverPodView{
+				{name: podNew, ip: newIP},
 			},
 			outgoingIP: newIP,
 			newIP:      newIP,
@@ -383,20 +385,20 @@ func TestPlanFailoverFence(t *testing.T) {
 		{
 			// Seed path: no prior intent, so there is no outgoing master at all.
 			name: "no outgoing master (seed) -> nothing to fence",
-			nodes: map[string]*redisclient.RedisNodeState{
-				newIP: node(RoleMaster, true),
+			views: []failoverPodView{
+				{name: podNew, ip: newIP},
 			},
 			outgoingIP: "",
 			newIP:      newIP,
 			want:       "",
 		},
 		{
-			name: "outgoing master pod gone from the gather -> nothing to fence",
-			nodes: map[string]*redisclient.RedisNodeState{
-				otherIP: node(RoleReplica, true),
-				newIP:   node(RoleReplica, true),
+			// A pod that has not got an IP yet must never absorb the "" lookup.
+			name: "pods without IPs do not match an empty outgoing IP",
+			views: []failoverPodView{
+				{name: podNoIP, ip: ""},
 			},
-			outgoingIP: oldIP,
+			outgoingIP: "",
 			newIP:      newIP,
 			want:       "",
 		},
@@ -404,8 +406,7 @@ func TestPlanFailoverFence(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			state := &redisclient.ReplicationState{RedisNodes: tc.nodes}
-			if got := planFailoverFence(state, tc.outgoingIP, tc.newIP); got != tc.want {
+			if got := planFailoverFence(tc.views, tc.outgoingIP, tc.newIP); got != tc.want {
 				t.Errorf("planFailoverFence() = %q, want %q", got, tc.want)
 			}
 		})
