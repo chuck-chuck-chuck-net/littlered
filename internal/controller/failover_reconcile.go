@@ -542,6 +542,24 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 			// on the next (fast) requeue.
 			return err
 		}
+
+		// Fence the outgoing master (ADR-011 §7 amendment): demote it so it stops
+		// accepting writes. On a graceful delete it is still alive and still
+		// mastering for the rest of its preStop window, and an established client
+		// connection through the master Service is NOT re-routed by the label
+		// flip — so without this it keeps ACKing writes that die with the pod
+		// (measured: 202 of 1171 lost, silently). Best-effort and idempotent: it
+		// is a convergence step the straggler repoint would eventually perform
+		// anyway, so a failure here is retried by the next pass, never fatal.
+		if fenceIP := planFailoverFence(state, intent.masterIP, plan.masterIP); fenceIP != "" {
+			auditLog.Info("Fencing outgoing master: demoting it so it can no longer accept writes",
+				"outgoingMaster", fenceIP, "outgoingPod", podNameForIP(podList, fenceIP), "newMaster", plan.masterIP)
+			if err := r.slaveOfBounded(ctx, lr, fenceIP, plan.masterIP, password); err != nil {
+				auditLog.Error(err, "Failed to fence outgoing master; writes may be lost until it dies",
+					"outgoingMaster", fenceIP)
+			}
+		}
+
 		if err := r.markFailoverTransition(ctx, lr, epoch); err != nil {
 			return err
 		}

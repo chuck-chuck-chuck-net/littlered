@@ -1,7 +1,10 @@
 # ADR-011: `failover` Mode — Operator-Managed HA without Sentinel
 
 ## Status
-Accepted (mode ships as **experimental**; see Lifecycle)
+Accepted (mode ships as **experimental**; see Lifecycle).
+Amended 2026-08-17 (LR-038): §7 gains the outgoing-master **fence**, and §8's graduation
+gate gains a **durability** bar — an availability bar alone graduated a mode that
+silently lost acknowledged writes on every graceful handover.
 
 ## Context
 
@@ -190,6 +193,34 @@ delete), the operator performs the §5 promotion *proactively* during the grace 
 preStop hook only sleeps to hold the grace window. Rolling updates keep the existing
 one-pod-at-a-time StatefulSet semantics.
 
+**Promotion alone is not a handover — the outgoing master must also be fenced**
+(amended 2026-08-17, LR-038). Promoting a replica says who the *new* master is; it does
+nothing about the *old* one, which on a graceful delete is still alive and still
+mastering for the rest of its preStop window. Two things then conspire: the operator
+never speaks to it (the straggler repoint that would is blocked by its own
+`!anyTerminating` gate, §6), and an established client connection through the master
+Service is **not** re-routed by the operator's label flip. So the client keeps writing
+into a doomed pod for the whole grace window — *however fast the operator promotes* —
+and those writes die with it. Measured on t3e: **202 of 1171 acknowledged writes lost**,
+with `DataCorruptions: 0` and write availability 97.66%. The keys were gone, not wrong,
+so nothing caught it.
+
+So the promotion carries a fence: demote the outgoing master (`REPLICAOF <new-master>`,
+pure `planFailoverFence`) so it answers `-READONLY`. The loss becomes **visible write
+failures instead of silent data loss** — pillar 3.2's principle, applied to failover
+rather than to memory pressure. It is the §6 straggler repoint applied to the one pod
+that gate excludes, at the one moment it matters, so it is best-effort and idempotent;
+it is skipped when the outgoing master is unreachable (the crash path leaves nothing to
+fence), already demoted, or is itself the pod being promoted.
+
+This is a **data-safety** property, and it cut the other way from the availability
+numbers: failover mode *beat* sentinel mode on write availability in both variants while
+being the only one of the two that lost acknowledged writes. Sentinel's pod-led preStop
+(`SENTINEL failover mymaster`, then wait for the address to change) converts handover
+into visible write failures; failover-graceful converted it into silent loss. Bounding
+that loss is part of the graduation gate (§8) — an availability bar alone would have
+graduated the mode with this hole open.
+
 ### 8. Lifecycle
 
 Ships **experimental**: setting `mode: failover` is the opt-in; the operator emits the
@@ -199,6 +230,16 @@ HA e2e suite (graceful, crash, hybrid double-failover), chaos/soak, and managed-
 dogfooding evidence, matching sentinel-mode's bars (data corruptions 0, write
 availability > 0.40 over the 120s chaos window, recovery ≤ 90s with the watcher path
 < 15s).
+
+**Plus a durability bar (added 2026-08-17, LR-038):** on the *graceful* path, at most a
+handful of acknowledged writes may be lost — the bound is the replication lag at the
+promotion instant (~1 per failover at the chaos client's 10 writes/s), asserted as ≤ 5
+over the two-failover tier. This bar exists because the availability bars above are
+blind to it: the mode passed every one of them while losing 17% of acknowledged writes
+(§7). It is measured by the chaos client's exact post-traffic sweep over every
+acknowledged write, not by the sampled read counters, which cannot distinguish one lost
+key read five times from five lost keys. The *crash* path is deliberately not bounded —
+a kill -9 loses the unreplicated tail by construction.
 
 ## Consequences
 

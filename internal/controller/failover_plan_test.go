@@ -19,6 +19,8 @@ package controller
 import (
 	"testing"
 	"time"
+
+	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
 const linkStatusUp = "up" // test-side counterpart of linkStatusDown
@@ -295,6 +297,116 @@ func TestPlanFailover(t *testing.T) {
 			}
 			if tc.wantHolders != 0 && got.holders != tc.wantHolders {
 				t.Errorf("holders = %d, want %d", got.holders, tc.wantHolders)
+			}
+		})
+	}
+}
+
+// --- planFailoverFence: closing the graceful-handover write-loss window -----
+//
+// MEASURED, not hypothesised (t3e, 2026-08-17): the rapid-double-failover chaos
+// tier lost 202 of 1171 acknowledged writes on the GRACEFUL path, with
+// DataCorruptions 0 and write availability 97.66% — the loss was invisible to
+// every assertion the suite had. Cause: the operator promotes a replica but never
+// speaks to the outgoing master, which keeps running and keeps ACKing writes for
+// its whole ~10s preStop window (resources_failover.go), while an established TCP
+// connection through the master Service is not re-routed by the label flip. Those
+// writes die with the pod.
+//
+// The fix is to demote the outgoing master as part of the promotion, so it starts
+// answering -READONLY: the loss becomes VISIBLE write failures instead of silent
+// data loss (pillar 3.2's principle, applied to failover).
+//
+// This is not a new mechanism — it is the existing straggler repoint applied to
+// the one pod the secondary-healing gate (settled && !anyTerminating) excludes,
+// at the one moment it matters. Hence the narrow seam: fence exactly the outgoing
+// master, never the healthy stragglers, which keep their conservative gate.
+func TestPlanFailoverFence(t *testing.T) {
+	const oldIP, newIP, otherIP = "10.0.0.1", "10.0.0.2", "10.0.0.3"
+
+	node := func(role string, reachable bool) *redisclient.RedisNodeState {
+		return &redisclient.RedisNodeState{Role: role, Reachable: reachable}
+	}
+
+	tests := []struct {
+		name       string
+		nodes      map[string]*redisclient.RedisNodeState
+		outgoingIP string
+		newIP      string
+		want       string
+	}{
+		{
+			// The graceful window: terminating, but redis is alive and still
+			// mastering, so it can still accept a write. THE case this exists for.
+			name: "outgoing master still reachable and mastering -> fence it",
+			nodes: map[string]*redisclient.RedisNodeState{
+				oldIP: node(RoleMaster, true),
+				newIP: node(RoleReplica, true),
+			},
+			outgoingIP: oldIP,
+			newIP:      newIP,
+			want:       oldIP,
+		},
+		{
+			// Crash path: nothing to fence, and no dial to waste on a dead or
+			// blackholing IP (LR-017).
+			name: "outgoing master unreachable -> nothing to fence",
+			nodes: map[string]*redisclient.RedisNodeState{
+				oldIP: node(RoleMaster, false),
+				newIP: node(RoleReplica, true),
+			},
+			outgoingIP: oldIP,
+			newIP:      newIP,
+			want:       "",
+		},
+		{
+			name: "outgoing master already demoted -> nothing to fence (idempotent re-entry)",
+			nodes: map[string]*redisclient.RedisNodeState{
+				oldIP: node(RoleReplica, true),
+				newIP: node(RoleReplica, true),
+			},
+			outgoingIP: oldIP,
+			newIP:      newIP,
+			want:       "",
+		},
+		{
+			// Resume of a half-applied promotion: the intent already names the pod
+			// being promoted. Fencing it would demote the new master.
+			name: "outgoing is the pod being promoted -> never fence the new master",
+			nodes: map[string]*redisclient.RedisNodeState{
+				newIP: node(RoleMaster, true),
+			},
+			outgoingIP: newIP,
+			newIP:      newIP,
+			want:       "",
+		},
+		{
+			// Seed path: no prior intent, so there is no outgoing master at all.
+			name: "no outgoing master (seed) -> nothing to fence",
+			nodes: map[string]*redisclient.RedisNodeState{
+				newIP: node(RoleMaster, true),
+			},
+			outgoingIP: "",
+			newIP:      newIP,
+			want:       "",
+		},
+		{
+			name: "outgoing master pod gone from the gather -> nothing to fence",
+			nodes: map[string]*redisclient.RedisNodeState{
+				otherIP: node(RoleReplica, true),
+				newIP:   node(RoleReplica, true),
+			},
+			outgoingIP: oldIP,
+			newIP:      newIP,
+			want:       "",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			state := &redisclient.ReplicationState{RedisNodes: tc.nodes}
+			if got := planFailoverFence(state, tc.outgoingIP, tc.newIP); got != tc.want {
+				t.Errorf("planFailoverFence() = %q, want %q", got, tc.want)
 			}
 		})
 	}

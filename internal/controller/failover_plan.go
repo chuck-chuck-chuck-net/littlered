@@ -257,3 +257,34 @@ func planFailover(
 	}
 	return failoverPlan{action: failoverPromote, masterIP: best.IP, holders: len(holders)}
 }
+
+// planFailoverFence returns the IP of the OUTGOING master that must be demoted
+// so that it can no longer accept writes, or "" when there is nothing to fence.
+//
+// WHY (measured on t3e, 2026-08-17): a graceful master delete lost 202 of 1171
+// acknowledged writes, silently — DataCorruptions 0, write availability 97.66%.
+// The operator promoted a replica but never spoke to the outgoing master, which
+// kept running and kept ACKing writes for its whole ~10s preStop window while an
+// established client connection through the master Service stayed pinned to it.
+// Demoting it makes those writes fail visibly (-READONLY) instead of vanishing:
+// pillar 3.2's "errors rather than silent data loss", applied to failover.
+//
+// Deliberately narrow. This is the existing straggler repoint
+// (planFailoverRepoints) applied to the ONE pod its caller's conservative gate
+// (settled && !anyTerminating) excludes, at the one moment it matters. The
+// healthy stragglers keep that gate; only the master being replaced is fenced.
+//
+// Nothing to fence when the outgoing master is unreachable (the crash path — and
+// no dial is wasted on a dead or blackholing IP, LR-017), already demoted (so
+// re-entry is idempotent), absent from the gather, or IS the pod being promoted
+// (a resumed half-applied promotion — fencing it would demote the new master).
+func planFailoverFence(state *redisclient.ReplicationState, outgoingIP, newMasterIP string) string {
+	if outgoingIP == "" || outgoingIP == newMasterIP {
+		return ""
+	}
+	rn := state.RedisNodes[outgoingIP]
+	if rn == nil || !rn.Reachable || rn.Role != RoleMaster {
+		return ""
+	}
+	return outgoingIP
+}
