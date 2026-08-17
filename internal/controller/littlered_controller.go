@@ -113,6 +113,25 @@ type LittleRedReconciler struct {
 	// when the reconciler is built without a manager (unit/envtest) — the
 	// multi-site helpers tolerate that (single-site behavior is unaffected).
 	sites *siteClientRegistry
+
+	// gracefulFailover issues a graceful CLUSTER FAILOVER against one node's address.
+	// Injectable, and not merely for convenience: without it the master rebalancer's FIRE
+	// path could not be tested at all (it constructs its own client and dials a real pod),
+	// so the branch that ACTUATES against a live instance was disclosed as untested
+	// plumbing. That is the wrong branch to leave uncovered — it is the one LR-031
+	// switched on for the recommended dual-site topology. nil means "use the real client",
+	// so production wiring needs no change.
+	gracefulFailover func(ctx context.Context, lr *littleredv1alpha1.LittleRed, addr string) error
+}
+
+// issueGracefulFailover sends a graceful CLUSTER FAILOVER to addr, through the injected seam
+// when one is set. Graceful (not TAKEOVER): it is the no-data-loss primitive (LR-025).
+func (r *LittleRedReconciler) issueGracefulFailover(ctx context.Context, lr *littleredv1alpha1.LittleRed, addr string) error {
+	if r.gracefulFailover != nil {
+		return r.gracefulFailover(ctx, lr, addr)
+	}
+	cc := redisclient.NewClusterClient(r.getRedisPassword(ctx, lr), lr.Spec.TLS.Enabled)
+	return cc.ClusterFailover(ctx, addr)
 }
 
 // event emits a Kubernetes Event for lr, tolerating a nil Recorder (e.g. in unit
@@ -1860,6 +1879,15 @@ const (
 	reasonSiteLossDetected     = "SiteLossDetected"
 	reasonSiteTakeoverExecuted = "SiteTakeoverExecuted"
 	reasonRefusedSiteTakeover  = "RefusedSiteTakeover"
+
+	// Multi-site master-balance reason (ADR-012 D2). The rebalancer ACTUATES on the
+	// healthy path — it issues a graceful CLUSTER FAILOVER against a live, serving
+	// instance — so it owes an operator the same visibility the takeover gives. LR-031
+	// switched it on for topologies where it was previously inert (K=4 over 2 or 3 sites,
+	// including the recommended dual-site), so instances carrying drift start moving
+	// mastership after an upgrade; this event is how a human sees that happen instead of
+	// inferring it from a master-count change after the fact.
+	reasonMasterRebalanced = "MasterRebalanced"
 
 	// Multi-site reduced-site-loss-resilience warning reasons (ADR-012 D2). Structural,
 	// spec-level: the True reason when the balance invariant is unsatisfiable, the False

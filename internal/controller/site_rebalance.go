@@ -22,6 +22,7 @@ import (
 	"sort"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
@@ -386,15 +387,24 @@ func (r *LittleRedReconciler) rebalanceMasters(ctx context.Context, lr *littlere
 	auditLog.Info("Master-balance: correcting drift with a graceful CLUSTER FAILOVER on an under-mastered site's replica",
 		"shard", mv.shard, "toSite", mv.toSite, "replica", key)
 
-	password := r.getRedisPassword(ctx, lr)
-	cc := redisclient.NewClusterClient(password, lr.Spec.TLS.Enabled)
 	addr := fmt.Sprintf("%s:%d", ip, littleredv1alpha1.RedisPort)
-	if err := cc.ClusterFailover(ctx, addr); err != nil {
+	if err := r.issueGracefulFailover(ctx, lr, addr); err != nil {
 		// A failed graceful failover is not fatal — retry next reconcile. Do NOT stamp the
 		// marker (nothing is in flight to settle), so the next pass re-attempts promptly.
 		auditLog.Error(err, "Master-balance: graceful CLUSTER FAILOVER failed (will retry)", "replica", key)
 		return false, nil
 	}
+
+	// Report the move. Emitted only AFTER the failover is accepted: announcing a move that
+	// did not happen would tell an operator mastership changed when it did not, which is
+	// worse than saying nothing. This is the rebalancer's only machine-readable "mastership
+	// moved" signal — before it, the actuation LR-031 switched on for the recommended
+	// dual-site topology was visible only as an after-the-fact master-count change or by
+	// grepping this file's audit prose.
+	r.event(lr, corev1.EventTypeNormal, reasonMasterRebalanced, fmt.Sprintf(
+		"Master-balance: moved shard %d's mastership to site %q via a graceful CLUSTER FAILOVER "+
+			"on replica %s, correcting master-per-site drift (ADR-012 D2). One move per reconcile, "+
+			"no data loss.", mv.shard, mv.toSite, key))
 
 	// Stamp the settle/anti-thrash marker and requeue.
 	return true, r.setRebalancePendingSince(ctx, lr, metav1.Now())

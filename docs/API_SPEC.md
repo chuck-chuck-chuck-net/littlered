@@ -781,6 +781,15 @@ status:
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |
 | `ClusterReady` | — | Reserved for future use (defined but not currently set) |
 
+**Master-balance events (no condition).** The master rebalancer (ADR-012 D2) has no condition of
+its own — drift is not a fault, and the healthy path stays `Ready`. It emits one Normal
+`MasterRebalanced` event per move, naming the shard, the destination site and the replica
+promoted. That event is the only machine-readable record that mastership *moved*; the resulting
+distribution is published in `status.multiSite.masterCounts`, and `lrctl verify` renders it,
+distinguishing `[OVER FLOOR]` (an actionable availability exposure) from `[OVER TARGET]` (a
+recovery downgrade). Moves are serialized to one per reconcile behind a 30s settle cooldown, so a
+burst of these events indicates something other than ordinary drift correction.
+
 ### 3.2 Phase Transitions
 
 ```

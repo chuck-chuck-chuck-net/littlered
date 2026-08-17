@@ -18,13 +18,16 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"reflect"
 	"sort"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/tools/events"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	climultisite "github.com/littlered-operator/littlered-operator/internal/cli/multisite"
@@ -377,6 +380,91 @@ func TestRebalanceMastersGating(t *testing.T) {
 		// Marker must be untouched (still set) — no dial, no re-stamp/clear.
 		if lr.Status.MultiSite.RebalancePendingSince == nil {
 			t.Fatalf("cooldown-wait must leave the pending marker set")
+		}
+	})
+}
+
+// TestRebalanceMastersFires covers the executor's FIRE path — drift, past cooldown, an in-sync
+// replica available — which was previously disclosed as "dials a real pod, left to e2e, untested
+// plumbing". That was the wrong branch to leave uncovered: it is the one that ACTUATES against a
+// live serving instance, and LR-031 switched it on for the recommended dual-site topology. The
+// gracefulFailover seam makes it testable without a Redis.
+func TestRebalanceMastersFires(t *testing.T) {
+	// driftGT() is 3+1+2 over four shards with a shard-0 replica in the empty site3, so the
+	// planner's single move is {shard 0 -> site3}.
+	newFiring := func(t *testing.T) (*LittleRedReconciler, *littleredv1alpha1.LittleRed, *events.FakeRecorder, *[]string) {
+		t.Helper()
+		lr := multiSiteClusterCR(4, 2, 4, 1)
+		// Past the settle cooldown, so the move is not deferred.
+		old := metav1.NewTime(metav1.Now().Add(-2 * masterRebalanceCooldown))
+		lr.Status.MultiSite = &littleredv1alpha1.MultiSiteStatus{RebalancePendingSince: &old}
+		rec := events.NewFakeRecorder(16)
+		var dialed []string
+		r := &LittleRedReconciler{
+			Client:   newStatusFakeClient(t, lr),
+			Recorder: rec,
+			gracefulFailover: func(_ context.Context, _ *littleredv1alpha1.LittleRed, addr string) error {
+				dialed = append(dialed, addr)
+				return nil
+			},
+		}
+		return r, lr, rec, &dialed
+	}
+
+	t.Run("issues exactly one graceful failover and reports it as an event", func(t *testing.T) {
+		r, lr, rec, dialed := newFiring(t)
+
+		acted, err := r.rebalanceMasters(context.Background(), lr, driftGT(), nil)
+		if err != nil {
+			t.Fatalf("rebalanceMasters: %v", err)
+		}
+		if !acted {
+			t.Fatal("acted=false: drift past the cooldown must produce a move")
+		}
+		// ONE move per reconcile is the LR-021-style serialization that keeps the rebalancer
+		// from restarting several masters in one wave.
+		if len(*dialed) != 1 {
+			t.Fatalf("graceful failovers issued = %d (%v), want exactly 1 per reconcile", len(*dialed), *dialed)
+		}
+
+		// The event is the operator's only machine-readable signal that mastership MOVED.
+		// Without it the actuation LR-031 enabled is visible only as a master-count change
+		// after the fact, or by grepping the audit log for a prose string.
+		var got []string
+		for _, e := range drainRecorderEvents(rec) {
+			if strings.Contains(e, reasonMasterRebalanced) {
+				got = append(got, e)
+			}
+		}
+		if len(got) != 1 {
+			t.Fatalf("%s events = %d, want exactly 1: %v", reasonMasterRebalanced, len(got), got)
+		}
+		// It must say WHICH shard moved WHERE, or it cannot be acted on.
+		if !strings.Contains(got[0], "shard 0") || !strings.Contains(got[0], "site3") {
+			t.Errorf("event must name the shard and destination site, got: %s", got[0])
+		}
+	})
+
+	t.Run("a failed failover emits no event and does not stamp the marker", func(t *testing.T) {
+		r, lr, rec, _ := newFiring(t)
+		lr.Status.MultiSite.RebalancePendingSince = nil
+		r.gracefulFailover = func(_ context.Context, _ *littleredv1alpha1.LittleRed, _ string) error {
+			return errors.New("connection refused")
+		}
+
+		acted, err := r.rebalanceMasters(context.Background(), lr, driftGT(), nil)
+		if err != nil || acted {
+			t.Fatalf("acted=%v err=%v, want acted=false err=nil (retry next pass)", acted, err)
+		}
+		// Reporting a move that did not happen is worse than reporting nothing: it would tell
+		// an operator mastership changed when it did not.
+		for _, e := range drainRecorderEvents(rec) {
+			if strings.Contains(e, reasonMasterRebalanced) {
+				t.Errorf("a FAILED failover must not be reported as a rebalance: %s", e)
+			}
+		}
+		if lr.Status.MultiSite.RebalancePendingSince != nil {
+			t.Error("no move is in flight, so nothing must be waiting to settle")
 		}
 	})
 }
