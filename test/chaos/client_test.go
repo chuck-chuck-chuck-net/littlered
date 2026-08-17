@@ -17,8 +17,66 @@ limitations under the License.
 package chaos
 
 import (
+	"errors"
+	"fmt"
 	"testing"
+
+	"github.com/redis/go-redis/v9"
 )
+
+// TestClassifyRead pins the distinction that DataCorruptions alone could never
+// catch: a read that finds an already-ACKed key *absent* is a lost write (a
+// durability failure), not a read failure (an availability one). Writes carry no
+// TTL, so absence has no benign explanation.
+func TestClassifyRead(t *testing.T) {
+	const expected = "cafebabe"
+
+	tests := []struct {
+		name   string
+		result string
+		err    error
+		want   readOutcome
+	}{
+		{
+			name:   "key present with expected value",
+			result: expected,
+			want:   readOK,
+		},
+		{
+			name: "key absent — an acknowledged write vanished",
+			err:  redis.Nil,
+			want: readLost,
+		},
+		{
+			name: "key absent, error wrapped by a caller",
+			err:  fmt.Errorf("get 42: %w", redis.Nil),
+			want: readLost,
+		},
+		{
+			name: "transport error",
+			err:  errors.New("dial tcp 10.0.0.1:6379: i/o timeout"),
+			want: readFailed,
+		},
+		{
+			name: "server refuses to serve the slot",
+			err:  errors.New("CLUSTERDOWN The cluster is down"),
+			want: readFailed,
+		},
+		{
+			name:   "key present with the wrong value",
+			result: "deadbeef",
+			want:   readCorrupt,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := classifyRead(tt.result, tt.err, expected); got != tt.want {
+				t.Errorf("classifyRead() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
 
 func TestExpectedValue(t *testing.T) {
 	// Test deterministic value generation

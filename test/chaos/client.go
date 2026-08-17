@@ -23,6 +23,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -41,6 +42,7 @@ type Metrics struct {
 	ReadAttempts     atomic.Int64
 	ReadSuccesses    atomic.Int64
 	ReadFailures     atomic.Int64
+	LostKeys         atomic.Int64
 	DataCorruptions  atomic.Int64
 	HighestConfirmed atomic.Int64
 }
@@ -53,6 +55,7 @@ type MetricsSnapshot struct {
 	ReadAttempts     int64 `json:"readAttempts"`
 	ReadSuccesses    int64 `json:"readSuccesses"`
 	ReadFailures     int64 `json:"readFailures"`
+	LostKeys         int64 `json:"lostKeys"`
 	DataCorruptions  int64 `json:"dataCorruptions"`
 	HighestConfirmed int64 `json:"highestConfirmed"`
 }
@@ -65,7 +68,12 @@ func (m MetricsSnapshot) WriteAvailability() float64 {
 	return float64(m.WriteSuccesses) / float64(m.WriteAttempts)
 }
 
-// ReadAvailability returns the ratio of successful reads to attempted reads
+// ReadAvailability returns the ratio of successful reads to attempted reads.
+//
+// A lost key counts as a non-success here, deliberately: the client asked for
+// data it had been promised and did not get it. So this ratio alone cannot tell
+// "the store was unreachable" from "the store answered, and the data was gone" —
+// read it together with LostKeys, which separates the two.
 func (m MetricsSnapshot) ReadAvailability() float64 {
 	if m.ReadAttempts == 0 {
 		return 1.0
@@ -73,15 +81,28 @@ func (m MetricsSnapshot) ReadAvailability() float64 {
 	return float64(m.ReadSuccesses) / float64(m.ReadAttempts)
 }
 
+// KeyLossRate returns the ratio of reads that found an already-ACKed key absent.
+// This is a durability measure, deliberately kept out of ReadAvailability: an
+// acknowledged-then-lost write and a read the server could not serve are
+// different failures, and conflating them hides the worse one.
+func (m MetricsSnapshot) KeyLossRate() float64 {
+	if m.ReadAttempts == 0 {
+		return 0.0
+	}
+	return float64(m.LostKeys) / float64(m.ReadAttempts)
+}
+
 // String returns a human-readable summary of the metrics
 func (m MetricsSnapshot) String() string {
 	return fmt.Sprintf(
 		"Writes: %d attempted, %d succeeded, %d failed (%.2f%% availability)\n"+
 			"Reads: %d attempted, %d succeeded, %d failed (%.2f%% availability)\n"+
+			"Lost keys (ACKed write, key absent): %d (%.2f%% of reads)\n"+
 			"Data corruptions: %d\n"+
 			"Highest confirmed key: %d",
 		m.WriteAttempts, m.WriteSuccesses, m.WriteFailures, m.WriteAvailability()*100,
 		m.ReadAttempts, m.ReadSuccesses, m.ReadFailures, m.ReadAvailability()*100,
+		m.LostKeys, m.KeyLossRate()*100,
 		m.DataCorruptions,
 		m.HighestConfirmed,
 	)
@@ -289,6 +310,40 @@ func (tc *TestClient) doWrite(n int64) {
 	}
 }
 
+// readOutcome is the classification of a single read of an already-confirmed key.
+type readOutcome int
+
+const (
+	// readOK — the key was present and held the expected value.
+	readOK readOutcome = iota
+	// readFailed — the read did not complete (transport error, timeout, server
+	// refusing to serve). An availability event.
+	readFailed
+	// readLost — the read completed and the key was absent. Because every write
+	// is issued without a TTL and the key was previously ACKed, absence means an
+	// acknowledged write vanished. A durability event, not an availability one.
+	readLost
+	// readCorrupt — the key was present but held a value other than the expected
+	// one. The strongest failure signal there is.
+	readCorrupt
+)
+
+// classifyRead is the pure seam: it decides what a read result means, so the
+// distinction between "could not read" and "the data is gone" is testable
+// without a live Redis.
+func classifyRead(result string, err error, expected string) readOutcome {
+	if err != nil {
+		if errors.Is(err, redis.Nil) {
+			return readLost
+		}
+		return readFailed
+	}
+	if result != expected {
+		return readCorrupt
+	}
+	return readOK
+}
+
 // doRead attempts to read and verify a random confirmed key
 func (tc *TestClient) doRead() {
 	// Pick a random key from the confirmed slice
@@ -308,18 +363,17 @@ func (tc *TestClient) doRead() {
 
 	key := tc.keyName(n)
 	result, err := tc.client.Get(ctx, key).Result()
-	if err != nil {
+
+	switch classifyRead(result, err, expectedValue(n)) {
+	case readFailed:
 		tc.metrics.ReadFailures.Add(1)
-		return
-	}
-
-	expected := expectedValue(n)
-	if result != expected {
+	case readLost:
+		tc.metrics.LostKeys.Add(1)
+	case readCorrupt:
 		tc.metrics.DataCorruptions.Add(1)
-		return
+	case readOK:
+		tc.metrics.ReadSuccesses.Add(1)
 	}
-
-	tc.metrics.ReadSuccesses.Add(1)
 }
 
 // Start begins the test client operations
@@ -376,6 +430,7 @@ func (tc *TestClient) GetMetrics() MetricsSnapshot {
 		ReadAttempts:     tc.metrics.ReadAttempts.Load(),
 		ReadSuccesses:    tc.metrics.ReadSuccesses.Load(),
 		ReadFailures:     tc.metrics.ReadFailures.Load(),
+		LostKeys:         tc.metrics.LostKeys.Load(),
 		DataCorruptions:  tc.metrics.DataCorruptions.Load(),
 		HighestConfirmed: tc.metrics.HighestConfirmed.Load(),
 	}

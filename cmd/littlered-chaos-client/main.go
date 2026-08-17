@@ -127,11 +127,11 @@ loop:
 			dRead := m.ReadSuccesses - lastMetrics.ReadSuccesses
 			lastMetrics = m
 
-			fmt.Printf("[%v] Writes: %d/%d (%.1f%%, +%d), Reads: %d/%d (%.1f%%, +%d), Corruptions: %d\n",
+			fmt.Printf("[%v] Writes: %d/%d (%.1f%%, +%d), Reads: %d/%d (%.1f%%, +%d), Lost: %d, Corruptions: %d\n",
 				elapsed,
 				m.WriteSuccesses, m.WriteAttempts, m.WriteAvailability()*100, dWrite,
 				m.ReadSuccesses, m.ReadAttempts, m.ReadAvailability()*100, dRead,
-				m.DataCorruptions)
+				m.LostKeys, m.DataCorruptions)
 		}
 	}
 
