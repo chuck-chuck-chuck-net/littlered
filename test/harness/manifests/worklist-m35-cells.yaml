@@ -1,0 +1,92 @@
+# M3.5 work list — the matrix cells that need no fault primitive.
+#
+# docs/E2E_SOAK_HARNESS_DESIGN.md §11 M3.5 / docs/MULTI_SITE_E2E_TEST_MATRIX.md §9 step 3.
+# Every cell's "fault" here is an API call or a pod delete, so this array runs on exactly the
+# infrastructure M3 already proved. It is the point where the harness stops being infrastructure
+# and starts producing findings about littlered itself.
+#
+# WHY THIS ORDER. Cheapest and most deterministic first, so a broken lab or a broken driver is
+# discovered in two minutes rather than forty:
+#
+#   1. F1   — pure API calls. No Redis needs to be healthy at all (a CEL transition rule fires on
+#             any Update), so this fails fast and for unambiguous reasons.
+#   2. I1/I3 — bringup regressions. One instance each, no disruption beyond a Secret rewrite.
+#   3. G2   — the rebalancer must be INERT on a balanced cluster. Run BEFORE the drift cells:
+#             if the rebalancer churns spontaneously, every G assertion below is meaningless,
+#             and this is the cheapest way to find that out.
+#   4. G1/G4/G5 — first contact with the rebalancer's executor. Deliberately last: they are the
+#             only items here that deliberately move mastership on a live cluster.
+#
+# EACH ITEM OWNS ITS OWN NAMESPACES AND INSTANCES. The specs create and tear down their own
+# topologies (the fixture field below selects the SUITE's multi-site context, not the topology the
+# spec builds), so items are independent and a parked failure cannot poison the next one.
+#
+# PREREQUISITES — the lab substrate bootstrapped once, and the images pushed at this array's tag:
+#
+#     make e2e-harness-sites-setup E2E_HARNESS_LAB=/path/to/your-lab.yaml
+#     make e2e-harness-images LITTLERED_REGISTRY=<your registry>
+#
+# For an unattended run add a mirrored redisImage below (and mirror oliver006/redis_exporter into
+# the same registry — the exporter inherits the main image's registry). A mirror hostname is never
+# a committed default, so the shipped list keeps the public one.
+#
+# NOT INCLUDED: G9, the upgrade-actuation cell. It needs a SECOND operator image built from a
+# pre-LR-031 commit with the CRD pinned at the current version, which is infrastructure this
+# array does not yet have. Deferred deliberately, and in the right order: G9 validates the
+# upgrade path, which is worth little until G1/G4/G5 show the executor works at all.
+
+array: m35cells
+
+defaults:
+  # These items bring up 6-9 pods across sites and wait for a stretched cluster to form, then
+  # exercise a 30s-cooldown reconciler. Generous enough for a cold node's image pulls plus two
+  # settle cooldowns, tight enough that a wedged item cannot eat the night.
+  timeout: 40m
+  # For an autonomous run:
+  #   redisImage: myregistry.example/library/redis:8.4.2
+
+items:
+    # --- 1. Topology immutability (F1). Four contexts, three multi-site fixtures plus a
+    # single-site instance, created and torn down one at a time.
+  - name: f1-immutability
+    fixture: F2-K4
+    labelFilter: multisite-immutability
+    # No focus: all four contexts of the cell run, each standing up the fixture its own §2.1
+    # analysis requires (a 2-site fixture would make two of the cases prove nothing).
+    timeout: 30m
+
+    # --- 2. Bringup regressions (I1, I3).
+  - name: i1-clusterformed-veto
+    fixture: F2-K4
+    labelFilter: multisite-bringup
+    focus: never arms a takeover
+    # I1 deliberately HOLDS past the full takeover cooldown and then waits for a healed
+    # bootstrap, so it is the slowest of the no-fault cells.
+    timeout: 35m
+
+  - name: i3-crosssite-replicas-rps0
+    fixture: F2-K4
+    labelFilter: multisite-bringup
+    focus: reattaches every cross-site member
+
+    # --- 3. The rebalancer must be inert before we trust it to act.
+  - name: g2-no-thrash-when-balanced
+    fixture: F3-K3
+    labelFilter: multisite-rebalance
+    focus: issues zero rebalance moves
+
+    # --- 4. First contact with the rebalancer's executor (G1, G4, G5).
+  - name: g1-native-target-3site
+    fixture: F3-K3
+    labelFilter: multisite-rebalance
+    focus: restores the native-survival target
+
+  - name: g4-floor-tier-dual-site
+    fixture: F2-K4
+    labelFilter: multisite-rebalance
+    focus: falls to the floor tier
+
+  - name: g5-floor-tier-3site
+    fixture: F3-K4
+    labelFilter: multisite-rebalance
+    focus: restores the fence-safe
