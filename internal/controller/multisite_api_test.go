@@ -158,42 +158,75 @@ var _ = Describe("MultiSite CRD validation", func() {
 		return lr
 	}
 
+	// Each transition spec asserts the SPECIFIC rule that must reject it, never merely
+	// that the Update failed. Four of these used to assert `NotTo(Succeed())`, which is
+	// the same weakness LR-033 found the hard way: a spec that is rejected for some
+	// unrelated reason passes while testing nothing, and a mutation that deletes its
+	// rule stays green. Note that ContainSubstring alone is NOT sufficient protection —
+	// an edit rejected by several rules yields all their messages — so the fixtures
+	// below are also chosen so that exactly ONE rule can apply (measured, see the F1
+	// header in test/e2e/multisite_immutability_test.go).
+	rejectedBy := func(err error, wantMsg string) {
+		GinkgoHelper()
+		Expect(err).To(HaveOccurred(), "the API server must reject this edit")
+		Expect(err.Error()).To(ContainSubstring(wantMsg),
+			"rejected, but not by the rule under test — this spec would stay green if that "+
+				"rule were deleted")
+	}
+
 	It("rejects adding a site to an existing instance", func() {
 		lr := create(&littleredv1alpha1.MultiSiteSpec{
 			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
 			SitesPerShard: 2,
 		})
 		lr.Spec.MultiSite.Sites = append(lr.Spec.MultiSite.Sites, remote("gamma", "c"))
-		err := k8sClient.Update(ctx, lr)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("immutable"))
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.multiSite.sites is immutable")
 	})
 
+	// 3 sites → 2 keeps MinItems=2 AND keeps sitesPerShard(2) <= sites(2), so immutability
+	// is the only applicable rule. On a 2-site instance this same edit trips three rules.
 	It("rejects removing a site from an existing instance", func() {
 		lr := create(&littleredv1alpha1.MultiSiteSpec{
 			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b"), remote("gamma", "c")},
 			SitesPerShard: 2,
 		})
 		lr.Spec.MultiSite.Sites = lr.Spec.MultiSite.Sites[:2]
-		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.multiSite.sites is immutable")
 	})
 
+	// The case that exists only because listType went map→atomic (LR-033): under
+	// listType=map, CEL list equality is order-blind and this reorder was ACCEPTED while
+	// silently re-placing every shard.
 	It("rejects reordering the site list (placement is index-based)", func() {
 		lr := create(&littleredv1alpha1.MultiSiteSpec{
 			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
 			SitesPerShard: 2,
 		})
 		lr.Spec.MultiSite.Sites = []littleredv1alpha1.SiteSpec{remote("beta", "b"), remote("alpha", "a")}
-		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.multiSite.sites is immutable")
 	})
 
+	// 3 sites so that raising sitesPerShard to 3 stays within sitesPerShard <= |sites|:
+	// on 2 sites this edit is rejected by that bound too, and proves nothing.
 	It("rejects changing sitesPerShard", func() {
 		lr := create(&littleredv1alpha1.MultiSiteSpec{
 			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b"), remote("gamma", "c")},
 			SitesPerShard: 2,
 		})
 		lr.Spec.MultiSite.SitesPerShard = 3
-		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.multiSite.sitesPerShard is immutable")
+	})
+
+	// The lowering direction gets its own spec rather than being assumed symmetric: it is
+	// the one that would ORPHAN per-site StatefulSets (the LR-028 subject). sps 3→2 stays
+	// at or above Minimum=2, so again exactly one rule applies.
+	It("rejects lowering sitesPerShard", func() {
+		lr := create(&littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b"), remote("gamma", "c")},
+			SitesPerShard: 3,
+		})
+		lr.Spec.MultiSite.SitesPerShard = 2
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.multiSite.sitesPerShard is immutable")
 	})
 
 	It("rejects changing cluster.shards while multiSite is set", func() {
@@ -202,7 +235,24 @@ var _ = Describe("MultiSite CRD validation", func() {
 			SitesPerShard: 2,
 		})
 		lr.Spec.Cluster.Shards = 6
-		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.cluster.shards is immutable while spec.multiSite is set")
+	})
+
+	// The shrink direction, which must be rejected by ADMISSION rather than by the LR-028
+	// runtime guard — that guard is defence in depth and must never be what catches this.
+	// Started at 6 rather than the builder's 3, so the lowered value (4) is still above
+	// Minimum=3 and immutability stays the only applicable rule.
+	It("rejects shrinking cluster.shards while multiSite is set", func() {
+		lr := newMultiSiteCR(ModeCluster, &littleredv1alpha1.MultiSiteSpec{
+			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
+			SitesPerShard: 2,
+		})
+		lr.Spec.Cluster.Shards = 6
+		Expect(k8sClient.Create(ctx, lr)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(ctx, lr) })
+
+		lr.Spec.Cluster.Shards = 4
+		rejectedBy(k8sClient.Update(ctx, lr), "spec.cluster.shards is immutable while spec.multiSite is set")
 	})
 
 	It("rejects adding multiSite to an existing single-site instance", func() {
@@ -211,7 +261,7 @@ var _ = Describe("MultiSite CRD validation", func() {
 			Sites:         []littleredv1alpha1.SiteSpec{remote("alpha", "a"), remote("beta", "b")},
 			SitesPerShard: 2,
 		}
-		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+		rejectedBy(k8sClient.Update(ctx, lr), "cannot be added to or removed from an existing instance")
 	})
 
 	It("rejects removing multiSite from an existing stretched instance", func() {
@@ -220,7 +270,7 @@ var _ = Describe("MultiSite CRD validation", func() {
 			SitesPerShard: 2,
 		})
 		lr.Spec.MultiSite = nil
-		Expect(k8sClient.Update(ctx, lr)).NotTo(Succeed())
+		rejectedBy(k8sClient.Update(ctx, lr), "cannot be added to or removed from an existing instance")
 	})
 
 	// LR-033: sitesPerShard is REQUIRED, so there is no dynamic default for the
