@@ -31,6 +31,54 @@ import (
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
 
+// failoverDisruptions are the three shapes in which a master can be lost, named
+// for what they actually do to the process — which is the distinction that turned
+// out to decide whether acknowledged writes survive (LR-038):
+//
+//	graceful      pod deleted normally. SIGTERM, preStop runs, the pod self-fences
+//	              and hands over. A PLANNED handover.
+//	force-delete  `--grace-period=0 --force`. The pod OBJECT is removed from the
+//	              API immediately, but the container still terminates through the
+//	              kubelet's normal path — measurement says hooks run here too.
+//	kill-9        the container's PID 1 is killed from outside its PID namespace.
+//	              NO hook can run, the process dies instantly, the pod and its IP
+//	              survive, and the epoch gate parks the restarted container.
+//
+// NOTE the suite-wide `restartModes` calls its force-delete variant "crash",
+// which is misleading in exactly the way that cost this investigation time: a
+// force delete is not a crash, and conflating the two hid that only kill-9 is
+// genuinely hook-less. Renaming `restartModes` would rename six specs and every
+// FOCUS string that selects them, so this tier carries its own accurate names and
+// the global rename is a separate sweep.
+var failoverDisruptions = []struct {
+	Name string
+	// Planned marks a disruption the operator is told about in advance (a
+	// deletionTimestamp), so a clean handover is possible and its cost is
+	// assertable. An abrupt loss has no handover to measure.
+	Planned bool
+	Apply   func(namespace, podName string)
+}{
+	{
+		Name:    "graceful",
+		Planned: true,
+		Apply: func(namespace, podName string) {
+			_, err := deletePodMode(namespace, podName, true)
+			Expect(err).NotTo(HaveOccurred())
+		},
+	},
+	{
+		Name: "force-delete",
+		Apply: func(namespace, podName string) {
+			_, err := deletePodMode(namespace, podName, false)
+			Expect(err).NotTo(HaveOccurred())
+		},
+	},
+	{
+		Name:  "kill-9",
+		Apply: killPodProcess,
+	},
+}
+
 // Failover-mode chaos tier — the deliberate counterpart of the sentinel-mode
 // "rapid double failover" pair in sentinel_standalone_chaos_test.go.
 //
@@ -45,20 +93,21 @@ import (
 //
 // It is NOT redundant with the existing failover specs: "Hybrid Double-Failover"
 // asserts correctness invariants (UID/RunID/label agreement) with no traffic
-// flowing, and the kill-9 tier measures availability but for an in-place
-// container crash rather than a cascade of pod losses. This is the only failover
-// spec that measures write availability across a rapid mastership cascade.
+// flowing, and the standalone kill-9 tier measures a SINGLE in-place crash. This
+// is the only failover spec that measures availability and durability across a
+// rapid mastership cascade, and the only one that measures all three disruption
+// shapes on one yardstick.
 //
 // Cost note: like its sentinel twin this is NOT labelled "extended" (parity —
 // an opt-in mirror of a default-tier test would not get run alongside it), so it
-// adds two ~3min specs to a default run. Skip with LABEL_FILTER='!failover-mode'.
+// adds three ~3min specs to a default run. Skip with LABEL_FILTER='!failover-mode'.
 var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered, func() {
 
 	Context("Failover Resilience", Ordered, func() {
-		for _, mode := range restartModes {
-			mode := mode // capture range variable
-			It(fmt.Sprintf("should maintain availability during rapid double failover (%s)", mode.Name), func() {
-				crName := fmt.Sprintf("chaos-failover-%s-%d", mode.Name, time.Now().Unix())
+		for _, d := range failoverDisruptions {
+			d := d // capture range variable
+			It(fmt.Sprintf("should maintain availability during rapid double failover (%s)", d.Name), func() {
+				crName := fmt.Sprintf("chaos-failover-%s-%d", d.Name, time.Now().Unix())
 				// Add dynamic labels for the artifact collector
 				AddReportEntry("cr:" + crName)
 				const testDuration = 120 * time.Second
@@ -122,8 +171,7 @@ var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered,
 
 				oldRunID1, _ := getPodRunID(testNamespace, master1)
 
-				_, err = deletePodMode(testNamespace, master1, mode.Graceful)
-				Expect(err).NotTo(HaveOccurred())
+				d.Apply(testNamespace, master1)
 
 				// 20s comfortably clears the 10s post-transition cooldown that serializes
 				// cascades (ADR-011), so failover 2 is a genuine second event and not a
@@ -146,8 +194,7 @@ var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered,
 					oldRunID2 = runID
 				}, 1*time.Minute, 2*time.Second).Should(Succeed())
 
-				_, err = deletePodMode(testNamespace, master2, mode.Graceful)
-				Expect(err).NotTo(HaveOccurred())
+				d.Apply(testNamespace, master2)
 
 				By("verifying third master eventually emerges with different RunID")
 				Eventually(func(g Gomega) {
@@ -168,7 +215,7 @@ var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered,
 
 				metrics, err := getChaosClientMetrics(testNamespace, chaosPodName)
 				Expect(err).NotTo(HaveOccurred())
-				GinkgoWriter.Printf("Failover Rapid-Double-Failover Metrics (%s):\n%s\n", mode.Name, metrics.String())
+				GinkgoWriter.Printf("Failover Rapid-Double-Failover Metrics (%s):\n%s\n", d.Name, metrics.String())
 
 				// Same two assertions, same thresholds, as the sentinel tier. Corruption
 				// is the hard invariant; the availability bar is deliberately loose
@@ -199,11 +246,24 @@ var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered,
 				// The crash path is deliberately NOT bounded here: a kill -9 loses the
 				// unreplicated tail by construction (async replication), and asserting
 				// a number we have not measured would be tuning, not a check.
-				if mode.Graceful {
-					Expect(metrics.FinalMissing).To(BeNumerically("<=", 5),
-						"acknowledged writes were lost on a PLANNED handover: %d of %d. "+
-							"DataCorruptions cannot catch this — the writes are gone, not wrong.",
-						metrics.FinalMissing, metrics.FinalChecked)
+				// DURABILITY — every shape, not just the planned one.
+				//
+				// The bound is a design claim, not a fitted number: a master either
+				// gets to fence itself before dying (graceful, force-delete) or dies
+				// instantly with nothing in flight to lose (kill-9). Neither leaves a
+				// window in which acknowledged writes can vanish, so the only writes
+				// at risk are those ACKed within the replication lag of the promotion
+				// instant — ~1 per failover at 10 writes/s, so ~2 here.
+				//
+				// Measured 0 on all three shapes. This is the assertion most likely to
+				// teach us something if it ever fails: it went red at 202 of 1171 when
+				// the terminating master was never fenced at all.
+				Expect(metrics.FinalMissing).To(BeNumerically("<=", 5),
+					"acknowledged writes were LOST (%s): %d of %d. DataCorruptions cannot "+
+						"catch this — the writes are gone, not wrong.",
+					d.Name, metrics.FinalMissing, metrics.FinalChecked)
+
+				if d.Planned {
 
 					// AVAILABILITY, graceful path only — the other half of the handover.
 					//
