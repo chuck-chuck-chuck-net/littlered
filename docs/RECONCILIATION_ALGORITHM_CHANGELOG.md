@@ -282,6 +282,53 @@ Three readings, in descending confidence:
 1. **The fence works, and durability parity on the graceful path is reached.** 0 lost, replicated across two runs (0 of 990, 0 of 983).
 2. **The fence's availability cost is roughly double sentinel's** (81.98% vs 94.75%, i.e. ~216 failed writes vs ~63). The arithmetic points at the cause: ~216 failures at 10 writes/s ≈ 21.6s over two failovers ≈ **the full remaining preStop window each time**. Fencing stops the writes from being *lost*, but the client's established connection stays pinned to the old pod until it dies, so every write in that window fails rather than being served by the new master. Sentinel's pod-led preStop instead *waits for the master address to change* and then exits, cutting the window short. The obvious next step is to stop making the client wait for the pod to die — after the demote, `CLIENT KILL TYPE normal` on the outgoing master forces a reconnect, which the Service then routes to the new master. Untested; it would convert most of that 21.6s into a sub-second reconnect.
 3. **failover-crash's 19-20 lost keys are unexplained**, and the leading suspect is a **test-parity defect rather than the mode**: `failoverCR` pins `resources.limits.cpu: "100m"` (`failover_utils_test.go`) while the sentinel chaos CR sets no resources and therefore gets the product defaults — which per pillar 3.3 include **no CPU limit at all**. A replica throttled to 0.1 core lags, and ~20 keys is ~2s of replication lag at the client's 10 writes/s. So the "mirror" tier, whose entire stated purpose is comparability, is not actually comparing like with like. Until that is equalised, no mode-level conclusion should be drawn from the crash cells. The second candidate, if throttling is ruled out, is the replica-selection interaction on the *second* cascade: after failover 1 the killed pod returns and full-resyncs (EmptyDir), so crash 2 chooses between a continuously-attached replica and a resyncing one, and `BestDataHolder`'s offset comparison across a fresh full-resync deserves a direct look.
+
+### Addendum 2 — the pod fences itself, and the matrix closes (t3e, 2026-08-18)
+
+The operator-side fence (above) fixed the graceful path's *durability* and made its
+*availability* worse: writes stopped vanishing but started failing for the whole
+remaining preStop window, 81.23% against sentinel's ~95%. Both halves are now fixed, by
+moving the primary fence into the pod.
+
+**Re-reading LR-016 is what unlocked it.** LR-016 forbids a pod inferring the state of
+OTHER nodes — its origin was a probe restarting a replica because its master looked
+unreachable. `sleep 10` treated that as "a pod may do nothing", which is a category
+error: **"I am being terminated" is local knowledge that cannot be wrong**, and the pod is
+the only party holding it instantly. So the preStop now (1) self-fences with
+`CONFIG SET min-replicas-to-write 99` — **target-free on purpose**, since needing to know
+the new master would reintroduce the very race this removes — and (2) waits for
+mastership to move, then exits *at once* instead of sleeping out the window. A replica
+exits immediately, having nothing to hand over (which also stops rolling updates paying
+the budget per pod). The operator-side fence remains as the backstop; safety no longer
+depends on it winning a race.
+
+**Final four-cell matrix, one harness, exact final-sweep numbers:**
+
+| cell | writes | reads | ACKed writes lost |
+|---|---|---|---|
+| failover graceful | **96.07%** | 98.33% | **0** of 1149 |
+| failover crash | **98.50%** | **100.00%** | **0** of 1181 |
+| sentinel graceful | 95.41% | 98.25% | **0** of 1143 |
+| sentinel crash | 97.58% | 99.50% | **0** of 1169 |
+
+Zero loss in every cell, and failover mode is now at or better than sentinel on **all
+four** numbers. For the ADR-011 graduation gate that settles the availability-vs-Sentinel
+question in failover mode's favour — but only because the durability number was measured
+first: the mode previously looked *better* than sentinel on write availability precisely
+while it was the only one of the two losing acknowledged data.
+
+**Honest open question.** The crash cell also went 20 lost → 0 (18/17/18 visible write
+failures across three runs, a near-1:1 conversion), and a `--grace-period=0 --force`
+delete should not run a preStop hook at all. Leading hypothesis: `--force` removes the API
+object while the **kubelet still runs its normal termination path**, hook included, because
+it never observed a zero-grace deletion object — which would mean "crash" in this tier was
+never SIGKILL-without-a-hook, and the ~2s window came from endpoint removal breaking the
+client's pinned connection. Not confirmed: `kubectl logs` cannot read a force-deleted pod,
+so the obvious instrument is blind, and the reproducible-but-unexplained result is recorded
+as such rather than claimed. The clean control is the **kill-9 tier**, where the container
+process dies and no hook can possibly run — if that path loses writes while force-delete
+does not, the hypothesis is confirmed and the unconditional operator-side fence gets a real
+red to be built against.
 ## [LR-039] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
 > **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and LR-038 on the
 > failover line (`release/0.3.1`); none are present on this branch, hence the jump from LR-025.

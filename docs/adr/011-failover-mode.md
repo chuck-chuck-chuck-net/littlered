@@ -5,6 +5,11 @@ Accepted (mode ships as **experimental**; see Lifecycle).
 Amended 2026-08-17 (LR-038): §7 gains the outgoing-master **fence**, and §8's graduation
 gate gains a **durability** bar — an availability bar alone graduated a mode that
 silently lost acknowledged writes on every graceful handover.
+Amended 2026-08-18 (LR-038): the **primary fence moves into the pod** (preStop self-fence,
+target-free, then exit as soon as mastership moves), because operator-side fencing can only
+win a race while the pod cannot lose one. §4 also corrects a false statement about Pod
+watches. Outcome: zero acknowledged writes lost in all four cells of the two modes'
+rapid-double-failover tiers, with failover mode at or better than sentinel on every number.
 
 ## Context
 
@@ -117,7 +122,16 @@ multi-master windows become normal).
   today's `sentinel_monitor.go`) probes the current master IP on a ~1s cadence with
   `ProbeTimeout`-bounded `INFO` and pushes a `GenericEvent` when a failure streak
   crosses `downAfterMilliseconds` — replacing the `+switch-master` subscription as the
-  fast path. Pod add/delete/readiness events already trigger reconcile via ownership.
+  fast path.
+  **Correction (2026-08-18, LR-038): the controller does NOT watch Pods.** `SetupWithManager`
+  owns ConfigMap/Service/StatefulSet/PDB only, so a pod appearing or vanishing reaches the
+  reconcile *indirectly* — via the StatefulSet's own status changing (e.g. `readyReplicas`
+  dropping), via the monitor channel, or via the 2s/30s requeue. This matters because the
+  StatefulSet status carries no information about whether the old master's **process** is
+  still running, which is precisely the distinction the fence exists for. Adding a Pod watch
+  is desirable for latency but must not be mistaken for a fix: alone it would make the
+  operator promote *sooner* relative to the container's real death, widening the window in
+  which an unfenced ex-master can still accept writes.
 - The master is declared dead iff:
   - **(a) Kubernetes-authoritative:** the master pod is deleted/replaced or its redis
     container is not-Ready per kubelet. Acted on immediately — the kubelet's local
@@ -205,18 +219,30 @@ and those writes die with it. Measured on t3e: **202 of 1171 acknowledged writes
 with `DataCorruptions: 0` and write availability 97.66%. The keys were gone, not wrong,
 so nothing caught it.
 
-So the promotion carries a fence: demote the outgoing master (`REPLICAOF <new-master>`,
-pure `planFailoverFence`) so it answers `-READONLY`. The loss becomes **visible write
+So a handover has two halves, and **the primary fence lives in the pod**: on SIGTERM the
+preStop self-fences with `CONFIG SET min-replicas-to-write 99` — target-free, because
+needing to know the new master would reintroduce the race it removes — then waits for
+mastership to move and exits at once. LR-016 does not forbid this: it forbids a pod
+inferring the state of *other* nodes, whereas "I am being terminated" is local knowledge
+that cannot be wrong, held instantly and only by the pod. Operator-side fencing can only
+win a race; the pod cannot lose one.
+
+The operator still demotes the outgoing master (`REPLICAOF <new-master>`, pure
+`planFailoverFence`) as a backstop and convergence step, so it answers `-READONLY`. The loss becomes **visible write
 failures instead of silent data loss** — pillar 3.2's principle, applied to failover
 rather than to memory pressure. It is the §6 straggler repoint applied to the one pod
 that gate excludes, at the one moment it matters, so it is best-effort and idempotent;
 it is skipped when the outgoing master is unreachable (the crash path leaves nothing to
 fence), already demoted, or is itself the pod being promoted.
 
-Verified on t3e: **202 of 1171 acknowledged writes lost → 0 of 990**, with the conversion
-visible almost one-for-one (write availability 97.66% → 82.50%, i.e. ~210 *visible*
-failures where ~202 writes used to vanish; read availability 78.05% → 99.17%, since those
-"read failures" *were* the lost keys). Fencing keys off the **pod list**, not the gathered
+Verified on t3e: **202 of 1171 acknowledged writes lost → 0**, with the conversion visible
+almost one-for-one (~210 *visible* failures where ~202 writes used to vanish; read
+availability 78.05% → 99.17%, since those "read failures" *were* the lost keys). The
+operator-side fence alone cost write availability (82.50%) because the pod held the
+client's pinned connection for its whole remaining window; with the pod-local fence and
+prompt exit the graceful path measures **96.07% writes / 0 lost**, and the full four-cell
+matrix has **zero loss in every cell with failover mode at or better than sentinel on all
+four numbers** (§8). Fencing keys off the **pod list**, not the gathered
 Redis state: the gather deliberately omits terminating pods, so a first attempt keyed on it
 was silently inert — and widening the gather would be worse than inert, because a
 reachable, still-mastering terminating pod would then read as a *live* master to
@@ -246,7 +272,11 @@ handful of acknowledged writes may be lost — the bound is the replication lag 
 promotion instant (~1 per failover at the chaos client's 10 writes/s), asserted as ≤ 5
 over the two-failover tier. This bar exists because the availability bars above are
 blind to it: the mode passed every one of them while losing 17% of acknowledged writes
-(§7). It is measured by the chaos client's exact post-traffic sweep over every
+(§7). **Outcome (t3e, 2026-08-18):** all four cells of the two modes' rapid-double-failover
+tiers now lose **zero** acknowledged writes, and failover mode measures at or better than
+sentinel on write and read availability in both the graceful and crash variants — the
+comparison this gate exists to settle, decided only because durability was measured
+first. It is measured by the chaos client's exact post-traffic sweep over every
 acknowledged write, not by the sampled read counters, which cannot distinguish one lost
 key read five times from five lost keys. The *crash* path is deliberately not bounded —
 a kill -9 loses the unreplicated tail by construction.
