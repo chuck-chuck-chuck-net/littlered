@@ -400,12 +400,7 @@ done`
 	}
 	finalScript := buf.String()
 
-	// preStop only holds the termination grace window open: graceful handover
-	// is operator-led (ADR-011 §7 — the reconcile sees the deletionTimestamp
-	// and promotes proactively during the grace period). Do NOT port the
-	// sentinel-mode preStop's failover logic; the pod makes no topology
-	// decisions (LR-016).
-	preStopScript := "sleep 10"
+	preStopScript := buildFailoverPreStop(lr)
 
 	container := corev1.Container{
 		Name:            ComponentRedis,
@@ -499,6 +494,109 @@ done`
 	}
 
 	return container
+}
+
+// failoverPreStopWaitIterations x failoverPreStopWaitSeconds bounds how long the
+// hook waits for the operator to move mastership away. The product matches the
+// old fixed `sleep 10`, so the worst case is unchanged and stays well inside the
+// default 30s termination grace period; the difference is that the hook now
+// leaves as soon as the handover is done instead of always sleeping it out.
+const (
+	failoverPreStopWaitIterations = 10
+	failoverPreStopWaitSeconds    = 1
+)
+
+// buildFailoverPreStop renders the failover-mode preStop hook: SELF-FENCE, then
+// wait for the operator to move mastership away, then exit promptly.
+//
+// WHY THE POD AND NOT THE OPERATOR (LR-038). ADR-011 §7 made the handover
+// operator-led and left the hook as a bare `sleep 10`, on the reading that a pod
+// must make no topology decisions (LR-016). That reading was too broad: LR-016
+// forbids inferring the state of OTHER nodes — the mistake was a probe restarting
+// a replica because its master looked unreachable. "I am being terminated" is
+// local knowledge that cannot be wrong, and the pod is the only party that has it
+// instantly. Acting on it is not a topology decision.
+//
+// This matters because operator-side fencing can only ever win a race, while the
+// pod cannot lose one: the write path closes before the operator has even noticed
+// the deletionTimestamp. Measured, the operator-side fence alone left 202 of 1171
+// acknowledged writes lost per two graceful failovers before it worked at all.
+//
+// The fence is deliberately TARGET-FREE. `min-replicas-to-write 99` cannot be
+// satisfied, so writes fail -NOREPLICAS immediately, and we never need to know
+// who the new master is — needing that would reintroduce exactly the race this
+// removes. Reads keep serving and replication of already-ACKed writes continues,
+// so the promoted replica still receives them. Nothing is persisted (no CONFIG
+// REWRITE), so a container restart clears it.
+//
+// Then it waits for mastership to move and exits at once when it has. The old
+// fixed sleep held the pod — and with it the client's pinned TCP connection,
+// which a label flip does not re-route — for the full grace window even though
+// the handover completed in about a second, turning ~9s per failover into refused
+// writes. A replica exits immediately, since it has nothing to hand over (which
+// also speeds up rolling updates).
+func buildFailoverPreStop(lr *littleredv1alpha1.LittleRed) string {
+	tmpl := template.Must(template.New("failover-prestop").Delims("[[", "]]").Parse(`
+exec >/proc/1/fd/1 2>&1
+echo "preStop: starting at $(date)"
+
+AUTH_ARGS=""
+if [ -n "$REDIS_PASSWORD" ]; then
+  AUTH_ARGS="-a $REDIS_PASSWORD --no-auth-warning"
+fi
+
+myrole() {
+  redis-cli $AUTH_ARGS [[.TLSFlags]] -t 2 info replication 2>/dev/null \
+    | grep -F 'role:' | head -n 1 | cut -d: -f2 | tr -d '\r'
+}
+
+ROLE=$(myrole)
+echo "preStop: my role is '$ROLE'"
+
+if [ "$ROLE" != "master" ]; then
+  echo "preStop: not the master — nothing to hand over, exiting immediately"
+  exit 0
+fi
+
+# SELF-FENCE. Target-free on purpose (see buildFailoverPreStop).
+if redis-cli $AUTH_ARGS [[.TLSFlags]] -t 2 CONFIG SET min-replicas-to-write 99 >/dev/null 2>&1; then
+  echo "preStop: writes fenced (-NOREPLICAS); reads and replication continue"
+else
+  echo "preStop: WARNING could not fence writes — the operator-side fence is the backstop"
+fi
+
+# Wait for the operator to move mastership away, then leave at once.
+i=0
+while [ $i -lt [[.WaitIterations]] ]; do
+  R=$(myrole)
+  if [ "$R" != "master" ]; then
+    echo "preStop: mastership handed over (role now '$R'), exiting"
+    exit 0
+  fi
+  i=$((i + 1))
+  sleep [[.WaitSeconds]]
+done
+echo "preStop: still master after the wait budget — exiting anyway, writes stay fenced"
+exit 0
+`))
+
+	tlsFlags := ""
+	if lr.Spec.TLS.Enabled {
+		tlsFlags = tlsInsecureFlags
+	}
+	var buf bytes.Buffer
+	if err := tmpl.Execute(&buf, struct {
+		TLSFlags       string
+		WaitIterations int
+		WaitSeconds    int
+	}{
+		TLSFlags:       tlsFlags,
+		WaitIterations: failoverPreStopWaitIterations,
+		WaitSeconds:    failoverPreStopWaitSeconds,
+	}); err != nil {
+		panic(fmt.Sprintf("failed to execute failover preStop template: %v", err))
+	}
+	return buf.String()
 }
 
 // buildFailoverLivenessProbe creates the liveness probe for the failover-mode

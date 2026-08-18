@@ -420,3 +420,59 @@ func TestFailoverServicesSelectPods(t *testing.T) {
 		}
 	}
 }
+
+// --- preStop self-fence (LR-038) --------------------------------------------
+//
+// The e2e availability bound in test/e2e/failover_chaos_test.go is what went red
+// for this (81.23% against a 0.90 bar, 225 refused writes); these are the fast
+// structural guards so a future edit cannot quietly undo it. Teeth verified by
+// mutation: restoring the old `sleep 10` body fails the fence assertion here and
+// the TLS assertion below (the fence check is fatal, so it short-circuits the
+// ordering and bound checks in the same run).
+func TestBuildFailoverPreStopSelfFences(t *testing.T) {
+	lr := newFailoverTestLittleRed()
+	script := buildFailoverPreStop(lr)
+
+	const fence = "CONFIG SET min-replicas-to-write 99"
+	if !strings.Contains(script, fence) {
+		t.Fatalf("preStop must self-fence writes; missing %q\n%s", fence, script)
+	}
+
+	// A replica has nothing to hand over: it must leave without waiting, which is
+	// also what keeps rolling updates from paying the wait budget per pod.
+	if !strings.Contains(script, `if [ "$ROLE" != "master" ]`) {
+		t.Error("preStop must exit immediately when this pod is not the master")
+	}
+
+	// Ordering is load-bearing: fencing AFTER the wait would leave the write path
+	// open for exactly the window the fence exists to close.
+	fenceAt := strings.Index(script, fence)
+	waitAt := strings.Index(script, "while [ $i -lt")
+	if fenceAt < 0 || waitAt < 0 || fenceAt > waitAt {
+		t.Errorf("preStop must fence BEFORE waiting for handover (fence at %d, wait at %d)", fenceAt, waitAt)
+	}
+
+	// Bounded: a wedged or absent operator must not hold the pod past its grace
+	// period. The budget also must not regress into the old unconditional sleep.
+	if strings.Contains(script, "while true") || strings.Contains(script, "while :") {
+		t.Error("preStop wait must be bounded, not an infinite loop")
+	}
+	if failoverPreStopWaitIterations*failoverPreStopWaitSeconds > 25 {
+		t.Errorf("preStop wait budget %ds exceeds the default 30s termination grace period with no margin",
+			failoverPreStopWaitIterations*failoverPreStopWaitSeconds)
+	}
+}
+
+func TestBuildFailoverPreStopTLSFlags(t *testing.T) {
+	plain := buildFailoverPreStop(newFailoverTestLittleRed())
+	if strings.Contains(plain, "--tls") {
+		t.Error("preStop must not pass --tls when TLS is disabled")
+	}
+
+	lr := newFailoverTestLittleRed()
+	lr.Spec.TLS.Enabled = true
+	secure := buildFailoverPreStop(lr)
+	if !strings.Contains(secure, "--tls") {
+		t.Error("preStop must pass TLS flags to redis-cli when TLS is enabled, or it cannot fence")
+	}
+}

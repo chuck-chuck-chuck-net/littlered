@@ -204,6 +204,24 @@ var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered,
 						"acknowledged writes were lost on a PLANNED handover: %d of %d. "+
 							"DataCorruptions cannot catch this — the writes are gone, not wrong.",
 						metrics.FinalMissing, metrics.FinalChecked)
+
+					// AVAILABILITY, graceful path only — the other half of the handover.
+					//
+					// A planned handover should cost only as long as the handover
+					// actually takes. Two failovers, each costing the operator's
+					// notice-plus-promote latency (~1-2s at a 2s fast requeue), is
+					// ~2-4s of the 120s window, so >0.90 leaves generous headroom
+					// while still catching the failure mode: a pod that holds its
+					// grace window open for a fixed 10s keeps the client's pinned
+					// connection on a fenced master for ~9s per failover, which is
+					// ~20s of refused writes and lands near 0.82. Sentinel mode,
+					// whose preStop exits as soon as the master address changes,
+					// measures ~0.95 on the identical harness — so this bar also
+					// keeps the mode comparison honest in the direction the fence
+					// made worse.
+					Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.90),
+						"planned handover cost far more write availability than the handover itself: "+
+							"%d of %d writes failed", metrics.WriteFailures, metrics.WriteAttempts)
 				}
 			})
 		}
