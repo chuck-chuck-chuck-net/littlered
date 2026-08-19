@@ -140,6 +140,13 @@ const (
 
 	labelAppName      = "app.kubernetes.io/name"
 	labelAppInstance  = "app.kubernetes.io/instance"
+	labelAppManagedBy = "app.kubernetes.io/managed-by"
+	labelAppVersion   = "app.kubernetes.io/version"
+	labelMode         = operatorKeyPrefix + "mode"
+	managedByValue    = "littlered-operator"
+	// operatorKeyPrefix namespaces every label and annotation key the operator owns.
+	// Keys under it are never inherited from the LittleRed resource (see metadata.go).
+	operatorKeyPrefix = "redis.chuck-chuck-chuck.net/"
 	fileRedisConf     = "redis.conf"
 	volNameConfig     = "config"
 	volNameData       = "data"
@@ -198,21 +205,24 @@ func computePodTemplateHash(tmpl *corev1.PodTemplateSpec) string {
 	return hex.EncodeToString(sum[:])[:16]
 }
 
-// commonLabels returns the standard labels applied to all resources
+// commonLabels returns the standard labels applied to all resources, layered over the
+// labels inherited from the LittleRed resource (ADR-015).
 func commonLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
-	return map[string]string{
-		labelAppName:                       appName,
-		labelAppInstance:                   lr.Name,
-		"app.kubernetes.io/managed-by":     "littlered-operator",
-		"app.kubernetes.io/version":        lr.Spec.Image.Tag,
-		"redis.chuck-chuck-chuck.net/mode": lr.Spec.Mode,
-	}
+	return objectLabels(lr, map[string]string{
+		labelAppName:      appNameFor(lr),
+		labelAppInstance:  lr.Name,
+		labelAppManagedBy: managedByValue,
+		labelAppVersion:   lr.Spec.Image.Tag,
+		labelMode:         lr.Spec.Mode,
+	})
 }
 
-// selectorLabels returns labels used for selecting pods
+// selectorLabels returns labels used for selecting pods. Selectors carry only the
+// operator's structural labels — never inherited ones, which are free to change while a
+// StatefulSet's selector is immutable.
 func selectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return map[string]string{
-		labelAppName:     appName,
+		labelAppName:     appNameFor(lr),
 		labelAppInstance: lr.Name,
 	}
 }
@@ -220,7 +230,7 @@ func selectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 // redisSelectorLabels returns labels for selecting Redis pods
 func redisSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return map[string]string{
-		labelAppName:      appName,
+		labelAppName:      appNameFor(lr),
 		labelAppInstance:  lr.Name,
 		labelAppComponent: ComponentRedis,
 	}
@@ -229,7 +239,7 @@ func redisSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 // sentinelSelectorLabels returns labels for selecting Sentinel pods
 func sentinelSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return map[string]string{
-		labelAppName:      appName,
+		labelAppName:      appNameFor(lr),
 		labelAppInstance:  lr.Name,
 		labelAppComponent: ComponentSentinel,
 	}
@@ -238,7 +248,7 @@ func sentinelSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 // masterSelectorLabels returns labels for selecting the master pod
 func masterSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return map[string]string{
-		labelAppName:      appName,
+		labelAppName:      appNameFor(lr),
 		labelAppInstance:  lr.Name,
 		labelAppComponent: ComponentRedis,
 		LabelRole:         RoleMaster,
@@ -250,7 +260,7 @@ func masterSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 // front every shard's pods.
 func clusterSelectorLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return map[string]string{
-		labelAppName:      appName,
+		labelAppName:      appNameFor(lr),
 		labelAppInstance:  lr.Name,
 		labelAppComponent: ComponentCluster,
 	}
@@ -270,9 +280,10 @@ func clusterShardSelectorLabels(lr *littleredv1alpha1.LittleRed, shardIdx int) m
 func buildConfigMap(lr *littleredv1alpha1.LittleRed) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName(lr),
-			Namespace: lr.Namespace,
-			Labels:    commonLabels(lr),
+			Name:        configMapName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      commonLabels(lr),
+			Annotations: inheritedAnnotations(lr),
 		},
 		Data: map[string]string{
 			fileRedisConf: buildRedisConfig(lr),
@@ -347,19 +358,15 @@ func buildStatefulSet(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentRedis
 
-	podLabels := make(map[string]string)
-	maps.Copy(podLabels, selectorLabels(lr))
-	podLabels[labelAppComponent] = ComponentRedis
-	// Add user-defined pod labels
-	maps.Copy(podLabels, lr.Spec.PodTemplate.Labels)
+	owned := selectorLabels(lr)
+	owned[labelAppComponent] = ComponentRedis
+	podLabels := podTemplateLabels(lr, owned)
 
 	// Compute config hash for pod annotations to trigger rolling update on config change
 	configData := map[string]string{fileRedisConf: buildRedisConfig(lr)}
 	configHash := computeConfigHash(configData)
 
-	podAnnotations := make(map[string]string)
-	maps.Copy(podAnnotations, lr.Spec.PodTemplate.Annotations)
-	podAnnotations[AnnotationConfigHash] = configHash
+	podAnnotations := podTemplateAnnotations(lr, map[string]string{AnnotationConfigHash: configHash})
 
 	replicas := int32(1)
 
@@ -372,9 +379,10 @@ func buildStatefulSet(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      statefulSetName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        statefulSetName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    &replicas,
@@ -764,7 +772,7 @@ exit 1`))
 
 // serviceAnnotations returns merged user + Prometheus annotations for a Redis service.
 func serviceAnnotations(lr *littleredv1alpha1.LittleRed) map[string]string {
-	annotations := map[string]string{}
+	annotations := inheritedAnnotations(lr)
 	maps.Copy(annotations, lr.Spec.Service.Annotations)
 	if lr.Spec.Metrics.IsEnabled() {
 		annotations["prometheus.io/scrape"] = annotationValueTrue
@@ -839,9 +847,10 @@ func buildServiceMonitor(lr *littleredv1alpha1.LittleRed) *monitoringv1.ServiceM
 
 	sm := &monitoringv1.ServiceMonitor{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      serviceMonitorName(lr),
-			Namespace: namespace,
-			Labels:    labels,
+			Name:        serviceMonitorName(lr),
+			Namespace:   namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: monitoringv1.ServiceMonitorSpec{
 			Selector: metav1.LabelSelector{
@@ -874,9 +883,10 @@ func buildSentinelConfigMap(lr *littleredv1alpha1.LittleRed) *corev1.ConfigMap {
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sentinelConfigMapName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        sentinelConfigMapName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Data: map[string]string{
 			"sentinel.conf": buildSentinelConfig(lr),
@@ -1015,9 +1025,10 @@ func buildConfigMapSentinelMode(lr *littleredv1alpha1.LittleRed) *corev1.ConfigM
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        configMapName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Data: map[string]string{
 			fileRedisConf: buildRedisConfigSentinel(lr),
@@ -1039,17 +1050,13 @@ func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed, replicas int
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentRedis
 
-	podLabels := make(map[string]string)
-	maps.Copy(podLabels, redisSelectorLabels(lr))
-	maps.Copy(podLabels, lr.Spec.PodTemplate.Labels)
+	podLabels := podTemplateLabels(lr, redisSelectorLabels(lr))
 
 	// Compute config hash for pod annotations to trigger rolling update on config change
 	configData := map[string]string{fileRedisConf: buildRedisConfigSentinel(lr)}
 	configHash := computeConfigHash(configData)
 
-	podAnnotations := make(map[string]string)
-	maps.Copy(podAnnotations, lr.Spec.PodTemplate.Annotations)
-	podAnnotations[AnnotationConfigHash] = configHash
+	podAnnotations := podTemplateAnnotations(lr, map[string]string{AnnotationConfigHash: configHash})
 
 	containers := []corev1.Container{buildRedisContainerSentinel(lr)}
 
@@ -1068,9 +1075,10 @@ func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed, replicas int
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      statefulSetName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        statefulSetName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:        &replicas,
@@ -1474,16 +1482,13 @@ func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed, replicas int32) *
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentSentinel
 
-	podLabels := make(map[string]string)
-	maps.Copy(podLabels, sentinelSelectorLabels(lr))
+	podLabels := podTemplateLabels(lr, sentinelSelectorLabels(lr))
 
 	// Compute config hash for pod annotations to trigger rolling update on config change
 	configData := map[string]string{"sentinel.conf": buildSentinelConfig(lr)}
 	configHash := computeConfigHash(configData)
 
-	podAnnotations := map[string]string{
-		AnnotationConfigHash: configHash,
-	}
+	podAnnotations := podTemplateAnnotations(lr, map[string]string{AnnotationConfigHash: configHash})
 
 	containers := []corev1.Container{buildSentinelContainer(lr)}
 	// Add exporter sidecar if metrics enabled — points at the Sentinel port so
@@ -1494,9 +1499,10 @@ func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed, replicas int32) *
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sentinelStatefulSetName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        sentinelStatefulSetName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:    &replicas,
@@ -1680,7 +1686,7 @@ func buildMasterService(lr *littleredv1alpha1.LittleRed) *corev1.Service {
 	labels := commonLabels(lr)
 	maps.Copy(labels, lr.Spec.Service.Labels)
 
-	annotations := map[string]string{}
+	annotations := inheritedAnnotations(lr)
 	maps.Copy(annotations, lr.Spec.Service.Annotations)
 
 	return &corev1.Service{
@@ -1814,9 +1820,10 @@ func buildClusterConfigMap(lr *littleredv1alpha1.LittleRed) *corev1.ConfigMap {
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        configMapName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Data: map[string]string{
 			fileRedisConf: buildClusterRedisConfig(lr),
@@ -1965,17 +1972,13 @@ func buildClusterShardStatefulSet(lr *littleredv1alpha1.LittleRed, shardIdx int,
 	labels[labelAppComponent] = ComponentCluster
 	labels[LabelShard] = clusterShardLabelValue(shardIdx)
 
-	podLabels := make(map[string]string)
-	maps.Copy(podLabels, clusterShardSelectorLabels(lr, shardIdx))
-	maps.Copy(podLabels, lr.Spec.PodTemplate.Labels)
+	podLabels := podTemplateLabels(lr, clusterShardSelectorLabels(lr, shardIdx))
 
 	// Compute config hash for pod annotations to trigger rolling update on config change
 	configData := map[string]string{fileRedisConf: buildClusterRedisConfig(lr)}
 	configHash := computeConfigHash(configData)
 
-	podAnnotations := make(map[string]string)
-	maps.Copy(podAnnotations, lr.Spec.PodTemplate.Annotations)
-	podAnnotations[AnnotationConfigHash] = configHash
+	podAnnotations := podTemplateAnnotations(lr, map[string]string{AnnotationConfigHash: configHash})
 
 	cluster := lr.Spec.Cluster
 	if cluster == nil {
@@ -2028,9 +2031,10 @@ func buildClusterShardStatefulSet(lr *littleredv1alpha1.LittleRed, shardIdx int,
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      clusterShardStatefulSetName(lr, shardIdx),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        clusterShardStatefulSetName(lr, shardIdx),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:        &replicas,
@@ -2548,9 +2552,10 @@ func buildClusterHeadlessService(lr *littleredv1alpha1.LittleRed) *corev1.Servic
 
 	return &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      clusterHeadlessServiceName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        clusterHeadlessServiceName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: corev1.ServiceSpec{
 			Type:                     corev1.ServiceTypeClusterIP,
@@ -2634,9 +2639,10 @@ func buildSentinelRedisPDB(lr *littleredv1alpha1.LittleRed) *policyv1.PodDisrupt
 	maxUnavailable, minAvailable := pdbSpec(lr)
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      podDisruptionBudgetName(lr),
-			Namespace: lr.Namespace,
-			Labels:    commonLabels(lr),
+			Name:        podDisruptionBudgetName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      commonLabels(lr),
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MaxUnavailable: maxUnavailable,
@@ -2652,9 +2658,10 @@ func buildSentinelPDB(lr *littleredv1alpha1.LittleRed) *policyv1.PodDisruptionBu
 	maxUnavailable, minAvailable := pdbSpec(lr)
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      sentinelPodDisruptionBudgetName(lr),
-			Namespace: lr.Namespace,
-			Labels:    commonLabels(lr),
+			Name:        sentinelPodDisruptionBudgetName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      commonLabels(lr),
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MaxUnavailable: maxUnavailable,
@@ -2677,9 +2684,10 @@ func buildClusterShardPDB(lr *littleredv1alpha1.LittleRed, shardIdx int) *policy
 	labels[LabelShard] = clusterShardLabelValue(shardIdx)
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      clusterShardPDBName(lr, shardIdx),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        clusterShardPDBName(lr, shardIdx),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: policyv1.PodDisruptionBudgetSpec{
 			MaxUnavailable: maxUnavailable,

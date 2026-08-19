@@ -2,8 +2,23 @@ apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
   name: store-full
+  # Labels and annotations on the LittleRed resource are inherited by every resource the
+  # operator creates for it — StatefulSets, Services, ConfigMap, PDBs, ServiceMonitor and
+  # the pods themselves — so scrape configs and dashboards can group on them. The
+  # operator's own keys are never overridden, and Helm/Argo CD/Flux/kubectl bookkeeping is
+  # not propagated. Editing these rolls the pods, because pod labels live in the pod
+  # template.
+  labels:
+    team: payments
+    environment: production
+  annotations:
+    owner: team-payments@example.com
 spec:
   mode: standalone
+
+  # Value for app.kubernetes.io/name on every owned resource. Immutable: the label is part
+  # of the StatefulSet selector, which Kubernetes does not allow to change.
+  appName: littlered
 
   image:
     registry: docker.io

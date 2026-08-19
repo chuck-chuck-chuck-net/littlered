@@ -82,6 +82,8 @@ const (
 	// median, ~45 extra refused writes in a ~20% tail. Set 0 explicitly at
 	// replicas: 1.
 	DefaultFailoverMinReplicasToWrite = 1
+	// DefaultAppName is the default app.kubernetes.io/name value for owned resources.
+	DefaultAppName = "littlered"
 
 	// Placement defaults (cluster-mode shard anti-affinity)
 	DefaultShardTopologyKey       = "kubernetes.io/hostname"
@@ -144,6 +146,12 @@ func (r *LittleRed) SetDefaults() {
 	// Mode
 	if spec.Mode == "" {
 		spec.Mode = DefaultMode
+	}
+
+	// AppName — the app.kubernetes.io/name value, and part of every selector, so it
+	// must never end up empty.
+	if spec.AppName == "" {
+		spec.AppName = DefaultAppName
 	}
 
 	// Image

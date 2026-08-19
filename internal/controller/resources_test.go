@@ -130,7 +130,7 @@ func TestCommonLabels(t *testing.T) {
 		{"app.kubernetes.io/name", "littlered"},
 		{"app.kubernetes.io/instance", testLRName},
 		{"app.kubernetes.io/managed-by", "littlered-operator"},
-		{"app.kubernetes.io/version", littleredv1alpha1.DefaultImageTag},
+		{labelAppVersion, littleredv1alpha1.DefaultImageTag},
 		{"redis.chuck-chuck-chuck.net/mode", ModeStandalone},
 	}
 

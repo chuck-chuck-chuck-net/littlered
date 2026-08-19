@@ -10,6 +10,43 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
+### Added
+
+- **Labels and annotations on a `LittleRed` resource are now inherited by every resource
+  the operator creates for it** — StatefulSets, Services, the ConfigMap,
+  PodDisruptionBudgets, the ServiceMonitor and the pods — so `team=payments` or
+  `environment=production` set where a user naturally puts it reaches the objects a scrape
+  config actually selects on. Resolves
+  [#96](https://github.com/littlered-operator/littlered/issues/96). The operator's own keys
+  always win and are never inherited, and bookkeeping stamped on the CR by Helm, Argo CD,
+  Flux or kubectl is not propagated (Argo CD's tracking labels on a child confuse its
+  pruning; `last-applied-configuration` would embed a copy of the CR into every child
+  object). See ADR-015 and `docs/API_SPEC.md` §5.3.
+
+  **Note:** pod labels live in the pod template, so editing CR metadata triggers a rolling
+  update — a failover in sentinel mode, a serialized per-shard roll in cluster mode, and in
+  standalone mode a restart that **discards the data** (EmptyDir, no persistence).
+
+- **`spec.appName` sets the `app.kubernetes.io/name` value** (default `littlered`, so
+  existing instances are unaffected), threaded through every selector so the label and the
+  selectors can never disagree. It is **immutable**, enforced by a CEL rule: the label is
+  part of `StatefulSet.spec.selector`, which Kubernetes does not allow to change, and
+  recreating the StatefulSet would discard the data. This is the direct request in #96 —
+  grouping an instance under the user's own application name for monitoring.
+
+### Fixed
+
+- **`spec.podTemplate.labels` could break an instance.** It was merged last, so it could
+  override the operator's structural labels — making the pod template disagree with its
+  StatefulSet's `spec.selector`, which the API server rejects outright. The instance then
+  stopped reconciling with an error pointing at the StatefulSet rather than at the field
+  that caused it. Those five keys (`app.kubernetes.io/name`, `/instance`, `/component`,
+  `redis.chuck-chuck-chuck.net/shard`, `/role`) are now rejected by CRD validation, so the
+  error lands on the CR. Use `spec.appName` for the app name.
+
+- **Sentinel pods now get `spec.podTemplate.labels`.** `buildSentinelStatefulSet` was the
+  one builder that never applied them, unlike standalone, sentinel-mode Redis and cluster.
+
 ### Changed
 
 - Default `redis_exporter` sidecar image is now **v1.89.0** (from v1.88.0). Instances

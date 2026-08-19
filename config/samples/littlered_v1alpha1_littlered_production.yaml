@@ -40,8 +40,9 @@ spec:
         whenUnsatisfiable: DoNotSchedule
         labelSelector:
           matchLabels:
-            # app.kubernetes.io/name is always the constant "littlered"; the
-            # per-instance discriminator is app.kubernetes.io/instance (= metadata.name).
+            # app.kubernetes.io/name carries spec.appName (default "littlered"), so it
+            # is not per-instance; the discriminator is app.kubernetes.io/instance
+            # (= metadata.name).
             app.kubernetes.io/instance: store-prod
 
   # Faster failover detection

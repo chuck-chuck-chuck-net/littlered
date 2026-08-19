@@ -67,6 +67,25 @@ spec:
               vacuously true while the registry has one CR-resident member, are on
               heavyOperations in internal/controller/operation_registry.go.
             properties:
+              appName:
+                default: littlered
+                description: |-
+                  AppName is the value used for the app.kubernetes.io/name label on every resource
+                  this instance owns. Set it to group the instance under your own application name
+                  in monitoring and scrape configs.
+
+                  It is immutable: the label is part of the StatefulSet's spec.selector, which
+                  Kubernetes does not allow to change after creation. Changing the name therefore
+                  requires recreating the instance — and because storage is EmptyDir, that discards
+                  the data.
+                maxLength: 63
+                minLength: 1
+                pattern: ^[a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?$
+                type: string
+                x-kubernetes-validations:
+                - message: 'spec.appName is immutable: it is part of the StatefulSet
+                    selector, which Kubernetes does not allow to change'
+                  rule: self == oldSelf
               auth:
                 description: Auth defines authentication settings
                 properties:
@@ -1392,8 +1411,24 @@ spec:
                   labels:
                     additionalProperties:
                       type: string
-                    description: Labels are additional pod labels
+                    description: |-
+                      Labels are additional pod labels, merged over any labels inherited from the
+                      LittleRed resource's own metadata.
+
+                      The operator's structural labels cannot be set here: they make up the
+                      StatefulSet and Service selectors, and a pod template whose labels disagree with
+                      its StatefulSet's selector is rejected by the API server. Use spec.appName to
+                      choose the app.kubernetes.io/name value.
                     type: object
+                    x-kubernetes-validations:
+                    - message: spec.podTemplate.labels may not set the operator's
+                        structural labels (app.kubernetes.io/name, app.kubernetes.io/instance,
+                        app.kubernetes.io/component, redis.chuck-chuck-chuck.net/shard,
+                        redis.chuck-chuck-chuck.net/role); use spec.appName for the
+                        app name
+                      rule: '!self.exists(k, k in [''app.kubernetes.io/name'', ''app.kubernetes.io/instance'',
+                        ''app.kubernetes.io/component'', ''redis.chuck-chuck-chuck.net/shard'',
+                        ''redis.chuck-chuck-chuck.net/role''])'
                   nodeSelector:
                     additionalProperties:
                       type: string

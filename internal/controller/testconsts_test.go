@@ -46,4 +46,16 @@ const (
 	testReplidB = "BBB"
 
 	diskTypeSSD = "ssd"
+
+	// Metadata-inheritance tests (ADR-021).
+	metaTeamKey     = "team"
+	metaTeamValue   = "payments"
+	metaOwnerKey    = "owner"
+	metaOwnerValue  = "team-a"
+	metaKeepKey     = "keep"
+	metaKeepValue   = "me"
+	metaHijackValue = "hijack"
+	metaStaleTag    = "9.9.9"
+	metaTierKey     = "tier"
+	metaCustomApp   = "redis"
 )

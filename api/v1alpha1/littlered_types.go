@@ -43,6 +43,22 @@ type LittleRedSpec struct {
 	// +optional
 	Mode string `json:"mode,omitempty"`
 
+	// AppName is the value used for the app.kubernetes.io/name label on every resource
+	// this instance owns. Set it to group the instance under your own application name
+	// in monitoring and scrape configs.
+	//
+	// It is immutable: the label is part of the StatefulSet's spec.selector, which
+	// Kubernetes does not allow to change after creation. Changing the name therefore
+	// requires recreating the instance — and because storage is EmptyDir, that discards
+	// the data.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([-a-zA-Z0-9_.]*[a-zA-Z0-9])?$`
+	// +kubebuilder:default="littlered"
+	// +kubebuilder:validation:XValidation:rule="self == oldSelf",message="spec.appName is immutable: it is part of the StatefulSet selector, which Kubernetes does not allow to change"
+	// +optional
+	AppName string `json:"appName,omitempty"`
+
 	// Image defines the container image to use
 	// +optional
 	Image ImageSpec `json:"image,omitempty"`
@@ -385,7 +401,14 @@ type PodTemplateSpec struct {
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
-	// Labels are additional pod labels
+	// Labels are additional pod labels, merged over any labels inherited from the
+	// LittleRed resource's own metadata.
+	//
+	// The operator's structural labels cannot be set here: they make up the
+	// StatefulSet and Service selectors, and a pod template whose labels disagree with
+	// its StatefulSet's selector is rejected by the API server. Use spec.appName to
+	// choose the app.kubernetes.io/name value.
+	// +kubebuilder:validation:XValidation:rule="!self.exists(k, k in ['app.kubernetes.io/name', 'app.kubernetes.io/instance', 'app.kubernetes.io/component', 'redis.chuck-chuck-chuck.net/shard', 'redis.chuck-chuck-chuck.net/role'])",message="spec.podTemplate.labels may not set the operator's structural labels (app.kubernetes.io/name, app.kubernetes.io/instance, app.kubernetes.io/component, redis.chuck-chuck-chuck.net/shard, redis.chuck-chuck-chuck.net/role); use spec.appName for the app name"
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 

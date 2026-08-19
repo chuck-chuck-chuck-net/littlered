@@ -30,6 +30,7 @@ status:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `mode` | `string` | No | `standalone` | Deployment mode: `standalone`, `sentinel`, `cluster`, or `failover` (**experimental** — operator-managed HA without Sentinel, see §2.12) |
+| `appName` | `string` | No | `littlered` | Value for the `app.kubernetes.io/name` label on every owned resource. **Immutable.** See [section 5](#5-labels-and-annotations) |
 
 ### 2.2 Image Configuration
 
@@ -337,7 +338,7 @@ spec:
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
 | `podTemplate.annotations` | `map[string]string` | No | `{}` | Pod annotations |
-| `podTemplate.labels` | `map[string]string` | No | `{}` | Additional pod labels |
+| `podTemplate.labels` | `map[string]string` | No | `{}` | Additional pod labels. May not set the structural labels — see [section 5](#5-labels-and-annotations) |
 | `podTemplate.nodeSelector` | `map[string]string` | No | `{}` | Node selector |
 | `podTemplate.tolerations` | `[]Toleration` | No | `[]` | Tolerations |
 | `podTemplate.affinity` | `Affinity` | No | `nil` | Affinity/anti-affinity |
@@ -1005,7 +1006,7 @@ spec:
         requiredDuringSchedulingIgnoredDuringExecution:
           - labelSelector:
               matchLabels:
-                app.kubernetes.io/name: littlered
+                app.kubernetes.io/name: littlered        # spec.appName (immutable, see 5.6)
                 app.kubernetes.io/instance: store
             topologyKey: kubernetes.io/hostname
 ```
@@ -1122,6 +1123,87 @@ annotations:
   redis.chuck-chuck-chuck.net/assignment-epoch: "3"            # monotonic per instance
 ```
 
+### 5.4 Inheritance from the LittleRed resource
+
+Labels and annotations on the `LittleRed` resource itself are **inherited by every resource
+the operator creates for it** — StatefulSets, Services, the ConfigMap, PodDisruptionBudgets,
+the ServiceMonitor and the pods. This is the intended way to attach team, environment or
+ownership metadata that monitoring and scrape configs group on (ADR-021).
+
+```yaml
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: store
+  labels:
+    team: payments            # -> lands on every owned resource, including pods
+    environment: production
+  annotations:
+    owner: team-payments@example.com
+spec:
+  appName: littlered          # -> value of app.kubernetes.io/name
+```
+
+**Precedence**, least to most specific:
+
+1. labels/annotations inherited from the `LittleRed` resource
+2. the operator's own keys — these always win
+3. `spec.podTemplate.labels` / `.annotations` (pods only)
+4. `spec.service.labels` / `.annotations`, `spec.metrics.serviceMonitor.labels` (their object only)
+
+### 5.5 Keys the operator owns
+
+Never inherited, and never overridable:
+
+| Key | Why |
+|-----|-----|
+| `app.kubernetes.io/name` | Part of every selector. Set its **value** with `spec.appName` |
+| `app.kubernetes.io/instance` | Part of every selector (= `metadata.name`) |
+| `app.kubernetes.io/component` | Part of every selector (`redis`, `sentinel`, `cluster`) |
+| `redis.chuck-chuck-chuck.net/shard` | Per-shard StatefulSet selector (cluster mode) |
+| `redis.chuck-chuck-chuck.net/role` | Master Service selector (sentinel mode) |
+| `app.kubernetes.io/managed-by`, `app.kubernetes.io/version` | Operator-maintained; a user value would go stale |
+| anything under `redis.chuck-chuck-chuck.net/` | The operator's own key namespace |
+
+The first five are **structural**: they make up the Service and StatefulSet selectors.
+Setting one in `spec.podTemplate.labels` is rejected by CRD validation, because a pod
+template that disagrees with its StatefulSet's selector is rejected by the API server —
+which would surface as a failing StatefulSet apply far from the field that caused it.
+
+### 5.6 Keys that are not propagated
+
+Bookkeeping stamped on the CR by whatever applied it describes *that* relationship, not the
+children, so it stops at the CR: keys under `kubectl.kubernetes.io/`, `argocd.argoproj.io/`,
+`meta.helm.sh/`, `helm.sh/`, `kustomize.toolkit.fluxcd.io/` and `helm.toolkit.fluxcd.io/`.
+
+### 5.7 `spec.appName` is immutable
+
+`app.kubernetes.io/name` is part of `StatefulSet.spec.selector`, which Kubernetes does not
+allow to change after creation. Changing it would require deleting and recreating the
+StatefulSet — and since storage is EmptyDir, that discards the data. The API server
+therefore rejects the update:
+
+```
+spec.appName is immutable: it is part of the StatefulSet selector, which Kubernetes does not allow to change
+```
+
+Choose the value at creation time. To change it, create a new instance and migrate clients.
+
+### 5.8 Editing CR metadata restarts pods
+
+Pod labels and annotations live in the pod template, and Kubernetes has no in-place pod
+label update through a StatefulSet — so **adding or changing a label on the `LittleRed`
+resource triggers a rolling update**:
+
+| Mode | Effect |
+|------|--------|
+| `cluster` | Rolls shard by shard (serialized); each shard's master fails over to its replica |
+| `sentinel` | Rolls the pods; the master fails over |
+| `standalone` | Restarts the single pod — **the data is discarded** (EmptyDir, no persistence) |
+
+Object-level metadata (Services, ConfigMap, PDBs, ServiceMonitor) updates in place with no
+restart. If you relabel CRs routinely, do it at a time when a roll is acceptable.
+
 ---
 
 ## 6. Go Types (Reference)
@@ -1133,6 +1215,11 @@ type LittleRedSpec struct {
     // +kubebuilder:validation:Enum=standalone;sentinel;cluster;failover
     // +kubebuilder:default=standalone
     Mode string `json:"mode,omitempty"`
+
+    // AppName is the app.kubernetes.io/name value for owned resources. Immutable.
+    // +kubebuilder:default="littlered"
+    // +kubebuilder:validation:XValidation:rule="self == oldSelf"
+    AppName string `json:"appName,omitempty"`
 
     // Image defines the container image to use
     Image ImageSpec `json:"image,omitempty"`
@@ -1271,7 +1358,18 @@ type ConfigSpec struct {
 | `maxmemory` must parse as quantity | Invalid memory format |
 | At most one registered **CR-resident heavy field** may change per update (ADR-020) | Rejected at admission, on `kubectl apply`. A CEL **transition** rule on `spec`: it does not fire on create, so a CR that sets every field at once is unaffected. **Today the constraint is vacuously true** — the declared-operations registry has exactly one CR-resident member (`spec.sentinel.masterName`), so the count of changed heavy fields can never exceed one, and **no apply is refused by it**. It is shipped now so the second member (auth) adds a term rather than a rule, and a unit test fails if a member is registered without one. |
 
-### 7.2 Status Condition on Validation Failure
+### 7.2 Schema-Level Validation (CEL, enforced by the API server)
+
+Rejected at `kubectl apply` time rather than reported in status:
+
+| Rule | Error Condition |
+|------|-----------------|
+| `spec.cluster` only with `mode: cluster` | Mode/section mismatch |
+| `spec.sentinel` only with `mode: sentinel` | Mode/section mismatch |
+| `spec.appName` is immutable | Any change after creation — the label is part of the StatefulSet selector (see [5.7](#57-specappname-is-immutable)) |
+| `spec.podTemplate.labels` may not set structural labels | `app.kubernetes.io/name`, `/instance`, `/component`, `redis.chuck-chuck-chuck.net/shard`, `/role` (see [5.5](#55-keys-the-operator-owns)) |
+
+### 7.3 Status Condition on Validation Failure
 
 ```yaml
 status:
