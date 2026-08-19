@@ -17,6 +17,7 @@ limitations under the License.
 package controller
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -410,5 +411,70 @@ func TestPlanFailoverFence(t *testing.T) {
 				t.Errorf("planFailoverFence() = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// --- masterStartAuthorizedFor: the guard that keeps an emptied ex-master down --
+//
+// MEASURED (t3e, 2026-08-19): a kill-9 of a PROMOTED master destroyed 352 of 1145
+// acknowledged writes, with DataCorruptions 0 and write availability 95.50%. The
+// promoted pod had started as a replica (start marker = epoch 1), was promoted
+// in place (annotation master@2, no restart, so the marker stayed 1), and on
+// restart read 2 > 1 and came back as an EMPTY master — whereupon the operator
+// believed it healthy and repointed the replicas holding the only copy onto it.
+//
+// The fix is that a restarted process may start as master ONLY with explicit
+// operator authorization, which cannot predate the death it refers to. This table
+// pins WHICH actions grant it: seeding (zero data holders, target may be parked)
+// and nothing else. A promotion must never grant it, because its target is by
+// construction a running data holder — authorizing a start there re-arms exactly
+// the wipe above for the next kill-9.
+func TestMasterStartAuthorizedFor(t *testing.T) {
+	tests := []struct {
+		action failoverAction
+		want   bool
+		why    string
+	}{
+		{failoverSeed, true, "zero data holders; the seeded pod may be parked by the start gate"},
+		{failoverPromote, false, "in-place promotion of a REACHABLE data holder; no start involved"},
+		{failoverUnsafeElect, false, "still an in-place promotion, just with divergence authorized"},
+		{failoverNone, false, "no mastership decision at all"},
+		{failoverWait, false, "no mastership decision at all"},
+		{failoverRefuse, false, "explicitly declining to elect"},
+	}
+
+	for _, tc := range tests {
+		if got := masterStartAuthorizedFor(tc.action); got != tc.want {
+			t.Errorf("masterStartAuthorizedFor(%v) = %v, want %v — %s", tc.action, got, tc.want, tc.why)
+		}
+	}
+}
+
+// TestFailoverStartupGateRequiresMasterAuthorization pins the pod-side half: the
+// generated startup script must refuse a master role for a RESTARTED process
+// unless the operator's authorization is newer than what the process started
+// under. Structural, because the logic lives in shell.
+func TestFailoverStartupGateRequiresMasterAuthorization(t *testing.T) {
+	script := buildRedisContainerFailover(newFailoverTestLittleRed()).Command[2]
+
+	for _, want := range []string{
+		// the start marker is read, and named for what it is
+		"START_MARKER",
+		"STARTED_UNDER_EPOCH",
+		// the master-role gate exists and consults the authorization annotation
+		`if [ "$ASSIGNED_ROLE" = "master" ] && [ -n "$STARTED_UNDER_EPOCH" ]`,
+		AnnotationMasterStartAuthorizedEpoch,
+		`"$MASTER_START_AUTH" -gt "$STARTED_UNDER_EPOCH"`,
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("startup script missing %q — a restarted process could start as an empty master", want)
+		}
+	}
+
+	// The marker must be recorded before exec, or nothing detects the restart.
+	markerAt := strings.Index(script, `> "$START_MARKER"`)
+	execAt := strings.Index(script, "exec redis-server")
+	if markerAt < 0 || execAt < 0 || markerAt > execAt {
+		t.Errorf("the start marker must be written BEFORE exec (marker at %d, exec at %d)", markerAt, execAt)
 	}
 }

@@ -70,6 +70,15 @@ type failoverStamp struct {
 	role     string
 	masterIP string // empty for a master stamp
 	epoch    int64
+	// authorizeMasterStart additionally stamps
+	// AnnotationMasterStartAuthorizedEpoch, granting this pod permission to
+	// START a fresh process as master (LR-038). Required only when the target
+	// may be a RESTARTED pod parked by the start gate — i.e. the seed/bootstrap
+	// paths, where the operator has established that no data is at risk. An
+	// in-place promotion of a running replica must NOT set it: that pod keeps
+	// serving the data it already holds, and authorizing a future restart to
+	// come back as an empty master is exactly the wipe this guards against.
+	authorizeMasterStart bool
 }
 
 // resolveFailoverIntent derives the current intent from the pods' assignment

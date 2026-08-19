@@ -66,6 +66,7 @@ func TestFailoverModeAndAnnotationConsts(t *testing.T) {
 		{AnnotationAssignedRole, "redis.chuck-chuck-chuck.net/assigned-role"},
 		{AnnotationAssignedMasterIP, "redis.chuck-chuck-chuck.net/assigned-master-ip"},
 		{AnnotationAssignmentEpoch, "redis.chuck-chuck-chuck.net/assignment-epoch"},
+		{AnnotationMasterStartAuthorizedEpoch, "redis.chuck-chuck-chuck.net/master-start-authorized-epoch"},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -214,14 +215,21 @@ func TestFailoverStartupScriptContent(t *testing.T) {
 		AnnotationAssignedMasterIP,
 		AnnotationAssignmentEpoch,
 		"/podinfo/annotations",
-		// the epoch gate: run-marker on the EmptyDir + numeric greater-than
-		"/data/littlered-run-epoch",
+		// the start gate: the marker on the EmptyDir recording what THIS PROCESS
+		// started under (renamed from "run-epoch" in LR-038 — comparing an
+		// incrementing epoch against a start-time snapshot is an ordering device
+		// answering an identity question, and the name hid that), plus the
+		// numeric greater-than and the separate master-start authorization.
+		"/data/littlered-started-under-epoch",
 		"-gt",
+		AnnotationMasterStartAuthorizedEpoch,
 		// replica start path + IP identity
 		"--replicaof",
 		"--replica-announce-ip",
-		// the distinctive kill-9 parked-state log line
-		"already consumed",
+		// the distinctive parked-state log lines (stale assignment, and a
+		// restarted process denied a master start)
+		"waiting for operator re-authorization",
+		"parking so the operator can fail over to a pod that does",
 		// probes' bootstrap guard marker
 		"/data/bootstrap-in-progress",
 	}

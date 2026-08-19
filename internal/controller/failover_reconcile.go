@@ -262,7 +262,11 @@ func (r *LittleRedReconciler) bootstrapFailover(ctx context.Context, lr *littler
 	auditLog := r.getLogger(ctx, lr, LogCategoryAudit)
 	auditLog.Info("Bootstrap: stamping initial assignment set",
 		"master", pod0Name, "masterIP", pod0.Status.PodIP, "epoch", epoch)
-	if err := r.stampFailoverAssignments(ctx, lr, podList, pod0Name, pod0.Status.PodIP, epoch); err != nil {
+	// authorizeMasterStart: bootstrap is by definition a fresh start with no data
+	// anywhere, and redis-0 may already carry a start marker (e.g. its container
+	// restarted while we were still waiting to bootstrap). Without the
+	// authorization it would park forever (LR-038).
+	if err := r.stampFailoverAssignments(ctx, lr, podList, pod0Name, pod0.Status.PodIP, epoch, true); err != nil {
 		return err
 	}
 	if err := r.markFailoverTransition(ctx, lr, epoch); err != nil {
@@ -513,7 +517,10 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 		masterPod := podNameForIP(podList, plan.masterIP)
 		msg := fmt.Sprintf("Failover recovery: no data present, seeded %s as master (epoch %d)", masterPod, epoch)
 		auditLog.Info(msg, "master", plan.masterIP, "masterPod", masterPod, "epoch", epoch)
-		if err := r.stampFailoverAssignments(ctx, lr, podList, masterPod, plan.masterIP, epoch); err != nil {
+		// authorizeMasterStart: seeding runs only with ZERO data holders, and the
+		// seeded pod may be parked by the start gate after a restart, so it needs
+		// explicit permission to come up as master (LR-038).
+		if err := r.stampFailoverAssignments(ctx, lr, podList, masterPod, plan.masterIP, epoch, masterStartAuthorizedFor(plan.action)); err != nil {
 			return err
 		}
 		if err := r.markFailoverTransition(ctx, lr, epoch); err != nil {
@@ -534,7 +541,13 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 
 		// ADR-011 §5 execution order: stamp the new intent first (it is the
 		// durable record a crashed operator resumes from), then promote.
-		if err := r.stampFailoverAssignments(ctx, lr, podList, masterPod, plan.masterIP, epoch); err != nil {
+		// authorizeMasterStart=false, deliberately: BestDataHolder only ever returns
+		// a REACHABLE node (DataHolders requires Reachable && Keys > 0), so this is
+		// an in-place promotion of a running process that already holds the data.
+		// Authorizing a master START here would hand a future kill-9 of this very
+		// pod permission to return as an EMPTY master — the 352-of-1145 wipe this
+		// guard exists to prevent (LR-038).
+		if err := r.stampFailoverAssignments(ctx, lr, podList, masterPod, plan.masterIP, epoch, masterStartAuthorizedFor(plan.action)); err != nil {
 			return err
 		}
 		if err := r.promoteFailoverMaster(ctx, lr, state, plan.masterIP, password); err != nil {
@@ -630,7 +643,7 @@ func (r *LittleRedReconciler) slaveOfBounded(ctx context.Context, lr *littleredv
 // gets assigned-role=master, every other non-terminating pod with an IP gets
 // assigned-role=replica pointing at masterIP, all at the same epoch. Pods
 // already carrying the exact target assignment are skipped (idempotent).
-func (r *LittleRedReconciler) stampFailoverAssignments(ctx context.Context, lr *littleredv1alpha1.LittleRed, podList *corev1.PodList, masterName, masterIP string, epoch int64) error {
+func (r *LittleRedReconciler) stampFailoverAssignments(ctx context.Context, lr *littleredv1alpha1.LittleRed, podList *corev1.PodList, masterName, masterIP string, epoch int64, authorizeMasterStart bool) error {
 	var firstErr error
 	for i := range podList.Items {
 		p := &podList.Items[i]
@@ -641,6 +654,7 @@ func (r *LittleRedReconciler) stampFailoverAssignments(ctx context.Context, lr *
 		if p.Name == masterName {
 			s.role = RoleMaster
 			s.masterIP = ""
+			s.authorizeMasterStart = authorizeMasterStart
 		}
 		if err := r.stampFailoverPod(ctx, lr, s); err != nil && firstErr == nil {
 			firstErr = err
@@ -658,9 +672,12 @@ func (r *LittleRedReconciler) stampFailoverPod(ctx context.Context, lr *littlere
 		return err
 	}
 	epochStr := strconv.FormatInt(s.epoch, 10)
+	authSatisfied := !s.authorizeMasterStart ||
+		pod.Annotations[AnnotationMasterStartAuthorizedEpoch] == epochStr
 	if pod.Annotations[AnnotationAssignedRole] == s.role &&
 		pod.Annotations[AnnotationAssignedMasterIP] == s.masterIP &&
-		pod.Annotations[AnnotationAssignmentEpoch] == epochStr {
+		pod.Annotations[AnnotationAssignmentEpoch] == epochStr &&
+		authSatisfied {
 		return nil
 	}
 	patch := client.MergeFrom(pod.DeepCopy())
@@ -670,6 +687,12 @@ func (r *LittleRedReconciler) stampFailoverPod(ctx context.Context, lr *littlere
 	pod.Annotations[AnnotationAssignedRole] = s.role
 	pod.Annotations[AnnotationAssignedMasterIP] = s.masterIP
 	pod.Annotations[AnnotationAssignmentEpoch] = epochStr
+	if s.authorizeMasterStart {
+		// Explicit permission for a RESTARTED pod to start a fresh process as
+		// master (LR-038). Never stamped by an in-place promotion, so it cannot
+		// authorize a future kill-9 to return as an empty master.
+		pod.Annotations[AnnotationMasterStartAuthorizedEpoch] = epochStr
+	}
 	return r.Patch(ctx, pod, patch)
 }
 

@@ -60,7 +60,10 @@ const (
 	// runMarkerPath is the epoch run-marker on the EmptyDir: it survives a
 	// container restart (same pod, same IP, wiped dataset) but not a pod
 	// replacement — the ADR-001 same-IP kill-9 hazard, re-owned (ADR-011 §3).
-	runMarkerPath = "/data/littlered-run-epoch"
+	// startMarkerPath records the assignment epoch THIS PROCESS STARTED UNDER.
+	// Named for what it is: not "the epoch we are at" but "what my current
+	// incarnation booted with". The distinction is load-bearing (LR-038).
+	startMarkerPath = "/data/littlered-started-under-epoch"
 )
 
 // failoverSpecOrDefault returns the (defaulted) FailoverSpec, tolerating a nil
@@ -306,7 +309,7 @@ touch /data/bootstrap-in-progress
 cp /etc/redis/redis.conf /data/redis.conf
 
 ANNOTATIONS_FILE=[[.AnnotationsFile]]
-RUN_MARKER=[[.RunMarker]]
+START_MARKER=[[.StartMarker]]
 
 # Read one annotation value from the downward-API projection. The kubelet
 # renders one key="value" per line (value quoted/escaped) and rewrites the file
@@ -322,18 +325,44 @@ if [ -n "$REDIS_PASSWORD" ]; then
   AUTH_ARGS="--requirepass $REDIS_PASSWORD --masterauth $REDIS_PASSWORD"
 fi
 
-# Epoch gate (ADR-011 §3; the ADR-001 same-IP kill-9 hazard, re-owned):
-# the run-marker survives a container restart (same pod, same IP, dataset
-# wiped) but not a pod replacement. An assignment is honored only if there is
-# no marker OR its epoch is numerically GREATER than the consumed marker
-# epoch — a kill-9'd ex-master must never reclaim mastership from its stale
-# assigned-role annotation.
-MARKER_EPOCH=""
-[ -f "$RUN_MARKER" ] && MARKER_EPOCH=$(cat "$RUN_MARKER")
+# Start gate (ADR-011 §3; the ADR-001 same-IP kill-9 hazard, re-owned).
+#
+# The marker survives a container restart (same pod, same IP, dataset wiped in
+# RAM) but not a pod replacement, so its presence means exactly: "I am a
+# restarted process and I hold no data."
+#
+# TWO DIFFERENT RULES, because the two roles carry different risk (LR-038):
+#
+#   replica  ordering suffices. Honor an assignment whose epoch is GREATER than
+#            the one we started under. Starting as a replica of the live master
+#            loses nothing (we resync), so a stale replica assignment is
+#            harmless and the operator's re-authorization releases us.
+#
+#   master   ordering does NOT suffice, and this is the subtle one. An in-place
+#            promotion (the operator sending REPLICAOF NO ONE to a RUNNING
+#            replica) advances the assignment epoch WITHOUT restarting the
+#            process, so the marker is never rewritten and stays behind. A
+#            later kill-9 then reads a strictly greater epoch and treats a
+#            pre-death instruction as fresh — coming back as an EMPTY master
+#            that the operator believes is healthy, whereupon the replicas
+#            holding the only surviving copy are repointed onto it and resync
+#            from nothing. Measured: 352 of 1145 acknowledged writes destroyed,
+#            with corruptions 0 and write availability 95.50%.
+#
+#            So a restarted process may only start as master with the operator's
+#            EXPLICIT permission, stamped after it observed the restart and
+#            established that no data is at risk. Permission cannot predate the
+#            death it refers to, which is what closes the race that ordering
+#            alone cannot.
+#
+# Parking is the yield either way: not Ready, serving nothing, so the operator
+# sees a dead master and fails over to the pod that actually holds the data.
+STARTED_UNDER_EPOCH=""
+[ -f "$START_MARKER" ] && STARTED_UNDER_EPOCH=$(cat "$START_MARKER")
 
 log "Starting Redis node $(hostname) with IP ${POD_IP}. Waiting for operator assignment..."
 log "Auth enabled: $([ -n "$REDIS_PASSWORD" ] && echo yes || echo no)"
-[ -n "$MARKER_EPOCH" ] && log "Run-marker found (epoch $MARKER_EPOCH): container restart detected, requiring a fresher assignment."
+[ -n "$STARTED_UNDER_EPOCH" ] && log "Start marker found (started under epoch $STARTED_UNDER_EPOCH): this is a RESTARTED process holding no data; a fresher assignment is required, and starting as master additionally requires explicit operator authorization."
 
 while true; do
   ASSIGNED_ROLE=$(annotation "[[.AnnRole]]")
@@ -352,19 +381,30 @@ while true; do
     continue
   fi
 
-  if [ -n "$MARKER_EPOCH" ] && ! [ "$ASSIGNMENT_EPOCH" -gt "$MARKER_EPOCH" ] 2>/dev/null; then
-    # Parking here IS the kill-9 yield: the operator sees the restart with its
-    # global view and either fails over to a data-holding replica (epoch
-    # bumped, we get re-assigned as replica) or re-authorizes us as master
-    # when no data exists anywhere.
-    log "Assignment epoch $ASSIGNMENT_EPOCH already consumed (run-marker epoch $MARKER_EPOCH); waiting for operator re-authorization..."
+  if [ -n "$STARTED_UNDER_EPOCH" ] && ! [ "$ASSIGNMENT_EPOCH" -gt "$STARTED_UNDER_EPOCH" ] 2>/dev/null; then
+    log "Assignment epoch $ASSIGNMENT_EPOCH is not newer than the epoch this process started under ($STARTED_UNDER_EPOCH); waiting for operator re-authorization..."
     sleep 2
     continue
   fi
 
-  # Fresh assignment: consume it BEFORE exec, so a container restart replaying
-  # the same annotations parks above instead of re-honoring this assignment.
-  echo "$ASSIGNMENT_EPOCH" > "$RUN_MARKER"
+  # A restarted process starting as MASTER needs explicit authorization, not
+  # just a newer epoch (see the start-gate note above).
+  if [ "$ASSIGNED_ROLE" = "master" ] && [ -n "$STARTED_UNDER_EPOCH" ]; then
+    MASTER_START_AUTH=$(annotation "[[.AnnMasterStartAuth]]")
+    if [ -z "$MASTER_START_AUTH" ] || ! [ "$MASTER_START_AUTH" -gt "$STARTED_UNDER_EPOCH" ] 2>/dev/null; then
+      log "Master assignment (epoch $ASSIGNMENT_EPOCH) carries no operator authorization to START as master newer than epoch $STARTED_UNDER_EPOCH (found '''$MASTER_START_AUTH'''). This process restarted and holds no data; parking so the operator can fail over to a pod that does..."
+      sleep 2
+      continue
+    fi
+    log "Operator authorized this restarted process to start as master (authorization epoch $MASTER_START_AUTH > $STARTED_UNDER_EPOCH)."
+  fi
+
+  # Record what this process is starting under BEFORE exec, so a container
+  # restart replaying the same annotations parks above instead of re-honoring
+  # them. Note this records the START only: an in-place role change made later
+  # by the operator is invisible here, which is exactly why the master path
+  # needs its own authorization rather than trusting epoch ordering.
+  echo "$ASSIGNMENT_EPOCH" > "$START_MARKER"
   rm -f /data/bootstrap-in-progress
 
   if [ "$ASSIGNED_ROLE" = "master" ]; then
@@ -381,19 +421,21 @@ done`
 	tmpl := template.Must(template.New("failover-startup").Delims("[[", "]]").Parse(script))
 	var buf bytes.Buffer
 	err := tmpl.Execute(&buf, struct {
-		AnnotationsFile string
-		RunMarker       string
-		AnnRole         string
-		AnnMasterIP     string
-		AnnEpoch        string
-		RedisPort       int
+		AnnotationsFile    string
+		StartMarker        string
+		AnnRole            string
+		AnnMasterIP        string
+		AnnEpoch           string
+		AnnMasterStartAuth string
+		RedisPort          int
 	}{
-		AnnotationsFile: mountPathPodInfo + "/" + fileAnnotations,
-		RunMarker:       runMarkerPath,
-		AnnRole:         AnnotationAssignedRole,
-		AnnMasterIP:     AnnotationAssignedMasterIP,
-		AnnEpoch:        AnnotationAssignmentEpoch,
-		RedisPort:       littleredv1alpha1.RedisPort,
+		AnnotationsFile:    mountPathPodInfo + "/" + fileAnnotations,
+		StartMarker:        startMarkerPath,
+		AnnRole:            AnnotationAssignedRole,
+		AnnMasterIP:        AnnotationAssignedMasterIP,
+		AnnEpoch:           AnnotationAssignmentEpoch,
+		AnnMasterStartAuth: AnnotationMasterStartAuthorizedEpoch,
+		RedisPort:          littleredv1alpha1.RedisPort,
 	})
 	if err != nil {
 		panic(fmt.Sprintf("failed to execute failover startup template: %v", err))

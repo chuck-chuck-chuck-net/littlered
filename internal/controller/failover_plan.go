@@ -307,3 +307,22 @@ func planFailoverFence(views []failoverPodView, outgoingIP, newMasterIP string) 
 	}
 	return ""
 }
+
+// masterStartAuthorizedFor reports whether a mastership stamp for this action
+// must ALSO grant the target permission to start a fresh process as master
+// (AnnotationMasterStartAuthorizedEpoch, LR-038).
+//
+// Exactly one action needs it: failoverSeed. Seeding runs only when there are
+// ZERO data holders, and its target may be a pod the start gate has parked after
+// a restart — without the authorization it would park forever.
+//
+// The promotion actions must NOT grant it, and that is the whole point of the
+// guard. BestDataHolder only ever returns a REACHABLE node (DataHolders requires
+// Reachable && Keys > 0), so a promotion is always an in-place role change on a
+// running process that already holds the data — no start is involved. Granting a
+// start authorization there would let a later kill-9 of that same pod come back
+// as an EMPTY master while its replicas hold the only surviving copy, which is
+// the 352-of-1145 wipe measured on t3e.
+func masterStartAuthorizedFor(action failoverAction) bool {
+	return action == failoverSeed
+}

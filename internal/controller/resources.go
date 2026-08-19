@@ -51,6 +51,17 @@ const (
 	AnnotationAssignedRole     = "redis.chuck-chuck-chuck.net/assigned-role"
 	AnnotationAssignedMasterIP = "redis.chuck-chuck-chuck.net/assigned-master-ip"
 	AnnotationAssignmentEpoch  = "redis.chuck-chuck-chuck.net/assignment-epoch"
+	// AnnotationMasterStartAuthorizedEpoch is the operator's explicit permission
+	// for a pod to *start* a fresh Redis process as master (LR-038). It is
+	// deliberately separate from AnnotationAssignedRole, which conflates two jobs:
+	// a boot instruction ("start as master") and a standing intent record ("you
+	// are the master"). For a pod that has died those must not be the same thing —
+	// an in-place promotion advances the assignment epoch without changing the
+	// process incarnation, so a restarted pod cannot tell a pre-death instruction
+	// from a fresh one by ordering alone. The operator stamps this ONLY after it
+	// has observed the restart and decided no data is at risk, so it cannot exist
+	// before the death it refers to.
+	AnnotationMasterStartAuthorizedEpoch = "redis.chuck-chuck-chuck.net/master-start-authorized-epoch"
 )
 
 // Resource name helpers
