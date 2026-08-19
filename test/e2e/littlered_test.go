@@ -218,11 +218,11 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
-    masterName: e2e-scoped
+    masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace, e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -610,11 +610,11 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
-    masterName: e2e-scoped
+    masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace, e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -673,7 +673,7 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
-    masterName: e2e-scoped
+    masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
@@ -684,7 +684,7 @@ spec:
       limits:
         cpu: "50m"
         memory: "48Mi"
-`, crName, testNamespace)
+`, crName, testNamespace, e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -779,11 +779,11 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
-    masterName: e2e-scoped
+    masterName: %s
     quorum: 2
     downAfterMilliseconds: 3000
     failoverTimeout: 10000
-`, crName, testNamespace)
+`, crName, testNamespace, e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
