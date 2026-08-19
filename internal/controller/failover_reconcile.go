@@ -452,19 +452,49 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 		log.Error(err, "failed to clear FailoverRecovery condition")
 	}
 
-	// 7a. Straggler repoint (Rule R analog). Secondary healing keeps the
-	// conservative gate (ADR-011 §6): settled transition AND no terminating
-	// pods — this step only.
-	if settled && !anyTerminating {
-		for _, ip := range planFailoverRepoints(state, liveMasterIP) {
-			rn := state.RedisNodes[ip]
-			auditLog.Info("Redis pod is not following the intended master, issuing SLAVEOF",
-				"pod", rn.PodName, "current_role", rn.Role, "target_master", liveMasterIP)
-			if err := r.slaveOfBounded(ctx, lr, ip, liveMasterIP, password); err != nil {
-				auditLog.Error(err, "Failed to repoint straggler", "pod", rn.PodName)
-			}
-			eng.requeueFast = true
+	// 7a. Straggler repoint (Rule R analog). UNGATED as of LR-038 — it previously
+	// required `settled && !anyTerminating`, and both halves were inherited from
+	// sentinel mode rather than reasoned for this one (pillar 3.5 scope).
+	//
+	// `!anyTerminating` meant "don't churn the topology while a pod is going
+	// away", which protects against a *competing actor* mid-failover. In failover
+	// mode there is no competing actor — the operator is the algorithm — so it
+	// bought nothing and cost three things: it hid the outgoing master from the
+	// fence (the 202-write loss), it kept a freshly promoted master replica-less
+	// for extra passes (measured: 60 extra refused writes under
+	// minReplicasToWrite:1), and it suppressed `min-replicas-to-write` as a
+	// self-fence, since stripping a dying master of its last replica is itself a
+	// fencing action.
+	//
+	// `settled` additionally waited for the master *label* to flip. That is
+	// redundant here: reaching this point already requires liveMasterIP != "",
+	// i.e. the intended master is reachable AND reporting role:master.
+	//
+	// Repointing EARLIER is also the safer direction for data, which is the
+	// opposite of how the gate reads. A straggler still following the old master
+	// can only drift further ahead of the new one while we wait — so waiting
+	// enlarges the divergence a resync will discard rather than protecting it. And
+	// the live master is by construction not behind: it was chosen either by
+	// bootstrap (no data anywhere) or by BestDataHolder (highest offset among
+	// reachable holders).
+	//
+	// A bonus falls out: the outgoing master is itself a straggler by
+	// planFailoverRepoints' definition (reachable, role:master, not the live
+	// master), so removing the gate demotes it here too — the operator-side fence,
+	// arriving for free on any path where its pod object still exists.
+	//
+	// Step 7b (re-authorization) keeps `settled`: it stamps annotations that
+	// release parked pods, and releasing a pod into a role that is about to change
+	// is a different risk from redirecting a running replica.
+	for _, ip := range planFailoverRepoints(state, liveMasterIP) {
+		rn := state.RedisNodes[ip]
+		auditLog.Info("Redis pod is not following the intended master, issuing SLAVEOF",
+			"pod", rn.PodName, "current_role", rn.Role, "target_master", liveMasterIP,
+			"settled", settled, "anyTerminating", anyTerminating)
+		if err := r.slaveOfBounded(ctx, lr, ip, liveMasterIP, password); err != nil {
+			auditLog.Error(err, "Failed to repoint straggler", "pod", rn.PodName)
 		}
+		eng.requeueFast = true
 	}
 
 	// 7b. Re-authorization loop (ADR-011 §3): release parked pods (their
