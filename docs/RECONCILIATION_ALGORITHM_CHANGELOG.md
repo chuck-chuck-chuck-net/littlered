@@ -391,6 +391,51 @@ real and correctly placed (kill-9 write availability 96.33% → 91.24%, ~5s per 
 parked pod now *waiting* for the operator instead of wrongly resuming), and force-delete's
 2 lost is the first non-zero on that path — landing exactly on the "~1 per failover" figure
 the ≤5 bound was derived from, so the bound was reasoned rather than luckily zero.
+
+### Addendum 4 — second-environment confirmation, and item (4) (s1 + t3e, 2026-08-19)
+
+**Item (4): the straggler repoint is ungated.** It required `settled && !anyTerminating`;
+neither half was reasoned for this mode (both came from sentinel mode, where the point is not
+to churn while a *competing actor* is mid-failover — there is none here, pillar 3.5 scope).
+The gate cost three things, each of which surfaced as its own symptom above: it hid the
+outgoing master from the fence, it kept a freshly promoted master replica-less for extra
+passes, and it suppressed `min-replicas-to-write` as a self-fence (stripping a dying master
+of its last replica *is* a fencing action). `settled` was additionally redundant — reaching
+that step already requires the intended master to be reachable and reporting `role:master`.
+Repointing **earlier** is also the safer direction for data: a straggler still following the
+old master can only drift *further* ahead while we wait, so waiting enlarges the divergence a
+resync discards rather than protecting it, and the live master is by construction not behind
+(chosen by bootstrap or `BestDataHolder`). A bonus falls out — the outgoing master is itself
+a straggler by `planFailoverRepoints`' definition, so ungating demotes it here too, which is
+the operator-side fence arriving for free wherever its pod object still exists.
+
+**It makes `minReplicasToWrite: 1` free**, which is the measurement that matters for the
+default. On force-delete the knob cost **78 refused writes before (4) and 12 after** — a
+6.5× reduction, against 16/17/19 measured at knob=0, i.e. indistinguishable from off. So the
+repoint latency *was* the knob's entire cost. All cells 0 lost at both knob settings.
+
+**Cross-environment confirmation (the numbers now rest on two clusters, one multi-node):**
+
+| cell | s1 (multi-node) | t3e (single node) | lost |
+|---|---|---|---|
+| sentinel graceful | 94.25% | 95.41% | 0 / 0 |
+| sentinel crash | 96.67% | 97.58% | 0 / 0 |
+| failover graceful | 96.58% | 96.75% | 0 / 0 |
+| failover force-delete | 98.58% | 98.41% | 0 / 0 |
+| failover kill-9 | 91.92% | 93.14% | 0 / 0 |
+
+Ten cells, zero acknowledged writes lost in every one, and `failover >= sentinel` on both
+comparable variants in both environments. The kill-9 **start-gate fix is confirmed off t3e** —
+on the pre-fix build s1 reproduced the bug identically (master stuck, 60s timeout), which also
+retires "t3e artifact" as an explanation.
+
+Two cautions recorded so later readers do not over-read single runs: **kill-9 availability is
+noisy** (91.24 / 91.92 / 93.14 / 96.50 across single runs on both clusters — do not read a
+3pp move from one run), and the near-identical numbers between a loopback single-node cluster
+and a multi-node one with real network hops say this tier's availability cost is dominated by
+**operator reaction time** (reconcile cadence, label flip, client reconnect), not replication
+latency. Which is consistent with where the wins came from: removing waits, not speeding up
+replication.
 ## [LR-039] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
 > **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and LR-038 on the
 > failover line (`release/0.3.1`); none are present on this branch, hence the jump from LR-025.
