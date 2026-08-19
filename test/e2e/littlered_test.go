@@ -218,6 +218,7 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
+    masterName: e2e-scoped
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
@@ -609,6 +610,7 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
+    masterName: e2e-scoped
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
@@ -671,6 +673,7 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
+    masterName: e2e-scoped
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
@@ -776,6 +779,7 @@ spec:
       cpu: "100m"
       memory: "128Mi"
   sentinel:
+    masterName: e2e-scoped
     quorum: 2
     downAfterMilliseconds: 3000
     failoverTimeout: 10000

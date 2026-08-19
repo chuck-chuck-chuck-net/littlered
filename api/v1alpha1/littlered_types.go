@@ -398,6 +398,35 @@ type PodTemplateSpec struct {
 
 // SentinelSpec defines sentinel-specific settings
 type SentinelSpec struct {
+	// MasterName is the Sentinel master name for THIS instance, and it must be unique
+	// among every Sentinel deployment reachable on the same pod network.
+	//
+	// It is not a cosmetic label. The master name is the ONLY isolation boundary
+	// Sentinel's gossip protocol has: a Sentinel receiving a hello message looks the
+	// name up and, if it does not know it, discards the message — and performs no
+	// other check. There is no instance identifier, no namespace, and no
+	// authentication between Sentinels beyond the optional password. Two instances
+	// that share a master name and can reach each other are, protocol-wise, ONE
+	// deployment: the one with the higher config epoch can reassign the other's
+	// master to a foreign Redis pod, whose replicas then FLUSH their datasets to
+	// resynchronise from it. Recommended value: "<namespace>.<name>".
+	//
+	// The historic value "mymaster" is accepted — a legacy client may hardcode it
+	// with no way to parameterise it, and it is the current value of every instance
+	// created before this field existed. Setting it deliberately is a choice the
+	// operator does not second-guess; only LEAVING IT UNSET raises the
+	// SentinelMasterNameUnscoped warning condition.
+	//
+	// Required. Instances created before this field existed keep running with
+	// "mymaster" and must set it explicitly on their next change to spec.sentinel;
+	// this is a client-visible change requiring Sentinel-aware clients to be
+	// reconfigured (clients using the label-routed master Service are unaffected).
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$`
+	MasterName string `json:"masterName,omitempty"`
+
 	// Quorum is the number of Sentinels needed to agree on failure
 	// +kubebuilder:default=2
 	// +optional
@@ -563,6 +592,15 @@ const (
 	// attention (in cooldown, or refusing because divergent data is present); False
 	// records a completed recovery.
 	ConditionGhostMasterRecovery = "GhostMasterRecovery"
+	// ConditionSentinelMasterNameUnscoped is a surfaced WARNING (never a refusal): the
+	// instance has not set spec.sentinel.masterName and is therefore falling back to the
+	// shared legacy Sentinel master name. The master name is the only isolation boundary
+	// Sentinel's gossip protocol has, so any other unscoped Sentinel deployment reachable
+	// on the same pod network can absorb this instance's topology — reassigning its master
+	// to a foreign Redis pod, whose replicas then flush their datasets to resync from it.
+	// The CRD requires the field, so this can only be an instance created before the field
+	// existed; validation cannot reach it, which is why this condition exists.
+	ConditionSentinelMasterNameUnscoped = "SentinelMasterNameUnscoped"
 )
 
 // LittleRedStatus defines the observed state of LittleRed

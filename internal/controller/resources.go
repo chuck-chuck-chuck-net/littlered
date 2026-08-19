@@ -1121,9 +1121,9 @@ log "Auth enabled: $([ -n "$REDIS_PASSWORD" ] && echo yes || echo no)"
 	# Defence: set YIELD_MASTER=true. The main loop sleeps (Redis NOT started) until
 	# Sentinel's down-after-milliseconds fires, failover completes, and a different
 	# master is elected. We then join as a replica.
-	STORED_RUNID=$(redis-cli -h $SENTINEL_SVC -p 26379 $SENTINEL_AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel master mymaster 2>/dev/null \
+	STORED_RUNID=$(redis-cli -h $SENTINEL_SVC -p 26379 $SENTINEL_AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel master [[.MasterName]] 2>/dev/null \
 	  | awk 'prev=="runid"{print; exit} {prev=$0}' || true)
-	SENTINEL_MASTER_IP=$(redis-cli -h $SENTINEL_SVC -p 26379 $SENTINEL_AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel get-master-addr-by-name mymaster 2>/dev/null \
+	SENTINEL_MASTER_IP=$(redis-cli -h $SENTINEL_SVC -p 26379 $SENTINEL_AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel get-master-addr-by-name [[.MasterName]] 2>/dev/null \
 	  | head -n 1 || true)
 
 	YIELD_MASTER=false
@@ -1142,7 +1142,7 @@ log "Auth enabled: $([ -n "$REDIS_PASSWORD" ] && echo yes || echo no)"
 	while true; do
 	  # Use --raw to get just the values (IP/Host on line 1, Port on line 2)
 	  # Use -t to avoid hanging on DNS or network issues
-	  SENTINEL_REPLY=$(redis-cli -h $SENTINEL_SVC -p 26379 $SENTINEL_AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel get-master-addr-by-name mymaster || true)
+	  SENTINEL_REPLY=$(redis-cli -h $SENTINEL_SVC -p 26379 $SENTINEL_AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel get-master-addr-by-name [[.MasterName]] || true)
 	  CURRENT_MASTER_HOST=$(echo "$SENTINEL_REPLY" | head -n 1)
 	  CURRENT_MASTER_PORT=$(echo "$SENTINEL_REPLY" | sed -n '2p')
 
@@ -1206,13 +1206,15 @@ log "Auth enabled: $([ -n "$REDIS_PASSWORD" ] && echo yes || echo no)"
 		tlsFlags = tlsInsecureFlags
 	}
 	err := tmpl.Execute(&buf, struct {
-		Name      string
-		Namespace string
-		TLSFlags  string
+		Name       string
+		Namespace  string
+		TLSFlags   string
+		MasterName string
 	}{
-		Name:      lr.Name,
-		Namespace: lr.Namespace,
-		TLSFlags:  tlsFlags,
+		Name:       lr.Name,
+		Namespace:  lr.Namespace,
+		TLSFlags:   tlsFlags,
+		MasterName: lr.SentinelMasterName(),
 	})
 
 	if err != nil {
@@ -1243,7 +1245,7 @@ if [ "$ROLE" = "master" ]; then
   # reconfiguration step and get stuck pointing at the dead master IP.
   EXPECTED_SLAVES=2
   for i in $(seq 1 10); do
-    SLAVE_COUNT=$(redis-cli --raw -h $SENTINEL_SVC -p 26379 $AUTH_ARGS [[.TLSFlags]] SENTINEL SLAVES mymaster 2>/dev/null | grep -c "^name$" || true)
+    SLAVE_COUNT=$(redis-cli --raw -h $SENTINEL_SVC -p 26379 $AUTH_ARGS [[.TLSFlags]] SENTINEL SLAVES [[.MasterName]] 2>/dev/null | grep -c "^name$" || true)
     SLAVE_COUNT=${SLAVE_COUNT:-0}
     if [ "$SLAVE_COUNT" -ge "$EXPECTED_SLAVES" ]; then
       echo "Sentinel knows $SLAVE_COUNT/$EXPECTED_SLAVES replicas. Proceeding with failover."
@@ -1255,10 +1257,10 @@ if [ "$ROLE" = "master" ]; then
   # Pause writes for 30s to ensure a clean handover
   redis-cli $AUTH_ARGS [[.TLSFlags]] CLIENT PAUSE 30000 WRITE || true
   # Trigger failover
-  redis-cli -h $SENTINEL_SVC -p 26379 $AUTH_ARGS [[.TLSFlags]] SENTINEL failover mymaster || true
+  redis-cli -h $SENTINEL_SVC -p 26379 $AUTH_ARGS [[.TLSFlags]] SENTINEL failover [[.MasterName]] || true
   # Wait for Sentinel to acknowledge the new master
   for i in $(seq 1 10); do
-    MASTER_IP=$(redis-cli -h $SENTINEL_SVC -p 26379 $AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel get-master-addr-by-name mymaster | head -n 1 || true)
+    MASTER_IP=$(redis-cli -h $SENTINEL_SVC -p 26379 $AUTH_ARGS [[.TLSFlags]] -t 2 --raw sentinel get-master-addr-by-name [[.MasterName]] | head -n 1 || true)
     if [ -n "$MASTER_IP" ] && [ "$MASTER_IP" != "$POD_IP" ]; then
        echo "Failover confirmed. New master: $MASTER_IP"
        exit 0
@@ -1272,13 +1274,15 @@ fi`))
 		sentinelPreStopTLSFlags = tlsInsecureFlags
 	}
 	err = preStopTmpl.Execute(&preStopBuf, struct {
-		Name      string
-		Namespace string
-		TLSFlags  string
+		Name       string
+		Namespace  string
+		TLSFlags   string
+		MasterName string
 	}{
-		Name:      lr.Name,
-		Namespace: lr.Namespace,
-		TLSFlags:  sentinelPreStopTLSFlags,
+		Name:       lr.Name,
+		Namespace:  lr.Namespace,
+		TLSFlags:   sentinelPreStopTLSFlags,
+		MasterName: lr.SentinelMasterName(),
 	})
 	if err != nil {
 		panic(fmt.Sprintf("failed to execute sentinel prestop template: %v", err))

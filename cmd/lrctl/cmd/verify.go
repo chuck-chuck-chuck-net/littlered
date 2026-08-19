@@ -305,7 +305,7 @@ func verifySentinel(
 		fmt.Printf("  [!] Sentinel reports failover in progress!\n")
 	}
 
-	actions := state.GetHealActions()
+	actions := state.GetHealActions(masterNameOf(cCtx))
 	if len(actions) > 0 {
 		fmt.Println("\nRecommended Healing Actions:")
 		for _, a := range actions {
@@ -346,7 +346,7 @@ func verifySentinelJSON(
 	}
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
 	state := redisclient.GatherClusterState(ctx, g, redisMap, sentinelMap)
-	return buildSentinelVerifyJSON(name, namespace, redisMap, state)
+	return buildSentinelVerifyJSON(name, namespace, redisMap, state, masterNameOf(cCtx))
 }
 
 // verifyClusterJSON gathers cluster ground truth and returns it as a

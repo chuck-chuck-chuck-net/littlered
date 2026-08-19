@@ -11,6 +11,13 @@ type ClusterContext struct {
 	Namespace string
 	Mode      string // sentinel, cluster
 
+	// SentinelMasterName is the instance's Sentinel master name. It is per-instance
+	// (it is the only isolation boundary Sentinel's gossip has), so every SENTINEL
+	// command lrctl issues must use this value and never a constant. Empty when the
+	// CR could not be read (unmanaged discovery), in which case callers fall back to
+	// v1alpha1.LegacySentinelMasterName.
+	SentinelMasterName string
+
 	// Pods grouped by their role/component
 	RedisPods    []corev1.Pod
 	SentinelPods []corev1.Pod // In sidecar mode, this might be the same as RedisPods

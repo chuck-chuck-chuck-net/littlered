@@ -697,6 +697,9 @@ func (r *LittleRedReconciler) reconcileMasterService(ctx context.Context, little
 //
 //nolint:gocyclo
 func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) error {
+	// The Sentinel master name is this instance's isolation boundary against every
+	// other Sentinel deployment on the pod network — never a shared constant.
+	sentinelMasterName := littleRed.SentinelMasterName()
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 
 	// Skip if we haven't bootstrapped yet
@@ -770,14 +773,14 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 				"pod", sn.PodName, "ip", ip, "master", state.RealMasterIP)
 			podAddr := fmt.Sprintf("%s:%d", ip, littleredv1alpha1.SentinelPort)
 			podSC := redisclient.NewSentinelClient([]string{podAddr}, password, littleRed.Spec.TLS.Enabled)
-			if err := podSC.Monitor(ctx, redisclient.SentinelMasterName, state.RealMasterIP, littleredv1alpha1.RedisPort, quorum); err != nil {
+			if err := podSC.Monitor(ctx, sentinelMasterName, state.RealMasterIP, littleredv1alpha1.RedisPort, quorum); err != nil {
 				auditLog.Error(err, "Failed to re-register sentinel pod", "pod", sn.PodName)
 				continue
 			}
 			if password != "" {
-				_ = podSC.Set(ctx, redisclient.SentinelMasterName, "auth-pass", password)
+				_ = podSC.Set(ctx, sentinelMasterName, "auth-pass", password)
 			}
-			applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel)
+			applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel, sentinelMasterName)
 		}
 	}
 
@@ -826,12 +829,12 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 			podAddr := fmt.Sprintf("%s:%d", ip, littleredv1alpha1.SentinelPort)
 			podSC := redisclient.NewSentinelClient([]string{podAddr}, password, littleRed.Spec.TLS.Enabled)
 
-			_ = podSC.Remove(ctx, redisclient.SentinelMasterName)
-			if err := podSC.Monitor(ctx, redisclient.SentinelMasterName, state.RealMasterIP, littleredv1alpha1.RedisPort, quorum); err == nil {
+			_ = podSC.Remove(ctx, sentinelMasterName)
+			if err := podSC.Monitor(ctx, sentinelMasterName, state.RealMasterIP, littleredv1alpha1.RedisPort, quorum); err == nil {
 				if password != "" {
-					_ = podSC.Set(ctx, redisclient.SentinelMasterName, "auth-pass", password)
+					_ = podSC.Set(ctx, sentinelMasterName, "auth-pass", password)
 				}
-				applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel)
+				applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel, sentinelMasterName)
 			}
 
 			ghostMasterFound = true
@@ -846,12 +849,12 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 			podAddr := fmt.Sprintf("%s:%d", ip, littleredv1alpha1.SentinelPort)
 			podSC := redisclient.NewSentinelClient([]string{podAddr}, password, littleRed.Spec.TLS.Enabled)
 
-			_ = podSC.Remove(ctx, redisclient.SentinelMasterName)
-			if err := podSC.Monitor(ctx, redisclient.SentinelMasterName, state.RealMasterIP, littleredv1alpha1.RedisPort, quorum); err == nil {
+			_ = podSC.Remove(ctx, sentinelMasterName)
+			if err := podSC.Monitor(ctx, sentinelMasterName, state.RealMasterIP, littleredv1alpha1.RedisPort, quorum); err == nil {
 				if password != "" {
-					_ = podSC.Set(ctx, redisclient.SentinelMasterName, "auth-pass", password)
+					_ = podSC.Set(ctx, sentinelMasterName, "auth-pass", password)
 				}
-				applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel)
+				applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel, sentinelMasterName)
 			}
 
 			ghostMasterFound = true // using this flag to trigger requeue
@@ -937,10 +940,10 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 
 	if state.GhostReplicaResetSafe(ghostFound, clusterWhole) {
 		auditLog.Info("Issuing SENTINEL RESET to clear ghost nodes from topology",
-			"master", redisclient.SentinelMasterName, "reachableRedis", reachableRedis)
+			"master", sentinelMasterName, "reachableRedis", reachableRedis)
 		sentinelAddresses := r.getSentinelAddresses(ctx, littleRed)
 		sc := redisclient.NewSentinelClient(sentinelAddresses, password, littleRed.Spec.TLS.Enabled)
-		_ = sc.Reset(ctx, redisclient.SentinelMasterName)
+		_ = sc.Reset(ctx, sentinelMasterName)
 	} else if ghostFound {
 		log.Info("Ghost replica detected but skipping SENTINEL RESET",
 			"master", state.RealMasterIP, "clusterWhole", clusterWhole,
@@ -1007,24 +1010,25 @@ func (r *LittleRedReconciler) getSentinelAddresses(ctx context.Context, littleRe
 // specific sentinel pod for the named master. Must be called after SENTINEL MONITOR
 // to apply user-configured thresholds. All Set errors are intentionally swallowed —
 // a failure to apply settings is non-fatal and will be retried on the next reconcile.
-func applySentinelSettings(ctx context.Context, sc *redisclient.SentinelClient, spec *littleredv1alpha1.SentinelSpec) {
+func applySentinelSettings(ctx context.Context, sc *redisclient.SentinelClient, spec *littleredv1alpha1.SentinelSpec, sentinelMasterName string) {
 	if spec == nil {
 		return
 	}
 	if spec.DownAfterMilliseconds > 0 {
-		_ = sc.Set(ctx, redisclient.SentinelMasterName, "down-after-milliseconds", fmt.Sprintf("%d", spec.DownAfterMilliseconds))
+		_ = sc.Set(ctx, sentinelMasterName, "down-after-milliseconds", fmt.Sprintf("%d", spec.DownAfterMilliseconds))
 	}
 	if spec.FailoverTimeout > 0 {
-		_ = sc.Set(ctx, redisclient.SentinelMasterName, "failover-timeout", fmt.Sprintf("%d", spec.FailoverTimeout))
+		_ = sc.Set(ctx, sentinelMasterName, "failover-timeout", fmt.Sprintf("%d", spec.FailoverTimeout))
 	}
 	if spec.ParallelSyncs > 0 {
-		_ = sc.Set(ctx, redisclient.SentinelMasterName, "parallel-syncs", fmt.Sprintf("%d", spec.ParallelSyncs))
+		_ = sc.Set(ctx, sentinelMasterName, "parallel-syncs", fmt.Sprintf("%d", spec.ParallelSyncs))
 	}
 }
 
 // getMasterPodName queries Sentinel to find the current master pod name.
 // Returns an error if Sentinel query fails.
 func (r *LittleRedReconciler) getMasterPodName(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, podList *corev1.PodList) (string, error) {
+	sentinelMasterName := littleRed.SentinelMasterName()
 	// Try to get real master from Sentinel
 	addresses := r.getSentinelAddresses(ctx, littleRed)
 
@@ -1038,7 +1042,7 @@ func (r *LittleRedReconciler) getMasterPodName(ctx context.Context, littleRed *l
 	defer cancel()
 
 	sc := redisclient.NewSentinelClient(addresses, password, littleRed.Spec.TLS.Enabled)
-	masterInfo, err := sc.GetMaster(checkCtx)
+	masterInfo, err := sc.GetMaster(checkCtx, sentinelMasterName)
 	if err != nil {
 		// If Sentinel explicitly says "no master", it's a confirmed state
 		if strings.Contains(err.Error(), "redis: nil") {
@@ -1167,6 +1171,9 @@ func (r *LittleRedReconciler) updateMasterLabel(ctx context.Context, littleRed *
 //
 //nolint:gocyclo
 func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
+	// The Sentinel master name is this instance's isolation boundary against every
+	// other Sentinel deployment on the pod network — never a shared constant.
+	sentinelMasterName := lr.SentinelMasterName()
 	log := r.getLogger(ctx, lr, LogCategoryRecon)
 	stateLog := r.getLogger(ctx, lr, LogCategoryState)
 
@@ -1269,7 +1276,7 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 		if masterPodName != "" {
 			password := r.getRedisPassword(ctx, latest)
 			sc := redisclient.NewSentinelClient(r.getSentinelAddresses(ctx, latest), password, latest.Spec.TLS.Enabled)
-			if replicas, err := sc.GetReplicas(ctx, redisclient.SentinelMasterName); err == nil {
+			if replicas, err := sc.GetReplicas(ctx, sentinelMasterName); err == nil {
 				for _, rep := range replicas {
 					if !strings.Contains(rep.Flags, "s_down") &&
 						!strings.Contains(rep.Flags, "o_down") &&
@@ -1342,6 +1349,11 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 				LastTransitionTime: metav1.Now(),
 			})
 		}
+
+		// Surface whether this instance has its own Sentinel gossip identity. Runs on
+		// every pass, independent of readiness: an unscoped instance is exposed whether
+		// or not it is healthy, and it is the only signal a pre-field instance gets.
+		r.reconcileSentinelMasterNameCondition(latest)
 
 		// Update observed generation
 		latest.Status.ObservedGeneration = latest.Generation
@@ -1594,6 +1606,9 @@ func (r *LittleRedReconciler) bootstrapSentinel(ctx context.Context, lr *littler
 // Shared by initial bootstrap (bootstrapSentinel) and leaderless recovery
 // (recoverLeaderlessDeadlock).
 func (r *LittleRedReconciler) seedSentinelsWithMaster(ctx context.Context, lr *littleredv1alpha1.LittleRed, masterIP, password string, quorum int) (configured, total int, err error) {
+	// The Sentinel master name is this instance's isolation boundary against every
+	// other Sentinel deployment on the pod network — never a shared constant.
+	sentinelMasterName := lr.SentinelMasterName()
 	sentinelPods := &corev1.PodList{}
 	if err := r.List(ctx, sentinelPods,
 		client.InNamespace(lr.Namespace),
@@ -1618,23 +1633,23 @@ func (r *LittleRedReconciler) seedSentinelsWithMaster(ctx context.Context, lr *l
 		// onto masterIP by REMOVE-ing the stale entry first: a plain SENTINEL MONITOR is
 		// rejected while a same-named master is still configured, so without this the
 		// sentinel stays stranded on the ghost and the election never takes effect.
-		if info, gerr := podSC.GetMaster(ctx); gerr == nil && info != nil {
+		if info, gerr := podSC.GetMaster(ctx, sentinelMasterName); gerr == nil && info != nil {
 			if info.IP == masterIP {
 				configured++
 				continue
 			}
-			_ = podSC.Remove(ctx, redisclient.SentinelMasterName)
+			_ = podSC.Remove(ctx, sentinelMasterName)
 		}
 
 		auditLog.Info("Pointing Sentinel at master", "sentinel", pod.Name, "master", masterIP)
-		if merr := podSC.Monitor(ctx, redisclient.SentinelMasterName, masterIP, littleredv1alpha1.RedisPort, quorum); merr != nil {
+		if merr := podSC.Monitor(ctx, sentinelMasterName, masterIP, littleredv1alpha1.RedisPort, quorum); merr != nil {
 			auditLog.Error(merr, "Failed to configure sentinel", "sentinel", pod.Name)
 			continue // best-effort
 		}
 		if password != "" {
-			_ = podSC.Set(ctx, redisclient.SentinelMasterName, "auth-pass", password)
+			_ = podSC.Set(ctx, sentinelMasterName, "auth-pass", password)
 		}
-		applySentinelSettings(ctx, podSC, lr.Spec.Sentinel)
+		applySentinelSettings(ctx, podSC, lr.Spec.Sentinel, sentinelMasterName)
 		configured++
 	}
 	return configured, total, nil
@@ -1797,6 +1812,12 @@ const (
 	reasonReseededFromSurvivor = "ReseededFromSurvivor"
 	reasonUnsafeRebootstrap    = "UnsafeRebootstrap"
 	reasonRecovered            = "Recovered"
+
+	// Sentinel master-name scoping reasons. The master name is the only isolation
+	// boundary Sentinel's gossip protocol has, so an instance that never chose one
+	// shares an identity with every other unscoped instance on the pod network.
+	reasonSentinelMasterNameUnscoped = "SentinelMasterNameUnscoped"
+	reasonSentinelMasterNameScoped   = "SentinelMasterNameScoped"
 )
 
 // setLeaderlessSince stamps Status.LeaderlessSince and sets the LeaderlessRecovery

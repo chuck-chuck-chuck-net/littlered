@@ -80,7 +80,7 @@ func (g *cliGatherer) GetSentinelState(
 	ctx context.Context, podName, ip string,
 ) (*redisclient.SentinelNodeState, error) {
 	// Get Master
-	masterCmd := []string{redisCliBin, "-p", "26379", modeSentinel, roleMaster, sentinelMasterName}
+	masterCmd := []string{redisCliBin, "-p", "26379", modeSentinel, roleMaster, masterNameOf(g.cCtx)}
 	stdout, _, err := k8s.Exec(ctx, g.coreClient, g.config, g.cCtx.Namespace, podName, g.cCtx.SentinelContainer, masterCmd)
 	if err != nil {
 		if strings.Contains(err.Error(), "ERR No such master") {
@@ -116,7 +116,7 @@ func (g *cliGatherer) GetSentinelState(
 	}
 
 	// Get Replicas
-	replicasCmd := []string{redisCliBin, "-p", "26379", modeSentinel, "replicas", sentinelMasterName}
+	replicasCmd := []string{redisCliBin, "-p", "26379", modeSentinel, "replicas", masterNameOf(g.cCtx)}
 	stdout, _, err = k8s.Exec(
 		ctx, g.coreClient, g.config, g.cCtx.Namespace, podName, g.cCtx.SentinelContainer, replicasCmd)
 	if err == nil {

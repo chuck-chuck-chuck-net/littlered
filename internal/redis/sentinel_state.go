@@ -351,7 +351,7 @@ func (s *SentinelClusterState) GhostReplicaResetSafe(ghostFound, clusterWhole bo
 }
 
 // GetHealActions returns a list of recommended actions to fix the cluster state
-func (s *SentinelClusterState) GetHealActions() []string {
+func (s *SentinelClusterState) GetHealActions(masterName string) []string {
 	var actions []string
 	if s.RealMasterIP == "" {
 		return actions
@@ -384,7 +384,7 @@ func (s *SentinelClusterState) GetHealActions() []string {
 		}
 	}
 	if ghostFound {
-		actions = append(actions, "SENTINEL RESET mymaster")
+		actions = append(actions, fmt.Sprintf("SENTINEL RESET %s", masterName))
 	}
 
 	return actions

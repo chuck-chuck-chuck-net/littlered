@@ -7,6 +7,10 @@ metadata:
 spec:
   mode: sentinel
   sentinel:
+    # REQUIRED. The Sentinel master name is the only isolation boundary
+    # Sentinel gossip has: two instances sharing it on one pod network can
+    # merge quorums and destroy each other's data. Scope it per instance.
+    masterName: sample.sentinel
     quorum: {{ .Values.sentinel.quorum }}
     downAfterMilliseconds: {{ .Values.sentinel.downAfterMilliseconds }}
     failoverTimeout: {{ .Values.sentinel.failoverTimeout }}

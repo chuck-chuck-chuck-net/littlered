@@ -42,11 +42,12 @@ func getFromCR(ctx context.Context, k8sClient client.Client, namespace, name str
 	}
 
 	cCtx := &types.ClusterContext{
-		Name:              name,
-		Namespace:         namespace,
-		Mode:              lr.Spec.Mode,
-		RedisContainer:    containerRedis,
-		SentinelContainer: containerSentinel,
+		Name:               name,
+		Namespace:          namespace,
+		Mode:               lr.Spec.Mode,
+		SentinelMasterName: lr.SentinelMasterName(),
+		RedisContainer:     containerRedis,
+		SentinelContainer:  containerSentinel,
 	}
 
 	for _, pod := range podList.Items {

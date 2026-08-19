@@ -108,7 +108,11 @@ var _ = Describe("LittleRed Controller", func() {
 		It("rejects spec.sentinel when mode is not sentinel", func() {
 			lr := newLR("mismatch-sentinel")
 			lr.Spec.Mode = ModeStandalone
-			lr.Spec.Sentinel = &littleredv1alpha1.SentinelSpec{}
+			// masterName must be set even though this spec is expected to be rejected:
+			// omitting it makes the API server reject the object for the *required
+			// field* instead of the mode mismatch under test, which would be a false
+			// pass. (Same trap as LR-033's negative specs and sitesPerShard.)
+			lr.Spec.Sentinel = &littleredv1alpha1.SentinelSpec{MasterName: "probe.mismatch"}
 
 			err := k8sClient.Create(ctx, lr)
 			Expect(err).To(HaveOccurred())

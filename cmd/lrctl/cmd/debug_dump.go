@@ -200,8 +200,11 @@ func collectRedisState(
 
 		case modeSentinel:
 			// Sentinel pod.
-			sentinelCmd := authShell + ` redis-cli $AUTH -p 26379 SENTINEL MASTER mymaster` +
-				` && echo "---" && redis-cli $AUTH -p 26379 SENTINEL REPLICAS mymaster`
+			// Per-instance master name: a hardcoded one would report "No such master"
+			// on any correctly-scoped instance.
+			mn := lr.SentinelMasterName()
+			sentinelCmd := authShell + ` redis-cli $AUTH -p 26379 SENTINEL MASTER ` + mn +
+				` && echo "---" && redis-cli $AUTH -p 26379 SENTINEL REPLICAS ` + mn
 			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "sentinel",
 				[]string{"sh", "-c", sentinelCmd})
 			writeFile(dir, fmt.Sprintf("sentinel-%s-state.txt", pod.Name), out)
@@ -213,6 +216,13 @@ func collectRedisState(
 
 func collectK8sResources(dir, name, ns string) {
 	fmt.Println("  Collecting Kubernetes resources...")
+
+	// Server and client versions. Behaviour that a dump is used to explain can depend
+	// on the API server version — CRD validation ratcheting, for one, changes whether
+	// a newly-required field blocks writes on pre-existing objects, and it shifted
+	// across 1.29/1.30/1.33. Without this a reader has to go and ask.
+	writeFile(dir, "kubernetes-version.txt", kubectl("version"))
+	writeFile(dir, "nodes.txt", kubectl("get", "nodes", "-o", "wide"))
 
 	writeFile(dir, "pods.txt",
 		kubectl("get", "pods", "-n", ns,

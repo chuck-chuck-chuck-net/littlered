@@ -191,6 +191,7 @@ metadata:
 spec:
   mode: sentinel
   sentinel:
+    masterName: e2e-scoped
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000

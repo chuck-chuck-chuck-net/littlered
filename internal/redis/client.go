@@ -52,8 +52,12 @@ func makeTLSConfig(enabled bool) *tls.Config {
 }
 
 const (
-	// SentinelMasterName is the name used to identify the master in sentinel
-	SentinelMasterName = "mymaster"
+	// NOTE: there is deliberately NO package-level Sentinel master-name constant.
+	// The master name is the only isolation boundary Sentinel's gossip protocol has,
+	// so it must be per-instance (LittleRed.SentinelMasterName()) and is passed
+	// explicitly to every method here. A shared constant is what allowed two
+	// unrelated instances to merge into one quorum — see
+	// docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md.
 	// DefaultTimeout for redis operations
 	DefaultTimeout = 5 * time.Second
 	// ProbeTimeout bounds a single ground-truth probe against one pod address — a
@@ -97,12 +101,12 @@ func NewSentinelClient(addresses []string, password string, tlsEnabled bool) *Se
 }
 
 // GetMaster queries sentinels to find the current master IP and Port
-func (c *SentinelClient) GetMaster(ctx context.Context) (*MasterInfo, error) {
+func (c *SentinelClient) GetMaster(ctx context.Context, masterName string) (*MasterInfo, error) {
 	var lastErr error
 
 	for _, addr := range c.addresses {
 		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
-		master, err := c.getMasterFromSentinel(actx, addr)
+		master, err := c.getMasterFromSentinel(actx, addr, masterName)
 		cancel()
 		if err != nil {
 			lastErr = err
@@ -189,13 +193,13 @@ func (c *SentinelClient) IsFailoverInProgress(ctx context.Context, name string) 
 
 // GetMasterAcrossAll queries all sentinels and returns a map of master IP -> count.
 // This is used to detect split-brain or lack of consensus.
-func (c *SentinelClient) GetMasterAcrossAll(ctx context.Context) (map[string]int, error) {
+func (c *SentinelClient) GetMasterAcrossAll(ctx context.Context, masterName string) (map[string]int, error) {
 	counts := make(map[string]int)
 	reachable := 0
 
 	for _, addr := range c.addresses {
 		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
-		master, err := c.getMasterFromSentinel(actx, addr)
+		master, err := c.getMasterFromSentinel(actx, addr, masterName)
 		cancel()
 		if err != nil {
 			continue
@@ -316,7 +320,7 @@ func (c *SentinelClient) Set(ctx context.Context, name, option, value string) er
 	return nil
 }
 
-func (c *SentinelClient) getMasterFromSentinel(ctx context.Context, addr string) (*MasterInfo, error) {
+func (c *SentinelClient) getMasterFromSentinel(ctx context.Context, addr, masterName string) (*MasterInfo, error) {
 	client := redis.NewSentinelClient(&redis.Options{
 		Addr:        addr,
 		Password:    c.password,
@@ -326,8 +330,8 @@ func (c *SentinelClient) getMasterFromSentinel(ctx context.Context, addr string)
 	})
 	defer func() { _ = client.Close() }()
 
-	// SENTINEL GET-MASTER-ADDR-BY-NAME mymaster
-	result, err := client.GetMasterAddrByName(ctx, SentinelMasterName).Result()
+	// SENTINEL GET-MASTER-ADDR-BY-NAME <masterName>
+	result, err := client.GetMasterAddrByName(ctx, masterName).Result()
 	if err != nil {
 		return nil, fmt.Errorf("failed to get master addr: %w", err)
 	}
