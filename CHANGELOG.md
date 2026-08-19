@@ -21,6 +21,15 @@ cut a release (`scripts/prepare-release.sh`).
   a full patch release rather than a floor. A Dependabot builder bump now fails CI
   until `go.mod` follows it, which is the prompt that was missing.
 
+- **The golangci-lint version can no longer drift between local and CI.** `make lint`
+  resolves the version from the `go.mod` tool pin, while `.github/workflows/lint.yml`
+  states it a second time — they agreed only by coincidence, so a Dependabot bump of the
+  tool directive would move local lint while CI stayed pinned, reinstating the skew #90
+  and #93 closed (inverted: findings that only reproduce in one place). A guard test
+  (`test/tooling`) now fails if the two disagree, in either direction. Completes
+  [#98](https://github.com/chuck-chuck-chuck-net/littlered/issues/98); the version alignment
+  itself shipped in 0.3.0.
+
 ### Changed
 
 - **Kubernetes client libraries move from 0.36.3 to 0.37.1, controller-runtime from 0.24.1
