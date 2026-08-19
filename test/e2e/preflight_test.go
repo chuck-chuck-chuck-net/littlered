@@ -10,7 +10,7 @@ import (
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
-	. "github.com/onsi/gomega"     //nolint:revive
+	. "github.com/onsi/gomega"    //nolint:revive
 
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )

@@ -101,7 +101,10 @@ spec:
 	// --- Tier 2: a single surviving replica still holds the data ----------
 	Context("Single-survivor deadlock", Ordered, func() {
 		var crName string
-		BeforeAll(func() { crName = fmt.Sprintf("leaderless-survivor-%d", time.Now().Unix()); deploySentinel(crName, false) })
+		BeforeAll(func() {
+			crName = fmt.Sprintf("leaderless-survivor-%d", time.Now().Unix())
+			deploySentinel(crName, false)
+		})
 		AfterAll(func() { cleanup(crName) })
 
 		It("promotes the sole data holder and preserves its data (no opt-in required)", func() {

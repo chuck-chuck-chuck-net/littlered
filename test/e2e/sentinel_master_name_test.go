@@ -22,6 +22,7 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -153,7 +154,18 @@ spec:
 // payload flipped A onto B's master and A's replicas flushed to resync from it. That
 // is the red this spec must produce against pre-fix code.
 var _ = Describe("Sentinel Cross-Instance Isolation", Ordered, func() {
-	var instA, instB string
+	var instA, instB, lrctlBin string
+
+	// lrctlVerify runs the REAL CLI against the cluster. The detector behind it is
+	// unit-tested; what only this can show is the whole plumbing — CLI gatherer to
+	// evidence to rendered output — producing the text a human actually reads. Its
+	// exit status is ignored: verify exits non-zero on an unhealthy instance, which is
+	// precisely the case under test.
+	lrctlVerify := func(crName string) string {
+		out, _ := utils.Run(exec.Command(lrctlBin, "verify", crName, "-n", testNamespace))
+		AddReportEntry("lrctl verify "+crName, out)
+		return out
+	}
 
 	sentinelExec := func(crName string, args ...string) (string, error) {
 		full := append([]string{"exec", crName + "-sentinel-0", "-n", testNamespace,
@@ -212,6 +224,14 @@ spec:
 	}
 
 	BeforeAll(func() {
+		By("building lrctl")
+		lrctlBin = filepath.Join("..", "..", "bin", "lrctl")
+		out, err := utils.Run(exec.Command("go", "build", "-o", lrctlBin, "../../cmd/lrctl/main.go"))
+		Expect(err).NotTo(HaveOccurred(), "build output: %s", out)
+		abs, err := filepath.Abs(lrctlBin)
+		Expect(err).NotTo(HaveOccurred())
+		lrctlBin = abs
+
 		stamp := time.Now().Unix()
 		instA, instB = fmt.Sprintf("iso-a-%d", stamp), fmt.Sprintf("iso-b-%d", stamp)
 		deploy(instA)
@@ -309,6 +329,12 @@ spec:
 
 		By("confirming instance A is still serving")
 		Expect(getPhase(instA)).To(Equal("Running"))
+
+		By("lrctl verify reports the scoped name and no foreign contact")
+		report := lrctlVerify(instA)
+		Expect(report).To(ContainSubstring("Master name: " + e2eMasterName(testNamespace, instA)))
+		Expect(report).To(ContainSubstring("No foreign Sentinel contact observed"))
+		Expect(report).NotTo(ContainSubstring("Evidence of another Sentinel deployment"))
 	})
 
 	// Positive control for the spec above. Without it, a payload that never reaches
@@ -325,17 +351,26 @@ spec:
 	// advertised master is a TEST-NET-1 address (RFC 5737) so nothing can attach to
 	// it and instance A is left undisturbed.
 	It("proves the injection path is live by capturing an instance that shares the name", func() {
-		const bogusMaster = "192.0.2.10"
+		// The advertised master is instance A's real master: a LIVE address. An
+		// unroutable one (TEST-NET) would work for the capture itself, but Sentinel
+		// flags it s_down after down-after-milliseconds and the diagnostic then
+		// correctly reclassifies it as ordinary dead debris — making any assertion on
+		// verify's output a race against a 5 s timer. A live foreign master is also
+		// the faithful scenario: this is now a genuine cross-instance capture.
+		//
+		// Deliberately destructive to BOTH instances; they are torn down immediately
+		// after, and instance A's own assertions have already completed above.
+		foreignMaster := podIP(instA + "-redis-0")
 
 		before, err := sentinelExec(instB, "SENTINEL", "masters")
 		Expect(err).NotTo(HaveOccurred())
 		bMasterName := field(before, "name")
-		Expect(field(before, "ip")).NotTo(Equal(bogusMaster))
+		Expect(field(before, "ip")).NotTo(Equal(foreignMaster))
 
 		hello := fmt.Sprintf("%s,26379,%s,9999,%s,%s,6379,9999",
 			podIP(instB+"-sentinel-0"),
 			"f1111111111111111111111111111111deadbeef",
-			bMasterName, bogusMaster)
+			bMasterName, foreignMaster)
 		out, err := sentinelExec(instB, "PUBLISH", "__sentinel__:hello", hello)
 		Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
 		Expect(strings.TrimSpace(out)).To(Equal("1"))
@@ -344,8 +379,17 @@ spec:
 		Eventually(func(g Gomega) {
 			masters, err := sentinelExec(instB, "SENTINEL", "masters")
 			g.Expect(err).NotTo(HaveOccurred())
-			g.Expect(field(masters, "ip")).To(Equal(bogusMaster),
+			g.Expect(field(masters, "ip")).To(Equal(foreignMaster),
 				"the injection did not land; the isolation spec above proves nothing")
 		}, 30*time.Second, 2*time.Second).Should(Succeed())
+
+		By("lrctl verify names the capture rather than reporting a healthy instance")
+		Eventually(func(g Gomega) {
+			report := lrctlVerify(instB)
+			g.Expect(report).To(ContainSubstring("Evidence of another Sentinel deployment"))
+			g.Expect(report).To(ContainSubstring(foreignMaster),
+				"the diagnostic must name the foreign master, not merely flag a problem")
+			g.Expect(report).NotTo(ContainSubstring("No foreign Sentinel contact observed"))
+		}, 60*time.Second, 5*time.Second).Should(Succeed())
 	})
 })
