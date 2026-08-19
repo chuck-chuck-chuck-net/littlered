@@ -34,10 +34,10 @@ import (
 var _ = Describe("Sentinel and Standalone Chaos Testing", Ordered, func() {
 
 	Context("Sentinel Resilience", Ordered, func() {
-		for _, mode := range restartModes {
-			mode := mode // capture range variable
-			It(fmt.Sprintf("should maintain availability during rapid double failover (%s)", mode.Name), func() {
-				crName := fmt.Sprintf("chaos-sentinel-%s-%d", mode.Name, time.Now().Unix())
+		for _, d := range chaosDisruptions {
+			d := d // capture range variable
+			It(fmt.Sprintf("should maintain availability during rapid double failover (%s)", d.Name), func() {
+				crName := fmt.Sprintf("chaos-sentinel-%s-%d", d.Name, time.Now().Unix())
 				// Add dynamic labels for the artifact collector
 				AddReportEntry("cr:" + crName)
 				const testDuration = 120 * time.Second
@@ -121,8 +121,7 @@ spec:
 
 				oldRunID1, _ := getPodRunID(testNamespace, master1)
 
-				_, err = deletePodMode(testNamespace, master1, mode.Graceful)
-				Expect(err).NotTo(HaveOccurred())
+				d.Apply(testNamespace, master1)
 
 				By("waiting for failover to complete (approx 20s)")
 				time.Sleep(20 * time.Second)
@@ -145,8 +144,7 @@ spec:
 					oldRunID2 = runID
 				}, 1*time.Minute, 2*time.Second).Should(Succeed())
 
-				_, err = deletePodMode(testNamespace, master2, mode.Graceful)
-				Expect(err).NotTo(HaveOccurred())
+				d.Apply(testNamespace, master2)
 
 				By("verifying third master eventually emerges with different RunID")
 				Eventually(func(g Gomega) {
@@ -175,10 +173,35 @@ spec:
 				// against a deliberately loose bar, and discarded — which is how a 20-point
 				// graceful-vs-crash spread in the other mode had no baseline to be read
 				// against. Every other chaos tier already prints.
-				GinkgoWriter.Printf("Sentinel Rapid-Double-Failover Metrics (%s):\n%s\n", mode.Name, metrics.String())
+				GinkgoWriter.Printf("Sentinel Rapid-Double-Failover Metrics (%s):\n%s\n", d.Name, metrics.String())
 
 				Expect(metrics.DataCorruptions).To(Equal(int64(0)), "Data corruption detected!")
 				Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.40))
+
+				// The sweep must actually have run, or FinalMissing == 0 is vacuous.
+				Expect(metrics.FinalChecked).To(BeNumerically(">", 500),
+					"final verification sweep did not check a meaningful number of keys")
+				Expect(metrics.FinalUnreadable).To(BeNumerically("<", metrics.FinalChecked/10),
+					"too many keys unreadable at sweep time to trust the durability verdict")
+
+				// DURABILITY — same bound and same derivation as the failover-mode
+				// mirror (LR-038), so the two tiers assert symmetrically rather than
+				// only reporting symmetrically. A master either hands over before
+				// dying, or dies with a guard that stops an emptied restart from
+				// reclaiming mastership — sentinel mode's guard being the yield on
+				// Sentinel's stored run-id. Neither leaves a window in which
+				// acknowledged writes vanish, so the only writes at risk are those
+				// ACKed within the replication lag of the promotion instant: ~1 per
+				// failover at 10 writes/s, ~2 for this spec's two.
+				//
+				// Measured 0 on graceful and force-delete across four runs on two
+				// clusters. NEW and unmeasured for kill-9 at the time of writing —
+				// asserted as a PREDICTION from the yield mechanism, so a red here is
+				// a finding about sentinel mode, not a flaky bound.
+				Expect(metrics.FinalMissing).To(BeNumerically("<=", 5),
+					"acknowledged writes were LOST (%s): %d of %d. DataCorruptions cannot "+
+						"catch this — the writes are gone, not wrong.",
+					d.Name, metrics.FinalMissing, metrics.FinalChecked)
 			})
 		}
 	})

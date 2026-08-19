@@ -75,6 +75,12 @@ const (
 	// Failover-mode defaults (experimental; see ADR-011)
 	DefaultFailoverDownAfterMs       = 5000
 	DefaultFailoverReplicas    int32 = 2
+	// DefaultFailoverMinReplicasToWrite is 1 (LR-038): with the default 2 replicas
+	// this is the "master plus one replica" durable pair, and it is what lets an
+	// isolated master fence ITSELF during a partition — the one case operator-side
+	// fencing cannot reach. Measured free at replicas >= 2 (12 refused writes vs
+	// 16-19 with the check off). Set 0 explicitly at replicas: 1.
+	DefaultFailoverMinReplicasToWrite = 1
 
 	// Placement defaults (cluster-mode shard anti-affinity)
 	DefaultShardTopologyKey       = "kubernetes.io/hostname"
@@ -306,7 +312,14 @@ func (f *FailoverSpec) SetDefaults() {
 	if f.DownAfterMilliseconds == 0 {
 		f.DownAfterMilliseconds = DefaultFailoverDownAfterMs
 	}
-	// MinReplicasToWrite defaults to 0 (off) — the zero value, nothing to set.
+	// MinReplicasToWrite defaults to 1 (LR-038). Settable here only because the
+	// field is a POINTER: with a bare int, "unset" and "explicitly 0" are the same
+	// value, so defaulting would override a user's deliberate "off". nil is
+	// unambiguous, so the Go-side and CRD-side defaults finally agree instead of
+	// depending on which path created the object.
+	if f.MinReplicasToWrite == nil {
+		f.MinReplicasToWrite = new(DefaultFailoverMinReplicasToWrite)
+	}
 }
 
 // GetTotalNodes returns the total number of cluster nodes (shards * (1 + replicas))

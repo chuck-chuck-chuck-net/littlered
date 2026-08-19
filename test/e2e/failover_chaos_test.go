@@ -31,54 +31,6 @@ import (
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
 
-// failoverDisruptions are the three shapes in which a master can be lost, named
-// for what they actually do to the process — which is the distinction that turned
-// out to decide whether acknowledged writes survive (LR-038):
-//
-//	graceful      pod deleted normally. SIGTERM, preStop runs, the pod self-fences
-//	              and hands over. A PLANNED handover.
-//	force-delete  `--grace-period=0 --force`. The pod OBJECT is removed from the
-//	              API immediately, but the container still terminates through the
-//	              kubelet's normal path — measurement says hooks run here too.
-//	kill-9        the container's PID 1 is killed from outside its PID namespace.
-//	              NO hook can run, the process dies instantly, the pod and its IP
-//	              survive, and the epoch gate parks the restarted container.
-//
-// NOTE the suite-wide `restartModes` calls its force-delete variant "crash",
-// which is misleading in exactly the way that cost this investigation time: a
-// force delete is not a crash, and conflating the two hid that only kill-9 is
-// genuinely hook-less. Renaming `restartModes` would rename six specs and every
-// FOCUS string that selects them, so this tier carries its own accurate names and
-// the global rename is a separate sweep.
-var failoverDisruptions = []struct {
-	Name string
-	// Planned marks a disruption the operator is told about in advance (a
-	// deletionTimestamp), so a clean handover is possible and its cost is
-	// assertable. An abrupt loss has no handover to measure.
-	Planned bool
-	Apply   func(namespace, podName string)
-}{
-	{
-		Name:    "graceful",
-		Planned: true,
-		Apply: func(namespace, podName string) {
-			_, err := deletePodMode(namespace, podName, true)
-			Expect(err).NotTo(HaveOccurred())
-		},
-	},
-	{
-		Name: "force-delete",
-		Apply: func(namespace, podName string) {
-			_, err := deletePodMode(namespace, podName, false)
-			Expect(err).NotTo(HaveOccurred())
-		},
-	},
-	{
-		Name:  "kill-9",
-		Apply: killPodProcess,
-	},
-}
-
 // Failover-mode chaos tier — the deliberate counterpart of the sentinel-mode
 // "rapid double failover" pair in sentinel_standalone_chaos_test.go.
 //
@@ -104,7 +56,7 @@ var failoverDisruptions = []struct {
 var _ = Describe("Failover Mode Chaos Testing", Label("failover-mode"), Ordered, func() {
 
 	Context("Failover Resilience", Ordered, func() {
-		for _, d := range failoverDisruptions {
+		for _, d := range chaosDisruptions {
 			d := d // capture range variable
 			It(fmt.Sprintf("should maintain availability during rapid double failover (%s)", d.Name), func() {
 				crName := fmt.Sprintf("chaos-failover-%s-%d", d.Name, time.Now().Unix())

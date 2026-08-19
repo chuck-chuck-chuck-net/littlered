@@ -188,12 +188,36 @@ spec:
                       declares the master down on probe evidence and initiates a failover.
                     type: integer
                   minReplicasToWrite:
-                    default: 0
+                    default: 1
                     description: |-
                       MinReplicasToWrite is rendered into redis.conf as min-replicas-to-write:
                       the master stops accepting writes when fewer than this many replicas are
-                      connected. 0 (the default) disables the check; setting it trades write
-                      availability for a bound on data lost in a failover.
+                      connected (within min-replicas-max-lag, Redis default 10s). 0 disables the
+                      check.
+
+                      Defaults to 1 (LR-038). With the default replicas: 2 this is the "master
+                      plus one replica" durable pair — writes stop only when BOTH replicas are
+                      gone, and it is what makes a master isolated from its replicas fence
+                      ITSELF, locally, during a partition, with no operator involvement. That is
+                      the one case operator-side fencing cannot reach.
+
+                      It costs nothing measurable at replicas >= 2: on the rapid-double-failover
+                      tier it measured 12 refused writes against 16-19 with the check off.
+
+                      SET IT TO 0 IF YOU RUN replicas: 1. There the promoted master has ZERO
+                      replicas until the old pod returns and resyncs, so the check blocks writes
+                      for the whole recovery rather than just the handover, and any single replica
+                      blip stops writes in steady state. That is a deliberate choice between
+                      availability (0) and a bound on loss (1), and it is yours to make — which is
+                      why it is not defaulted per-topology: a derived default would put the
+                      effective value out of the reader's sight and out of the CRD (LR-033).
+                      A POINTER on purpose. The default is non-zero, and the operator Updates the
+                      whole object to add its finalizer — so with a bare int + omitempty an
+                      explicit 0 would be dropped on serialization and the API server would
+                      re-apply the default, silently turning a user's deliberate "off" back on.
+                      That is LR-033's hazard (a reconciler Update persisting a value back into the
+                      user's spec), and it would hit exactly the replicas: 1 users told above to
+                      set 0. nil means unset; a pointer to 0 survives the round-trip.
                     minimum: 0
                     type: integer
                   replicas:

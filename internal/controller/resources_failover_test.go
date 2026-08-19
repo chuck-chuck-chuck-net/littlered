@@ -262,12 +262,17 @@ func TestFailoverPreStopHook(t *testing.T) {
 		t.Fatal("failover container missing preStop exec hook")
 	}
 	hook := strings.Join(container.Lifecycle.PreStop.Exec.Command, " ")
-	if !strings.Contains(hook, "sleep") {
-		t.Errorf("preStop hook should just sleep (operator-led handover, ADR-011 §7), got %q", hook)
+	// The hook no longer "just sleeps" (LR-038): it self-fences and then waits for
+	// mastership to move, exiting as soon as it has. The detailed structural
+	// assertions live in TestBuildFailoverPreStopSelfFences; here we only pin that
+	// it is not the old fixed sleep and does not reach for Sentinel.
+	if !strings.Contains(hook, "CONFIG SET min-replicas-to-write") {
+		t.Errorf("preStop hook must self-fence writes (LR-038), got %q", hook)
 	}
-	// Do NOT port the sentinel-mode `SENTINEL failover` preStop.
-	if strings.Contains(hook, "SENTINEL") || strings.Contains(hook, "sentinel") {
-		t.Errorf("preStop hook must not talk to Sentinel, got %q", hook)
+	// Do NOT port the sentinel-mode `SENTINEL failover` preStop: the pod fences
+	// itself locally and never issues a topology command.
+	if strings.Contains(hook, "SENTINEL ") || strings.Contains(hook, "sentinel failover") {
+		t.Errorf("preStop hook must not issue Sentinel commands, got %q", hook)
 	}
 }
 
@@ -296,15 +301,25 @@ func TestBuildRedisConfigFailover(t *testing.T) {
 		t.Error("failover redis.conf must not contain anything sentinel-specific")
 	}
 
-	// minReplicasToWrite defaults to 0 -> directive omitted entirely.
-	if strings.Contains(config, "min-replicas-to-write") {
-		t.Error("min-replicas-to-write must be omitted when spec.failover.minReplicasToWrite is 0")
+	// The DEFAULT is now 1 (LR-038), so the defaulted config must CARRY the
+	// directive...
+	if !strings.Contains(config, "min-replicas-to-write 1") {
+		t.Error("defaulted failover redis.conf must carry 'min-replicas-to-write 1' (LR-038)")
+	}
+
+	// ...and an explicit 0 must still omit it entirely. That is the opt-out path
+	// replicas: 1 users are told to take, so it needs its own assertion rather
+	// than riding on the old default.
+	off := newFailoverTestLittleRed()
+	off.Spec.Failover.MinReplicasToWrite = new(0)
+	if strings.Contains(buildRedisConfigFailover(off), "min-replicas-to-write") {
+		t.Error("min-replicas-to-write must be omitted when spec.failover.minReplicasToWrite is explicitly 0")
 	}
 }
 
 func TestBuildRedisConfigFailoverMinReplicasToWrite(t *testing.T) {
 	lr := newFailoverTestLittleRed()
-	lr.Spec.Failover.MinReplicasToWrite = 1
+	lr.Spec.Failover.MinReplicasToWrite = new(1)
 	config := buildRedisConfigFailover(lr)
 	if !strings.Contains(config, "min-replicas-to-write 1") {
 		t.Error("failover redis.conf missing 'min-replicas-to-write 1'")

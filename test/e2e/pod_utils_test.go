@@ -31,6 +31,7 @@ import (
 	"time"
 
 	. "github.com/onsi/ginkgo/v2" //nolint:revive // dot-import is the Ginkgo/Gomega convention in tests
+	. "github.com/onsi/gomega"    //nolint:revive // dot-import is the Ginkgo/Gomega convention in tests
 
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
@@ -257,9 +258,73 @@ type restartMode struct {
 }
 
 // restartModes contains the two deletion modes used in dual-mode tests.
+//
+// NAMING CAVEAT (LR-038): "crash" here is a `--grace-period=0 --force` delete,
+// which is NOT a crash — the pod OBJECT is removed from the API while the
+// container still terminates through the kubelet's normal path, hooks included.
+// The genuine crash is kill-9 of the container's PID 1, where no hook can run.
+// Conflating the two hid a data-loss bug for a whole release: the only kill-9
+// coverage killed the BOOTSTRAP master, the one master the failover-mode start
+// gate happened to protect, so a kill-9 of a PROMOTED master silently destroyed
+// 352 of 1145 acknowledged writes.
+//
+// The chaos tiers use chaosDisruptions below, which names all three shapes
+// correctly. restartModes is kept for the four non-chaos dual-mode specs: adding
+// a third shape there would grow the suite everywhere, and renaming its variants
+// would rename six specs plus every FOCUS string that selects them. Tracked as a
+// separate sweep.
 var restartModes = []restartMode{
 	{"graceful", true},
 	{"crash", false},
+}
+
+// chaosDisruption is one way a master can be lost, named for what it actually
+// does to the PROCESS — which is the distinction that decides whether
+// acknowledged writes survive (LR-038).
+type chaosDisruption struct {
+	Name string
+	// Planned marks a disruption the operator/Sentinel is told about in advance
+	// (a deletionTimestamp), so a clean handover is possible and its cost is
+	// assertable. An abrupt loss has no handover whose cost could be measured.
+	Planned bool
+	Apply   func(namespace, podName string)
+}
+
+// chaosDisruptions is the shared three-shape set for the mode-comparison chaos
+// tiers. Shared deliberately: the failover tier exists to be measured against the
+// sentinel tier on ONE yardstick, and a per-tier copy is exactly how yardsticks
+// drift.
+//
+//	graceful      pod deleted normally. SIGTERM, preStop runs, handover happens.
+//	force-delete  `--grace-period=0 --force`. The pod OBJECT vanishes from the API
+//	              but the container still terminates through the kubelet's path.
+//	kill-9        the container's PID 1 is killed from outside its PID namespace.
+//	              NO hook can run, the process dies instantly, and the pod and its
+//	              IP survive — the case both modes need a restart guard for, and
+//	              where they solve it differently: sentinel mode yields on
+//	              Sentinel's stored run-id (identity, kept by a continuous external
+//	              observer), failover mode on an operator-stamped start
+//	              authorization.
+var chaosDisruptions = []chaosDisruption{
+	{
+		Name:    "graceful",
+		Planned: true,
+		Apply: func(namespace, podName string) {
+			_, err := deletePodMode(namespace, podName, true)
+			Expect(err).NotTo(HaveOccurred())
+		},
+	},
+	{
+		Name: "force-delete",
+		Apply: func(namespace, podName string) {
+			_, err := deletePodMode(namespace, podName, false)
+			Expect(err).NotTo(HaveOccurred())
+		},
+	},
+	{
+		Name:  "kill-9",
+		Apply: killPodProcess,
+	},
 }
 
 // deletePod deletes a pod in the given namespace.

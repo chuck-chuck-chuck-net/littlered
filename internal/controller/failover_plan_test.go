@@ -115,6 +115,57 @@ func TestPlanMasterDeath(t *testing.T) {
 			downSince: elapsed(),
 			want:      masterDeathHold,
 		},
+
+		// --- ARITY (LR-038 / handover gap 3) -------------------------------
+		// Every row above uses two witnesses or none. `replicas: 1` is the CRD
+		// minimum and therefore a supported, reachable topology, and it has
+		// exactly ONE witness — an arity this table never exercised.
+		//
+		// The policy question it forces, which ADR-011 never visibly answered:
+		// IS A SINGLE WITNESS SUFFICIENT CORROBORATION TO DECLARE A MASTER DEAD?
+		// The answer encoded here is YES, and it is a deliberate choice rather
+		// than an accident of `len(links) > 0`:
+		//   - LR-017's lesson is that the OPERATOR'S OWN DIAL is never sufficient,
+		//     because a blackholing network fools exactly one viewpoint — the
+		//     operator's. A replica is an independent viewpoint, and at
+		//     `replicas: 1` it is the only one that exists.
+		//   - Requiring two would make `replicas: 1` permanently undead: no
+		//     failover could ever be declared on probe evidence, so the mode's
+		//     minimum topology would silently lose its HA.
+		//   - The kubelet-authoritative branch is unaffected either way, so a
+		//     genuinely dead pod is still caught with no witnesses at all.
+		{
+			name:      "arity 1: single witness reporting link:down IS sufficient corroboration (replicas:1 is supported)",
+			pod:       livePod,
+			reachable: false,
+			links:     []string{linkStatusDown},
+			downSince: elapsed(),
+			want:      masterDeathDeclareProbe,
+		},
+		{
+			name:      "arity 1: the single witness still sees link:up -> vetoed (one witness can also veto)",
+			pod:       livePod,
+			reachable: false,
+			links:     []string{linkStatusUp},
+			downSince: elapsed(),
+			want:      masterDeathHold,
+		},
+		{
+			name:      "arity 3: unanimous link:down -> dead (no majority arithmetic; ALL must agree)",
+			pod:       livePod,
+			reachable: false,
+			links:     []string{linkStatusDown, linkStatusDown, linkStatusDown},
+			downSince: elapsed(),
+			want:      masterDeathDeclareProbe,
+		},
+		{
+			name:      "arity 3: a single dissenting link:up vetoes the majority (unanimity, not quorum)",
+			pod:       livePod,
+			reachable: false,
+			links:     []string{linkStatusDown, linkStatusDown, linkStatusUp},
+			downSince: elapsed(),
+			want:      masterDeathHold,
+		},
 	}
 
 	for _, tc := range tests {
@@ -238,6 +289,42 @@ func TestPlanFailover(t *testing.T) {
 			wantMasterIP: ipReplica,
 			wantDiverged: false,
 			wantHolders:  2,
+		},
+		// --- ARITY (LR-038 / handover gap 3) -------------------------------
+		// planFailover is set-based (union-find over lineages), so nothing here
+		// scales with the holder count — which is exactly the claim these rows
+		// pin. `replicas: 1` yields at most ONE holder, and that single holder is
+		// then the only copy of the data in existence.
+		{
+			name:         "arity 1: the sole holder is promoted with no opt-in (replicas:1 — it is the ONLY copy)",
+			redis:        []rnSpec{{ip: ipReplica, reachable: true, keys: 7, offset: 300, replid: "A", role: roleSlave}},
+			since:        nil,
+			wantAction:   failoverPromote,
+			wantMasterIP: ipReplica,
+			wantHolders:  1,
+		},
+		{
+			name: "arity 3: three holders, one lineage -> promote highest offset, still no opt-in",
+			redis: []rnSpec{
+				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: "A", role: roleSlave},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 250, replid: "A", role: roleSlave},
+				{ip: ipNode9, reachable: true, keys: 5, offset: 180, replid: "A", role: roleSlave},
+			},
+			since:        nil,
+			wantAction:   failoverPromote,
+			wantMasterIP: ipReplica,
+			wantHolders:  3,
+		},
+		{
+			name: "arity 3: one divergent lineage among three refuses — divergence is set-based, not a vote",
+			redis: []rnSpec{
+				{ip: ipMaster, reachable: true, keys: 5, offset: 100, replid: "A", role: roleSlave},
+				{ip: ipReplica, reachable: true, keys: 5, offset: 250, replid: "A", role: roleSlave},
+				{ip: ipNode9, reachable: true, keys: 5, offset: 180, replid: "B", role: RoleMaster},
+			},
+			since:       nil,
+			wantAction:  failoverRefuse,
+			wantHolders: 3,
 		},
 		{
 			name: "func: terminating dead master never blocks promotion (contrast sentinel Rule A)",

@@ -36,8 +36,9 @@ func TestFailoverSetDefaults(t *testing.T) {
 		if f.DownAfterMilliseconds != DefaultFailoverDownAfterMs {
 			t.Errorf("DownAfterMilliseconds = %d, want %d", f.DownAfterMilliseconds, DefaultFailoverDownAfterMs)
 		}
-		if f.MinReplicasToWrite != 0 {
-			t.Errorf("MinReplicasToWrite = %d, want 0 (off by default)", f.MinReplicasToWrite)
+		if f.MinReplicasToWrite == nil || *f.MinReplicasToWrite != DefaultFailoverMinReplicasToWrite {
+			t.Errorf("MinReplicasToWrite = %v, want %d (LR-038: the durable pair is on by default)",
+				f.MinReplicasToWrite, DefaultFailoverMinReplicasToWrite)
 		}
 		if f.AllowUnsafeRebootstrapOnDeadlock {
 			t.Error("AllowUnsafeRebootstrapOnDeadlock must default to false")
@@ -49,7 +50,7 @@ func TestFailoverSetDefaults(t *testing.T) {
 		lr := &LittleRed{Spec: LittleRedSpec{Mode: ModeFailover, Failover: &FailoverSpec{
 			Replicas:                         &replicas,
 			DownAfterMilliseconds:            12000,
-			MinReplicasToWrite:               1,
+			MinReplicasToWrite:               new(1),
 			AllowUnsafeRebootstrapOnDeadlock: true,
 		}}}
 		lr.SetDefaults()
@@ -60,8 +61,8 @@ func TestFailoverSetDefaults(t *testing.T) {
 		if f.DownAfterMilliseconds != 12000 {
 			t.Errorf("DownAfterMilliseconds = %d, want 12000 (user value preserved)", f.DownAfterMilliseconds)
 		}
-		if f.MinReplicasToWrite != 1 {
-			t.Errorf("MinReplicasToWrite = %d, want 1 (user value preserved)", f.MinReplicasToWrite)
+		if f.MinReplicasToWrite == nil || *f.MinReplicasToWrite != 1 {
+			t.Errorf("MinReplicasToWrite = %v, want 1 (user value preserved)", f.MinReplicasToWrite)
 		}
 		if !f.AllowUnsafeRebootstrapOnDeadlock {
 			t.Error("AllowUnsafeRebootstrapOnDeadlock = false, want true (user value preserved)")
@@ -87,7 +88,7 @@ func TestValidateFailover(t *testing.T) {
 		{"nil section is valid", nil, false},
 		{"defaults are valid", &FailoverSpec{Replicas: replicas(2), DownAfterMilliseconds: 5000}, false},
 		{"zero replicas rejected", &FailoverSpec{Replicas: replicas(0)}, true},
-		{"negative minReplicasToWrite rejected", &FailoverSpec{Replicas: replicas(2), MinReplicasToWrite: -1}, true},
+		{"negative minReplicasToWrite rejected", &FailoverSpec{Replicas: replicas(2), MinReplicasToWrite: new(-1)}, true},
 		{"one replica is valid", &FailoverSpec{Replicas: replicas(1)}, false},
 	}
 	for _, tt := range tests {
@@ -122,5 +123,28 @@ func TestFailoverCRDContainsModeAndCELRule(t *testing.T) {
 		if !strings.Contains(crdStr, want) {
 			t.Errorf("generated CRD missing %q; run `make manifests`", want)
 		}
+	}
+}
+
+// TestFailoverMinReplicasToWriteExplicitZeroSurvivesDefaulting is the reason the
+// field is a *int and not an int (LR-038). The default is non-zero and the
+// operator Updates the whole object to add its finalizer, so with a bare int +
+// omitempty an explicit 0 would be dropped on serialization and the API server
+// would re-apply the default — silently turning a deliberate "off" back on, for
+// exactly the replicas: 1 users the docs tell to set 0. That is LR-033's hazard.
+func TestFailoverMinReplicasToWriteExplicitZeroSurvivesDefaulting(t *testing.T) {
+	off := 0
+	lr := &LittleRed{Spec: LittleRedSpec{Mode: ModeFailover, Failover: &FailoverSpec{
+		Replicas:           new(int32(1)),
+		MinReplicasToWrite: &off,
+	}}}
+	lr.SetDefaults()
+
+	got := lr.Spec.Failover.MinReplicasToWrite
+	if got == nil {
+		t.Fatal("defaulting dropped an explicitly-set minReplicasToWrite")
+	}
+	if *got != 0 {
+		t.Errorf("MinReplicasToWrite = %d, want 0 — an explicit opt-out must not be re-defaulted", *got)
 	}
 }

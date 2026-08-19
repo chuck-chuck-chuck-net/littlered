@@ -882,3 +882,109 @@ var _ = Describe("Failover Mode Deadlock Recovery", Label("failover-mode"), func
 		})
 	})
 })
+
+// =============================================================================
+// Minimum topology: replicas: 1 (LR-038 / handover gap 3)
+//
+// `replicas: 1` is the CRD MINIMUM and therefore a supported, reachable topology,
+// and until now nothing exercised it — unit or e2e. Every other failover spec runs
+// the default 2. That gap mattered more than it looked:
+//
+//   - it is the only topology with a SINGLE witness, so it is where the
+//     "is one witness enough corroboration to declare a master dead?" question
+//     becomes real rather than academic (answered YES, pinned in the arity rows of
+//     TestPlanMasterDeath)
+//   - it is where the promoted master has ZERO replicas until the old pod returns,
+//     which is what makes the new minReplicasToWrite: 1 default harshest — hence
+//     this spec sets it to 0, the documented opt-out
+//   - it is where the start-gate bug would have wiped the ONLY copy rather than
+//     one of three
+//
+// Deliberately ONE spec, not a parameterised re-run of the whole tier. There is no
+// count-dependent arithmetic anywhere in failover mode (no quorum, no majority):
+// planMasterDeath branches on "any witness disagrees", planFailover on set-based
+// lineage. So re-running 18 specs at another count would exercise identical
+// branches with longer slices — the lowest-yield coverage available, and precisely
+// the coverage that rots because only the default ever gets run.
+//
+// `replicas: 3` is DECLINED for the same reason, recorded here so it is not
+// re-proposed as an obvious gap: it adds a pod and a few minutes of suite time and
+// cannot reach a branch that 2 does not already reach. Arity 3 is covered where it
+// costs nothing — the pure tables.
+// =============================================================================
+var _ = Describe("Failover Mode Minimum Topology", Label("failover-mode"), Ordered, func() {
+	crName := "fo-min-topology"
+
+	BeforeAll(func() {
+		AddReportEntry("cr:" + crName)
+		cmd := exec.Command("kubectl", "apply", "-f", "-")
+		// minReplicasToWrite: 0 — the documented opt-out for this topology. With
+		// the default 1, a promoted master here has no replica until the old pod
+		// resyncs, so writes would be refused for the whole recovery rather than
+		// just the handover. Setting it makes the spec assert the OPT-OUT path,
+		// which is the one a replicas: 1 user is told to take.
+		cmd.Stdin = strings.NewReader(failoverCR(crName, 1, 5000, nil, "    minReplicasToWrite: 0\n"))
+		_, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+
+		Eventually(func(g Gomega) {
+			g.Expect(getPhase(crName)).To(Equal("Running"))
+			g.Expect(getMasterPod(crName)).NotTo(BeEmpty())
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+	})
+
+	AfterAll(func() { cleanupFailoverCR(crName) })
+
+	It("should stand up 2 pods and report a consistent topology", func() {
+		cmd := exec.Command("kubectl", "get", "statefulset", crName+"-redis",
+			"-n", testNamespace, "-o", "jsonpath={.status.readyReplicas}")
+		out, err := utils.Run(cmd)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(out)).To(Equal("2"), "replicas: 1 must yield 1 + 1 = 2 data pods")
+
+		verifyFailoverTopologySync(testNamespace, crName, 1)
+	})
+
+	It("should fail over to its ONLY replica without losing data", func() {
+		originalMaster := getMasterPod(crName)
+		Expect(originalMaster).NotTo(BeEmpty())
+		originalUID := podUID(testNamespace, originalMaster)
+		Expect(originalUID).NotTo(BeEmpty())
+
+		By("writing data and waiting for the sole replica to hold it")
+		const key, value = "fo-min-key", "fo-min-value"
+		out, err := redisExec(testNamespace, originalMaster, "SET", key, value)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(strings.TrimSpace(out)).To(Equal("OK"))
+
+		replicas := otherRedisPods(crName, originalMaster)
+		Expect(replicas).To(HaveLen(1), "replicas: 1 must have exactly one non-master data pod")
+		soleReplica := replicas[0]
+		Eventually(func(g Gomega) {
+			out, _ := redisExec(testNamespace, soleReplica, "GET", key)
+			g.Expect(strings.TrimSpace(out)).To(Equal(value))
+		}, 30*time.Second, 2*time.Second).Should(Succeed(),
+			"the sole replica never received the data — there is no second copy in this topology")
+
+		By("killing the master, leaving exactly ONE witness and ONE data holder")
+		_, err = deletePodMode(testNamespace, originalMaster, false)
+		Expect(err).NotTo(HaveOccurred())
+
+		By("the sole replica must be promoted (a single witness IS sufficient corroboration)")
+		Eventually(func(g Gomega) {
+			m := getMasterPod(crName)
+			g.Expect(m).To(Equal(soleReplica),
+				"the only surviving data holder must become master")
+			g.Expect(getPodRoleLabel(testNamespace, m)).To(Equal("master"))
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("the data must survive — this was the only copy")
+		Eventually(func(g Gomega) {
+			out, _ := redisExec(testNamespace, getMasterPod(crName), "GET", key)
+			g.Expect(strings.TrimSpace(out)).To(Equal(value))
+		}, 1*time.Minute, 3*time.Second).Should(Succeed(),
+			"data lost at replicas: 1 — there was no other holder to recover from")
+
+		verifyFailoverTopologySync(testNamespace, crName, 1)
+	})
+})
