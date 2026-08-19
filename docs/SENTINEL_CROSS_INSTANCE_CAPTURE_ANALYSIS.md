@@ -497,7 +497,7 @@ our own master correctly.
 
 **Instead, make the state fast to identify and documented to fix by hand:**
 
-- **`lrctl verify` diagnostic** (not yet implemented): report the effective master name, the
+- **`lrctl verify` diagnostic** (implemented): reports the effective master name, the
   Sentinel-known sentinel and replica counts against what we deployed, and any Sentinel-known
   address that is not one of our pods. `num-other-sentinels: 8` on a three-sentinel instance was
   the loudest signal in this dump and nothing surfaces it today. A tool run when someone is

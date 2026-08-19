@@ -268,7 +268,10 @@ The capability belongs in `lrctl verify` as **diagnosis** instead: report the ef
 the Sentinel-known sentinel/replica counts against what we deployed, and any known address that is
 not one of our pods. A tool run when someone is already suspicious makes no safety claim by being
 silent. (`num-other-sentinels: 8` on a three-sentinel instance was the loudest signal in the
-incident dump, and nothing surfaces it today. Not yet implemented.)
+incident dump, and nothing surfaced it.) **Implemented** — `SentinelClusterState.DetectCrossInstance`
+plus reporting in `verify`'s text and JSON output. Wiring it exposed that the `lrctl` gatherer
+fabricated replica flags (`"found"` / `"s_down,ghost"`) where the operator-side gatherer keeps what
+Sentinel actually reported, which would have made the diagnostic structurally unable to work.
 
 ### F. A spec-level CEL rule requiring the field — rejected
 
@@ -357,9 +360,8 @@ system. What it would insure against — some future route to "Sentinels monitor
 master" that is not a name collision — has no known instance; the address-adoption path does not
 produce it, since there our Sentinels still monitor our own master correctly.
 
-**Adopted instead:** make the state fast to identify and documented to fix by hand — the
-`lrctl verify` diagnostic of Alternative E, and a runbook stating plainly that the instance returns
-empty. Detection is not the gap: a captured instance sits at `Ready=False` and ordinary alerting
+**Adopted instead, and both now implemented:** the `lrctl verify` diagnostic of Alternative E, and
+the runbook in `USAGE.md` stating plainly that the instance returns empty. Detection is not the gap: a captured instance sits at `Ready=False` and ordinary alerting
 catches it.
 
 ## Deferred: the mutating admission webhook

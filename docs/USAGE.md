@@ -1289,8 +1289,24 @@ kubectl logs store-sentinel-0
 ### Recovering a sentinel instance captured by another Sentinel deployment
 
 **Symptoms.** The instance sits at `Ready=False` / `phase: Initializing` and `status.master` is
-empty. Its Sentinels report a master IP that is **not one of its own pods**, and report more
-sentinels or replicas than you deployed:
+empty. `lrctl verify` names it directly:
+
+```bash
+lrctl verify store -n apps
+# Sentinel Identity:
+#   Master name: mymaster
+#   [WARN] This is the historic shared default. ...
+#   [FAIL] Evidence of another Sentinel deployment sharing this master name:
+#          - monitored master is not one of this instance's pods, and is alive: 10.9.9.9
+#          - <pod> reports 8 other sentinels; 2 were deployed
+```
+
+Note what that check can and cannot tell you: it reports evidence, and a clean result means
+"nothing visible from this vantage", not "isolated" — a deployment yours has not merged with is
+invisible by construction.
+
+By hand, the same signals are in the Sentinel reply — a master IP that is **not one of its own
+pods**, and more sentinels or replicas than you deployed:
 
 ```bash
 kubectl exec store-sentinel-0 -c sentinel -- redis-cli -p 26379 SENTINEL master <masterName>
