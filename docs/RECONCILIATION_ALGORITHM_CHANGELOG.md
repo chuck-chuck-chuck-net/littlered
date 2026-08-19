@@ -329,6 +329,68 @@ as such rather than claimed. The clean control is the **kill-9 tier**, where the
 process dies and no hook can possibly run — if that path loses writes while force-delete
 does not, the hypothesis is confirmed and the unconditional operator-side fence gets a real
 red to be built against.
+
+### Addendum 3 — the epoch gate protected only the bootstrap master (t3e, 2026-08-19)
+
+Adding the genuinely-named `kill-9` variant to the tier (above) turned it red on the first
+run, on a latent bug in the shipped mode: **a kill-9 of a PROMOTED master destroyed 352 of
+1145 acknowledged writes** — 31% — with `DataCorruptions: 0` and write availability 95.50%.
+The arithmetic (second kill lands ~30–35s into a 120s window at 10 writes/s) says
+*everything written before the kill* was wiped, not a tail.
+
+**The epoch gate was answering the wrong kind of question.** It is an **ordering** device —
+"is this instruction newer than the last one I used?" — being used to answer an **identity**
+question: "was this instruction issued for *this process incarnation*?" The two coincide
+everywhere except one place: an **in-place promotion advances the assignment epoch without
+restarting the process**, so the start marker is never rewritten and stays behind.
+
+| | annotation | marker |
+|---|---|---|
+| bootstrap: redis-1 starts as **replica** @1 | `replica@1` | **1** |
+| failover 1: stamp `master@2` + `REPLICAOF NO ONE` to the **live** process | `master@2` | **still 1** |
+| kill-9 | `2 > 1` → honored → **empty master** | |
+
+The operator then sees a reachable `role:master` at the intended IP, believes it healthy,
+and repoints the replicas holding the only surviving copy onto it.
+
+**What was already right, and why this hid for so long.** On promotion the operator
+re-stamps *every* pod, so the superseded ex-master does get `assigned-role=replica` — that
+case has two layers of protection because it is the one the design imagined (the ADR comment
+reads "a kill-9'd ex-master must never reclaim mastership from its **stale** assigned-role
+annotation"). The unimagined case is the pod whose master annotation is **current** but was
+issued while it was alive. And the e2e coverage matched the blind spot exactly: the only
+kill-9 test killed the **bootstrap** master — the single master whose marker happens to equal
+its master epoch — which is why this survived 16/16.
+
+**Fix — narrow, because the two roles carry different risk.** A restarted process (marker
+present ⇒ no data) may honor a **replica** assignment on the existing ordering rule, since
+starting as a replica of the live master loses nothing. A **master** assignment additionally
+requires `AnnotationMasterStartAuthorizedEpoch`, which the operator stamps only after it has
+observed the restart and established that no data is at risk — permission that **cannot
+predate the death it refers to**, closing the race ordering alone cannot. Pure seam
+`masterStartAuthorizedFor`: **seed only**. Promotion must never grant it (its target is by
+construction a reachable, running data holder — `DataHolders` requires `Reachable && Keys > 0`
+— so authorizing a *start* there re-arms the wipe for the next kill-9); bootstrap grants it
+because nothing holds data and redis-0 may already carry a marker.
+
+Rejected: "every start waits to be introduced by the operator" (the cluster-mode analogy).
+More uniform, but it puts an annotation round-trip through the kubelet's projected-volume
+refresh on the critical path of **every** pod start, forever, to protect states that provably
+cannot lose data. The narrow gate also makes the promoted-master case behave exactly like the
+bootstrap-master case, whose recovery cost is already measured (single kill-9: 0 lost of 1155,
+96.33% writes).
+
+**Renamed, because the old name hid the bug:** `/data/littlered-run-epoch` →
+`/data/littlered-started-under-epoch`, `MARKER_EPOCH` → `STARTED_UNDER_EPOCH`,
+`runMarkerPath` → `startMarkerPath`. It is not "the epoch we are at", it is "what my current
+incarnation booted with".
+
+**Verified (3/3 green):** kill-9 **352 lost → 0**; graceful 0 lost / 96.50% writes;
+force-delete 0 → **2** lost / 98.58%. Two observations worth keeping: the gate's cost is
+real and correctly placed (kill-9 write availability 96.33% → 91.24%, ~5s per kill, the
+parked pod now *waiting* for the operator instead of wrongly resuming), and force-delete's
+2 lost is the first non-zero on that path — landing exactly on the "~1 per failover" figure
+the ≤5 bound was derived from, so the bound was reasoned rather than luckily zero.
 ## [LR-039] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
 > **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and LR-038 on the
 > failover line (`release/0.3.1`); none are present on this branch, hence the jump from LR-025.

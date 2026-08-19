@@ -5,6 +5,10 @@ Accepted (mode ships as **experimental**; see Lifecycle).
 Amended 2026-08-17 (LR-038): §7 gains the outgoing-master **fence**, and §8's graduation
 gate gains a **durability** bar — an availability bar alone graduated a mode that
 silently lost acknowledged writes on every graceful handover.
+Amended 2026-08-19 (LR-038): §3's epoch gate becomes a **start gate** — a restarted process
+may not start as master without explicit operator authorization. The epoch is an *ordering*
+device that was answering an *identity* question, and it protected only the bootstrap master;
+a kill-9 of a **promoted** master destroyed 352 of 1145 acknowledged writes.
 Amended 2026-08-18 (LR-038): the **primary fence moves into the pod** (preStop self-fence,
 target-free, then exit as soon as mastership moves), because operator-side fencing can only
 win a race while the pod cannot lose one. §4 also corrects a false statement about Pod
@@ -95,16 +99,29 @@ assignment channel:
   **No reachability PING before starting as replica** (ADR-002's deadlock constraint):
   Redis's own retry logic handles a temporarily unreachable master; the operator
   repoints later if the target is truly dead.
-- **Epoch gate — the ADR-001 same-IP kill-9 hazard, re-owned.** Before `exec`, the
-  script writes the assignment epoch to a run-marker on the EmptyDir
-  (`/data/littlered-run-epoch`). The marker survives a container restart (same pod,
-  same IP, wiped dataset) but not a pod replacement. On start, an assignment is honored
-  only if there is no marker **or** the annotation epoch is **greater** than the marker
-  epoch. A kill-9'd ex-master therefore cannot reclaim mastership from its stale
-  `assigned-role: master` annotation — it parks until the operator, seeing the restart
-  with its global view, either fails over to a data-holding replica (normal case, epoch
-  bumped, this pod re-assigned as replica) or re-authorizes it as master (no data
-  anywhere). This is Sentinel-mode's run-id yield with the operator as the authority.
+- **Start gate — the ADR-001 same-IP kill-9 hazard, re-owned.** Before `exec`, the script
+  records the assignment epoch it is starting under in a marker on the EmptyDir
+  (`/data/littlered-started-under-epoch`). The marker survives a container restart (same
+  pod, same IP, dataset wiped in RAM) but not a pod replacement, so its presence means
+  exactly "I am a restarted process and I hold no data". Two rules, because the roles carry
+  different risk (**amended 2026-08-19, LR-038**):
+  - **replica** — ordering suffices: honor an assignment whose epoch is greater than the one
+    this process started under. Starting as a replica of the live master loses nothing.
+  - **master** — ordering does **not** suffice. An in-place promotion (the operator sending
+    `REPLICAOF NO ONE` to a *running* replica) advances the epoch **without** restarting the
+    process, so the marker stays behind and a later kill-9 reads a strictly greater epoch and
+    treats a pre-death instruction as fresh — returning as an **empty master** the operator
+    believes is healthy, whereupon the replicas holding the only copy are repointed onto it.
+    Measured: **352 of 1145 acknowledged writes destroyed**, corruptions 0, write availability
+    95.50%. So a restarted process may start as master only with
+    `master-start-authorized-epoch`, stamped by the operator **after** it observed the restart
+    and established no data is at risk — permission that cannot predate the death it refers
+    to. Pure seam `masterStartAuthorizedFor`: seed and bootstrap only, never a promotion.
+  Parking is the yield either way: not Ready, serving nothing, so the operator sees a dead
+  master and fails over to the pod that actually holds the data.
+  **Framing worth keeping:** the epoch is an *ordering* device, and it was being used to
+  answer an *identity* question ("was this issued for my current incarnation?"). It fails
+  exactly where ordering and identity diverge.
 - The epoch is **derived from live state** when bumped (max over current pod annotation
   epochs + 1), never read back from status; status only mirrors it.
 
