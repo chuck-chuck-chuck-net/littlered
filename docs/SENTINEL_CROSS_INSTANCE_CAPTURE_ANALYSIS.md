@@ -397,10 +397,10 @@ explicit `maxmemory` bypasses `CalculateMaxmemory` (90 % of limit) with no sanit
 
 ## 9. Fix direction
 
-Two workstreams, not alternatives. **Neither preserves the data already lost**: capture →
-`+convert-to-slave` was 10 s, and the flush follows the `SLAVEOF` within about a second. Any
-operator-side detector runs on a reconcile cadence behind a cooldown and is two orders of
-magnitude too slow. **A detector restores service; only prevention preserves data.**
+**Prevention only.** Capture → `+convert-to-slave` was 10 s, and the flush follows the `SLAVEOF`
+within about a second. Any operator-side detector runs on a reconcile cadence behind a cooldown
+and is two orders of magnitude too slow. **Only prevention preserves data** — and automated
+recovery turns out to be not merely late but unwinnable (§9.2).
 
 ### 9.1 Prevention — an instance-unique Sentinel master name
 
@@ -415,16 +415,22 @@ DNS-1123 *label* and cannot contain a dot), free of the comma and whitespace tha
 hello payload and the sentinel config file, human-readable, and derivable by a chart at render
 time, which matters because Sentinel-aware clients must carry the string.
 
-**Decided (working session, 2026-08-19): build the CEL floor now; the webhook is deferred and
-may never be built.**
+**Decided (working session, 2026-08-19), and implemented: a required field with no default; the
+webhook is deferred and may never be built.** See ADR-015 for the full decision record.
 
-**The floor — required, no default, no leniency.** `spec.sentinel.masterName` is required by a
-CEL rule on the CRD. No default, static or derived. No acceptance of an absent field on upgrade
-and no special-casing of `mymaster`. **Fail loud, fail hard, fail early**, on the grounds that
-under GitOps and automation a hard failure is increasingly the only kind that gets noticed at
-all. Paired with **explicit and loud documentation** telling people to choose something other
-than `mymaster`, since validation can force the decision to be *visible* but never *correct*
-(the invariant is a property of the pod network, not of the object).
+**The floor — required, no default, no leniency.** `spec.sentinel.masterName` is required, with
+no default, static or derived, no acceptance of an absent field on upgrade, and no special-casing
+of `mymaster`. **Fail loud, fail hard, fail early**, on the grounds that under GitOps and
+automation a hard failure is increasingly the only kind that gets noticed at all. Paired with
+**explicit and loud documentation** telling people to choose something other than `mymaster`,
+since validation can force the decision to be *visible* but never *correct* (the invariant is a
+property of the pod network, not of the object).
+
+> **Implemented as a plain `required` marker, not a CEL rule** — the reverse of what this section
+> originally proposed. §11 measured why: a spec-level CEL rule rejects the *operator's own* status
+> writes below Kubernetes 1.33, silently stopping reconciliation of every existing instance. Plain
+> `required` never wedges anything on any version. The loudness for the installed base is carried
+> by the runtime `SentinelMasterNameUnscoped` condition instead.
 
 **Deferred: a mutating admission webhook** stamping `<namespace>.<name>` on CREATE when the field
 is absent. It was the "help people do the right thing" option and remains available, but it is
@@ -450,29 +456,60 @@ condition and keeps running.
 existing instance's master on its next write, breaking every Sentinel-aware client with no user
 action to correlate the outage to.
 
-### 9.2 Recovery — a detector for the captured state
+### 9.2 Recovery for an already-captured instance — DECLINED
 
-Needed independently, because **the migration cannot rescue an already-captured instance**: any
-safe re-`MONITOR` is gated on a healthy instance, and a captured one has `RealMasterIP == ""`
-forever. Without a detector, an instance already in this state at upgrade time stays stuck
-permanently.
+An earlier draft of this section proposed one: split LR-024's `HasHealthyKnownReplica` veto on
+whether the ghost master is flagged down (`s_down`/`o_down` → LR-024's dead ghost, veto correct;
+flags clean → captured, veto's premise false), then elect a survivor and re-`MONITOR`. The
+predicate is sound and would be admissible — "the monitored master is a live address that is not
+one of my pods" is a *configuration* judgement from the Kubernetes pod list, not failure
+detection.
 
-LR-024 is one predicate away, and the discriminator is already on the wire. `SENTINEL master`
-returns the monitored master's `flags`; the gatherer calls it but `SentinelNodeState` does not
-retain them. No new dial is required.
+**It was rejected anyway, on two grounds that do not depend on the deployment being
+misconfigured.**
 
-- `flags` contain `s_down`/`o_down` → LR-024's dead ghost. Sentinel is trying and failing; the
-  `HasHealthyKnownReplica` veto is correct and stays exactly as it is.
-- `flags` clean → **captured**. Sentinel considers the master healthy and will never act, so the
-  veto's premise ("a promotable replica means a failover is imminent") is false and must not
-  apply.
+**Nothing survives to be salvaged.** The flush happens when the replica starts its full sync,
+about a second after the `SLAVEOF` — long before any reconcile could observe the capture. All
+three pods in the incident ended at `slave_repl_offset:1`. So a recovery restores an *empty*
+instance, which is precisely what deleting and recreating the CR already achieves at no
+engineering cost. The one path where data might survive — replication blocked before the sync
+starts — is unreachable: the capture itself requires the gossip to be accepted, which requires a
+shared or absent password, which is the same condition under which the replication auth also
+succeeds. The RDB version mismatch seen in the incident does not help, because it fails *after*
+the flush.
 
-Acting on "the monitored master is a live address that is not one of my pods" is a
-**configuration** judgement derived from the Kubernetes pod list, not a failure-detection one, so
-it is admissible under the ADR-012 D1 rule. It still needs a cooldown, because informer lag can
-transiently omit a fresh pod's IP from `ValidIPs`. Recovery is existing vocabulary: elect
-`BestDataHolder` (or seed the bootstrap master when there are no holders, which is this
-instance's case), `REPLICAOF NO ONE`, then `SENTINEL REMOVE` + `MONITOR` across all sentinels.
+**The operator structurally cannot win the reclaim.** `createSentinelRedisInstance` initialises
+`ri->config_epoch = 0` (sentinel.c:1304), so a `SENTINEL MONITOR` issued by the operator creates
+the master entry at **epoch 0**. Against a merged population still holding the captor's epoch that
+loses on the very next hello, roughly two seconds later — and the operator has no way to raise a
+config epoch, since only a genuine failover election does that. The rule would therefore reissue
+`REMOVE` + `MONITOR` every reconcile forever, never converging. Worse, each `REMOVE` + `MONITOR`
+wipes that sentinel's replica list, which is **LR-013's hazard exactly** — the mechanism that
+produced a permanent `no-good-slave` failover deadlock. The recovery's failure mode is to turn a
+broken-but-static instance into one thrashing its own topology, while two instances sharing a name
+ping-pong it between them.
+
+A rule that cannot win, living in the rule chain that already produced LR-001/007/011/013/024, is
+a liability rather than defence in depth. What it would have insured against — some future path to
+"Sentinels monitor a live non-pod master" that is not a name collision — has no known instance;
+the address-adoption path (§9.4) does not produce it, because there our Sentinels still monitor
+our own master correctly.
+
+**Instead, make the state fast to identify and documented to fix by hand:**
+
+- **`lrctl verify` diagnostic** (not yet implemented): report the effective master name, the
+  Sentinel-known sentinel and replica counts against what we deployed, and any Sentinel-known
+  address that is not one of our pods. `num-other-sentinels: 8` on a three-sentinel instance was
+  the loudest signal in this dump and nothing surfaces it today. A tool run when someone is
+  already suspicious makes no safety claim by being silent, so it carries none of the
+  false-assurance problem that sank the controller-side collision check (§10).
+- **A runbook** in the user documentation: scale the operator down, `SENTINEL REMOVE` +
+  `MONITOR <intended master>` on each sentinel, `REPLICAOF NO ONE` on that master, scale back up
+  — stating plainly that the instance returns **empty**, which is the part a reader needs told
+  rather than discovered.
+
+Detection is not the gap: a captured instance sits at `Ready=False` / `Initializing`, so ordinary
+Kubernetes alerting already catches it. It is stuck *loudly* until a human acts.
 
 ### 9.3 Migration — data-preserving, not seamless
 
@@ -661,8 +698,6 @@ Further coverage:
 - `masterName: mymaster` set explicitly is accepted and raises `SentinelMasterNameUnscoped`.
 - Migration: change `masterName` on a live, healthy instance → all Sentinels converge on the new
   name → **data intact** across the flip.
-- Recovery: capture an instance deliberately, assert §9.2 detects and restores service, and
-  assert the LR-024 dead-ghost path still takes the old branch with its veto intact — the veto is
-  being *split*, not weakened, and that must be shown.
-- Unit tier for the detector over `ReplicationState`, since the e2e is slow and the discriminator
-  (`flags` clean versus `s_down`/`o_down`) is a pure predicate.
+- ~~Recovery from a capture~~ — no longer applicable: automated recovery is declined (§9.2), so
+  there is nothing to assert. LR-024's veto is untouched, which is itself the point: no test is
+  needed for a guard that did not change.

@@ -165,11 +165,10 @@ reported `flags: master` — healthy, hence never failed over. Details in LR-038
   master directly, reading its `INFO`, adopting our replicas and issuing `SLAVEOF` to them — no
   hello, so the name is never consulted. Only distinct passwords close it. This is the concrete
   reason auth is recommended rather than merely nice.
-- **Not closed: recovery for an already-captured instance.** The migration is gated on health and a
-  captured instance has `RealMasterIP == ""` forever, so it cannot rescue itself. LR-024's
-  `planGhostMasterRecovery` is one predicate away — its `HasHealthyKnownReplica` veto assumes "a
-  promotable replica means a failover is imminent", false when the stolen master is healthy. The
-  split is designed (analysis §9.2) and not built.
+- **A captured instance is not recovered automatically, by decision.** It stays at `Ready=False` /
+  `Initializing` — loud to ordinary alerting — until a human runs the runbook, and comes back
+  empty. Automated recovery was designed and then **declined**, not deferred; see Alternative J,
+  which is the one rejection where building the thing would have made matters actively worse.
 - **Self-capture on delete-and-recreate is accepted.** A terminating previous generation holds a
   higher epoch and can repoint the fresh one — but at a *dead* address, so the `SLAVEOF` never
   completes a sync and no flush occurs. That degrades to LR-024's ghost-master deadlock: a liveness
@@ -316,6 +315,52 @@ co-located instances *with* auth were never hit. But it is a user-facing optiona
 boundary that can be switched off by leaving a default alone is not a boundary. It is also equally
 client-breaking on its own, so it is no cheaper than the rename. Adopted as a strong recommendation
 (Decision 6) and paired with the rename in one maintenance window.
+
+### J. Automated recovery for an already-captured instance — rejected
+
+The obvious follow-up, designed in full before being dropped: split LR-024's
+`HasHealthyKnownReplica` veto on whether the ghost master is flagged down — `s_down`/`o_down` is
+LR-024's dead ghost and the veto is correct; clean flags mean **captured**, where the veto's
+premise ("a promotable replica means a failover is imminent") is false because the stolen master
+looks perfectly healthy and Sentinel will never act. Then elect a survivor and re-`MONITOR`. The
+discriminator is already on the wire (`SENTINEL master` returns `flags`; the gatherer just does not
+retain them), and the predicate is admissible — "the monitored master is a live address that is not
+one of my pods" is a *configuration* judgement from the Kubernetes pod list, not failure detection.
+
+Rejected on two grounds, **neither of which depends on the deployment being misconfigured**.
+
+**There is nothing left to salvage.** The flush happens when the replica starts its full sync,
+about a second after the `SLAVEOF` — long before any reconcile could observe the capture (the
+neighbouring rules carry 30–120 s cooldowns precisely so they do not steal legitimate failovers).
+All three pods in the incident ended at `slave_repl_offset:1`. So recovery restores an *empty*
+instance, which is exactly what deleting and recreating the CR already achieves at no engineering
+cost and with no new code in the sentinel healing loop. The one path where data might survive —
+replication blocked before the sync begins — is unreachable: the capture requires the gossip to be
+accepted, which requires a shared or absent password, which is the same condition under which the
+replication auth also succeeds. The RDB version mismatch seen in the incident does not help,
+because it fails *after* the flush.
+
+**The operator structurally cannot win the reclaim.** `createSentinelRedisInstance` initialises
+`ri->config_epoch = 0` (sentinel.c:1304), so a `SENTINEL MONITOR` issued by the operator creates
+the master entry at **epoch 0**. Against a merged population still holding the captor's epoch that
+loses on the next hello, ~2 s later — and the operator has no way to raise a config epoch, because
+only a genuine failover election does. The rule would reissue `REMOVE` + `MONITOR` every reconcile,
+forever, never converging. And each `REMOVE` + `MONITOR` wipes that sentinel's replica list, which
+is **LR-013's hazard exactly** — the mechanism that produced a permanent `no-good-slave` failover
+deadlock. Its failure mode is therefore to convert a broken-but-static instance into one thrashing
+its own topology, while two instances sharing a name ping-pong it between them.
+
+A rule that provably cannot win, added to the chain that already produced LR-001/007/011/013/024,
+is a liability rather than defence in depth — and one whose code path would never execute in a
+correct configuration, so it would sit permanently unexercised in the most fragile part of the
+system. What it would insure against — some future route to "Sentinels monitor a live non-pod
+master" that is not a name collision — has no known instance; the address-adoption path does not
+produce it, since there our Sentinels still monitor our own master correctly.
+
+**Adopted instead:** make the state fast to identify and documented to fix by hand — the
+`lrctl verify` diagnostic of Alternative E, and a runbook stating plainly that the instance returns
+empty. Detection is not the gap: a captured instance sits at `Ready=False` and ordinary alerting
+catches it.
 
 ## Deferred: the mutating admission webhook
 

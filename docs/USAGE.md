@@ -1286,6 +1286,60 @@ kubectl logs store-redis-0 -c redis
 kubectl logs store-sentinel-0
 ```
 
+### Recovering a sentinel instance captured by another Sentinel deployment
+
+**Symptoms.** The instance sits at `Ready=False` / `phase: Initializing` and `status.master` is
+empty. Its Sentinels report a master IP that is **not one of its own pods**, and report more
+sentinels or replicas than you deployed:
+
+```bash
+kubectl exec store-sentinel-0 -c sentinel -- redis-cli -p 26379 SENTINEL master <masterName>
+# ip:                  <an address that is not one of this instance's Redis pods>
+# num-other-sentinels: 8      <-- you deployed 3, so 2 is the expected value
+# num-slaves:          6      <-- you deployed 2
+# flags:               master <-- and it looks healthy, so Sentinel will never fail over
+```
+
+The Redis pods will be `role:slave` pointing at that foreign address, and their logs will show
+repeated `MASTER <-> REPLICA sync: Flushing old data`.
+
+**This means another Sentinel deployment sharing your master name has taken over the instance's
+topology.** See "Isolating Sentinel instances" above for how it happens and how to prevent it.
+
+**The data is already gone.** The flush happens about a second after the takeover, long before
+anything can react. Recovery restores service on an empty instance — it does not restore data.
+The operator deliberately does **not** attempt this automatically: an operator-issued
+`SENTINEL MONITOR` starts at config epoch 0 and loses to the other deployment's epoch within
+seconds, so it could only loop, and each attempt would wipe the Sentinel replica list.
+
+**Recovery.** Because the outcome is an empty instance either way, the simplest correct fix is to
+delete and recreate the CR with a unique `masterName` (and auth) — do that if you can. If you must
+repair in place, first make sure the other deployment can no longer reach yours, or it will simply
+take over again:
+
+```bash
+# 1. Stop the operator fighting the manual repair.
+kubectl scale -n littlered-system deployment/littlered-operator --replicas=0
+
+# 2. Point every Sentinel back at this instance's own master.
+MASTER_IP=$(kubectl get pod store-redis-0 -o jsonpath='{.status.podIP}')
+for i in 0 1 2; do
+  kubectl exec store-sentinel-$i -c sentinel -- \
+    redis-cli -p 26379 SENTINEL REMOVE <masterName>
+  kubectl exec store-sentinel-$i -c sentinel -- \
+    redis-cli -p 26379 SENTINEL MONITOR <masterName> $MASTER_IP 6379 2
+done
+
+# 3. Promote that pod.
+kubectl exec store-redis-0 -c redis -- redis-cli REPLICAOF NO ONE
+
+# 4. Bring the operator back; it relabels and repoints the remaining replicas.
+kubectl scale -n littlered-system deployment/littlered-operator --replicas=1
+```
+
+**Then fix the cause**, or it recurs on the next pod-IP recycle: give the instance a unique
+`masterName` and enable authentication with a password not shared with the neighbouring instance.
+
 ### Cluster diagnostics
 
 ```bash
