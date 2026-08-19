@@ -312,13 +312,81 @@ apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
   name: store
+  namespace: apps
 spec:
   mode: sentinel
+  sentinel:
+    masterName: apps.store    # required — see "Isolating Sentinel instances" below
 ```
+
+`sentinel.masterName` is required and has no default. Read the next section before choosing a
+value: it is the only thing separating your instance from every other Sentinel deployment that
+can reach it.
 
 ```bash
 kubectl apply -f sentinel.yaml
 ```
+
+### Isolating Sentinel instances
+
+Two things protect a sentinel-mode instance from being absorbed by another Redis deployment on
+the same pod network. **Do both.** They close different holes, and neither is sufficient alone.
+
+**1. Give every instance a unique master name.**
+
+Use `<namespace>.<name>`. The master name is the *only* isolation Sentinel's gossip protocol
+has: a Sentinel receiving a hello message looks the name up and discards the message if it does
+not know it, and performs no other check — no instance identifier, no namespace, no
+authentication between Sentinels beyond the optional password.
+
+Two instances that share a master name and can reach each other are, protocol-wise, **one
+deployment**. The one with the higher config epoch can reassign the other's master to a foreign
+Redis pod; that instance's replicas then **flush their datasets** to resynchronise from a
+stranger. If both run the same Redis version the merge completes silently — the victim reports
+healthy, with a unanimous and self-consistent Sentinel view, while serving someone else's
+keyspace. This has happened in production; the analysis is in
+`SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md`.
+
+**2. Enable authentication.**
+
+```yaml
+spec:
+  auth:
+    enabled: true
+    existingSecret: redis-password
+```
+
+Auth is *not* only a client-edge control in Sentinel. The same password is the peer-membership
+credential: `sentinel-pass` (falling back to `requirepass`) authenticates Sentinel-to-Sentinel
+links in both directions, so an unauthenticated hello from a stranger is rejected outright, and
+a replica cannot complete a sync against a foreign master — which is the step that destroys
+data.
+
+**Why you need it even with unique names.** A unique name ends *gossip* fusion, but not the
+narrower **address-adoption** path: if another instance's master pod dies and Kubernetes recycles
+its IP onto *your* master, that instance's Sentinels — still holding the address as their own
+master — will connect to your master directly, read its `INFO`, adopt your replicas as theirs,
+and can issue `SLAVEOF` to them. No hello is involved, so the name is never consulted. Only
+distinct passwords stop it.
+
+Give co-located instances **different** passwords. A platform that templates one shared secret
+across every Redis instance in a namespace gets none of this protection.
+
+**Upgrading an existing instance.** Instances created before `masterName` existed keep running
+on the historic shared value `mymaster` and surface a `SentinelMasterNameUnscoped` warning
+condition:
+
+```bash
+kubectl get littlered store -o jsonpath='{.status.conditions[?(@.type=="SentinelMasterNameUnscoped")].message}'
+```
+
+Setting the field is a **client-visible change** — Sentinel-aware clients must be reconfigured
+in the same maintenance window; clients using the label-routed `{name}` Service are unaffected.
+There is no rolling cutover: monitoring one master under two names runs two independent failover
+state machines that can promote different replicas. Since a coordinated client reconfiguration
+is required anyway, enable authentication in the same window rather than paying for two
+outages. Setting `masterName: mymaster` explicitly is accepted (a legacy client may hardcode it)
+and silences the warning without changing behaviour or requiring any client change.
 
 ### Verify
 
@@ -354,13 +422,13 @@ kubectl get svc -l app.kubernetes.io/instance=store
 
 ```bash
 # Query sentinel for master
-kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name apps.store
 
 # Check master info
-kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL master mymaster
+kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL master apps.store
 
 # Check replicas
-kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL replicas mymaster
+kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL replicas apps.store
 ```
 
 ### Test failover
@@ -376,7 +444,7 @@ kubectl delete pod store-redis-0 --grace-period=0 --force
 kubectl get littlered store -w
 
 # Verify new master
-kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name mymaster
+kubectl exec -it store-sentinel-0 -- redis-cli -p 26379 SENTINEL get-master-addr-by-name apps.store
 ```
 
 ### Connect from your application
@@ -385,8 +453,18 @@ For sentinel-aware clients:
 
 ```
 Sentinel endpoints: store-sentinel.<namespace>.svc.cluster.local:26379
-Master name: mymaster
+Master name:        <spec.sentinel.masterName>     # e.g. apps.store
 ```
+
+The master name your client sends must match the CR exactly — read it from the spec rather
+than assuming a convention:
+
+```bash
+kubectl get littlered store -o jsonpath='{.spec.sentinel.masterName}'
+```
+
+Changing `masterName` later requires reconfiguring these clients in the same window; there is
+no overlap period during which both names resolve.
 
 For simple clients (connects to current master):
 
@@ -647,6 +725,8 @@ metadata:
   name: store
 spec:
   mode: sentinel
+  sentinel:
+    masterName: default.store   # required; unique per pod network
   podDisruptionBudget:
     create: true
     maxUnavailable: 1   # or set minAvailable instead — the two are mutually exclusive
@@ -769,6 +849,14 @@ already covers master/replica domain diversity — see above).
 
 ### With authentication
 
+In sentinel mode, authentication is **strongly recommended** and is not only a client-edge
+control: the same password is Sentinel's peer-membership credential, so it also stops a foreign
+Sentinel deployment on the same pod network from talking to yours, and stops your replicas
+completing a sync against a foreign master. See "Isolating Sentinel instances" above — it is
+the only thing that closes the address-adoption path, which a unique master name does not.
+Give co-located instances **different** passwords; one shared platform secret gives no
+isolation.
+
 ```bash
 # Create password secret
 kubectl create secret generic redis-password --from-literal=password=mysecretpassword
@@ -845,6 +933,7 @@ spec:
         release: prometheus
 
   sentinel:
+    masterName: default.prod-cache   # required; unique per pod network
     # quorum defaults to 2 — only set it if you need a different value
     downAfterMilliseconds: 5000
     failoverTimeout: 60000
@@ -1143,6 +1232,8 @@ metadata:
   name: tuned-cache
 spec:
   mode: sentinel
+  sentinel:
+    masterName: default.tuned-cache   # required; unique per pod network
   requeueIntervals:
     fast: "10s"
     steadyState: "1m"

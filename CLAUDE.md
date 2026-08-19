@@ -71,6 +71,7 @@ Welcome! This document provides a high-level, condensed overview of the LittleRe
 - **Decision**: Sentinel and Redis nodes strictly use **Pod IPs** for identification, with hostname announcement and resolution explicitly disabled.
 - **Rationale**: In a pure in-memory architecture, a pod restart results in total data loss. By using ephemeral IPs, a restarted pod (with a new IP) is treated as a completely new node by Sentinel. This prevents "Ghost Masters" (empty pods reclaimed as masters) and eliminates DNS-related race conditions during failover.
 - **Implication**: Any transition to persistent storage (PVCs) will require a pivot to stable Podname-based identities. (See ADR-001)
+- **The cross-tenant consequence** (LR-038): IP-only identity was reasoned about for *our own* pods returning on new addresses. It is equally exposed to *other tenants'* pods arriving on ours. A recycled pod IP inheriting a stale Sentinel entry is what introduced two unrelated instances to each other in production; because both answered to the hardcoded master name `mymaster`, they merged into one quorum and one instance's master was reassigned to the other's Redis pod, whose replicas then flushed their data. Two consequences are now load-bearing: **`spec.sentinel.masterName` is required and must be unique per pod network** — the master name is the *only* isolation Sentinel's gossip protocol has (`sentinelProcessHelloMessage` looks it up and discards unknown names, and checks nothing else) — and **authentication is strongly recommended**, because it is the peer-membership credential too and is the only thing closing the narrower *address-adoption* path a unique name leaves open (a foreign Sentinel whose recycled master address is now our master reads its `INFO` directly, no hello involved). Pillar 3.1's EmptyDir posture widens the window: every Sentinel restart re-learns its peer set from gossip. See `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` and changelog LR-038.
 
 ### 3.8 Discovery Deadlock Prevention (Sentinel Mode)
 - **Decision**: Removed `PING` connectivity check from the Redis startup script. (See ADR-002)
@@ -121,7 +122,7 @@ Welcome! This document provides a high-level, condensed overview of the LittleRe
 | **Cluster** | `shards × (1 + replicasPerShard)` Pods, as **one StatefulSet per shard** (`{name}-shard-K`) | Horizontal Scaling / Large Data |
 
 ### Key Logic:
-- **Sentinel Mode**: The operator manages a `redis.chuck-chuck-chuck.net/role: master` label on Pods. The `{name}` Service uses this label as a selector to always route traffic to the current master.
+- **Sentinel Mode**: The operator manages a `redis.chuck-chuck-chuck.net/role: master` label on Pods. The `{name}` Service uses this label as a selector to always route traffic to the current master. `spec.sentinel.masterName` is **required** and must be unique among Sentinel deployments sharing a pod network (pillar 3.7, LR-038); Sentinel-aware clients carry that value, clients using the `{name}` Service do not.
 - **Cluster Mode**: N per-shard StatefulSets (`{name}-shard-K`, pod `-K-0` = shard K master; stable `redis.chuck-chuck-chuck.net/shard` label — pillar 3.12), fronted by one shared headless Service `{name}-cluster`. Sophisticated repair loop handles:
     1. Quorum loss (via `CLUSTER FAILOVER TAKEOVER`).
     2. Partition healing (via `CLUSTER MEET`).

@@ -346,6 +346,8 @@ Only applicable when `mode: sentinel`:
 ```yaml
 spec:
   sentinel:
+    masterName: myns.store      # REQUIRED. Must be unique across every Sentinel
+                                # deployment reachable on this pod network.
     quorum: 2                   # Sentinels needed to agree on failure (default: 2)
     downAfterMilliseconds: 30000  # Time before marking master down
     failoverTimeout: 180000     # Failover timeout
@@ -363,12 +365,38 @@ spec:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
+| `sentinel.masterName` | `string` | **Yes** | *none* | The Sentinel master name for this instance. **Must be unique across every Sentinel deployment reachable on the same pod network** — see the warning below. Recommended: `<namespace>.<name>`. Max 128 chars, `^[a-zA-Z0-9]([a-zA-Z0-9._-]*[a-zA-Z0-9])?$` (no comma or whitespace: the Sentinel hello payload is comma-separated and `sentinel.conf` is space-separated). Sentinel-aware clients must be configured with this value. |
 | `sentinel.quorum` | `int` | No | `2` | Sentinels needed to agree on failure |
 | `sentinel.downAfterMilliseconds` | `int` | No | `30000` | Time to mark master as down |
 | `sentinel.failoverTimeout` | `int` | No | `180000` | Failover timeout |
 | `sentinel.parallelSyncs` | `int` | No | `1` | Parallel replica syncs |
 | `sentinel.allowUnsafeRebootstrapOnDeadlock` | `bool` | No | `false` | Permit the operator to break a leaderless bootstrap deadlock (all Sentinels bare, no master) when **two or more** Redis pods hold data, by force-electing the most-complete pod as master and **discarding** the others. Enable only for caches where data loss is acceptable. With ≥2 data holders and this unset, the operator refuses and waits for manual intervention. Deadlocks with no data, or a single data-holding pod, are always broken automatically and safely regardless of this flag. |
 | `sentinel.resources` | `ResourceRequirements` | No | See above | Sentinel container resources |
+
+> **The master name is a security and data-safety boundary, not a label.**
+>
+> It is the *only* isolation Sentinel's gossip protocol has. A Sentinel receiving a hello
+> message looks the master name up and discards the message if it does not know it — and
+> performs no other check. There is no instance identifier, no namespace, and no
+> authentication between Sentinels beyond the optional password.
+>
+> Two instances that share a master name and can reach each other are, protocol-wise, **one
+> deployment**: the one with the higher config epoch can reassign the other's master to a
+> foreign Redis pod, whose replicas then **flush their datasets** to resynchronise from it.
+> This has happened in production. See `SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md`.
+>
+> Use `<namespace>.<name>`, and **enable authentication** (§2.5) — see the isolation notes in
+> `USAGE.md`.
+
+**Upgrading an existing instance.** Instances created before this field existed keep running
+with the historic shared name `mymaster` and report a `SentinelMasterNameUnscoped` warning
+condition. They are only forced to state a name on their next change to `spec.sentinel`.
+Setting `masterName: mymaster` explicitly is accepted — a legacy client may hardcode it — and
+silences the warning without changing behaviour. **Changing the value is client-visible:**
+Sentinel-aware clients must be reconfigured in the same maintenance window (clients using the
+label-routed `{name}` Service are unaffected), and there is no rolling cutover — monitoring one
+master under two names runs two independent failover state machines that can promote different
+replicas.
 
 ### 2.12 Cluster-Specific Configuration
 
@@ -791,11 +819,17 @@ apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
   name: store
+  namespace: apps
 spec:
   mode: sentinel
+  sentinel:
+    masterName: apps.store    # required; unique per pod network (§2.11)
 ```
 
 Deploys: 1 master + 2 replicas + 3 sentinels with defaults (`docker.io/library/redis:8.4.2`).
+
+`sentinel.masterName` is the one field a sentinel instance cannot omit. It is not cosmetic —
+see the warning in §2.11.
 
 ### 4.9 Sentinel with Production Settings
 
@@ -832,6 +866,7 @@ spec:
     existingSecret: redis-password
 
   sentinel:
+    masterName: production.store   # required; unique per pod network (§2.11)
     # quorum defaults to 2 — only set it if you need a different value
     downAfterMilliseconds: 5000
     failoverTimeout: 60000
