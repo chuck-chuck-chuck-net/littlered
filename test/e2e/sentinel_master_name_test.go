@@ -261,6 +261,10 @@ spec:
 			bMasterName, bMasterIP)
 		out, err := sentinelExec(instA, "PUBLISH", "__sentinel__:hello", hello)
 		Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
+		// redis-cli exits 0 on a Redis error reply, so check the reply itself:
+		// sentinelPublishCommand answers 1, anything else means the hello never
+		// reached the processor and this spec would pass having tested nothing.
+		Expect(strings.TrimSpace(out)).To(Equal("1"), "Sentinel refused the injected hello")
 
 		By("holding instance A to its own topology")
 		// Generous window: the epoch bump and +switch-master are processed inside the
@@ -294,5 +298,43 @@ spec:
 
 		By("confirming instance A is still serving")
 		Expect(getPhase(instA)).To(Equal("Running"))
+	})
+
+	// Positive control for the spec above. Without it, a payload that never reaches
+	// the hello processor — wrong token count, a Redis error reply, a future change
+	// to the wire format — would make the isolation assertion pass having proved
+	// nothing, because "nothing happened" is also what success looks like.
+	//
+	// Same payload shape, same injection path, one variable changed: the master name
+	// now matches the receiving instance's own. If Sentinel acts on this one, then it
+	// would have acted on the other too had the name matched, and the isolation above
+	// is attributable to the name rather than to a dud payload.
+	//
+	// Deliberately destructive to instance B, which is torn down straight after. The
+	// advertised master is a TEST-NET-1 address (RFC 5737) so nothing can attach to
+	// it and instance A is left undisturbed.
+	It("proves the injection path is live by capturing an instance that shares the name", func() {
+		const bogusMaster = "192.0.2.10"
+
+		before, err := sentinelExec(instB, "SENTINEL", "masters")
+		Expect(err).NotTo(HaveOccurred())
+		bMasterName := field(before, "name")
+		Expect(field(before, "ip")).NotTo(Equal(bogusMaster))
+
+		hello := fmt.Sprintf("%s,26379,%s,9999,%s,%s,6379,9999",
+			podIP(instB+"-sentinel-0"),
+			"f1111111111111111111111111111111deadbeef",
+			bMasterName, bogusMaster)
+		out, err := sentinelExec(instB, "PUBLISH", "__sentinel__:hello", hello)
+		Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
+		Expect(strings.TrimSpace(out)).To(Equal("1"))
+
+		By("instance B follows the injected configuration, because the name matched")
+		Eventually(func(g Gomega) {
+			masters, err := sentinelExec(instB, "SENTINEL", "masters")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(field(masters, "ip")).To(Equal(bogusMaster),
+				"the injection did not land; the isolation spec above proves nothing")
+		}, 30*time.Second, 2*time.Second).Should(Succeed())
 	})
 })
