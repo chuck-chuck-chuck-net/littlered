@@ -273,13 +273,24 @@ spec:
 			masters, err := sentinelExec(instA, "SENTINEL", "masters")
 			g.Expect(err).NotTo(HaveOccurred())
 
+			// Every failure carries the raw reply. Without it a red is unreadable:
+			// the compared value alone cannot distinguish "captured" from "observed
+			// mid-reset", and those demand opposite conclusions.
+			raw := func(what string) string {
+				return fmt.Sprintf("%s\nA's SENTINEL masters:\n%s", what, masters)
+			}
+
 			g.Expect(field(masters, "name")).To(Equal(aMasterName),
-				"instance A's master name changed")
+				raw("instance A's master name changed"))
 			g.Expect(aIPs).To(HaveKey(field(masters, "ip")),
-				"instance A is monitoring %s, which is not one of its own pods — it has been captured",
-				field(masters, "ip"))
+				raw(fmt.Sprintf("instance A is monitoring %s, which is not one of its own pods "+
+					"— it has been captured", field(masters, "ip"))))
+			// Checked last, and reported rather than asserted on its own: a
+			// +switch-master wipes this list, so a bare count is ambiguous in
+			// isolation. The master-IP assertion above is the authoritative one.
 			g.Expect(field(masters, "num-other-sentinels")).To(Equal("2"),
-				"instance A knows foreign Sentinels; the quorums have merged")
+				raw("instance A's known-sentinel count changed; if the master IP above is "+
+					"still an A pod this is a reset artifact, not (yet) a capture"))
 		}, 45*time.Second, 5*time.Second).Should(Succeed())
 
 		By("confirming A's data pods never followed a foreign master")
