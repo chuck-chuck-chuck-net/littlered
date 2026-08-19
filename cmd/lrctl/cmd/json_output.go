@@ -194,6 +194,25 @@ type sentinelVerifyJSON struct {
 	Redis             []redisNodeVerifyJSON    `json:"redis"`
 	HealActions       []string                 `json:"healActions"`
 	Healthy           bool                     `json:"healthy"`
+
+	// MasterName is the Sentinel master name in use — the instance's gossip identity.
+	MasterName string `json:"masterName"`
+	// CrossInstance is evidence that another Sentinel deployment shares that name.
+	// Its absence means "nothing visible from this vantage", never "isolated".
+	CrossInstance *crossInstanceJSON `json:"crossInstance,omitempty"`
+}
+
+type sentinelCountJSON struct {
+	PodName  string `json:"podName"`
+	Reported int    `json:"reported"`
+	Expected int    `json:"expected"`
+}
+
+type crossInstanceJSON struct {
+	ForeignMasterIPs  []string            `json:"foreignMasterIPs,omitempty"`
+	ForeignReplicaIPs []string            `json:"foreignReplicaIPs,omitempty"`
+	PeerSurplus       []sentinelCountJSON `json:"peerSurplus,omitempty"`
+	ReplicaSurplus    []sentinelCountJSON `json:"replicaSurplus,omitempty"`
 }
 
 type clusterNodeVerifyJSON struct {
@@ -222,6 +241,7 @@ type clusterVerifyJSON struct {
 func buildSentinelVerifyJSON(
 	name, namespace string, redisMap map[string]string,
 	state *redisclient.SentinelClusterState, sentinelMasterName string,
+	expectedSentinels, expectedReplicas int,
 ) sentinelVerifyJSON {
 	actions := state.GetHealActions(sentinelMasterName)
 	if actions == nil {
@@ -235,8 +255,25 @@ func buildSentinelVerifyJSON(
 		RealMasterIP:   state.RealMasterIP,
 		FailoverActive: state.FailoverActive,
 		HealActions:    actions,
+		MasterName:     sentinelMasterName,
 		Sentinels:      []sentinelNodeVerifyJSON{},
 		Redis:          []redisNodeVerifyJSON{},
+	}
+
+	if ev := state.DetectCrossInstance(expectedSentinels, expectedReplicas); ev.Any() {
+		ci := &crossInstanceJSON{
+			ForeignMasterIPs:  ev.ForeignMasterIPs,
+			ForeignReplicaIPs: ev.ForeignReplicaIPs,
+		}
+		for _, c := range ev.PeerSurplus {
+			ci.PeerSurplus = append(ci.PeerSurplus,
+				sentinelCountJSON{PodName: c.PodName, Reported: c.Reported, Expected: c.Expected})
+		}
+		for _, c := range ev.ReplicaSurplus {
+			ci.ReplicaSurplus = append(ci.ReplicaSurplus,
+				sentinelCountJSON{PodName: c.PodName, Reported: c.Reported, Expected: c.Expected})
+		}
+		result.CrossInstance = ci
 	}
 
 	if state.RealMasterIP != "" {

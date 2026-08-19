@@ -51,6 +51,20 @@ type SentinelNodeState struct {
 	FailoverStatus string
 	Reachable      bool
 	Replicas       []ReplicaInfo
+
+	// MasterFlags is the monitored master's `flags` field as this Sentinel reports it
+	// (e.g. "master", "s_down,master"). It is the discriminator between a master that
+	// is merely DEAD and one that is alive but not ours: a captured instance reports a
+	// foreign master with clean flags, because from Sentinel's vantage it is healthy —
+	// which is exactly why no failover ever fires. Already on the wire; previously
+	// discarded by the gatherers.
+	MasterFlags string
+
+	// NumOtherSentinels / NumSlaves are the peer and replica counts this Sentinel
+	// reports for the monitored master. Exceeding what we deployed is the loudest
+	// available sign that another Sentinel deployment has joined our quorum.
+	NumOtherSentinels int
+	NumSlaves         int
 }
 
 // SentinelClusterState represents the combined "Ground Truth" of the entire cluster

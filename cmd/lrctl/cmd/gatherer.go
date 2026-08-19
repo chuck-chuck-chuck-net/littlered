@@ -19,7 +19,6 @@ package cmd
 import (
 	"context"
 	"fmt"
-	"slices"
 	"strings"
 
 	"k8s.io/client-go/kubernetes"
@@ -113,33 +112,30 @@ func (g *cliGatherer) GetSentinelState(
 		if line == "failover-status" {
 			state.FailoverStatus = strings.TrimSpace(lines[i+1])
 		}
+		// Retained for the cross-instance diagnostic: `flags` distinguishes a master
+		// that is dead from one that is alive but not ours, and the counts are the
+		// loudest sign that another deployment has joined this quorum.
+		if line == "flags" {
+			state.MasterFlags = strings.TrimSpace(lines[i+1])
+		}
+		if line == "num-other-sentinels" {
+			state.NumOtherSentinels = atoiSafe(strings.TrimSpace(lines[i+1]))
+		}
+		if line == "num-slaves" {
+			state.NumSlaves = atoiSafe(strings.TrimSpace(lines[i+1]))
+		}
 	}
 
-	// Get Replicas
+	// Get Replicas. Every replica Sentinel knows is recorded with its REAL flags,
+	// including ones that are not this instance's pods — those are the whole point of
+	// the cross-instance diagnostic. An earlier version fabricated flags ("found" for
+	// our pods, "s_down,ghost" for everything else), which would have made every
+	// foreign replica look like dead debris and hidden exactly what we are looking for.
 	replicasCmd := []string{redisCliBin, "-p", "26379", modeSentinel, "replicas", masterNameOf(g.cCtx)}
 	stdout, _, err = k8s.Exec(
 		ctx, g.coreClient, g.config, g.cCtx.Namespace, podName, g.cCtx.SentinelContainer, replicasCmd)
 	if err == nil {
-		redisIPs := g.cCtx.GetRedisIPs()
-		for _, rip := range redisIPs {
-			if strings.Contains(stdout, rip) {
-				state.Replicas = append(state.Replicas, redisclient.ReplicaInfo{IP: rip, Flags: "found"})
-			}
-		}
-		// Try a basic search for IPs in the output to find ghosts
-		allLines := strings.Split(stdout, "\n")
-		for idx, l := range allLines {
-			if strings.Contains(l, "ip") && idx+1 < len(allLines) {
-				potentialIP := strings.TrimSpace(allLines[idx+1])
-				// Resolve hostname to IP if needed
-				resolvedIP := g.resolveIdentityToIP(potentialIP)
-
-				isValid := slices.Contains(redisIPs, resolvedIP)
-				if !isValid {
-					state.Replicas = append(state.Replicas, redisclient.ReplicaInfo{IP: resolvedIP, Flags: "s_down,ghost"})
-				}
-			}
-		}
+		state.Replicas = parseSentinelReplicas(stdout, g.resolveIdentityToIP)
 	}
 
 	return state, nil

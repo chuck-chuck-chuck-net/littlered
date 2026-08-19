@@ -280,7 +280,7 @@ func verifySentinel(
 	fmt.Println("\nRedis Status:")
 	for _, rn := range state.RedisNodes {
 		status := fmt.Sprintf("role:%s", rn.Role)
-		if rn.Role == "slave" {
+		if rn.Role == roleSlave {
 			status += fmt.Sprintf(", following:%s, link:%s", rn.MasterHost, rn.LinkStatus)
 		}
 		status += fmt.Sprintf(", keys:%d", rn.Keys)
@@ -304,6 +304,8 @@ func verifySentinel(
 	if state.FailoverActive {
 		fmt.Printf("  [!] Sentinel reports failover in progress!\n")
 	}
+
+	reportCrossInstance(state, cCtx)
 
 	actions := state.GetHealActions(masterNameOf(cCtx))
 	if len(actions) > 0 {
@@ -346,7 +348,8 @@ func verifySentinelJSON(
 	}
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
 	state := redisclient.GatherClusterState(ctx, g, redisMap, sentinelMap)
-	return buildSentinelVerifyJSON(name, namespace, redisMap, state, masterNameOf(cCtx))
+	return buildSentinelVerifyJSON(name, namespace, redisMap, state, masterNameOf(cCtx),
+		len(cCtx.SentinelPods), max(len(cCtx.RedisPods)-1, 0))
 }
 
 // verifyClusterJSON gathers cluster ground truth and returns it as a

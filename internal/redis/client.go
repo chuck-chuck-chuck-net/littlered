@@ -82,6 +82,11 @@ type MasterInfo struct {
 	Name           string
 	Flags          string
 	FailoverStatus string
+	// NumOtherSentinels / NumSlaves are the peer and replica counts this Sentinel
+	// reports for the master. Free on the wire (the reply is already a map) and the
+	// loudest available sign that another Sentinel deployment shares our master name.
+	NumOtherSentinels int
+	NumSlaves         int
 }
 
 // SentinelClient wraps sentinel operations
@@ -144,11 +149,13 @@ func (c *SentinelClient) GetMasterState(ctx context.Context, name string) (*Mast
 		}
 
 		return &MasterInfo{
-			Name:           result["name"],
-			IP:             result["ip"],
-			Port:           result["port"],
-			Flags:          result["flags"],
-			FailoverStatus: result["failover-status"],
+			Name:              result["name"],
+			IP:                result["ip"],
+			Port:              result["port"],
+			Flags:             result["flags"],
+			FailoverStatus:    result["failover-status"],
+			NumOtherSentinels: atoiOrZero(result["num-other-sentinels"]),
+			NumSlaves:         atoiOrZero(result["num-slaves"]),
 		}, nil
 	}
 
@@ -613,4 +620,15 @@ func ParseInfoField(info, field string) string {
 		}
 	}
 	return ""
+}
+
+// atoiOrZero parses a Sentinel reply field, yielding 0 rather than an error: these are
+// reporting values, where a malformed entry should degrade to "unknown" rather than
+// fail the gather.
+func atoiOrZero(s string) int {
+	n, err := strconv.Atoi(strings.TrimSpace(s))
+	if err != nil {
+		return 0
+	}
+	return n
 }

@@ -148,7 +148,7 @@ func inferClusterTopology(nodes []redisclient.ClusterNodeInfo) (shards, replicas
 				masters++
 				break
 			}
-			if f == "slave" {
+			if f == roleSlave {
 				replicas++
 				break
 			}
