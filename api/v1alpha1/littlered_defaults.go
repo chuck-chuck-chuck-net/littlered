@@ -78,8 +78,9 @@ const (
 	// DefaultFailoverMinReplicasToWrite is 1 (LR-038): with the default 2 replicas
 	// this is the "master plus one replica" durable pair, and it is what lets an
 	// isolated master fence ITSELF during a partition — the one case operator-side
-	// fencing cannot reach. Measured free at replicas >= 2 (12 refused writes vs
-	// 16-19 with the check off). Set 0 explicitly at replicas: 1.
+	// fencing cannot reach. Cost at replicas >= 2 over 10 passes: free at the
+	// median, ~45 extra refused writes in a ~20% tail. Set 0 explicitly at
+	// replicas: 1.
 	DefaultFailoverMinReplicasToWrite = 1
 
 	// Placement defaults (cluster-mode shard anti-affinity)

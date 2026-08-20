@@ -409,10 +409,16 @@ resync discards rather than protecting it, and the live master is by constructio
 a straggler by `planFailoverRepoints`' definition, so ungating demotes it here too, which is
 the operator-side fence arriving for free wherever its pod object still exists.
 
-**It makes `minReplicasToWrite: 1` free**, which is the measurement that matters for the
-default. On force-delete the knob cost **78 refused writes before (4) and 12 after** — a
-6.5× reduction, against 16/17/19 measured at knob=0, i.e. indistinguishable from off. So the
-repoint latency *was* the knob's entire cost. All cells 0 lost at both knob settings.
+**It makes `minReplicasToWrite: 1` affordable** — which is the measurement that matters for
+the default, and the first version of this entry over-read it. On force-delete the knob cost
+**78 refused writes before (4)**; after (4) a single run measured **12**, which was reported
+here as "indistinguishable from off". Ten passes later that is the *good mode of a bimodal
+distribution*: `13, 14, 16, 17, 18, 19, 19, 20, 63, 64` against `16/17/19` at knob=0. So the
+honest statement is **free at the median, with a ~20% tail costing ~45 more refused writes
+(~4.5s)** — bimodal rather than noisy, so an ordering condition rather than a smear. Item (4)
+is still what made it affordable (78 *every time* before it). All cells 0 lost at both knob
+settings. Recorded as a caution: a single favourable run is not a distribution, and this
+entry made that mistake about its own result.
 
 **Cross-environment confirmation (the numbers now rest on two clusters, one multi-node):**
 
@@ -436,6 +442,50 @@ and a multi-node one with real network hops say this tier's availability cost is
 **operator reaction time** (reconcile cadence, label flip, client reconnect), not replication
 latency. Which is consistent with where the wins came from: removing waits, not speeding up
 replication.
+
+### Addendum 5 — the six-cell matrix over 10 passes (t3e, 2026-08-20)
+
+Ten consecutive passes of both modes' `rapid double failover` tiers (60 chaos runs) on
+operator `803eb26` with `minReplicasToWrite` defaulting to 1. **All 10 passes green; 0
+MISSING and 0 corruptions in all 60 blocks.**
+
+| cell | n | write avail min/med/max | failed writes |
+|---|---|---|---|
+| failover graceful | 10 | 95.83 / 96.42 / 96.91 | 37-50 |
+| failover force-delete | 10 | 94.66 / 98.46 / 98.92 | 13-64 |
+| failover kill-9 | 10 | 85.13 / 92.19 / 95.73 | 51-178 |
+| sentinel graceful | 10 | 94.75 / 95.29 / 96.50 | 42-63 |
+| sentinel force-delete | 10 | 96.83 / 97.58 / 98.33 | 20-38 |
+| sentinel kill-9 | 10 | **43.32 / 54.92 / 73.89** | 313-679 |
+
+**The headline is the kill-9 column, and the distributions do not overlap:**
+
+    failover  85.13  90.24  90.65  92.15  92.15  92.24  93.66  93.99  94.31  95.73
+    sentinel  43.32  46.62  49.96  50.67  50.79  59.05  67.58  73.73  73.79  73.89
+
+Sentinel's *best* run (73.89%) is 11pp below failover's *worst* (85.13%), with zero data loss
+on both sides. The mechanism is not a defect in either mode: sentinel's kill-9 guard
+deliberately **suppresses Redis** on the restarted master and waits for Sentinel to reach
+SDOWN, elect, and be observed, whereas failover mode declares death from kubelet readiness
+and promotes in ~2s. So on a true crash the operator-led mode recovers availability roughly
+twice as fast, which is the strongest single result for the ADR-011 graduation gate — and it
+comes from the disruption shape that had **no coverage at all** before this session.
+
+**A mechanism contrast worth keeping** (both guards protect data; they cost differently):
+sentinel mode yields on **Sentinel's stored run-id** — an identity signal maintained by a
+continuous external observer, which is why it also covers a *promoted* master with no extra
+machinery. Failover mode moved that record into the pod (written once at `exec`) and thereby
+lost the observer, which is exactly the hole LR-038's start gate had to close with an
+operator-stamped authorization.
+
+**Cautions for whoever reads these numbers next.** Two cells are **bimodal**, not noisy —
+failover force-delete (13-20 vs 63-64) and sentinel kill-9 (~314 vs ~600+) — so a discrete
+ordering condition is at work in both and a single sample of either is meaningless. Diagnosing
+it needs operator logs correlated per pass and is left open. And `sentinel kill-9` sits nearest
+its assertion floor: 10 passes never dipped below the inherited `WriteAvailability > 0.40`, but
+the worst mode clusters at 43-51%, so a margin of ~3pp. If that cell ever fails, read it as
+"the yield's cost grew", not as a flaky test — and note the same `> 0.40` bar is uselessly
+loose for the failover cells, which measured 85-96%.
 ## [LR-039] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
 > **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and LR-038 on the
 > failover line (`release/0.3.1`); none are present on this branch, hence the jump from LR-025.

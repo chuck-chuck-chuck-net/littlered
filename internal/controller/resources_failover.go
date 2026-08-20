@@ -126,9 +126,10 @@ func buildRedisConfigFailover(lr *littleredv1alpha1.LittleRed) string {
 	//
 	// The real rationale: this is the only mechanism that fences a master isolated
 	// from its replicas, locally and during the partition, which is precisely the
-	// case operator-side fencing cannot reach. And it is measurably free at
-	// replicas >= 2 once the straggler repoint is ungated (12 refused writes vs
-	// 16-19 with the check off) — before that it cost 78.
+	// case operator-side fencing cannot reach. Once the straggler repoint is
+	// ungated its cost at replicas >= 2 is free at the median over 10 passes, with
+	// a ~20% tail costing ~45 more refused writes — before ungating it cost 78
+	// every time.
 	if n := failover.MinReplicasToWrite; n != nil && *n > 0 {
 		sb.WriteString("\n# Write-safety bound (spec.failover.minReplicasToWrite)\n")
 		fmt.Fprintf(&sb, "min-replicas-to-write %d\n", *n)
