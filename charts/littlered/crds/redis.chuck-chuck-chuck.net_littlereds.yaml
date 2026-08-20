@@ -201,8 +201,11 @@ spec:
                       ITSELF, locally, during a partition, with no operator involvement. That is
                       the one case operator-side fencing cannot reach.
 
-                      It costs nothing measurable at replicas >= 2: on the rapid-double-failover
-                      tier it measured 12 refused writes against 16-19 with the check off.
+                      Cost at replicas >= 2, from 10 passes of the rapid-double-failover tier:
+                      free at the median (18.5 refused writes against 16-19 with the check off),
+                      with a ~20% tail where it costs ~45 more (~4.5s). Bimodal rather than noisy,
+                      so it is an ordering condition, not a smear. No data loss either way in 60
+                      measured runs.
 
                       SET IT TO 0 IF YOU RUN replicas: 1. There the promoted master has ZERO
                       replicas until the old pod returns and resyncs, so the check blocks writes
