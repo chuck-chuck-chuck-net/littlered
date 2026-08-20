@@ -3,11 +3,11 @@
 ## Status
 
 Accepted and implemented (branch `fix/sentinel-master-name-scoping`, cut from `main`). Breaking:
-`spec.sentinel.masterName` is required on create. Changelog entry **LR-038**; incident analysis
+`spec.sentinel.masterName` is required on create. Changelog entry **LR-039**; incident analysis
 `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md`.
 
 > ADR number: 015, not 010–012 (claimed on sibling branches: 010 ghost-replica prune, 011 failover
-> mode, 012 multi-site site-loss takeover). Likewise LR-038 rather than LR-026 — IDs are allocated
+> mode, 012 multi-site site-loss takeover). Likewise LR-039 rather than LR-026 — IDs are allocated
 > globally so they survive a merge, at the cost of chronological order within one branch's file.
 >
 > **Cross-branch references.** This ADR cites **LR-033** (multi-site line) and **ADR-011** (failover
@@ -142,7 +142,7 @@ Red-first at three tiers, each observed failing for the defect's reason before t
 error` — which also exposed a pre-existing false pass, an older negative spec being rejected for the
 new field rather than the mode mismatch it tests), and e2e against `main`'s operator, where the
 capture reproduced in 45 s with `config-epoch: 9999`, B's replicas adopted, and the stolen master
-reported `flags: master` — healthy, hence never failed over. Details in LR-038.
+reported `flags: master` — healthy, hence never failed over. Details in LR-039.
 
 ## Consequences
 
@@ -414,7 +414,7 @@ underneath** so a skipped webhook degrades to a loud rejection rather than a sil
 
 - `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` — incident analysis, annotated timeline, the
   Sentinel source citations, and the measured ratcheting matrix.
-- `docs/RECONCILIATION_ALGORITHM_CHANGELOG.md` — **LR-038**; and LR-033 (derived defaults), LR-024
+- `docs/RECONCILIATION_ALGORITHM_CHANGELOG.md` — **LR-039**; and LR-033 (derived defaults), LR-024
   (ghost-master recovery and the veto this does not yet split), LR-004/005/008 (why every existing
   rule short-circuits when `RealMasterIP == ""`).
 - ADR-001 (strict IP-only identity — the assumption whose cross-tenant face this is), ADR-011

@@ -247,11 +247,16 @@ This document tracks significant changes to the LittleRed reconciliation logic. 
 - **Tests / validation:** red-first unit guards in `TestPlanClusterMigration` (new "replicate CHAOS" table case — a native failover promoted a new replica to own the range) and a dedicated `TestPlanReplicateNeverTargetsSelf` (invariant: the plan never emits a REPLICATE whose target is the replica pod's own NodeID), both observed **red** against the pre-fix planner (emitted `{10.1.0.2 → N01}` self) and green after. The e2e chaos tier's existing `waitMigrationComplete` assertion is the integration guard (it is what timed out in the field); reproduction there stays opportunistic (the native-failover-to-K-1 window is env-sensitive), with the deterministic guard in the unit tests per the tier-3 test discipline.
 - **Regresses:** None. The generalized exemption is strictly broader than the old `{name}-shard-K-0`-only check and identical on the normal path (no new pod owns a range until failover).
 
-## [LR-038] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
-> **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and are not
-> present on this branch, hence the jump from LR-025. IDs are allocated globally across
-> branches so they stay unique through a merge; chronological order within one branch's
-> file is deliberately sacrificed to that.
+## [LR-039] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
+> **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and LR-038 on the
+> failover line (`release/0.3.1`); none are present on this branch, hence the jump from LR-025.
+> IDs are allocated globally across branches so they stay unique through a merge; chronological
+> order within one branch's file is deliberately sacrificed to that.
+>
+> This entry was briefly numbered LR-038 by mistake — the highest ID was checked on the
+> multi-site line only (LR-037) and the failover line had already taken 038. **Check every
+> branch before claiming an ID**, not just the one you are working next to:
+> `for b in $(git branch --format='%(refname:short)'); do git show $b:docs/RECONCILIATION_ALGORITHM_CHANGELOG.md 2>/dev/null | grep -oE '^## \[LR-[0-9]{3}\]'; done | sort -u | tail -1`
 - **Date:** 2026-08-19
 - **Commits:** `0e28e8e` (fix), `fb8f3d8` + `7403da1` (e2e) — branch `fix/sentinel-master-name-scoping` off `main`.
 - **Problem (field incident, operator v0.2.1, a managed cloud):** two unrelated sentinel-mode instances in one namespace on a shared pod network **merged into a single Sentinel quorum**. The larger instance's Sentinel configuration won on config epoch and reassigned the smaller instance's master to a Redis pod belonging to the *other* instance; the demoted master was told `SLAVEOF` and **flushed its dataset** on the first replication attempt. The instance was unrecoverable for 13+ hours and no healing rule fired — not in v0.2.1, and not on `main` either. This is the project's first **safety** failure: every prior LR entry is a liveness failure whose surviving invariant is "we never serve the wrong data". Full analysis, with Redis source citations and the annotated timeline: `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md`.

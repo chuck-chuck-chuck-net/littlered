@@ -16,7 +16,7 @@ Sentinel mode manages three components:
 The operator follows a strict **enablement-over-intervention** philosophy (ADR-003): trust Sentinel's built-in failure detection (SDOWN/ODOWN) and failover mechanism. Only intervene when Sentinel cannot self-heal (ghost nodes, divergent masters, bare sentinels).
 
 **Every Sentinel command below names the instance's own master** — `spec.sentinel.masterName`,
-required and unique per pod network (ADR-015, LR-038). `<masterName>` in this document stands for
+required and unique per pod network (ADR-015, LR-039). `<masterName>` in this document stands for
 that value. It is not a formality: the master name is the only isolation Sentinel's gossip protocol
 has, so two instances sharing one are a single deployment as far as Sentinel is concerned, and
 either can reassign the other's master. Instances predating the field fall back to the historic
