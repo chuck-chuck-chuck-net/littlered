@@ -79,6 +79,13 @@ var _ = Describe("LittleRed Security Features", Label("security"), func() {
 						ReplicasPerShard: &replicas,
 					}
 				}
+				if mode == "sentinel" {
+					// masterName is required and has no default (ADR-015): derive it
+					// per instance via the shared helper, never a suite-wide literal.
+					cr.Spec.Sentinel = &littleredv1alpha1.SentinelSpec{
+						MasterName: e2eMasterName(testNamespace, crName),
+					}
+				}
 				Expect(k8sClient.Create(context.Background(), cr)).To(Succeed())
 
 				By("waiting for the instance to be ready")
@@ -160,6 +167,13 @@ var _ = Describe("LittleRed Security Features", Label("security"), func() {
 					cr.Spec.Cluster = &littleredv1alpha1.ClusterSpec{
 						Shards:           clusterShards,
 						ReplicasPerShard: &replicas,
+					}
+				}
+				if mode == "sentinel" {
+					// masterName is required and has no default (ADR-015): derive it
+					// per instance via the shared helper, never a suite-wide literal.
+					cr.Spec.Sentinel = &littleredv1alpha1.SentinelSpec{
+						MasterName: e2eMasterName(testNamespace, crName),
 					}
 				}
 				Expect(k8sClient.Create(context.Background(), cr)).To(Succeed())

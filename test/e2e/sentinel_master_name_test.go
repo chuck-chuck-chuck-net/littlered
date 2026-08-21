@@ -35,7 +35,7 @@ import (
 // e2eMasterName derives an instance's Sentinel master name exactly the way the
 // documentation tells users to: "<namespace>.<name>".
 //
-// Every e2e sentinel manifest uses it, and that is deliberate rather than tidiness.
+// Every e2e sentinel instance uses it, and that is deliberate rather than tidiness.
 // A single shared literal across the suite would make the e2e instances themselves a
 // cross-instance collision — the very defect under test — and two concurrent suite
 // runs against one cluster would merge each other's quorums. Deriving from BOTH the

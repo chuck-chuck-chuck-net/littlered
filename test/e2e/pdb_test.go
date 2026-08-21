@@ -90,6 +90,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 			Spec: littleredv1alpha1.LittleRedSpec{
 				Mode: "sentinel",
 				Sentinel: &littleredv1alpha1.SentinelSpec{
+					MasterName:            e2eMasterName(testNamespace, name),
 					Quorum:                2,
 					DownAfterMilliseconds: 5000,
 					FailoverTimeout:       10000,
