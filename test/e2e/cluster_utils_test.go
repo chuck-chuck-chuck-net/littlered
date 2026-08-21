@@ -180,7 +180,7 @@ func verifySentinelTopologySync(namespace, crName string, expectedSentinels, exp
 		var masterIPs []string
 		for i := 0; i < expectedSentinels; i++ {
 			sentinelPod := fmt.Sprintf("%s-sentinel-%d", crName, i)
-			cmd := exec.Command("kubectl", "exec", sentinelPod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379", "SENTINEL", "master", "mymaster")
+			cmd := exec.Command("kubectl", "exec", sentinelPod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(namespace, crName))
 			sentinelOutput, err := utils.Run(cmd)
 			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to execute SENTINEL master on %s", sentinelPod))
 
@@ -202,7 +202,7 @@ func verifySentinelTopologySync(namespace, crName string, expectedSentinels, exp
 
 		// 1b. Get replicas info from one sentinel to count only healthy ones
 		sentinelPod := fmt.Sprintf("%s-sentinel-0", crName)
-		cmd := exec.Command("kubectl", "exec", sentinelPod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379", "SENTINEL", "replicas", "mymaster")
+		cmd := exec.Command("kubectl", "exec", sentinelPod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379", "SENTINEL", "replicas", e2eMasterName(namespace, crName))
 		replicasOutput, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred(), "Failed to execute SENTINEL replicas on sentinel pod")
 

@@ -283,7 +283,7 @@ spec:
 				// Query sentinel-0 for master info to verify quorum
 				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
 					"-n", testNamespace, "-c", "sentinel", "--",
-					"redis-cli", "-p", "26379", "SENTINEL", "master", "mymaster")
+					"redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(testNamespace, crName))
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("num-slaves"))
@@ -725,7 +725,7 @@ spec:
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
 					"-n", testNamespace, "-c", "sentinel", "--",
-					"redis-cli", "-p", "26379", "SENTINEL", "master", "mymaster")
+					"redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(testNamespace, crName))
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("num-slaves"))
@@ -866,7 +866,7 @@ spec:
 				Eventually(func(g Gomega) {
 					cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
 						"-n", testNamespace, "-c", "sentinel", "--",
-						"redis-cli", "-p", "26379", "SENTINEL", "get-master-addr-by-name", "mymaster")
+						"redis-cli", "-p", "26379", "SENTINEL", "get-master-addr-by-name", e2eMasterName(testNamespace, crName))
 					output, err := utils.Run(cmd)
 					g.Expect(err).NotTo(HaveOccurred())
 					g.Expect(output).NotTo(BeEmpty())
@@ -878,7 +878,7 @@ spec:
 					// Query sentinel for current master address
 					cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
 						"-n", testNamespace, "-c", "sentinel", "--",
-						"redis-cli", "-p", "26379", "SENTINEL", "get-master-addr-by-name", "mymaster")
+						"redis-cli", "-p", "26379", "SENTINEL", "get-master-addr-by-name", e2eMasterName(testNamespace, crName))
 					masterInfo, err := utils.Run(cmd)
 					g.Expect(err).NotTo(HaveOccurred())
 					_, _ = fmt.Fprintf(GinkgoWriter, "Master info: %s\n", masterInfo)
@@ -923,7 +923,7 @@ spec:
 			Eventually(func(g Gomega) {
 				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
 					"-n", testNamespace, "-c", "sentinel", "--",
-					"redis-cli", "-p", "26379", "SENTINEL", "master", "mymaster")
+					"redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(testNamespace, crName))
 				output, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("num-slaves"))

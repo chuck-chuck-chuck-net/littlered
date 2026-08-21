@@ -130,7 +130,7 @@ var _ = Describe("LittleRed Security Features", Label("security"), func() {
 					cmd = exec.Command("kubectl", "exec", sentinelPod, "-n", testNamespace, "--", "redis-cli", "-p", "26379", "-a", password, "--no-auth-warning", "SENTINEL", "masters")
 					output, err = utils.Run(cmd)
 					Expect(err).NotTo(HaveOccurred())
-					Expect(output).To(ContainSubstring("mymaster"))
+					Expect(output).To(ContainSubstring(e2eMasterName(testNamespace, crName)))
 				}
 
 				By("cleaning up")
