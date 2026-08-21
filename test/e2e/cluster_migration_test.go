@@ -76,7 +76,7 @@ import (
 // Heavy + opt-in (the two-image redeploy is disruptive): Label("extended","migration").
 // It is excluded by the default `!extended` filter; run it explicitly with
 // `make test-e2e LABEL_FILTER='migration'` (see the Makefile E2E label convention).
-var _ = Describe("Cluster Legacy→Per-Shard In-Place Migration (ADR-013)", Label("extended", "migration"), Ordered, func() {
+var _ = Describe("Cluster Legacy→Per-Shard In-Place Migration (ADR-013)", Label("extended", "migration", "cluster"), Ordered, func() {
 
 	expectedNodes := clusterTotalNodes(clusterReplicasPerShard)
 

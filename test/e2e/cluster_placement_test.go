@@ -54,7 +54,7 @@ func schedulableNodeCount() int {
 	return count
 }
 
-var _ = Describe("Cluster Mode Per-Shard Placement", Label("placement"), Ordered, func() {
+var _ = Describe("Cluster Mode Per-Shard Placement", Label("placement", "cluster"), Ordered, func() {
 	const crName = "place-cluster"
 
 	AfterAll(func() {

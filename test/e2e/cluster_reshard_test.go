@@ -47,7 +47,7 @@ import (
 // Runs by default (Label "reshard", not "extended") — this is exactly the class of defect
 // unit tests cannot reach: it exercises the gather parsing a real mid-migration topology,
 // which is where LR-018's latent ParseClusterNodes bug hid.
-var _ = Describe("Cluster Mode Consolidated-Shard Reshard Recovery (LR-018)", Label("reshard"), Ordered, func() {
+var _ = Describe("Cluster Mode Consolidated-Shard Reshard Recovery (LR-018)", Label("reshard", "cluster"), Ordered, func() {
 	Context("native atomic slot migration (Redis 8.4+)", Ordered, func() {
 		// Default image (8.4.x) → ASM path. 300 keys migrate atomically.
 		consolidatedShardReshardSpecs("reshard-asm", "", 300, 0, true)

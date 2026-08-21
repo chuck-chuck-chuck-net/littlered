@@ -32,7 +32,7 @@ import (
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
 
-var _ = Describe("Cluster Mode Chaos Testing", Ordered, func() {
+var _ = Describe("Cluster Mode Chaos Testing", Label("cluster"), Ordered, func() {
 
 	Context("Baseline Stability (Masters, 0 Replicas)", Ordered, func() {
 		const crName = "chaos-cluster-stable"

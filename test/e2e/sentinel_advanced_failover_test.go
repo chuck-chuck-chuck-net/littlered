@@ -31,7 +31,7 @@ import (
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
 
-var _ = Describe("Sentinel Advanced Failover", func() {
+var _ = Describe("Sentinel Advanced Failover", Label("sentinel"), func() {
 
 	Context("Event-Driven Label Updates", Ordered, func() {
 		var crName string

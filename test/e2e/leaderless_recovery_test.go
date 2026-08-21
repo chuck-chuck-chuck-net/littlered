@@ -36,7 +36,7 @@ import (
 // Sentinel comes back BARE (no monitored master), and a restarted Redis pod parks
 // in the startup wait-loop — exactly the "all Sentinels bare, no reachable master,
 // bootstrapRequired already cleared" state the operator previously could not escape.
-var _ = Describe("Sentinel Leaderless Bootstrap Deadlock Recovery", func() {
+var _ = Describe("Sentinel Leaderless Bootstrap Deadlock Recovery", Label("sentinel"), func() {
 
 	deploySentinel := func(crName string, allowUnsafe bool) {
 		AddReportEntry("cr:" + crName)

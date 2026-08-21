@@ -72,26 +72,61 @@ make test-e2e KUBECONTEXT=kind-littlered-test-e2e
 
 When pinning is active, the test process uses `kubectl config view --raw --flatten --minify` to export a self-contained kubeconfig (with embedded certs, no external file references) containing only the selected context. This is written to a temp file and `KUBECONFIG` is set for the process. All kubectl commands and Go client calls automatically use the pinned config.
 
-### Filtering Tests
+### Running one deployment mode (`MODE`)
 
-Use `FOCUS` to run a subset of tests (passed to Ginkgo's `-focus` flag):
+A full run takes roughly 50–85 minutes, which is too long when the work at hand is
+mode-specific. `MODE` is the coarse cut for that: it runs one deployment mode and skips
+the others.
 
 ```bash
-# Only standalone tests
-make test-e2e FOCUS="Standalone"
+make test-e2e MODE=sentinel              # sentinel only (still excludes 'extended')
+make test-e2e MODE=cluster E2E_ALL=true  # cluster, including its extended tiers
+make list-e2e MODE=sentinel              # preview the selection; no cluster needed
+```
 
-# Only sentinel tests
-make test-e2e FOCUS="Sentinel"
+Valid values are `standalone`, `sentinel`, `cluster`, `failover`. A typo fails immediately
+with the list of valid values rather than silently selecting nothing. `MODE` composes with
+the `extended` rule (AND) and with `FOCUS`, so the two together narrow to one context:
 
-# Only cluster tests
-make test-e2e FOCUS="Cluster Mode"
+```bash
+make test-e2e MODE=sentinel FOCUS='Rolling Update'   # 4 specs
+```
+
+**Prefer `MODE` over a `FOCUS` regex for this.** Spec names do not cleanly separate modes:
+`FOCUS="Sentinel"` also matches `Sentinel and Standalone Chaos Testing` (pulling in
+standalone specs), the security tier spells its mode lowercase inside a `Context`, and the
+PDB tier has per-mode cases inside shared contexts. `MODE` uses Ginkgo labels attached to
+the outermost mode-pure container instead, so the cut is exact.
+
+Every spec carries exactly one mode label, and that is a **checked invariant** — an
+unlabelled spec would be invisible to every `MODE` run, which is a silently smaller test
+run and worse than having no knob at all:
+
+```bash
+make verify-e2e-mode-labels    # per-mode selections must sum to the full selection
+```
+
+See `test/e2e/mode_labels_test.go` for the scheme and where to attach the label when adding
+a tier.
+
+### Filtering Tests
+
+Use `FOCUS` to run a subset of tests (passed to Ginkgo's `-focus` flag). For whole-mode
+selection prefer `MODE` (above); `FOCUS` is for narrowing *within* a mode or onto a named
+context:
+
+```bash
+# Whole-mode selection: use MODE, not FOCUS (see above)
+make test-e2e MODE=standalone
+make test-e2e MODE=sentinel
+make test-e2e MODE=cluster
 
 # Only sentinel advanced-failover tests (sentinel mode; FOCUS="Failover" would
 # be ambiguous — it also matches the failover-mode suite)
 make test-e2e FOCUS="Sentinel Advanced Failover"
 
-# Only failover-mode tests (mode: failover) — use the Ginkgo label
-make test-e2e LABEL_FILTER='failover-mode'
+# Only failover-mode tests (mode: failover)
+make test-e2e MODE=failover
 
 # Only kill-9 / crash tests
 make test-e2e FOCUS="Kill-9"
@@ -119,6 +154,11 @@ Convention: when adding a tier that is slow, needs a non-default image, or is ot
 opt-in, tag it `Label("extended")` — it then runs under `make test-e2e-all`/CI-all and is
 skipped by the fast default, with no new flag to remember.
 
+Separately, every spec carries a **deployment-mode** label (`standalone`, `sentinel`,
+`cluster`, `failover-mode`) driving the `MODE` knob above. When adding a tier, label its
+outermost mode-pure container and run `make verify-e2e-mode-labels`; the mode labels are
+orthogonal to the tier labels, so a spec normally has one of each.
+
 ### Additional Flags
 
 Pass extra arguments to `go test` via `ARGS`:
@@ -143,6 +183,8 @@ make test-e2e ARGS="-timeout 90m"
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |
 | `CLUSTER_REPLICAS_PER_SHARD` | `1` | Replicas per shard for cluster tests that use replicas |
 | `NON_GRACEFUL_RESTART` | (none) | Advanced: when `true`, pod-restart helpers use a hard/non-graceful kill instead of a graceful delete |
+| `MODE` | (none) | Run one deployment mode only: `standalone`, `sentinel`, `cluster`, `failover`. Composes with `FOCUS`/`E2E_ALL`; invalid values fail fast |
+| `LABEL_FILTER` | `!extended` | Any Ginkgo label expression; overrides `MODE`/`E2E_ALL` |
 | `FOCUS` | (none) | Ginkgo focus filter (regex) |
 | `ARGS` | (none) | Extra arguments passed to `go test` |
 

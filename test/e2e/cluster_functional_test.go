@@ -31,7 +31,7 @@ import (
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
 
-var _ = Describe("Cluster Mode Functional Testing", Ordered, func() {
+var _ = Describe("Cluster Mode Functional Testing", Label("cluster"), Ordered, func() {
 
 	Context("Basic Operations (Masters + Replicas)", Ordered, func() {
 		const crName = "func-cluster-basic"

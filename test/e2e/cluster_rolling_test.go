@@ -31,7 +31,7 @@ import (
 	"github.com/littlered-operator/littlered-operator/test/utils"
 )
 
-var _ = Describe("Cluster Mode Rolling Update", Ordered, func() {
+var _ = Describe("Cluster Mode Rolling Update", Label("cluster"), Ordered, func() {
 	const crName = "roll-cluster"
 
 	BeforeAll(func() {

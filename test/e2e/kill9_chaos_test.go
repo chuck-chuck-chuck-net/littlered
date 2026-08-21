@@ -60,7 +60,7 @@ var _ = Describe("Kill-9 In-Pod Process Crash", Ordered, func() {
 	// This test is intentionally trivial. Its only job is to validate the
 	// killPodProcess helper before the sentinel/cluster tests rely on it.
 
-	Context("Standalone Mode — Kill-9 Smoke Test", Ordered, func() {
+	Context("Standalone Mode — Kill-9 Smoke Test", Label("standalone"), Ordered, func() {
 		It("should kill the Redis process and confirm the kill took effect", func() {
 			const crName = "kill9-smoke"
 			AddReportEntry("cr:" + crName)
@@ -175,7 +175,7 @@ spec:
 	// Sentinel mode
 	// -------------------------------------------------------------------------
 
-	Context("Sentinel Mode — Master Process Crash", Ordered, func() {
+	Context("Sentinel Mode — Master Process Crash", Label("sentinel"), Ordered, func() {
 		It("should recover from master kill-9 without data loss", func() {
 			const crName = "kill9-sentinel"
 			AddReportEntry("cr:" + crName)
@@ -340,7 +340,7 @@ spec:
 	// Cluster mode
 	// -------------------------------------------------------------------------
 
-	Context("Cluster Mode — Master Process Crash", Ordered, func() {
+	Context("Cluster Mode — Master Process Crash", Label("cluster"), Ordered, func() {
 		It("should recover from master shard kill-9 without data loss", func() {
 			const crName = "kill9-cluster"
 			AddReportEntry("cr:" + crName)

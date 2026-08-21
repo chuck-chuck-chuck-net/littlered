@@ -33,7 +33,7 @@ import (
 
 var _ = Describe("Sentinel and Standalone Chaos Testing", Ordered, func() {
 
-	Context("Sentinel Resilience", Ordered, func() {
+	Context("Sentinel Resilience", Label("sentinel"), Ordered, func() {
 		for _, d := range chaosDisruptions {
 			d := d // capture range variable
 			It(fmt.Sprintf("should maintain availability during rapid double failover (%s)", d.Name), func() {
@@ -206,7 +206,7 @@ spec:
 		}
 	})
 
-	Context("Standalone Mode Resilience", Ordered, func() {
+	Context("Standalone Mode Resilience", Label("standalone"), Ordered, func() {
 		It("should recover after pod restart", func() {
 			crName := "chaos-standalone"
 			const testDuration = 60 * time.Second

@@ -149,7 +149,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 	// shard, regardless of spec.podDisruptionBudget.create.
 
 	Context("Single-pod workloads", func() {
-		It("should never create a PDB in standalone mode, even when create=true", func() {
+		It("should never create a PDB in standalone mode, even when create=true", Label("standalone"), func() {
 			crName := "pdb-standalone-none"
 			pdbName := crName + "-redis-pdb"
 
@@ -169,7 +169,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 			}, 15*time.Second, 5*time.Second).Should(Succeed())
 		})
 
-		It("should never create a PDB in cluster mode with replicasPerShard=0", func() {
+		It("should never create a PDB in cluster mode with replicasPerShard=0", Label("cluster"), func() {
 			crName := "pdb-cluster-zero"
 
 			zero := 0
@@ -233,7 +233,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 			tc := tc
 			crName := fmt.Sprintf("pdb-off-%s", tc.mode)
 
-			It(fmt.Sprintf("should not create any PDB in %s mode when create is false", tc.mode), func() {
+			It(fmt.Sprintf("should not create any PDB in %s mode when create is false", tc.mode), modeLabel(tc.mode), func() {
 				AddReportEntry("cr:" + crName)
 
 				var cr *littleredv1alpha1.LittleRed
@@ -302,7 +302,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 			tc := tc
 			crName := fmt.Sprintf("pdb-on-%s", tc.mode)
 
-			It(fmt.Sprintf("should create PDB(s) with maxUnavailable=1 in %s mode when create is not set", tc.mode), func() {
+			It(fmt.Sprintf("should create PDB(s) with maxUnavailable=1 in %s mode when create is not set", tc.mode), modeLabel(tc.mode), func() {
 				AddReportEntry("cr:" + crName)
 
 				var cr *littleredv1alpha1.LittleRed
@@ -351,7 +351,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 	// Custom PDB values
 	// ============================================================================
 
-	Context("Custom PDB values", func() {
+	Context("Custom PDB values", Label("sentinel"), func() {
 		It("should apply custom maxUnavailable", func() {
 			crName := "pdb-custom-max"
 			pdbName := crName + "-redis-pdb"
@@ -462,7 +462,7 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 	// PDB lifecycle
 	// ============================================================================
 
-	Context("PDB lifecycle", func() {
+	Context("PDB lifecycle", Label("sentinel"), func() {
 		It("should delete PDB when create is toggled from true to false", func() {
 			crName := "pdb-toggle-off"
 			pdbName := crName + "-redis-pdb"

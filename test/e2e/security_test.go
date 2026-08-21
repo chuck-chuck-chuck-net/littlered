@@ -40,7 +40,7 @@ var _ = Describe("LittleRed Security Features", Label("security"), func() {
 	for _, mode := range modes {
 		mode := mode // capture range variable
 
-		Context(fmt.Sprintf("Password Authentication in %s mode", mode), func() {
+		Context(fmt.Sprintf("Password Authentication in %s mode", mode), modeLabel(mode), func() {
 			It("should enforce password authentication when enabled", func() {
 				crName := fmt.Sprintf("auth-%s", mode)
 				password := "e2e-secret-password"
@@ -138,7 +138,7 @@ var _ = Describe("LittleRed Security Features", Label("security"), func() {
 			})
 		})
 
-		Context(fmt.Sprintf("TLS Encryption in %s mode", mode), func() {
+		Context(fmt.Sprintf("TLS Encryption in %s mode", mode), modeLabel(mode), func() {
 			It("should enforce TLS encryption when enabled", func() {
 				crName := fmt.Sprintf("tls-%s", mode)
 				secretName := fmt.Sprintf("redis-tls-secret-%s", mode)

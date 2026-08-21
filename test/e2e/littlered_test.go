@@ -33,7 +33,7 @@ import (
 
 var _ = Describe("LittleRed", Ordered, func() {
 
-	Context("Standalone Mode", Ordered, func() {
+	Context("Standalone Mode", Label("standalone"), Ordered, func() {
 		const crName = "test-standalone"
 
 		AfterAll(func() {
@@ -196,7 +196,7 @@ spec:
 		})
 	})
 
-	Context("Sentinel Mode", Ordered, func() {
+	Context("Sentinel Mode", Label("sentinel"), Ordered, func() {
 		const crName = "test-sentinel"
 
 		BeforeAll(func() {
@@ -357,7 +357,7 @@ spec:
 		})
 	})
 
-	Context("Rolling Update", Ordered, func() {
+	Context("Rolling Update", Label("standalone"), Ordered, func() {
 		const crName = "test-rolling-update"
 
 		BeforeAll(func() {
@@ -580,7 +580,7 @@ spec:
 		})
 	})
 
-	Context("Sentinel Rolling Update", Ordered, func() {
+	Context("Sentinel Rolling Update", Label("sentinel"), Ordered, func() {
 		const crName = "test-sentinel-rolling"
 
 		AfterAll(func() {
@@ -744,7 +744,7 @@ spec:
 		})
 	})
 
-	Context("Sentinel Failover", Ordered, func() {
+	Context("Sentinel Failover", Label("sentinel"), Ordered, func() {
 		const crName = "test-failover"
 
 		BeforeAll(func() {

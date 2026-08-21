@@ -69,7 +69,7 @@ import (
 // design (pure in-memory, EmptyDir — pillar 3.1); the property under test is
 // AVAILABILITY RECOVERY, not durability. Each test writes a canary only to prove the
 // cluster was functional beforehand, and asserts fresh writes work after recovery.
-var _ = Describe("Cluster Total-Wipe Re-Bootstrap", func() {
+var _ = Describe("Cluster Total-Wipe Re-Bootstrap", Label("cluster"), func() {
 
 	expectedNodes := clusterTotalNodes(clusterReplicasPerShard)
 

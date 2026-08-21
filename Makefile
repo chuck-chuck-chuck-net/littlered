@@ -162,6 +162,33 @@ E2E_LABEL_FILTER = !extended
 ifeq ($(E2E_ALL),true)
 E2E_LABEL_FILTER =
 endif
+
+# MODE cuts a run down to ONE deployment mode. A full run is ~50-85min, which is too
+# long to be the only option when the work at hand is mode-specific ("we're looking at
+# sentinel right now"). Every spec carries exactly one mode label -- see
+# test/e2e/mode_labels_test.go for the scheme and hack/verify-e2e-mode-labels.sh for the
+# partition check that keeps it honest.
+#   make test-e2e MODE=sentinel          # sentinel only, still excluding 'extended'
+#   make test-e2e MODE=cluster E2E_ALL=true
+#   make list-e2e MODE=sentinel          # preview the selection, no cluster needed
+# MODE composes with the extended rule (AND); an explicit LABEL_FILTER overrides both.
+E2E_MODES = standalone sentinel cluster failover
+ifneq ($(MODE),)
+ifneq ($(filter-out $(E2E_MODES),$(MODE)),)
+$(error MODE must be one of: $(E2E_MODES) (got '$(MODE)'))
+endif
+# `failover` keeps its pre-existing 'failover-mode' label rather than being renamed.
+E2E_MODE_LABEL = $(MODE)
+ifeq ($(MODE),failover)
+E2E_MODE_LABEL = failover-mode
+endif
+ifeq ($(E2E_LABEL_FILTER),)
+E2E_LABEL_FILTER := $(E2E_MODE_LABEL)
+else
+E2E_LABEL_FILTER := $(E2E_MODE_LABEL) && $(E2E_LABEL_FILTER)
+endif
+endif
+
 ifneq ($(LABEL_FILTER),)
 E2E_LABEL_FILTER = $(LABEL_FILTER)
 endif
@@ -229,6 +256,7 @@ run-test-e2e: manifests generate fmt vet
 #   make list-e2e E2E_ALL=true                # every spec
 #   make list-e2e LABEL_FILTER='failover-mode'
 #   make list-e2e FOCUS='Standalone'
+#   make list-e2e MODE=sentinel               # one deployment mode's specs
 # --ginkgo.dry-run executes no nodes at all (not even BeforeSuite), so this needs no cluster and
 # no kubecontext. Both -v flags are required: go's (or go test buffers the output away) and
 # Ginkgo's (or the report is just dots). Deliberately has no codegen prerequisites — listing
@@ -236,6 +264,10 @@ run-test-e2e: manifests generate fmt vet
 .PHONY: list-e2e
 list-e2e: ## List the specs an e2e run would select, without touching a cluster (honors FOCUS/LABEL_FILTER/E2E_ALL).
 	@go test -tags=e2e ./test/e2e/ -v -timeout 5m --ginkgo.dry-run --ginkgo.v --ginkgo.no-color --ginkgo.seed=1 $(E2E_FOCUS) $(E2E_LABELS) 2>&1 | awk '/^Will run /{hdr=$$0} /^\/.*_test\.go:[0-9]+$$/{ if (prev !~ /^\[/ && prev != "") { loc=$$0; sub(/.*\/test\/e2e\//,"",loc); printf "%4d  %s\n        %s\n", ++n, prev, loc } } {prev=$$0} END{ if (n == 0) { print "no specs selected"; exit 1 } printf "\n%s (dry run -- nothing was executed)\n", hdr }'
+
+.PHONY: verify-e2e-mode-labels
+verify-e2e-mode-labels: ## Check the e2e mode labels partition the suite (no unlabelled/double-labelled specs).
+	@./hack/verify-e2e-mode-labels.sh
 
 .PHONY: cleanup-test-e2e
 cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests

@@ -45,7 +45,7 @@ func e2eMasterName(namespace, name string) string {
 	return fmt.Sprintf("%s.%s", namespace, name)
 }
 
-var _ = Describe("Sentinel Master Name Scoping", func() {
+var _ = Describe("Sentinel Master Name Scoping", Label("sentinel"), func() {
 
 	applyCR := func(manifest string) (string, error) {
 		cmd := exec.Command("kubectl", "apply", "-f", "-")
@@ -153,7 +153,7 @@ spec:
 // knows. Before per-instance naming both instances answered to "mymaster", so this
 // payload flipped A onto B's master and A's replicas flushed to resync from it. That
 // is the red this spec must produce against pre-fix code.
-var _ = Describe("Sentinel Cross-Instance Isolation", Ordered, func() {
+var _ = Describe("Sentinel Cross-Instance Isolation", Label("sentinel"), Ordered, func() {
 	var instA, instB, lrctlBin string
 
 	// lrctlVerify runs the REAL CLI against the cluster. The detector behind it is
