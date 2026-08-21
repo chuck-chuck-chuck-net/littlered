@@ -75,6 +75,50 @@ const (
 	ProbeTimeout = 3 * time.Second
 )
 
+// newBoundedClient builds a go-redis Sentinel client for ONE single-shot command
+// against ONE address — a control command (MONITOR/SET/RESET/REMOVE) or a probe
+// (SENTINEL master / is-master-down-by-addr).
+//
+// Its timeouts are ProbeTimeout, not DefaultTimeout, and that is load-bearing
+// rather than tidiness (LR-040). A context deadline alone does NOT bound these
+// calls: go-redis reports `context deadline exceeded` at the deadline but still
+// spends roughly another DefaultTimeout unwinding, so a 3s ctx over a 5s
+// ReadTimeout still costs ~5s of wall clock. The dial and read budgets have to be
+// short too. Both matter — the ctx bounds the pool's dial-retry loop (the
+// blackholing-IP case that stalled a reconcile ~117s), the timeouts bound each
+// individual attempt.
+//
+// A control command is one round-trip to one pod, so it has the same latency
+// profile as a probe: a live in-cluster sentinel answers in well under a second.
+func (c *SentinelClient) newBoundedClient(addr string) *redis.SentinelClient {
+	return redis.NewSentinelClient(&redis.Options{
+		Addr:         addr,
+		Password:     c.password,
+		DialTimeout:  ProbeTimeout,
+		ReadTimeout:  ProbeTimeout,
+		WriteTimeout: ProbeTimeout,
+		TLSConfig:    makeTLSConfig(c.tlsEnabled),
+	})
+}
+
+// newBoundedRedisClient is newBoundedClient's twin for the package-level
+// single-shot helpers (Ping / SlaveOf / GetReplicationInfo), which talk to one
+// Redis pod for one command. Same ProbeTimeout rationale (LR-040).
+//
+// Deliberately NOT used for cluster mode's per-node client: slot migration issues
+// MIGRATE with its own multi-second budget (spec.cluster.reshardMigrateTimeoutMillis),
+// so a blanket ProbeTimeout there would cut off legitimate long commands.
+func newBoundedRedisClient(addr, password string, tlsEnabled bool) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     password,
+		DialTimeout:  ProbeTimeout,
+		ReadTimeout:  ProbeTimeout,
+		WriteTimeout: ProbeTimeout,
+		TLSConfig:    makeTLSConfig(tlsEnabled),
+	})
+}
+
 // MasterInfo contains information about the current master
 type MasterInfo struct {
 	IP             string
@@ -132,13 +176,7 @@ func (c *SentinelClient) GetMasterState(ctx context.Context, name string) (*Mast
 
 	for _, addr := range c.addresses {
 		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
-		client := redis.NewSentinelClient(&redis.Options{
-			Addr:        addr,
-			Password:    c.password,
-			DialTimeout: DefaultTimeout,
-			ReadTimeout: DefaultTimeout,
-			TLSConfig:   makeTLSConfig(c.tlsEnabled),
-		})
+		client := c.newBoundedClient(addr)
 		result, err := client.Master(actx, name).Result()
 		_ = client.Close()
 		cancel()
@@ -170,13 +208,7 @@ func (c *SentinelClient) IsFailoverInProgress(ctx context.Context, name string) 
 	reachable := false
 	for _, addr := range c.addresses {
 		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
-		client := redis.NewSentinelClient(&redis.Options{
-			Addr:        addr,
-			Password:    c.password,
-			DialTimeout: DefaultTimeout,
-			ReadTimeout: DefaultTimeout,
-			TLSConfig:   makeTLSConfig(c.tlsEnabled),
-		})
+		client := c.newBoundedClient(addr)
 		result, err := client.Master(actx, name).Result()
 		_ = client.Close()
 		cancel()
@@ -276,14 +308,10 @@ func (c *SentinelClient) Subscribe(ctx context.Context, channels ...string) (<-c
 func (c *SentinelClient) Monitor(ctx context.Context, name, ip string, port int, quorum int) error {
 	var errors []string
 	for _, addr := range c.addresses {
-		client := redis.NewSentinelClient(&redis.Options{
-			Addr:        addr,
-			Password:    c.password,
-			DialTimeout: DefaultTimeout,
-			ReadTimeout: DefaultTimeout,
-			TLSConfig:   makeTLSConfig(c.tlsEnabled),
-		})
-		err := client.Process(ctx, redis.NewStatusCmd(ctx, "SENTINEL", "MONITOR", name, ip, port, quorum))
+		client := c.newBoundedClient(addr)
+		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+		err := client.Process(actx, redis.NewStatusCmd(actx, "SENTINEL", "MONITOR", name, ip, port, quorum))
+		cancel()
 		_ = client.Close()
 		if err != nil {
 			// If it's already monitored, that's fine
@@ -303,14 +331,10 @@ func (c *SentinelClient) Monitor(ctx context.Context, name, ip string, port int,
 func (c *SentinelClient) Set(ctx context.Context, name, option, value string) error {
 	var errors []string
 	for _, addr := range c.addresses {
-		client := redis.NewSentinelClient(&redis.Options{
-			Addr:        addr,
-			Password:    c.password,
-			DialTimeout: DefaultTimeout,
-			ReadTimeout: DefaultTimeout,
-			TLSConfig:   makeTLSConfig(c.tlsEnabled),
-		})
-		err := client.Process(ctx, redis.NewStatusCmd(ctx, "SENTINEL", "SET", name, option, value))
+		client := c.newBoundedClient(addr)
+		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+		err := client.Process(actx, redis.NewStatusCmd(actx, "SENTINEL", "SET", name, option, value))
+		cancel()
 		_ = client.Close()
 		if err != nil {
 			// If master not found on this node, we'll try again later
@@ -328,13 +352,7 @@ func (c *SentinelClient) Set(ctx context.Context, name, option, value string) er
 }
 
 func (c *SentinelClient) getMasterFromSentinel(ctx context.Context, addr, masterName string) (*MasterInfo, error) {
-	client := redis.NewSentinelClient(&redis.Options{
-		Addr:        addr,
-		Password:    c.password,
-		DialTimeout: DefaultTimeout,
-		ReadTimeout: DefaultTimeout,
-		TLSConfig:   makeTLSConfig(c.tlsEnabled),
-	})
+	client := c.newBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	// SENTINEL GET-MASTER-ADDR-BY-NAME <masterName>
@@ -382,13 +400,7 @@ func (c *SentinelClient) GetReplicas(ctx context.Context, masterName string) ([]
 }
 
 func (c *SentinelClient) getReplicasFromSentinel(ctx context.Context, sentinelAddr, masterName string) ([]ReplicaInfo, error) {
-	client := redis.NewSentinelClient(&redis.Options{
-		Addr:        sentinelAddr,
-		Password:    c.password,
-		DialTimeout: DefaultTimeout,
-		ReadTimeout: DefaultTimeout,
-		TLSConfig:   makeTLSConfig(c.tlsEnabled),
-	})
+	client := c.newBoundedClient(sentinelAddr)
 	defer func() { _ = client.Close() }()
 
 	// SENTINEL REPLICAS mymaster
@@ -415,15 +427,11 @@ func (c *SentinelClient) getReplicasFromSentinel(ctx context.Context, sentinelAd
 func (c *SentinelClient) Reset(ctx context.Context, masterName string) error {
 	var errors []string
 	for _, addr := range c.addresses {
-		client := redis.NewSentinelClient(&redis.Options{
-			Addr:        addr,
-			Password:    c.password,
-			DialTimeout: DefaultTimeout,
-			ReadTimeout: DefaultTimeout,
-			TLSConfig:   makeTLSConfig(c.tlsEnabled),
-		})
+		client := c.newBoundedClient(addr)
 		// SENTINEL RESET masterName
-		err := client.Process(ctx, redis.NewIntCmd(ctx, "SENTINEL", "RESET", masterName))
+		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+		err := client.Process(actx, redis.NewIntCmd(actx, "SENTINEL", "RESET", masterName))
+		cancel()
 		_ = client.Close()
 		if err != nil {
 			errors = append(errors, fmt.Sprintf("%s: %v", addr, err))
@@ -439,15 +447,11 @@ func (c *SentinelClient) Reset(ctx context.Context, masterName string) error {
 func (c *SentinelClient) Remove(ctx context.Context, masterName string) error {
 	var errors []string
 	for _, addr := range c.addresses {
-		client := redis.NewSentinelClient(&redis.Options{
-			Addr:        addr,
-			Password:    c.password,
-			DialTimeout: DefaultTimeout,
-			ReadTimeout: DefaultTimeout,
-			TLSConfig:   makeTLSConfig(c.tlsEnabled),
-		})
+		client := c.newBoundedClient(addr)
 		// SENTINEL REMOVE masterName
-		err := client.Process(ctx, redis.NewStatusCmd(ctx, "SENTINEL", "REMOVE", masterName))
+		actx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+		err := client.Process(actx, redis.NewStatusCmd(actx, "SENTINEL", "REMOVE", masterName))
+		cancel()
 		_ = client.Close()
 		if err != nil {
 			// If it's already removed, that's fine
@@ -465,13 +469,7 @@ func (c *SentinelClient) Remove(ctx context.Context, masterName string) error {
 
 // IsMonitoring checks if a specific sentinel address is monitoring the given master
 func (c *SentinelClient) IsMonitoring(ctx context.Context, sentinelAddr, masterName string) (bool, error) {
-	client := redis.NewSentinelClient(&redis.Options{
-		Addr:        sentinelAddr,
-		Password:    c.password,
-		DialTimeout: DefaultTimeout,
-		ReadTimeout: DefaultTimeout,
-		TLSConfig:   makeTLSConfig(c.tlsEnabled),
-	})
+	client := c.newBoundedClient(sentinelAddr)
 	defer func() { _ = client.Close() }()
 
 	_, err := client.GetMasterAddrByName(ctx, masterName).Result()
@@ -486,13 +484,7 @@ func (c *SentinelClient) IsMonitoring(ctx context.Context, sentinelAddr, masterN
 
 // Ping checks if a redis instance is reachable
 func Ping(ctx context.Context, addr, password string, tlsEnabled bool) error {
-	client := redis.NewClient(&redis.Options{
-		Addr:        addr,
-		Password:    password,
-		DialTimeout: DefaultTimeout,
-		ReadTimeout: DefaultTimeout,
-		TLSConfig:   makeTLSConfig(tlsEnabled),
-	})
+	client := newBoundedRedisClient(addr, password, tlsEnabled)
 	defer func() { _ = client.Close() }()
 
 	return client.Ping(ctx).Err()
@@ -500,13 +492,7 @@ func Ping(ctx context.Context, addr, password string, tlsEnabled bool) error {
 
 // SlaveOf reconfigures a redis instance to follow a new master
 func SlaveOf(ctx context.Context, addr, password, masterIP, masterPort string, tlsEnabled bool) error {
-	client := redis.NewClient(&redis.Options{
-		Addr:        addr,
-		Password:    password,
-		DialTimeout: DefaultTimeout,
-		ReadTimeout: DefaultTimeout,
-		TLSConfig:   makeTLSConfig(tlsEnabled),
-	})
+	client := newBoundedRedisClient(addr, password, tlsEnabled)
 	defer func() { _ = client.Close() }()
 
 	if masterIP == "" {
@@ -540,13 +526,7 @@ type ReplicationSnapshot struct {
 // It fetches the default INFO (a superset of the replication section) so a single
 // round trip yields role/offset, the replication id, and the total key count.
 func GetReplicationInfo(ctx context.Context, addr, password string, tlsEnabled bool) (*ReplicationSnapshot, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:        addr,
-		Password:    password,
-		DialTimeout: DefaultTimeout,
-		ReadTimeout: DefaultTimeout,
-		TLSConfig:   makeTLSConfig(tlsEnabled),
-	})
+	client := newBoundedRedisClient(addr, password, tlsEnabled)
 	defer func() { _ = client.Close() }()
 
 	info, err := client.Info(ctx).Result()
