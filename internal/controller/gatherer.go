@@ -59,6 +59,16 @@ func (g *operatorGatherer) GetRedisState(ctx context.Context, podName, ip string
 }
 
 func (g *operatorGatherer) GetSentinelState(ctx context.Context, podName, ip string) (*redisclient.SentinelNodeState, error) {
+	// An empty master name is a programming error, not a cluster state, and it must
+	// not be allowed to look like one (LR-041). `SENTINEL master ""` draws the same
+	// `ERR No such master with that name` as a genuine miss, so the not-monitoring
+	// branch below would report every sentinel as reachable-but-bare forever:
+	// silently disabling every sn.Monitoring-gated rule (ghost-master correction,
+	// ghost-replica pruning, HasHealthyKnownReplica) while Rule 0 re-registers the
+	// whole quorum every couple of seconds. Fail loudly instead.
+	if g.masterName == "" {
+		return nil, fmt.Errorf("sentinel gather requires a master name, but the gatherer was built without one")
+	}
 	podAddr := fmt.Sprintf("%s:%d", ip, littleredv1alpha1.SentinelPort)
 	sc := redisclient.NewSentinelClient([]string{podAddr}, g.password, g.tlsEnabled)
 
