@@ -1,12 +1,19 @@
 # Design Note: `failover` Mode (Operator-Managed HA without Sentinel)
 
-> **Status:** **Implemented (experimental)** on `feat/failover-mode` — the concrete design
-> is recorded in [ADR-011](adr/011-failover-mode.md), the algorithm in
-> [RECONCILIATION_LOOP_FAILOVER.md](RECONCILIATION_LOOP_FAILOVER.md). The HA e2e suite is
-> **green 16/16 on a real 3-node cluster (2026-08-01)** — including the §4 hybrid
-> double-failover scenario, which sentinel mode kept deadlocking on (LR-007/LR-008/LR-024).
-> The **§4 graduation-gate remainder is pending** (chaos/soak run, dogfooding evidence),
-> and the §3.4 drop/coexist/replace decision stays deferred until that gate.
+> **Status:** **Implemented (experimental)**; `feat/failover-mode` has been merged. The
+> concrete design is recorded in [ADR-011](adr/011-failover-mode.md), the algorithm in
+> [RECONCILIATION_LOOP_FAILOVER.md](RECONCILIATION_LOOP_FAILOVER.md).
+>
+> **This file is a historical design note, not current documentation.** It is the
+> exploratory reasoning from 2026-06-24, kept as written; where a question was later
+> settled the resolution is noted inline. For what the mode *does today*, read the
+> reconciliation-loop document — not this one.
+>
+> Since this note was written: the HA e2e suite went green 16/16 on a real 3-node
+> cluster (2026-08-01), and the §4 chaos/soak item is now satisfied — durability held
+> over 10 consecutive passes of the six-cell cross-mode matrix (60 runs, 2026-08-20),
+> 0 lost writes and 0 corruptions throughout. The §4 remainder is therefore **dogfooding
+> evidence only**, with the §3.4 drop/coexist/replace decision deferred until that.
 > **Created:** 2026-06-24 (design discussion) as an exploratory note. The sections below are
 > kept as written — they are the historical reasoning; per-item resolution notes are inline.
 > **Decision owners:** the littlered authors (spare-time OSS); also dogfooded on the

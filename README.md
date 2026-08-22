@@ -4,17 +4,21 @@ A Kubernetes operator for deploying Redis/Valkey as a pure in-memory data store.
 
 LittleRed is built for workloads where persistence is explicitly disabled and never enabled—not even by accident. It provides a full reconciliation engine to manage node identities and cluster membership across restarts and failures: the class of problem where static Helm charts and startup scripts reach their limits.
 
-## Upgrading to v0.3.1 (Sentinel Mode)
+## Upgrading to v0.3.1
 
-> **`spec.sentinel.masterName` is now required, and must be unique among every Sentinel deployment reachable on the same pod network.** Use `<namespace>.<name>`. **`standalone` and `cluster` instances are unaffected.**
->
-> The master name is the *only* isolation Sentinel's gossip protocol has: a Sentinel receiving a hello message looks the name up, discards it if unknown, and checks nothing else — no instance identifier, no namespace. Two instances that share a name and can reach each other are, protocol-wise, **one deployment**: the one with the higher config epoch can reassign the other's master to a foreign Redis pod, whose replicas then **flush their datasets** to resynchronise from a stranger. If both run the same Redis version the merge completes silently, and the victim reports healthy while serving someone else's keyspace. This has happened in production.
->
-> **Enable authentication in the same window.** It is the peer-membership credential too, and it is the only thing that closes the narrower path a unique name leaves open — a foreign Sentinel whose recycled master address is now yours reads its `INFO` directly, with no hello involved.
->
-> **Existing instances keep running.** They continue on the historic shared name `mymaster` and report a `SentinelMasterNameUnscoped` warning until you set the field; they are only forced to state a value on their next change to `spec.sentinel`. **Changing it is client-visible:** Sentinel-aware clients must be reconfigured in the same maintenance window, and there is no rolling cutover — monitoring one master under two names runs two independent failover state machines that can promote different replicas. Clients using the label-routed `{name}` Service are unaffected. Setting `masterName: mymaster` explicitly is accepted and silences the warning without changing behaviour. See [Isolating Sentinel instances](docs/USAGE.md#isolating-sentinel-instances).
->
-> **New: `mode: failover` (experimental).** 1 master + N replicas with **no Sentinel processes** — the operator is the sole failure detector and failover decider. We consider it the better design: sentinel mode has two independent failure detectors, the operator and Sentinel, and much of this project's hardest history is the two of them fighting over the same state. One decider removes that class outright. The trade is that HA is coupled to operator liveness. See [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md).
+### Sentinel mode: `spec.sentinel.masterName` is now required
+
+We had reports of *Sentinel collisions*: pod restarts on recycled IPs led two unrelated Sentinel instances to merge into one, losing both. A unique `masterName` — use `<namespace>.<name>` — closes most of those cases. Authentication closes the rest, which is why we now **strongly recommend authentication in sentinel mode**; see [Isolating Sentinel instances](docs/USAGE.md#isolating-sentinel-instances) for which cases need which, and `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` for the full analysis.
+
+**Existing instances keep running.** The requirement is enforced on new instances; an existing one is only forced to state a value on its next change to `spec.sentinel`, and reports a `SentinelMasterNameUnscoped` warning until then.
+
+Note that `masterName` is part of the configuration of Sentinel-aware clients. If you give an instance a new, unique master name — and enable authentication — you must reconfigure those clients in the same maintenance window. Clients that reach the master through the `{name}` Service are unaffected.
+
+### New `failover` mode (experimental)
+
+Same use case as sentinel mode — a highly available, replicated Redis instance — but managed directly by LittleRed instead of by Sentinel processes. The goal is to explore the robustness of that design, which avoids the "two brains" problem of running Sentinel under LittleRed: two independent failure detectors deciding about the same state. See [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md).
+
+Failover mode is **experimental**. Its e2e coverage is on parity with sentinel mode, but it has not seen real-world usage yet.
 
 ## Upgrading to v0.3.0 (Cluster Mode)
 

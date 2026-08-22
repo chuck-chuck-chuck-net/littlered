@@ -5,8 +5,18 @@ This document describes the detailed reconciliation logic for **failover mode** 
 For the high-level view that includes standalone, sentinel, and cluster modes, see [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md). For the sentinel-mode loop this mode is the alternative to, see [RECONCILIATION_LOOP_SENTINEL.md](RECONCILIATION_LOOP_SENTINEL.md).
 
 > **Status**: failover mode is **experimental**. The operator emits a warning event
-> (`ExperimentalMode`) on the first reconcile of a failover-mode instance. The
-> e2e suite is in progress; the ADR-011 graduation gate is pending.
+> (`ExperimentalMode`) on the first reconcile of a failover-mode instance.
+>
+> **e2e coverage is complete and at parity with sentinel mode**, and is not what
+> remains: the HA suite is green 16/16 on a real 3-node cluster, and durability was
+> verified over 10 consecutive passes of the six-cell cross-mode chaos matrix (60
+> runs, 2026-08-20) with **0 lost writes and 0 corruptions in every block**. In the
+> kill-9 column the two modes' distributions do not overlap — failover 85.13–95.73%
+> write availability against sentinel 43.32–73.89%.
+>
+> What is still pending on the ADR-011 graduation gate is **real-world evidence**:
+> managed-cloud dogfooding, and then the drop/coexist/replace-sentinel decision.
+> The mode has not carried production traffic.
 
 ---
 
