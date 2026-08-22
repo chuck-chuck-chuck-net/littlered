@@ -25,7 +25,13 @@ import (
 // This allows the Operator (direct TCP) and the CLI (K8s Exec) to share logic.
 type Gatherer interface {
 	GetRedisState(ctx context.Context, podName, ip string) (*RedisNodeState, error)
-	GetSentinelState(ctx context.Context, podName, ip string) (*SentinelNodeState, error)
+	// GetSentinelState probes one Sentinel pod for masterName. The name is a
+	// PARAMETER rather than implementation state on purpose (LR-041): as
+	// construction state it was silently omissible, and an unset required string
+	// zero-values to "" — which Sentinel answers exactly like an unknown name, so
+	// every sentinel read as reachable-but-bare and every Monitoring-gated rule
+	// went quietly dead. As a parameter the compiler asks for it at every call site.
+	GetSentinelState(ctx context.Context, podName, ip, masterName string) (*SentinelNodeState, error)
 
 	// Cluster mode
 	GetClusterID(ctx context.Context, podName, ip string) (string, error)
@@ -42,7 +48,12 @@ type Gatherer interface {
 // concurrent gather (see gatherNodeIdentities / LR-012); it was previously a plain
 // sequential loop, and the same blackhole-dial stall then bit sentinel mode on a
 // managed cloud. See the cross-mode-parity rule in CLAUDE.md.
-func GatherReplicationState(ctx context.Context, g Gatherer, redisPods, sentinelPods map[string]string) *ReplicationState {
+// masterName is the instance's Sentinel master name (LittleRed.SentinelMasterName()).
+// It is required whenever sentinelPods is non-empty; callers with no Sentinels
+// (failover mode) pass "" and no Sentinel probe is issued.
+func GatherReplicationState(
+	ctx context.Context, g Gatherer, redisPods, sentinelPods map[string]string, masterName string,
+) *ReplicationState {
 	state := NewReplicationState()
 
 	type redisResult struct {
@@ -79,7 +90,7 @@ func GatherReplicationState(ctx context.Context, g Gatherer, redisPods, sentinel
 		wg.Add(1)
 		go func(ip, name string) {
 			defer wg.Done()
-			ss, err := g.GetSentinelState(ctx, name, ip)
+			ss, err := g.GetSentinelState(ctx, name, ip, masterName)
 			if err != nil {
 				ss = &SentinelNodeState{PodName: name, IP: ip, Reachable: false}
 			}

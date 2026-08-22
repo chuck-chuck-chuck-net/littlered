@@ -28,9 +28,6 @@ import (
 type operatorGatherer struct {
 	password   string
 	tlsEnabled bool
-	// masterName is the instance's Sentinel master name. Sentinel-mode paths must
-	// set it; cluster-mode gatherers never reach GetSentinelState and leave it empty.
-	masterName string
 }
 
 func (g *operatorGatherer) GetRedisState(ctx context.Context, podName, ip string) (*redisclient.RedisNodeState, error) {
@@ -58,30 +55,27 @@ func (g *operatorGatherer) GetRedisState(ctx context.Context, podName, ip string
 	}, nil
 }
 
-func (g *operatorGatherer) GetSentinelState(ctx context.Context, podName, ip string) (*redisclient.SentinelNodeState, error) {
-	// An empty master name is a programming error, not a cluster state, and it must
-	// not be allowed to look like one (LR-041). `SENTINEL master ""` draws the same
-	// `ERR No such master with that name` as a genuine miss, so the not-monitoring
-	// branch below would report every sentinel as reachable-but-bare forever:
-	// silently disabling every sn.Monitoring-gated rule (ghost-master correction,
-	// ghost-replica pruning, HasHealthyKnownReplica) while Rule 0 re-registers the
-	// whole quorum every couple of seconds.
+func (g *operatorGatherer) GetSentinelState(
+	ctx context.Context, podName, ip, masterName string,
+) (*redisclient.SentinelNodeState, error) {
+	// Defence in depth for LR-041. The name is a parameter now, so the compiler
+	// demands one at every call site and the original defect — an omitted struct
+	// field zero-valuing to "" — is no longer expressible. This catches only an
+	// explicit empty argument.
 	//
-	// Refusing turns that into a NON-state: GatherReplicationState maps the error to
-	// Reachable:false, which no rule acts on destructively and which `lrctl verify`
-	// shows plainly — instead of a bare-looking sentinel, which is indistinguishable
-	// from ordinary post-restart churn. Note the error itself is swallowed there, so
-	// this is a detectable regression, not a reported one; the enforcing guard is
-	// TestSentinelGatherRequiresMasterName. Moving the check up into
-	// reconcileSentinelCluster (which has a logger and can fail the reconcile) would
-	// make it genuinely loud.
-	if g.masterName == "" {
-		return nil, fmt.Errorf("sentinel gather requires a master name, but the gatherer was built without one")
+	// It has to be refused rather than passed through: `SENTINEL master ""` draws
+	// the same `ERR No such master with that name` as a genuine miss, so the
+	// not-monitoring branch below would report the sentinel as reachable-but-bare,
+	// which is indistinguishable from ordinary post-restart churn and is what let
+	// the original bug hide for a whole release. GatherReplicationState maps this
+	// error to Reachable:false, a state no rule acts on destructively.
+	if masterName == "" {
+		return nil, fmt.Errorf("sentinel gather requires a master name, but none was passed")
 	}
 	podAddr := fmt.Sprintf("%s:%d", ip, littleredv1alpha1.SentinelPort)
 	sc := redisclient.NewSentinelClient([]string{podAddr}, g.password, g.tlsEnabled)
 
-	masterInfo, err := sc.GetMasterState(ctx, g.masterName)
+	masterInfo, err := sc.GetMasterState(ctx, masterName)
 	if err != nil {
 		if strings.Contains(err.Error(), "ERR No such master") || strings.Contains(err.Error(), "redis: nil") {
 			return &redisclient.SentinelNodeState{
@@ -106,7 +100,7 @@ func (g *operatorGatherer) GetSentinelState(ctx context.Context, podName, ip str
 		Reachable:         true,
 	}
 
-	if reps, err := sc.GetReplicas(ctx, g.masterName); err == nil {
+	if reps, err := sc.GetReplicas(ctx, masterName); err == nil {
 		state.Replicas = reps
 	}
 

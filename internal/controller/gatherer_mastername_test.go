@@ -83,16 +83,17 @@ func fakeSentinel(t *testing.T) string {
 // HasHealthyKnownReplica (LR-024's discriminator) — while Rule 0 sees a permanently
 // bare quorum and re-registers all three sentinels every 2s forever.
 //
-// An empty master name is a programming error, not a cluster state, so the gather must
-// refuse it instead of reporting a plausible-looking bare sentinel. Against the
-// pre-fix code this returns (state{Monitoring:false}, nil) and the test fails.
+// The name is now a PARAMETER, so the original defect (an omitted struct field
+// zero-valuing to "") is no longer expressible — the compiler demands a value at
+// every call site. This remains as defence in depth for an explicit empty argument,
+// and as the executable record of why the signature looks the way it does.
 func TestSentinelGatherRequiresMasterName(t *testing.T) {
 	fakeSentinel(t)
 	const host = "127.0.0.1"
 
 	t.Run("empty master name is refused", func(t *testing.T) {
-		g := &operatorGatherer{} // masterName deliberately unset, as the bug had it
-		st, err := g.GetSentinelState(context.Background(), "sentinel-0", host)
+		g := &operatorGatherer{}
+		st, err := g.GetSentinelState(context.Background(), "sentinel-0", host, "")
 		if err == nil {
 			t.Fatalf("GetSentinelState with an empty masterName returned no error "+
 				"(state=%+v); an unwired gatherer must fail loudly, not report a bare "+
@@ -107,8 +108,8 @@ func TestSentinelGatherRequiresMasterName(t *testing.T) {
 		// The refusal must be specific to the empty name. A sentinel that genuinely
 		// does not know THIS instance's master is ordinary runtime state (a freshly
 		// restarted pod) and Rule 0 depends on seeing it as reachable-but-bare.
-		g := &operatorGatherer{masterName: "ns.inst"}
-		st, err := g.GetSentinelState(context.Background(), "sentinel-0", host)
+		g := &operatorGatherer{}
+		st, err := g.GetSentinelState(context.Background(), "sentinel-0", host, "ns.inst")
 		if err != nil {
 			t.Fatalf("unexpected error for a known-name miss: %v", err)
 		}

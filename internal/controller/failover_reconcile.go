@@ -336,7 +336,9 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 	// deliberately ignored — in failover mode the operator's intent is the
 	// sole master authority (determineFailoverLiveMaster).
 	g := &operatorGatherer{password: password, tlsEnabled: lr.Spec.TLS.Enabled}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, map[string]string{})
+	// No Sentinels in failover mode, so no master name to supply and no Sentinel
+	// probe is issued.
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, map[string]string{}, "")
 
 	// 3. Re-derive the intent and the live master from live state.
 	views := buildFailoverPodViews(podList, state)

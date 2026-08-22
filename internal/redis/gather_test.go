@@ -71,7 +71,7 @@ func (f *fakeGatherer) GetRedisState(_ context.Context, podName, ip string) (*Re
 	return &RedisNodeState{PodName: podName, IP: ip, Reachable: true, LinkStatus: "up"}, nil
 }
 
-func (f *fakeGatherer) GetSentinelState(_ context.Context, podName, ip string) (*SentinelNodeState, error) {
+func (f *fakeGatherer) GetSentinelState(_ context.Context, podName, ip, _ string) (*SentinelNodeState, error) {
 	f.enter()
 	defer f.leave()
 	if f.probeDelay > 0 {
@@ -264,7 +264,7 @@ func TestGatherReplicationState_ProbesRunConcurrently(t *testing.T) {
 	g := &fakeGatherer{nodeID: map[string]string{}, dead: map[string]bool{}, probeDelay: delay}
 
 	start := time.Now()
-	GatherReplicationState(context.Background(), g, redisPods, sentinelPods)
+	GatherReplicationState(context.Background(), g, redisPods, sentinelPods, "ns.inst")
 	elapsed := time.Since(start)
 
 	// Serial would be >= totalPods*delay (720ms). Concurrent should be a small

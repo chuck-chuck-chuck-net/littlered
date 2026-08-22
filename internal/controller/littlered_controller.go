@@ -766,14 +766,8 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	}
 
 	// 2. Gather Cluster State (Ground Truth)
-	// masterName is REQUIRED here: the sentinel probes query by it, and an empty one
-	// makes every sentinel look bare (LR-041).
-	g := &operatorGatherer{
-		password:   password,
-		tlsEnabled: littleRed.Spec.TLS.Enabled,
-		masterName: sentinelMasterName,
-	}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap)
+	g := &operatorGatherer{password: password, tlsEnabled: littleRed.Spec.TLS.Enabled}
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, sentinelMasterName)
 
 	// 3. Healing
 

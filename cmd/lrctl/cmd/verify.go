@@ -268,7 +268,7 @@ func verifySentinel(
 
 	fmt.Println("Gathering Cluster Ground Truth...")
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap)
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx))
 
 	fmt.Println("\nSentinel Status:")
 	for _, sn := range state.SentinelNodes {
@@ -352,7 +352,7 @@ func verifySentinelJSON(
 		}
 	}
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap)
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx))
 	return buildSentinelVerifyJSON(name, namespace, redisMap, state, masterNameOf(cCtx),
 		len(cCtx.SentinelPods), max(len(cCtx.RedisPods)-1, 0))
 }
