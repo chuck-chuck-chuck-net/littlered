@@ -669,10 +669,10 @@ const (
 	// attention (in cooldown, or refusing because divergent data is present); False
 	// records a completed recovery.
 	ConditionGhostMasterRecovery = "GhostMasterRecovery"
-	// ConditionSentinelForsaken marks a sentinel instance that has been CAPTURED by
-	// another Sentinel deployment sharing its master name, and is therefore beyond
-	// the operator's help: every reachable Sentinel monitors a live master that is
-	// not one of this instance's pods, and no pod of ours is a master any more.
+	// ConditionForsaken marks a sentinel instance that has been CAPTURED by another
+	// Sentinel deployment sharing its master name, and is therefore beyond the
+	// operator's help: every reachable Sentinel monitors a live master that is not
+	// one of this instance's pods, and no pod of ours is a master any more.
 	//
 	// Forsaken is terminal by design, not by omission. Recovery is declined (ADR-015
 	// §9.2): the captured instance's data was flushed about a second after the
@@ -685,7 +685,7 @@ const (
 	// an all-clear it could not give. This condition only ever reports a positive,
 	// locally-observed fact — "our Sentinels serve someone else's master" — and says
 	// nothing whatsoever when absent.
-	ConditionSentinelForsaken = "SentinelForsaken"
+	ConditionForsaken = "Forsaken"
 
 	// ConditionSentinelMasterNameUnscoped is a surfaced WARNING (never a refusal): the
 	// instance has not set spec.sentinel.masterName and is therefore falling back to the
@@ -743,9 +743,9 @@ type LittleRedStatus struct {
 	GhostMasterStuckSince *metav1.Time `json:"ghostMasterStuckSince,omitempty"`
 
 	// ForsakenSince records when the operator first observed this instance captured
-	// by another Sentinel deployment (see ConditionSentinelForsaken). It exists only
-	// to hold the verdict below a cooldown, so a transient mid-failover read cannot
-	// declare an instance forsaken; it is a timer, like LeaderlessSince.
+	// by another Sentinel deployment (see ConditionForsaken). It exists only to hold
+	// the verdict below a cooldown, so a transient mid-failover read cannot declare
+	// an instance forsaken; it is a timer, like LeaderlessSince.
 	// +optional
 	ForsakenSince *metav1.Time `json:"forsakenSince,omitempty"`
 

@@ -583,6 +583,7 @@ status:
   # Sentinel mode only
   leaderlessSince: "2026-07-09T13:10:37Z"  # Set when a bootstrap deadlock is observed; cleared once a master is known
   ghostMasterStuckSince: "2026-07-31T10:15:00Z"  # Set when a ghost-master failover deadlock is observed; cleared once a master is known
+  forsakenSince: "2026-08-22T09:00:00Z"  # Set when the instance is observed captured by another Sentinel deployment; cleared once it is not
   sentinels:
     ready: 3
     total: 3
@@ -622,6 +623,7 @@ status:
 | `bootstrapRequired` | `bool` | True on creation, cleared after the first master is elected (sentinel + failover modes) |
 | `leaderlessSince` | `Time` | Set when the operator first observes a leaderless, all-Sentinels-bare bootstrap deadlock; cleared once a master is known. Gates the leaderless-recovery cooldown (sentinel mode). |
 | `ghostMasterStuckSince` | `Time` | Set when the operator first observes a ghost-master failover deadlock: a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so Sentinel aborts every failover `no-good-slave` while living survivors still hold the data. Cleared once a master is known again. Gates the ghost-master-recovery cooldown, so a recent master death gets its full Sentinel election window first (sentinel mode). |
+| `forsakenSince` | `Time` | Set when the operator first observes this instance captured by another Sentinel deployment sharing its master name: every reachable Sentinel serves a live master that is not one of its pods, and no pod of its own is a master. Cleared once the signature no longer holds. Gates the cooldown before the `Forsaken` verdict, so a transient mid-transition read cannot park a live instance (sentinel mode). |
 | `observedGeneration` | `int64` | Last processed `.metadata.generation` |
 | `conditions` | `[]Condition` | Detailed status conditions |
 | `redis.ready` | `int32` | Ready Redis pod count |
@@ -660,6 +662,7 @@ status:
 | `SentinelReady` | ✅ | Sentinel quorum established (sentinel mode; never set in failover mode) |
 | `LeaderlessRecovery` | ✅ | Sentinel mode only: reflects a leaderless bootstrap deadlock (every Sentinel bare, no master) and the operator's response — `True` means the instance is deadlocked and needs attention (in cooldown, or refusing because data is present); `False` records a completed recovery |
 | `GhostMasterRecovery` | ✅ | Sentinel mode only: reflects a ghost-master failover deadlock — a majority of Sentinels pinned to a dead (ghost) master IP with no promotable replica, so failover aborts `no-good-slave` while living survivors hold the data — and the operator's recovery of it. `True` means deadlocked/needs attention (in cooldown, or refusing because divergent data is present); `False` records a completed recovery |
+| `Forsaken` | ✅ | Sentinel mode only: `True` means this instance has been CAPTURED by another Sentinel deployment sharing its master name — every reachable Sentinel serves a live master that is not one of its pods, and no pod of its own is a master. Terminal by design: recovery is declined (ADR-015 §9.2), so the operator stops managing the instance and re-examines it at the steady interval; it stays `Ready=False` until a human runs the capture-recovery runbook in `docs/USAGE.md`. `False` records that its Sentinels are serving its own topology |
 | `FailoverRecovery` | ✅ | Failover mode only: `True` means the instance needs attention — most importantly the refuse-and-wait state, where the surviving data holders span divergent replication lineages and electing any one would discard independent writes (set `failover.allowUnsafeRebootstrapOnDeadlock` to authorize); `False` records a completed recovery |
 | `TLSReady` | — | Reserved for future use (defined but not currently set) |
 | `AuthReady` | — | Reserved for future use (defined but not currently set) |

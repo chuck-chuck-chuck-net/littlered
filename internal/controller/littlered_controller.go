@@ -586,8 +586,7 @@ func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littl
 	// how a human running the runbook gets picked up.
 	if littleRed.Status.Phase != littleredv1alpha1.PhaseRunning {
 		after := fast
-		if meta.IsStatusConditionTrue(littleRed.Status.Conditions,
-			littleredv1alpha1.ConditionSentinelForsaken) {
+		if meta.IsStatusConditionTrue(littleRed.Status.Conditions, littleredv1alpha1.ConditionForsaken) {
 			after = steady
 		}
 		log.Info("Not yet Running, requeueing",
@@ -808,8 +807,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		if forsakenPlan.Forsaken {
 			// Log once per transition, not per reconcile: the condition is the durable
 			// record, and this state persists until a human intervenes.
-			if !meta.IsStatusConditionTrue(littleRed.Status.Conditions,
-				littleredv1alpha1.ConditionSentinelForsaken) {
+			if !meta.IsStatusConditionTrue(littleRed.Status.Conditions, littleredv1alpha1.ConditionForsaken) {
 				forsakenLog.Info("Instance is forsaken: captured by another Sentinel deployment "+
 					"sharing its master name. Halting management.",
 					"foreign_master", forsakenPlan.ForeignMaster)
@@ -1903,7 +1901,7 @@ const (
 
 // setLeaderlessSince stamps Status.LeaderlessSince and sets the LeaderlessRecovery
 // condition to True/DeadlockDetected (retry on conflict). No-op if already stamped.
-// setForsaken arms the capture marker and surfaces the SentinelForsaken condition.
+// setForsaken arms the capture marker and surfaces the Forsaken condition.
 // Idempotent: once the marker is set the timer must not be restarted, or the cooldown
 // could never expire.
 func (r *LittleRedReconciler) setForsaken(
@@ -1930,7 +1928,7 @@ func (r *LittleRedReconciler) setForsaken(
 				"managing this instance; run the capture-recovery runbook in docs/USAGE.md.", foreign)
 		}
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type: littleredv1alpha1.ConditionSentinelForsaken, Status: status,
+			Type: littleredv1alpha1.ConditionForsaken, Status: status,
 			Reason: reason, Message: msg,
 		})
 		return r.Status().Update(ctx, latest)
@@ -1942,7 +1940,7 @@ func (r *LittleRedReconciler) setForsaken(
 // no API call, when nothing was set.
 func (r *LittleRedReconciler) clearForsaken(ctx context.Context, lr *littleredv1alpha1.LittleRed) error {
 	if lr.Status.ForsakenSince == nil &&
-		meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionSentinelForsaken) == nil {
+		meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionForsaken) == nil {
 		return nil
 	}
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
@@ -1953,7 +1951,7 @@ func (r *LittleRedReconciler) clearForsaken(ctx context.Context, lr *littleredv1
 		latest.Status.ForsakenSince = nil
 		lr.Status.ForsakenSince = nil
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
-			Type:    littleredv1alpha1.ConditionSentinelForsaken,
+			Type:    littleredv1alpha1.ConditionForsaken,
 			Status:  metav1.ConditionFalse,
 			Reason:  "NotCaptured",
 			Message: "This instance's Sentinels are serving its own topology.",

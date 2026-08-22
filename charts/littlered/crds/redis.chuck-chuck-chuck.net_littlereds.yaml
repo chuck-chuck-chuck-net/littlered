@@ -2320,9 +2320,9 @@ spec:
               forsakenSince:
                 description: |-
                   ForsakenSince records when the operator first observed this instance captured
-                  by another Sentinel deployment (see ConditionSentinelForsaken). It exists only
-                  to hold the verdict below a cooldown, so a transient mid-failover read cannot
-                  declare an instance forsaken; it is a timer, like LeaderlessSince.
+                  by another Sentinel deployment (see ConditionForsaken). It exists only to hold
+                  the verdict below a cooldown, so a transient mid-failover read cannot declare
+                  an instance forsaken; it is a timer, like LeaderlessSince.
                 format: date-time
                 type: string
               ghostMasterStuckSince:
