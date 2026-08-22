@@ -129,7 +129,17 @@ graph TD
 
 **Orphan tracking**: Orphaned replicas are tracked in `status.cluster.orphanedReplicas` with timestamps. The operator only force-promotes after the timeout, preventing premature interference.
 
-**CLUSTER MEET**: Uses the largest partition as the seed. Every node outside the seed's partition is MEETed into it.
+**CLUSTER MEET**: Uses the largest partition as the seed. Every node outside the seed's partition is MEETed into it — but only at addresses the operator has **attributed to this instance in the current pass** (`PlanPartitionMeets` / `AttributeMeetTarget`, LR-043).
+
+**Primary guard — confirm the address, do not infer it**: before each MEET (targets *and* the seed), the operator re-reads the pod **uncached** from the API server (`APIReader`, same `get pods` permission) and requires it to still report that IP (`confirmPodIP`). Kubernetes holds at most one live pod per IP, so a confirmed address is our pod by construction, and a recycled IP is by definition no longer our pod's. This runs on the MEET paths only — partition healing, bootstrap (where it simply replaces the existing cached read, at no extra cost) and the migration Meet phase — never in the steady loop or the gather. It narrows but does not eliminate the exposure: a *terminating* pod's object can still report an address the CNI has released, bounded by the object's removal rather than by unbounded informer lag.
+
+**Why attribution is still required**: `CLUSTER MEET` is the only Redis operation that creates a *fresh* identity binding. It performs no membership validation whatsoever (`clusterStartHandshake` checks the address syntax and nothing else), the receiver trusts an inbound MEET's whole gossip section, and the initiator adopts whatever node ID the responder reports — so a MEET at an address belonging to *another* instance merges the two clusters, bidirectionally and transitively via gossip. Node-ID keying protects only nodes we already know; the cluster bus carries no authentication, so `spec.auth` does not close it. Pod IPs here come from the cache-backed pod read (stale during churn — LR-012) and pod IPs really are recycled across unrelated instances on a shared pod network (LR-039). Attribution is the defence-in-depth half, covering the window above (and a mis-wired reader). A target is admitted only when it is identified this pass *and* one of:
+
+- **member** — its own gossip view names another node of ours (a genuinely partitioned node of this instance);
+- **fresh** — an isolated, slot-less node table (a new, restarted or wiped pod of ours);
+- **survivor** — isolated but owning exactly the slot range this instance assigns to that pod name.
+
+The seed is attributed by the same rule: the MEET is issued *at* the seed, so an unattributable seed would be told to meet all of our pods — the same merge, in the other direction. When the seed is refused, no MEET is issued that pass and the loop retries at the fast cadence. An address that answers as a *pristine* Redis is indistinguishable from our own fresh pod (that is what our own pods look like at bootstrap), and merging one costs nothing — no data, no slots, no epoch; the established-foreign-cluster merge, which does cost, is closed.
 
 **Why CLUSTER MEET must wait for failover**: When a master dies, its replacement pod starts isolated — a partition. The naive fix is `CLUSTER MEET`, but issuing it during an in-progress failover is dangerous:
 - Redis automatic failover requires a **majority vote from masters**

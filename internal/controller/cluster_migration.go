@@ -296,6 +296,79 @@ func (r *LittleRedReconciler) migrateLegacyCluster(
 	return r.executeMigrationPhase(ctx, lr, gt, facts, plan)
 }
 
+// executeMigrationMeets joins the not-yet-met new per-shard pods into the legacy cluster
+// mesh via a reachable legacy seed.
+//
+// Attribution before introduction (LR-043): the plan's MEET targets are addresses of pods
+// that are not yet mesh members, taken from the cache-backed pod list — so, exactly as in
+// the repair loop's Step 1, a stale IP recycled onto another instance's Redis pod would be
+// MEETed, and MEET validates nothing about membership on either side. The pure plan cannot
+// make this call: restrictToLegacyMesh removes both "unidentified" and "identified but not
+// yet in the mesh" pods from gt.Nodes, so the evidence is gone by the time it runs. Hence
+// the check lives here, where the address can be probed directly — one CLUSTER NODES per
+// un-met pod, in the Meet phase only.
+//
+// The seed is deliberately NOT put through the same predicate: it is a legacy
+// {name}-cluster-N pod of an already self-consistent cluster (identified this pass and
+// gated by the LegacyShapePreserved facts), and the predicate's survivor clause is keyed
+// on per-shard pod names, so a legitimate single-node legacy cluster (shards=1,
+// replicasPerShard=0) would be refused and the migration would never start.
+func (r *LittleRedReconciler) executeMigrationMeets(
+	ctx context.Context,
+	lr *littleredv1alpha1.LittleRed,
+	gt *redisclient.ClusterGroundTruth,
+	facts redisclient.LegacyFacts,
+	plan redisclient.MigrationPlan,
+	clusterClient *redisclient.ClusterClient,
+) {
+	auditLog := r.getLogger(ctx, lr, LogCategoryAudit)
+	seed := facts.SeedAddrs[0]
+
+	ourIDs := make(map[string]bool, len(gt.Nodes))
+	for _, n := range gt.Nodes {
+		if n.Reachable && n.NodeID != "" {
+			ourIDs[n.NodeID] = true
+		}
+	}
+	podNameOfAddr := make(map[string]string, len(facts.NewPodAddrs))
+	for podName, a := range facts.NewPodAddrs {
+		podNameOfAddr[a] = podName
+	}
+
+	for _, addr := range plan.Meets {
+		host, _, splitErr := net.SplitHostPort(addr)
+		if splitErr != nil {
+			host = addr
+		}
+		podName := podNameOfAddr[addr]
+		// Primary guard (LR-043): confirm the address against the API server (uncached)
+		// before introducing it. The addresses come from a cached pod List, and a new pod
+		// crashing/rescheduling mid-migration (the LR-025 chaos shape) is exactly how a
+		// stale one gets here. Meet phase only, one GET per not-yet-met pod.
+		if ok, why := r.confirmPodIP(ctx, lr.Namespace, podName, host); !ok {
+			auditLog.Info("Migration MEET: address is no longer confirmed as this pod's; skipping",
+				"target", host, "pod", podName, "reason", why)
+			continue
+		}
+		cand := redisclient.MeetCandidate{PodName: podName, PodIP: host}
+		if view, viewErr := clusterClient.GetClusterNodes(ctx, addr); viewErr == nil {
+			cand = redisclient.MeetCandidateFromNodes(podName, host, "", view)
+		} else {
+			auditLog.Info("Migration MEET: could not read the target's own cluster view; not meeting it this pass",
+				"target", host, "error", viewErr)
+		}
+		if v := redisclient.AttributeMeetTarget(cand, ourIDs, clusterShardCount(lr)); !v.Allowed() {
+			auditLog.Info("Migration MEET: skipping target not attributable to this instance",
+				"target", host, "pod", cand.PodName, "nodeID", cand.NodeID, "verdict", v)
+			continue
+		}
+		auditLog.Info("Migration MEET: joining new pod into the legacy cluster", "seed", seed, "target", host)
+		if err := clusterClient.ClusterMeet(ctx, seed, host, littleredv1alpha1.RedisPort); err != nil {
+			auditLog.Error(err, "Migration MEET failed; will retry", "target", host)
+		}
+	}
+}
+
 // executeMigrationPhase performs the idempotent I/O for the planned phase, sets the
 // in-progress condition, persists the monitoring status, and returns a fast requeue with
 // handled=true. Every action is safe to repeat: the next gather re-derives the phase.
@@ -325,17 +398,7 @@ func (r *LittleRedReconciler) executeMigrationPhase(
 		}
 
 	case redisclient.MigrationMeet:
-		seed := facts.SeedAddrs[0]
-		for _, addr := range plan.Meets {
-			host, _, splitErr := net.SplitHostPort(addr)
-			if splitErr != nil {
-				host = addr
-			}
-			auditLog.Info("Migration MEET: joining new pod into the legacy cluster", "seed", seed, "target", host)
-			if err := clusterClient.ClusterMeet(ctx, seed, host, littleredv1alpha1.RedisPort); err != nil {
-				auditLog.Error(err, "Migration MEET failed; will retry", "target", host)
-			}
-		}
+		r.executeMigrationMeets(ctx, lr, gt, facts, plan, clusterClient)
 
 	case redisclient.MigrationReplicate:
 		// Attach each new pod as a slot-less replica of the node currently owning its shard's

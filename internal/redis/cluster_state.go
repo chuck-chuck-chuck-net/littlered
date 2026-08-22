@@ -16,7 +16,10 @@ limitations under the License.
 
 package redis
 
-import "slices"
+import (
+	"slices"
+	"sort"
+)
 
 const (
 	roleMaster  = "master"
@@ -180,4 +183,262 @@ func (gt *ClusterGroundTruth) GetMastersWithReplicas() map[string][]string {
 		}
 	}
 	return m
+}
+
+// MeetVerdict is the attribution verdict for one candidate CLUSTER MEET target
+// (LR-043). MEET is the only Redis operation that creates a *fresh* identity
+// binding: `clusterStartHandshake` validates nothing but the address syntax, the
+// receiver trusts an inbound MEET's whole gossip section, and the initiator adopts
+// whatever node ID the responder reports (`clusterRenameNode`). Node-ID keying
+// protects only nodes we already know. So the operator must never MEET an address it
+// has not attributed to this instance in the current pass.
+type MeetVerdict string
+
+const (
+	// MeetAllowMember: the candidate already names another node of ours in its own
+	// gossip view — a genuinely partitioned or rejoining node of this instance.
+	MeetAllowMember MeetVerdict = "member"
+	// MeetAllowFresh: the candidate is isolated (single-entry node table) and owns no
+	// slots — what a new, restarted or wiped pod of ours looks like. Bootstrap's
+	// normal case.
+	MeetAllowFresh MeetVerdict = "fresh"
+	// MeetAllowSurvivor: the candidate is isolated but owns exactly the slot range
+	// this instance assigns to its pod name — an own survivor whose peers were
+	// forgotten (Step 2), attributable by slot alignment.
+	MeetAllowSurvivor MeetVerdict = "survivor"
+
+	// MeetDenyNoAddress: no pod IP to dial.
+	MeetDenyNoAddress MeetVerdict = "no-address"
+	// MeetDenyUnidentified: nothing answered our identity probe at that address, so
+	// we know nothing about what is there.
+	MeetDenyUnidentified MeetVerdict = "unidentified"
+	// MeetDenyNoView: the address answered but its CLUSTER NODES view was not
+	// gathered, so there is no attribution evidence either way.
+	MeetDenyNoView MeetVerdict = "no-gossip-view"
+	// MeetDenyUnattributed: the address answers as a cluster node we cannot attribute
+	// to this instance — the recycled-IP / foreign-cluster case.
+	MeetDenyUnattributed MeetVerdict = "unattributed"
+)
+
+// Allowed reports whether the verdict permits a CLUSTER MEET.
+func (v MeetVerdict) Allowed() bool {
+	return v == MeetAllowMember || v == MeetAllowFresh || v == MeetAllowSurvivor
+}
+
+// MeetCandidate is the evidence AttributeMeetTarget decides on. Every field comes from
+// data the caller has already gathered (identity probe + CLUSTER NODES), so attribution
+// costs no extra Redis round-trip in the repair loop.
+type MeetCandidate struct {
+	PodName string
+	PodIP   string
+	// NodeID is the candidate's own node ID, as reported by the address itself.
+	NodeID string
+	// Identified is true when the address answered an identity probe this pass.
+	Identified bool
+	// ViewKnown is true when the candidate's own CLUSTER NODES view was gathered.
+	// False means "we did not see its view", which is NOT the same as "its view is
+	// empty" — the latter would read as an isolated fresh pod.
+	ViewKnown bool
+	// KnownIDs is the candidate's own non-failed gossip view, including itself.
+	KnownIDs []string
+	// Slots are the slot ranges the candidate reports owning.
+	Slots []string
+}
+
+// AttributeMeetTarget decides whether the operator may CLUSTER MEET the candidate's
+// address (LR-043). The safety property is "never MEET an address this instance has not
+// attributed to itself this pass" — deliberately stronger than "skip unreachable",
+// because a foreign pod that shares our password answers our probes perfectly well.
+//
+// ourNodeIDs is the set of node IDs the operator identified for its own pod names this
+// pass; shards is the instance's configured shard count (used only by the survivor
+// clause — pass 0 to disable it).
+//
+// Known residual: an address answering as a *pristine* Redis (single-entry node table,
+// no slots) is indistinguishable from our own fresh pod, because that is exactly what
+// our own fresh pods look like and the cluster bus carries no instance identity and no
+// authentication. Merging a pristine node costs nothing (no data, no slots, no epoch);
+// the established-foreign-cluster merge, which does, is closed.
+func AttributeMeetTarget(c MeetCandidate, ourNodeIDs map[string]bool, shards int) MeetVerdict {
+	if c.PodIP == "" {
+		return MeetDenyNoAddress
+	}
+	if !c.Identified || c.NodeID == "" {
+		return MeetDenyUnidentified
+	}
+	if !c.ViewKnown {
+		return MeetDenyNoView
+	}
+
+	peers := 0
+	for _, id := range c.KnownIDs {
+		if id == "" || id == c.NodeID {
+			continue
+		}
+		peers++
+		// A positive attribution: the candidate already knows a node of ours, which a
+		// stranger cannot without prior contact. Tolerating unknown IDs alongside it is
+		// deliberate — our own nodes routinely still list ghosts of past incarnations.
+		if ourNodeIDs[id] {
+			return MeetAllowMember
+		}
+	}
+	if peers > 0 {
+		// Knows peers, none of them ours: an established cluster that is not this one.
+		return MeetDenyUnattributed
+	}
+
+	// Isolated. A pristine node is our fresh/wiped pod; a slot owner is only ours if it
+	// owns exactly the range this instance assigns to that pod name.
+	if len(c.Slots) == 0 {
+		return MeetAllowFresh
+	}
+	if ownsExactlyItsShardRange(c.PodName, c.Slots, shards) {
+		return MeetAllowSurvivor
+	}
+	return MeetDenyUnattributed
+}
+
+// ownsExactlyItsShardRange reports whether slots is exactly the single slot range this
+// instance assigns to podName's shard. A fragmented or misaligned owner is not
+// attributable this way (Step 3 refuses such topologies anyway).
+func ownsExactlyItsShardRange(podName string, slots []string, shards int) bool {
+	if shards <= 0 || len(slots) != 1 {
+		return false
+	}
+	k := ShardIndexFromPodName(podName)
+	if k < 0 || k >= shards {
+		return false
+	}
+	ranges := GenerateSlotRanges(shards)
+	start, end, err := ParseSlotRange(slots[0])
+	if err != nil {
+		return false
+	}
+	return start == ranges[k].Start && end == ranges[k].End
+}
+
+// nodeFlagsFailed reports whether a CLUSTER NODES entry's flags exclude it from the
+// observing node's live gossip view. It is the single definition of that filter, shared
+// by partition detection (gatherTopology) and MEET attribution.
+func nodeFlagsFailed(flags []string) bool {
+	for _, f := range flags {
+		if f == flagFail || f == "noaddr" || f == "handshake" {
+			return true
+		}
+	}
+	return false
+}
+
+// MeetCandidateFromNodes builds the attribution input for one address from that
+// address's own CLUSTER NODES output (its live view plus the slots it claims). Pass
+// nodeID when the caller already knows it (CLUSTER MYID), or "" to take it from the
+// view's `myself` entry. Callers that hold a gathered ClusterGroundTruth do not need
+// this — PlanPartitionMeets derives the same evidence from KnownNodes at no extra cost.
+func MeetCandidateFromNodes(podName, podIP, nodeID string, view []ClusterNodeInfo) MeetCandidate {
+	if nodeID == "" {
+		for i := range view {
+			if slices.Contains(view[i].Flags, "myself") {
+				nodeID = view[i].NodeID
+				break
+			}
+		}
+	}
+	c := MeetCandidate{
+		PodName: podName, PodIP: podIP, NodeID: nodeID,
+		Identified: nodeID != "", ViewKnown: nodeID != "",
+	}
+	for i := range view {
+		if !nodeFlagsFailed(view[i].Flags) {
+			c.KnownIDs = append(c.KnownIDs, view[i].NodeID)
+		}
+		if view[i].NodeID == nodeID {
+			c.Slots = view[i].Slots
+		}
+	}
+	return c
+}
+
+// MeetSkip records one candidate the operator declined to MEET, for the audit log. A
+// silently suppressed MEET is exactly what makes a future partition-healing bug hard to
+// diagnose, so every skip is reported with its reason.
+type MeetSkip struct {
+	PodName string
+	PodIP   string
+	NodeID  string
+	Verdict MeetVerdict
+}
+
+// MeetPlan is the Step 1 partition-healing plan: the seed to issue CLUSTER MEET at, the
+// attributable targets to introduce to it, and every skipped candidate with its reason.
+// Seed == nil means no MEET may be issued this pass (SeedVerdict says why).
+type MeetPlan struct {
+	Seed        *ClusterNodeState
+	SeedVerdict MeetVerdict
+	Targets     []*ClusterNodeState
+	Skipped     []MeetSkip
+}
+
+// PlanPartitionMeets builds the Step 1 MEET plan from gathered ground truth, admitting
+// only attributable addresses (see AttributeMeetTarget). The seed is attributed too: the
+// MEET is issued *at* the seed, so an unattributable seed would be told to meet all of
+// our pods — the same cluster merge in the other direction. Targets are returned in
+// deterministic pod-name order.
+func (gt *ClusterGroundTruth) PlanPartitionMeets(shards int) MeetPlan {
+	ourIDs := make(map[string]bool, len(gt.Nodes))
+	for _, n := range gt.Nodes {
+		if n.Reachable && n.NodeID != "" {
+			ourIDs[n.NodeID] = true
+		}
+	}
+
+	plan := MeetPlan{}
+	seed := gt.GetLargestPartitionSeed()
+	if seed == nil {
+		plan.SeedVerdict = MeetDenyUnidentified
+		return plan
+	}
+	plan.SeedVerdict = AttributeMeetTarget(gt.meetCandidate(seed), ourIDs, shards)
+	if !plan.SeedVerdict.Allowed() {
+		return plan
+	}
+	plan.Seed = seed
+
+	names := make([]string, 0, len(gt.Nodes))
+	for podName := range gt.Nodes {
+		names = append(names, podName)
+	}
+	sort.Strings(names)
+
+	for _, podName := range names {
+		n := gt.Nodes[podName]
+		if n.NodeID != "" && n.NodeID == seed.NodeID {
+			continue
+		}
+		v := AttributeMeetTarget(gt.meetCandidate(n), ourIDs, shards)
+		if v.Allowed() {
+			plan.Targets = append(plan.Targets, n)
+			continue
+		}
+		plan.Skipped = append(plan.Skipped, MeetSkip{
+			PodName: n.PodName, PodIP: n.PodIP, NodeID: n.NodeID, Verdict: v,
+		})
+	}
+	return plan
+}
+
+// meetCandidate projects a gathered node into the attribution input. The gossip view
+// comes from KnownNodes, which the gather already retains for partition detection
+// (LR-014) — so attribution adds no Redis round-trip.
+func (gt *ClusterGroundTruth) meetCandidate(n *ClusterNodeState) MeetCandidate {
+	view, viewKnown := gt.KnownNodes[n.NodeID]
+	return MeetCandidate{
+		PodName:    n.PodName,
+		PodIP:      n.PodIP,
+		NodeID:     n.NodeID,
+		Identified: n.Reachable && n.NodeID != "",
+		ViewKnown:  n.NodeID != "" && viewKnown,
+		KnownIDs:   view,
+		Slots:      n.Slots,
+	}
 }

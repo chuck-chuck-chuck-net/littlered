@@ -280,13 +280,7 @@ func probeNodeTopology(ctx context.Context, g Gatherer, n *ClusterNodeState) *to
 	for _, knownNode := range nodes {
 		v.seenIDs = append(v.seenIDs, knownNode.NodeID)
 
-		isFailed := false
-		for _, f := range knownNode.Flags {
-			if f == flagFail || f == "noaddr" || f == "handshake" {
-				isFailed = true
-			}
-		}
-		if !isFailed {
+		if !nodeFlagsFailed(knownNode.Flags) {
 			v.known = append(v.known, knownNode.NodeID)
 		}
 

@@ -206,9 +206,12 @@ func main() {
 	}
 
 	if err := (&controller.LittleRedReconciler{
-		Client:   mgr.GetClient(),
-		Scheme:   mgr.GetScheme(),
-		Recorder: mgr.GetEventRecorder("littlered-controller"),
+		Client: mgr.GetClient(),
+		// Uncached reader for the CLUSTER MEET paths (LR-043). SetupWithManager
+		// defaults this too; set here to document the intent at the wiring site.
+		APIReader: mgr.GetAPIReader(),
+		Scheme:    mgr.GetScheme(),
+		Recorder:  mgr.GetEventRecorder("littlered-controller"),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "LittleRed")
 		os.Exit(1)

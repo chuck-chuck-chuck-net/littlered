@@ -95,6 +95,17 @@ type LittleRedReconciler struct {
 	Scheme   *runtime.Scheme
 	Recorder events.EventRecorder
 
+	// APIReader is an UNCACHED reader (mgr.GetAPIReader()) — the same `get pods`
+	// permission as Client, just not served from the informer cache. It exists for
+	// the one class of decision where a stale cached Status.PodIP is not merely slow
+	// but unsafe: introducing an address to the cluster with CLUSTER MEET (LR-043).
+	// Used only on the MEET paths (partition healing, bootstrap, migration Meet),
+	// never in the steady reconcile loop. SetupWithManager defaults it from the
+	// manager, so production cannot omit it; unit/envtest reconcilers that skip
+	// SetupWithManager leave it nil and fall back to Client (itself a direct,
+	// uncached client there) — see (*LittleRedReconciler).apiReader.
+	APIReader client.Reader
+
 	// Background fast-detection monitors. monitorEvents is the mode-agnostic
 	// GenericEvent channel wired into SetupWithManager (both the sentinel
 	// +switch-master subscriber and the failover-mode master watcher push onto
@@ -1517,6 +1528,19 @@ func (r *LittleRedReconciler) setFailedStatus(ctx context.Context, lr *littlered
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *LittleRedReconciler) SetupWithManager(mgr ctrl.Manager) error {
+	// Default the uncached reader here, where the manager is already in hand, so a
+	// production reconciler cannot be constructed without it (LR-043). Leaving it to the
+	// wiring site would be the exact shape LR-041 warns about — a required value held as
+	// optional-looking construction state, which has no enforcement: drop the assignment
+	// in main.go and the MEET guard silently degrades to the cached read (i.e. back to the
+	// bug) with every test still green. Every production path goes through
+	// SetupWithManager; unit/envtest reconcilers that never call it keep the apiReader()
+	// fallback they need. Belt-and-braces with main.go's explicit assignment on purpose —
+	// that one documents intent at the wiring site, this one enforces it.
+	if r.APIReader == nil {
+		r.APIReader = mgr.GetAPIReader()
+	}
+
 	r.monitorEvents = make(chan event.GenericEvent)
 	r.monitors = make(map[types.NamespacedName]func())
 	r.failoverMonitors = make(map[types.NamespacedName]func())

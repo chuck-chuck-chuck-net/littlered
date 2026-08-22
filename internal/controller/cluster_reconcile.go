@@ -303,20 +303,60 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		}
 
 		auditLog.Info("Healing partitions", "count", len(gt.Partitions))
-		seedNode := gt.GetLargestPartitionSeed()
-		if seedNode != nil {
-			seedAddr := fmt.Sprintf("%s:%d", seedNode.PodIP, littleredv1alpha1.RedisPort)
-			for _, node := range gt.Nodes {
-				if node.NodeID == seedNode.NodeID {
-					continue
-				}
-				targetIP := node.PodIP
-				if targetIP == "" {
-					continue
-				}
-				auditLog.Info("Meeting node", "seed", seedAddr, "target", targetIP)
-				_ = clusterClient.ClusterMeet(ctx, seedAddr, targetIP, littleredv1alpha1.RedisPort)
+		// CLUSTER MEET is the one Redis operation that creates a *fresh* identity
+		// binding — it validates nothing about the target's cluster membership, and the
+		// initiator adopts whatever node ID the responder reports. Pod IPs here come
+		// from the cache-backed pod read, which LR-012 showed can be stale during churn,
+		// and LR-039 proved pod IPs really are recycled across unrelated instances on a
+		// shared pod network. So every address (targets AND the seed the command is
+		// issued at) must first be attributed to this instance. See LR-043.
+		plan := gt.PlanPartitionMeets(shards)
+		// Report every suppressed MEET — a silently skipped one is what would make a
+		// future partition-healing bug undiagnosable. Split by severity so the routine
+		// churn case (a pod we could not probe this pass) does not bury the one that
+		// means "something else is answering at our address": the audit line fires once
+		// per pass, not once per node, since Step 1 runs at the 2s cadence.
+		var unattributed, unknown []string
+		for _, skip := range plan.Skipped {
+			entry := fmt.Sprintf("%s@%s (%s)", skip.PodName, skip.PodIP, skip.Verdict)
+			if skip.Verdict == redisclient.MeetDenyUnattributed {
+				unattributed = append(unattributed, entry+" nodeID="+skip.NodeID)
+				continue
 			}
+			unknown = append(unknown, entry)
+		}
+		if len(unattributed) > 0 {
+			auditLog.Info("Skipping CLUSTER MEET: address answers as a cluster node not attributable to this instance",
+				"targets", strings.Join(unattributed, ", "))
+		}
+		if len(unknown) > 0 {
+			stateLog.Info("Skipping CLUSTER MEET: target not identified this pass",
+				"targets", strings.Join(unknown, ", "))
+		}
+		if plan.Seed == nil {
+			auditLog.Info("Skipping partition healing: no attributable MEET seed this pass",
+				"verdict", plan.SeedVerdict)
+			return ctrl.Result{RequeueAfter: fast}, nil
+		}
+		// Primary guard: confirm each address against the API server (uncached) before
+		// introducing it. The gather's pod IPs come from the informer cache, which is
+		// where the whole hazard originates; one uncached pod GET per MEET candidate
+		// answers "is this still OUR pod's address, right now" exactly, instead of
+		// inferring it from Redis-side state. MEET path only — never the steady loop.
+		if ok, why := r.confirmPodIP(ctx, littleRed.Namespace, plan.Seed.PodName, plan.Seed.PodIP); !ok {
+			auditLog.Info("Skipping partition healing: MEET seed address is no longer confirmed as this pod's",
+				"pod", plan.Seed.PodName, "seed", plan.Seed.PodIP, "reason", why)
+			return ctrl.Result{RequeueAfter: fast}, nil
+		}
+		seedAddr := fmt.Sprintf("%s:%d", plan.Seed.PodIP, littleredv1alpha1.RedisPort)
+		for _, node := range plan.Targets {
+			if ok, why := r.confirmPodIP(ctx, littleRed.Namespace, node.PodName, node.PodIP); !ok {
+				auditLog.Info("Skipping CLUSTER MEET: address is no longer confirmed as this pod's",
+					"pod", node.PodName, "target", node.PodIP, "reason", why)
+				continue
+			}
+			auditLog.Info("Meeting node", "seed", seedAddr, "target", node.PodIP, "pod", node.PodName)
+			_ = clusterClient.ClusterMeet(ctx, seedAddr, node.PodIP, littleredv1alpha1.RedisPort)
 		}
 		return ctrl.Result{RequeueAfter: fast}, nil
 	}
@@ -561,6 +601,54 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 	return r.updateClusterStatus(ctx, littleRed, nil)
 }
 
+// Reasons confirmPodIP reports when an address cannot be confirmed as a pod's current IP.
+const (
+	podIPGone     = "pod-gone"
+	podIPChanged  = "ip-changed"
+	podIPUnknown  = "unknown-pod"
+	podIPNoAnswer = "confirm-failed"
+)
+
+// apiReader returns the uncached reader for the MEET paths, falling back to the cached
+// Client when APIReader was not wired. The only production construction site
+// (cmd/littlered/main.go) always sets it; the fallback exists for unit and envtest
+// reconcilers, whose Client is itself a direct, uncached client — so the fallback is
+// never a silent downgrade there.
+func (r *LittleRedReconciler) apiReader() client.Reader {
+	if r.APIReader != nil {
+		return r.APIReader
+	}
+	return r.Client
+}
+
+// confirmPodIP asks the API server directly (no informer cache) whether podName still
+// holds ip. It returns false plus a short reason otherwise.
+//
+// This is the PRIMARY guard for CLUSTER MEET (LR-043), and it is a different kind of
+// evidence from AttributeMeetTarget: Kubernetes holds at most one live pod per IP, so if
+// our own pod object still reports this address then whatever answers there IS our pod —
+// no inference from Redis-side state needed. Conversely a recycled IP is, by definition,
+// no longer our pod's IP. Attribution stays as defence in depth, because this read is not
+// infallible either (see the residual note in changelog LR-043).
+func (r *LittleRedReconciler) confirmPodIP(ctx context.Context, namespace, podName, ip string) (bool, string) {
+	if podName == "" || ip == "" {
+		return false, podIPUnknown
+	}
+	pod := &corev1.Pod{}
+	if err := r.apiReader().Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, podIPGone
+		}
+		// Could not confirm. Deny: an unconfirmed address is exactly what must not be
+		// introduced to the cluster, and the fast requeue retries within ~2s.
+		return false, podIPNoAnswer
+	}
+	if pod.Status.PodIP != ip {
+		return false, podIPChanged
+	}
+	return true, ""
+}
+
 // gatherGroundTruth queries all pods to build a view of the cluster
 func (r *LittleRedReconciler) gatherGroundTruth(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) *redisclient.ClusterGroundTruth {
 	cluster := littleRed.Spec.Cluster
@@ -610,10 +698,26 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 	// Gather all Pod IPs and Node IDs, keyed by pod name.
 	podIPs := make(map[string]string, len(refs))
 	nodeIDs := make(map[string]string, len(refs))
+	// Per-pod attribution evidence for the MEET round below (LR-043): each address's own
+	// CLUSTER NODES view and the slots it claims. The revision gate above bounds *which
+	// deployment* a pod object belongs to, not how fresh its cached Status.PodIP is, so
+	// these addresses carry the same recycled-IP exposure as the repair loop's.
+	candidates := make(map[string]redisclient.MeetCandidate, len(refs))
 
 	for _, ref := range refs {
 		pod := &corev1.Pod{}
-		if err := r.Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: littleRed.Namespace}, pod); err != nil {
+		// UNCACHED read (LR-043). Bootstrap MEETs every one of these addresses, and the
+		// revision gate below bounds which *deployment* the pod object is from, not how
+		// fresh its cached Status.PodIP is — so a pod recreated at an unchanged STS
+		// revision would pass the gate carrying a stale IP that may now belong to
+		// another instance's pod. Reading uncached here replaces the cached read rather
+		// than adding to it: zero extra requests, and the IP we go on to MEET is by
+		// construction the one the API server reports for this pod right now.
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Name: ref.Name, Namespace: littleRed.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				log.Info("Bootstrap: pod not found (yet)", "pod", ref.Name)
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
 			return ctrl.Result{}, err
 		}
 		currentRevision := shardSTSs[ref.ShardIdx].Status.CurrentRevision
@@ -632,19 +736,26 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		nodeIDs[ref.Name] = id
-	}
 
-	// 1. CLUSTER MEET: everyone meets shard 0's master (the seed node).
-	seedName := shardMasterPodName(littleRed.Name, 0)
-	seedAddr := fmt.Sprintf("%s:%d", podIPs[seedName], littleredv1alpha1.RedisPort)
-	for _, ref := range refs {
-		if ref.Name == seedName {
+		view, viewErr := clusterClient.GetClusterNodes(ctx, addr)
+		if viewErr != nil {
+			// No view ⇒ no attribution evidence. Record the address as identified but
+			// view-less so AttributeMeetTarget denies it rather than reading it as an
+			// isolated fresh pod.
+			log.Info("Bootstrap: could not read node's own cluster view; it will not be MEETed this pass",
+				"pod", ref.Name, "error", viewErr)
+			candidates[ref.Name] = redisclient.MeetCandidate{
+				PodName: ref.Name, PodIP: pod.Status.PodIP, NodeID: id, Identified: true,
+			}
 			continue
 		}
-		auditLog.Info("Meeting node", "node", ref.Name, "target", seedName)
-		if err := clusterClient.ClusterMeet(ctx, seedAddr, podIPs[ref.Name], littleredv1alpha1.RedisPort); err != nil {
-			auditLog.Error(err, "Failed to meet node", "node", ref.Name)
-		}
+		candidates[ref.Name] = redisclient.MeetCandidateFromNodes(ref.Name, pod.Status.PodIP, id, view)
+	}
+
+	// 1. CLUSTER MEET: everyone meets shard 0's master (the seed node), but only at
+	// addresses attributable to this instance (LR-043).
+	if !r.bootstrapMeetRound(ctx, littleRed, clusterClient, refs, podIPs, nodeIDs, candidates) {
+		return ctrl.Result{RequeueAfter: time.Second}, nil
 	}
 
 	// Wait for gossip to propagate slightly
@@ -714,6 +825,64 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 	}
 
 	return r.updateClusterStatus(ctx, littleRed, nil)
+}
+
+// bootstrapMeetRound introduces every bootstrap pod to shard 0's master. It returns
+// false when the seed itself could not be attributed to this instance, in which case
+// the caller must requeue without touching the cluster.
+//
+// LR-043. CLUSTER MEET creates a fresh identity binding with no membership validation on
+// either side — `clusterStartHandshake` checks only the address syntax, the receiver
+// trusts an inbound MEET's gossip section, and the initiator adopts whatever node ID the
+// responder reports — so an address belonging to another instance merges two clusters,
+// bidirectionally and transitively via gossip. Two guards, in this order:
+//
+//   - the addresses come from the caller's UNCACHED pod read, so each one is confirmed as
+//     that pod's current IP at the API server (the primary guard: Kubernetes holds at most
+//     one live pod per IP, so no separate confirm read is needed here);
+//   - attribution as defence in depth, for the residual window where the API server still
+//     reports a terminating pod at an address the CNI has already handed on. At bootstrap
+//     our own pods are pristine (single-entry node table, no slots) or already know the
+//     seed, so nothing legitimate is suppressed.
+func (r *LittleRedReconciler) bootstrapMeetRound(
+	ctx context.Context,
+	littleRed *littleredv1alpha1.LittleRed,
+	clusterClient *redisclient.ClusterClient,
+	refs []ClusterPodRef,
+	podIPs, nodeIDs map[string]string,
+	candidates map[string]redisclient.MeetCandidate,
+) bool {
+	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
+	shards := clusterShardCount(littleRed)
+
+	seedName := shardMasterPodName(littleRed.Name, 0)
+	seedAddr := fmt.Sprintf("%s:%d", podIPs[seedName], littleredv1alpha1.RedisPort)
+	ourIDs := make(map[string]bool, len(nodeIDs))
+	for _, id := range nodeIDs {
+		ourIDs[id] = true
+	}
+
+	if v := redisclient.AttributeMeetTarget(candidates[seedName], ourIDs, shards); !v.Allowed() {
+		auditLog.Info("Bootstrap: refusing to seed CLUSTER MEET from an unattributable address",
+			"pod", seedName, "seed", seedAddr, "verdict", v)
+		return false
+	}
+
+	for _, ref := range refs {
+		if ref.Name == seedName {
+			continue
+		}
+		if v := redisclient.AttributeMeetTarget(candidates[ref.Name], ourIDs, shards); !v.Allowed() {
+			auditLog.Info("Bootstrap: skipping CLUSTER MEET, target not attributable to this instance",
+				"pod", ref.Name, "target", podIPs[ref.Name], "verdict", v)
+			continue
+		}
+		auditLog.Info("Meeting node", "node", ref.Name, "target", seedName)
+		if err := clusterClient.ClusterMeet(ctx, seedAddr, podIPs[ref.Name], littleredv1alpha1.RedisPort); err != nil {
+			auditLog.Error(err, "Failed to meet node", "node", ref.Name)
+		}
+	}
+	return true
 }
 
 // updateClusterStatus updates the LittleRed status for cluster mode.
