@@ -355,6 +355,10 @@ func (in *LittleRedStatus) DeepCopyInto(out *LittleRedStatus) {
 		in, out := &in.GhostMasterStuckSince, &out.GhostMasterStuckSince
 		*out = (*in).DeepCopy()
 	}
+	if in.ForsakenSince != nil {
+		in, out := &in.ForsakenSince, &out.ForsakenSince
+		*out = (*in).DeepCopy()
+	}
 	if in.Conditions != nil {
 		in, out := &in.Conditions, &out.Conditions
 		*out = make([]v1.Condition, len(*in))

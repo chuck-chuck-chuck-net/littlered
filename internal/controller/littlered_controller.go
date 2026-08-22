@@ -573,12 +573,28 @@ func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littl
 
 	fast, steady := littleRed.GetRequeueIntervals()
 
-	// Requeue if not running to check status
+	// Requeue if not running to check status.
+	//
+	// The fast cadence is for an instance that is CONVERGING, and that premise is
+	// load-bearing — the healing rules are driven by these iterations (LR-012/014/017).
+	// It is left exactly as it was for every such instance. The one exception is an
+	// instance that is forsaken: captured by another Sentinel deployment sharing its
+	// master name, where recovery is declined by design (ADR-015 §9.2) and the operator
+	// has already stopped managing it. Polling that at 2s forever buys nothing and
+	// drowns the log a real incident would appear in. It stays Ready=False and loudly
+	// broken either way; it is simply re-examined at the steady cadence, which is also
+	// how a human running the runbook gets picked up.
 	if littleRed.Status.Phase != littleredv1alpha1.PhaseRunning {
+		after := fast
+		if meta.IsStatusConditionTrue(littleRed.Status.Conditions,
+			littleredv1alpha1.ConditionSentinelForsaken) {
+			after = steady
+		}
 		log.Info("Not yet Running, requeueing",
 			"phase", littleRed.Status.Phase,
-			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total))
-		return ctrl.Result{RequeueAfter: fast}, nil
+			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total),
+			"requeueAfter", after)
+		return ctrl.Result{RequeueAfter: after}, nil
 	}
 
 	return ctrl.Result{RequeueAfter: steady}, nil
@@ -768,6 +784,43 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// 2. Gather Cluster State (Ground Truth)
 	g := &operatorGatherer{password: password, tlsEnabled: littleRed.Spec.TLS.Enabled}
 	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, sentinelMasterName)
+
+	// 2b. Is this instance still ours to manage?
+	//
+	// If another Sentinel deployment sharing our master name has captured us, every
+	// healing rule below is not merely useless but counterproductive: the LR-008
+	// ghost-master correction would reissue REMOVE+MONITOR every reconcile and lose to
+	// the captor's config epoch every time (ADR-015 §9.2). Recovery is declined by
+	// design, so the right move is to stop, say so, and leave the instance loudly
+	// broken for a human.
+	//
+	// This is a verdict about US, from OUR Sentinels' own answers — never a claim about
+	// isolation, which is why it is not the controller-side collision check ADR-015
+	// rejected. Silence here asserts nothing.
+	forsakenLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
+	forsakenPlan := planForsaken(state, littleRed.Status.ForsakenSince, time.Now())
+	switch {
+	case forsakenPlan.Captured:
+		if err := r.setForsaken(ctx, littleRed, metav1.Now(),
+			forsakenPlan.ForeignMaster, forsakenPlan.Forsaken); err != nil {
+			forsakenLog.Error(err, "failed to record the capture")
+		}
+		if forsakenPlan.Forsaken {
+			// Log once per transition, not per reconcile: the condition is the durable
+			// record, and this state persists until a human intervenes.
+			if !meta.IsStatusConditionTrue(littleRed.Status.Conditions,
+				littleredv1alpha1.ConditionSentinelForsaken) {
+				forsakenLog.Info("Instance is forsaken: captured by another Sentinel deployment "+
+					"sharing its master name. Halting management.",
+					"foreign_master", forsakenPlan.ForeignMaster)
+			}
+			return nil
+		}
+	default:
+		if err := r.clearForsaken(ctx, littleRed); err != nil {
+			forsakenLog.Error(err, "failed to clear the capture verdict")
+		}
+	}
 
 	// 3. Healing
 
@@ -1850,6 +1903,65 @@ const (
 
 // setLeaderlessSince stamps Status.LeaderlessSince and sets the LeaderlessRecovery
 // condition to True/DeadlockDetected (retry on conflict). No-op if already stamped.
+// setForsaken arms the capture marker and surfaces the SentinelForsaken condition.
+// Idempotent: once the marker is set the timer must not be restarted, or the cooldown
+// could never expire.
+func (r *LittleRedReconciler) setForsaken(
+	ctx context.Context, lr *littleredv1alpha1.LittleRed, t metav1.Time, foreign string, forsaken bool,
+) error {
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &littleredv1alpha1.LittleRed{}
+		if err := r.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest); err != nil {
+			return err
+		}
+		if latest.Status.ForsakenSince == nil {
+			latest.Status.ForsakenSince = &t
+			lr.Status.ForsakenSince = &t
+		}
+		status, reason, msg := metav1.ConditionFalse, "CaptureSuspected",
+			fmt.Sprintf("Sentinels are serving %s, which is not one of this instance's pods; "+
+				"waiting out the settling period before declaring the instance forsaken.", foreign)
+		if forsaken {
+			status, reason = metav1.ConditionTrue, "Captured"
+			msg = fmt.Sprintf("This instance has been captured by another Sentinel deployment sharing its "+
+				"master name: every Sentinel is serving %s, which is not one of its pods, and no pod of "+
+				"its own is a master. Recovery is declined by design — the dataset was flushed on capture "+
+				"and the operator cannot outbid the captor's config epoch. The operator has stopped "+
+				"managing this instance; run the capture-recovery runbook in docs/USAGE.md.", foreign)
+		}
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type: littleredv1alpha1.ConditionSentinelForsaken, Status: status,
+			Reason: reason, Message: msg,
+		})
+		return r.Status().Update(ctx, latest)
+	})
+}
+
+// clearForsaken retracts the verdict. Reached when a human has run the runbook (or the
+// captor has gone), so the instance becomes the operator's business again. No-op, and
+// no API call, when nothing was set.
+func (r *LittleRedReconciler) clearForsaken(ctx context.Context, lr *littleredv1alpha1.LittleRed) error {
+	if lr.Status.ForsakenSince == nil &&
+		meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionSentinelForsaken) == nil {
+		return nil
+	}
+	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &littleredv1alpha1.LittleRed{}
+		if err := r.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest); err != nil {
+			return err
+		}
+		latest.Status.ForsakenSince = nil
+		lr.Status.ForsakenSince = nil
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:    littleredv1alpha1.ConditionSentinelForsaken,
+			Status:  metav1.ConditionFalse,
+			Reason:  "NotCaptured",
+			Message: "This instance's Sentinels are serving its own topology.",
+		})
+		return r.Status().Update(ctx, latest)
+	})
+}
+
 func (r *LittleRedReconciler) setLeaderlessSince(ctx context.Context, lr *littleredv1alpha1.LittleRed, t metav1.Time) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &littleredv1alpha1.LittleRed{}
