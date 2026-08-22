@@ -749,6 +749,35 @@ type LittleRedStatus struct {
 	// +optional
 	ForsakenSince *metav1.Time `json:"forsakenSince,omitempty"`
 
+	// QuarantinedSince records when the operator took this instance's pods away
+	// because it is forsaken (see ConditionForsaken): a captured instance keeps
+	// replicating from the captor's master, which poisons the CAPTOR's Sentinel
+	// failover-candidate set with foreign pods. While this is set the desired Redis
+	// and Sentinel replica count is 0, so the captor can heal through its own
+	// existing ghost-replica pruning.
+	//
+	// It is a timer, like LeaderlessSince — but it is also the only thing that holds
+	// the quarantine: with no pods there is no reachable monitoring Sentinel, so the
+	// capture signature itself provably disappears. Cleared when the settling period
+	// elapses and the pods are allowed back (they return empty, which the existing
+	// no-data leaderless reseed handles).
+	// +optional
+	QuarantinedSince *metav1.Time `json:"quarantinedSince,omitempty"`
+
+	// QuarantineAttempts counts how many times this instance has been quarantined as
+	// forsaken. Attempt 2 therefore means it was captured again after its first
+	// quarantine and reseed. The count is bounded: once it reaches the operator's
+	// limit the instance stays at zero replicas instead of being released again,
+	// because every recapture re-pollutes a healthy neighbour.
+	//
+	// It is a monitoring surface, and the clearest operational signal available —
+	// "quarantined twice" says the instance's configuration is the problem (an
+	// unscoped Sentinel master name, no authentication) far better than any condition
+	// message. It is reset when the instance reaches a healthy Running state, never
+	// merely because the capture signature stopped being observable.
+	// +optional
+	QuarantineAttempts int32 `json:"quarantineAttempts,omitempty"`
+
 	// ObservedGeneration is the last observed generation
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`

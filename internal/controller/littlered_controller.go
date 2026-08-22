@@ -808,25 +808,72 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// isolation, which is why it is not the controller-side collision check ADR-015
 	// rejected. Silence here asserts nothing.
 	forsakenLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
-	forsakenPlan := planForsaken(state, littleRed.Status.ForsakenSince, time.Now())
+	now := time.Now()
+	forsakenPlan := planForsaken(state, littleRed.Status.ForsakenSince, now)
+
+	// 2c. Quarantine lifecycle (LR-044). A forsaken instance is not merely beyond help,
+	// it is actively harmful: its pods keep replicating from the CAPTOR's master, so the
+	// captor's Sentinel failover-candidate set holds foreign pods it can promote. Taking
+	// this instance's pods away removes the cause and lets the captor heal through the
+	// ghost-replica pruning it already has. Nothing is reclaimed here — the instance
+	// returns empty, which ADR-015 §9.2 names as the only achievable outcome anyway.
+	//
+	// The decision is pure; this call site only persists it. Note that the verdict above
+	// self-clears once the pods are gone (no reachable monitoring Sentinel ⇒ planForsaken
+	// clause 1 fails), so status.quarantinedSince and status.quarantineAttempts — not the
+	// signature — are what carry the state across the quarantine.
+	atRisk, unverified := quarantineDataRisk(state, forsakenPlan.ForeignMaster)
+	qPlan := planQuarantine(quarantineInput{
+		Captured:         forsakenPlan.Captured,
+		Forsaken:         forsakenPlan.Forsaken,
+		DataAtRisk:       atRisk,
+		DataUnverified:   unverified,
+		QuarantinedSince: littleRed.Status.QuarantinedSince,
+		Attempts:         littleRed.Status.QuarantineAttempts,
+		Dangerous:        quarantineConfigDangerous(littleRed),
+		Now:              now,
+	})
+
 	switch {
+	case qPlan.ScaleToZero:
+		// Quarantine in force — armed this pass, settling, or latched. Stop managing:
+		// with the pods gone there is nothing to heal, and the desired replica count
+		// is computed from the marker this records.
+		prevReason := ""
+		if c := meta.FindStatusCondition(littleRed.Status.Conditions,
+			littleredv1alpha1.ConditionForsaken); c != nil {
+			prevReason = c.Reason
+		}
+		if err := r.setForsaken(ctx, littleRed, metav1.Now(),
+			forsakenPlan.ForeignMaster, true, qPlan); err != nil {
+			forsakenLog.Error(err, "failed to record the quarantine")
+		}
+		if prevReason != quarantineReason(qPlan.Phase) {
+			// Log once per phase transition, not per reconcile.
+			forsakenLog.Info("Instance is forsaken and quarantined: captured by another "+
+				"Sentinel deployment sharing its master name. Halting management.",
+				"foreign_master", forsakenPlan.ForeignMaster, "quarantine", string(qPlan.Phase),
+				"attempt", qPlan.NextAttempts, "attempt_limit", qPlan.AttemptLimit)
+		}
+		return nil
 	case forsakenPlan.Captured:
 		if err := r.setForsaken(ctx, littleRed, metav1.Now(),
-			forsakenPlan.ForeignMaster, forsakenPlan.Forsaken); err != nil {
+			forsakenPlan.ForeignMaster, forsakenPlan.Forsaken, qPlan); err != nil {
 			forsakenLog.Error(err, "failed to record the capture")
 		}
 		if forsakenPlan.Forsaken {
-			// Log once per transition, not per reconcile: the condition is the durable
-			// record, and this state persists until a human intervenes.
+			// Forsaken but NOT quarantined: the only way here is a data clause
+			// refusing (a pod holds data the captor does not have, or a pod could not
+			// be proven empty). Log once per transition, not per reconcile.
 			if !meta.IsStatusConditionTrue(littleRed.Status.Conditions, littleredv1alpha1.ConditionForsaken) {
 				forsakenLog.Info("Instance is forsaken: captured by another Sentinel deployment "+
 					"sharing its master name. Halting management.",
-					"foreign_master", forsakenPlan.ForeignMaster)
+					"foreign_master", forsakenPlan.ForeignMaster, "quarantine", string(qPlan.Phase))
 			}
 			return nil
 		}
 	default:
-		if err := r.clearForsaken(ctx, littleRed); err != nil {
+		if err := r.clearForsaken(ctx, littleRed, qPlan); err != nil {
 			forsakenLog.Error(err, "failed to clear the capture verdict")
 		}
 	}
@@ -1921,17 +1968,91 @@ const (
 	// shares an identity with every other unscoped instance on the pod network.
 	reasonSentinelMasterNameUnscoped = "SentinelMasterNameUnscoped"
 	reasonSentinelMasterNameScoped   = "SentinelMasterNameScoped"
+
+	// Forsaken-gated quarantine reasons (LR-044). They are reported on the Forsaken
+	// condition, because the quarantine is what the operator DOES about that verdict
+	// rather than a separate state of its own.
+	reasonCaptured                 = "Captured"
+	reasonCaptureSuspected         = "CaptureSuspected"
+	reasonNotCaptured              = "NotCaptured"
+	reasonQuarantined              = "Quarantined"
+	reasonQuarantineLatched        = "QuarantineLatched"
+	reasonQuarantineRefusedData    = "QuarantineRefusedDataPresent"
+	reasonQuarantineRefusedUnknown = "QuarantineRefusedDataUnknown"
 )
+
+// quarantineReason maps a quarantine phase to the Forsaken condition reason it is
+// reported under. Quarantined and Settling deliberately share one reason: arming and
+// waiting are the same state to an operator, and it keeps the log/event to one per
+// transition rather than one per reconcile.
+func quarantineReason(p quarantinePhase) string {
+	switch p {
+	case quarantineStart, quarantineSettling:
+		return reasonQuarantined
+	case quarantineLatched:
+		return reasonQuarantineLatched
+	case quarantineHoldDataPresent:
+		return reasonQuarantineRefusedData
+	case quarantineHoldDataUnknown:
+		return reasonQuarantineRefusedUnknown
+	default:
+		return reasonCaptured
+	}
+}
 
 // setLeaderlessSince stamps Status.LeaderlessSince and sets the LeaderlessRecovery
 // condition to True/DeadlockDetected (retry on conflict). No-op if already stamped.
-// setForsaken arms the capture marker and surfaces the Forsaken condition.
-// Idempotent: once the marker is set the timer must not be restarted, or the cooldown
-// could never expire.
+// setForsaken arms the capture marker, persists the quarantine decision and surfaces
+// the Forsaken condition.
+//
+// Idempotent on both timers: once ForsakenSince is set the cooldown must not be
+// restarted, and QuarantinedSince/QuarantineAttempts are written only on the pass the
+// pure planner asks for (q.Arm), never on every pass of the same quarantine.
 func (r *LittleRedReconciler) setForsaken(
 	ctx context.Context, lr *littleredv1alpha1.LittleRed, t metav1.Time, foreign string, forsaken bool,
+	q quarantinePlan,
 ) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	status, reason, msg := metav1.ConditionFalse, reasonCaptureSuspected,
+		fmt.Sprintf("Sentinels are serving %s, which is not one of this instance's pods; "+
+			"waiting out the settling period before declaring the instance forsaken.", foreign)
+	switch {
+	case q.ScaleToZero:
+		status, reason = metav1.ConditionTrue, quarantineReason(q.Phase)
+		msg = fmt.Sprintf("This instance has been captured by another Sentinel deployment sharing its "+
+			"master name (its Sentinels serve %s, which is not one of its pods) and has been "+
+			"QUARANTINED: its Redis and Sentinel pods are scaled to 0 so the capturing instance can "+
+			"prune them from its own Sentinel topology. Nothing is recovered by this — the dataset was "+
+			"flushed on capture; the pods return EMPTY. Quarantine attempt %d of %d.",
+			foreign, q.NextAttempts, q.AttemptLimit)
+		if q.Phase == quarantineLatched {
+			msg = fmt.Sprintf("This instance has been quarantined %d time(s) as captured by another "+
+				"Sentinel deployment sharing its master name, and is now LATCHED at 0 replicas: every "+
+				"release has been followed by a recapture, and each recapture also re-pollutes the "+
+				"capturing instance. This is a configuration problem — set a unique "+
+				"spec.sentinel.masterName and enable spec.auth — not something the operator can retry "+
+				"its way out of. Run the capture-recovery runbook in docs/USAGE.md.", q.NextAttempts)
+		}
+	case forsaken:
+		status, reason = metav1.ConditionTrue, quarantineReason(q.Phase)
+		msg = fmt.Sprintf("This instance has been captured by another Sentinel deployment sharing its "+
+			"master name: every Sentinel is serving %s, which is not one of its pods, and no pod of "+
+			"its own is a master. Recovery is declined by design — the dataset was flushed on capture "+
+			"and the operator cannot outbid the captor's config epoch. The operator has stopped "+
+			"managing this instance; run the capture-recovery runbook in docs/USAGE.md.", foreign)
+		switch q.Phase {
+		case quarantineHoldDataPresent:
+			msg += " It has NOT been quarantined: a reachable pod still holds keys that the capturing " +
+				"instance does not have, so scaling to 0 could destroy the only copy."
+		case quarantineHoldDataUnknown:
+			msg += " It has NOT been quarantined: a pod of this instance did not answer, so it cannot " +
+				"be proven empty and scaling to 0 could destroy data."
+		}
+	}
+
+	prev := meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionForsaken)
+	changed := prev == nil || prev.Reason != reason
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		latest := &littleredv1alpha1.LittleRed{}
 		if err := r.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest); err != nil {
 			return err
@@ -1940,30 +2061,65 @@ func (r *LittleRedReconciler) setForsaken(
 			latest.Status.ForsakenSince = &t
 			lr.Status.ForsakenSince = &t
 		}
-		status, reason, msg := metav1.ConditionFalse, "CaptureSuspected",
-			fmt.Sprintf("Sentinels are serving %s, which is not one of this instance's pods; "+
-				"waiting out the settling period before declaring the instance forsaken.", foreign)
-		if forsaken {
-			status, reason = metav1.ConditionTrue, "Captured"
-			msg = fmt.Sprintf("This instance has been captured by another Sentinel deployment sharing its "+
-				"master name: every Sentinel is serving %s, which is not one of its pods, and no pod of "+
-				"its own is a master. Recovery is declined by design — the dataset was flushed on capture "+
-				"and the operator cannot outbid the captor's config epoch. The operator has stopped "+
-				"managing this instance; run the capture-recovery runbook in docs/USAGE.md.", foreign)
+		if q.Arm {
+			latest.Status.QuarantinedSince = &t
+			latest.Status.QuarantineAttempts = q.NextAttempts
+			lr.Status.QuarantinedSince = &t
+			lr.Status.QuarantineAttempts = q.NextAttempts
 		}
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type: littleredv1alpha1.ConditionForsaken, Status: status,
 			Reason: reason, Message: msg,
 		})
 		return r.Status().Update(ctx, latest)
-	})
+	}); err != nil {
+		return err
+	}
+
+	// One event per transition, not per reconcile. The attempt count is the clearest
+	// operational signal this state has: it says the configuration is the problem.
+	if changed && status == metav1.ConditionTrue {
+		r.event(lr, corev1.EventTypeWarning, reason, msg)
+	}
+	return nil
 }
 
-// clearForsaken retracts the verdict. Reached when a human has run the runbook (or the
-// captor has gone), so the instance becomes the operator's business again. No-op, and
-// no API call, when nothing was set.
-func (r *LittleRedReconciler) clearForsaken(ctx context.Context, lr *littleredv1alpha1.LittleRed) error {
-	if lr.Status.ForsakenSince == nil &&
+// quarantineConfigDangerous reports whether this instance's OWN configuration is the
+// known-dangerous one: no authentication AND the shared legacy Sentinel master name.
+// The master name is the only isolation boundary Sentinel's gossip protocol has, and
+// authentication is the only thing that closes the narrower address-adoption path
+// (ADR-015 §9.4) — so an instance with neither is expected to be recaptured rather
+// than unlucky, and gets no re-roll.
+//
+// It deliberately does NOT use SentinelMasterNameUnscoped(), which reports only that
+// the field is UNSET and (correctly, for its own purpose) does not flag an instance
+// that sets "mymaster" explicitly. Here the effective value is what matters: a
+// deliberate "mymaster" is exactly as capturable as an omitted one.
+func quarantineConfigDangerous(lr *littleredv1alpha1.LittleRed) bool {
+	return !lr.Spec.Auth.Enabled &&
+		lr.SentinelMasterName() == littleredv1alpha1.LegacySentinelMasterName
+}
+
+// clearForsaken retracts the verdict. Reached when a human has run the runbook, when
+// the captor has gone, and — routinely — on every pass of a quarantine, because with no
+// pods there is no reachable monitoring Sentinel and the capture signature provably
+// disappears. That is precisely why this function must NOT touch the attempt counter on
+// signature absence: a counter that reset every cycle could never latch.
+//
+// The two quarantine fields therefore have different lifecycles:
+//
+//   - QuarantinedSince is cleared when the pure planner says the settling period has
+//     elapsed (q.Clear) — the release, which hands the pods back so the existing
+//     no-data leaderless reseed can re-bootstrap them empty.
+//   - QuarantineAttempts is cleared only on SUCCESS: the instance actually reached a
+//     healthy Running state. Not when the signature stops being observable.
+//
+// No-op, and no API call, when there is nothing to clear.
+func (r *LittleRedReconciler) clearForsaken(
+	ctx context.Context, lr *littleredv1alpha1.LittleRed, q quarantinePlan,
+) error {
+	clearAttempts := lr.Status.Phase == littleredv1alpha1.PhaseRunning && lr.Status.QuarantineAttempts != 0
+	if lr.Status.ForsakenSince == nil && !q.Clear && !clearAttempts &&
 		meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionForsaken) == nil {
 		return nil
 	}
@@ -1974,10 +2130,20 @@ func (r *LittleRedReconciler) clearForsaken(ctx context.Context, lr *littleredv1
 		}
 		latest.Status.ForsakenSince = nil
 		lr.Status.ForsakenSince = nil
+		if q.Clear {
+			latest.Status.QuarantinedSince = nil
+			lr.Status.QuarantinedSince = nil
+		}
+		if clearAttempts {
+			latest.Status.QuarantinedSince = nil
+			latest.Status.QuarantineAttempts = 0
+			lr.Status.QuarantinedSince = nil
+			lr.Status.QuarantineAttempts = 0
+		}
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type:    littleredv1alpha1.ConditionForsaken,
 			Status:  metav1.ConditionFalse,
-			Reason:  "NotCaptured",
+			Reason:  reasonNotCaptured,
 			Message: "This instance's Sentinels are serving its own topology.",
 		})
 		return r.Status().Update(ctx, latest)

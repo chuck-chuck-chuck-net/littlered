@@ -605,3 +605,161 @@ loose for the failover cells, which measured 85-96%.
 - **Not e2e-verified.** The failure mode of this change is **over-suppression** — a MEET skipped that should have been issued, leaving a genuine partition unhealed — and unit tests cannot prove its absence. Step 1 returns early while partitioned, so Steps 2-4 are suspended for as long as it is suppressed; nothing downstream *assumes* Step 1 succeeded (each step re-derives from a fresh gather), so a suppressed MEET is a stall, not a corruption. The tiers that would catch it are `Cluster Mode Chaos Testing` (all three contexts — random and continuous multi-pod deletion is what manufactures partitions), `Cluster Mode Functional Testing > Failover Recovery`, `Cluster Total-Wipe Re-Bootstrap` (both flavors exercise the fresh-pod clause through bootstrap and self-heal), and `Cluster Legacy→Per-Shard In-Place Migration` incl. its restart-during-migration chaos tier. A fully degraded gather is *not* a new deadlock: with nothing reachable, `computePartitions` yields no components, `HasPartitions()` is false and Step 1 never runs.
 - **Regresses:** None expected. The uncached reads are confined to the MEET paths (partition healing, bootstrap, migration Meet) — the steady loop, the gather and every other mode are untouched, and `APIReader` needs no additional RBAC. **The reader is defaulted in `SetupWithManager`, and that is deliberate belt-and-braces — do not "clean it up".** Left to the wiring site alone, `APIReader` would be exactly the shape LR-041 warns about: a required value held as optional-looking construction state, with no enforcement. Drop the assignment in `main.go` in some future refactor and the MEET guard silently degrades to the cached read — back to this very bug — with every test still green. `SetupWithManager` already receives the manager, so it defaults the field (`if r.APIReader == nil { r.APIReader = mgr.GetAPIReader() }`); every production path goes through it, so production can no longer forget. The explicit `APIReader: mgr.GetAPIReader()` in `main.go` is kept as intent documentation at the wiring site (redundant but correct), and `apiReader()`'s nil fallback to `Client` remains for the unit/envtest reconcilers that never call `SetupWithManager` — and whose `Client` is itself a direct, uncached client, so the fallback is not a silent downgrade there. **Rejected: making it a constructor parameter**, which is what LR-041's lesson literally prescribes. It would force edits to ~10 unit/envtest constructors for a value those tests do not need; defaulting at the one place the manager is available buys the same enforcement where it matters at a fraction of the blast radius. `TestSetupWithManagerDefaultsAPIReader` pins it (mutation-checked: removing the default fails it with "APIReader is nil after SetupWithManager"). No gate, cadence or decision outside the MEET target set changed; every own-pod state that Step 1 legitimately heals is admitted by one of the three clauses (an own pod reachable enough to gather a view either knows a peer of ours, is pristine, or owns exactly its own range — a lone minority node keeps its peers in view as `fail?`, which the gather does not filter). LR-014's `NodeKnows` adjacency is now read by a second consumer but unchanged; the `fail`/`noaddr`/`handshake` filter was extracted to one definition (`nodeFlagsFailed`) shared by the gather and attribution, behaviour-preserving.
 - **Impacts:** `CLAUDE.md` pillar 3.4 (the pod list is only as trustworthy as the cached IP; MEET is where an unattributed address is destructive); `docs/RECONCILIATION_LOOP_CLUSTER.md` Step 1. Completes for cluster mode what LR-039 established for sentinel mode: **a recycled pod IP is a cross-instance identity hazard in every mode, and the operation to guard is the one that creates a new identity binding.**
+
+## [LR-044] The Captor Side of a Capture Was Silently Healthy — Forsaken-Gated Quarantine (decision layer)
+- **Date:** 2026-08-22
+- **Commit:** (pending)
+- **Scope:** **milestone 2 of 4 — the pure decision layer and its status surfaces only.** The planner
+  decides, and nothing yet acts on the decision: wiring `ScaleToZero` into the Redis and Sentinel
+  StatefulSet replica counts is a separate milestone, and the e2e that captures a victim and asserts
+  both sides recover is a later one. So this entry closes the *design* gap and records the reasoning;
+  the behaviour is not yet observable on a cluster. Everything below marked as inference stays
+  inference until that e2e runs.
+- **Problem — the gap LR-042 named and deliberately left open.** A capture has two sides and only one
+  is loud. Verified on a live pair: the *victim* reports `Initializing` / `Ready=False` (as ADR-015
+  §9.2 promises), while the instance whose master was adopted — the **captor** — reports `Running` /
+  `Ready=True` / *"All Redis and Sentinel pods are ready"* with its Sentinels holding **5 replicas
+  where 2 were deployed**, three of them the victim's pods. Its own topology is intact, so no rule
+  fires; but its Sentinel **failover-candidate set is poisoned**, and on its next master death Sentinel
+  can promote a *foreign* pod as its master. `lrctl verify` flags it (`FAIL`); the operator says
+  nothing. LR-042 stopped the operator wasting itself on the victim; it did nothing for the neighbour
+  the victim is damaging.
+- **Why the captor must not be operated on directly.** Its Sentinels are not confused: the victim's
+  pods are *genuinely* replicating from its master, so its master's `INFO replication` genuinely
+  reports five replicas. Sentinel rebuilds its replica list from the master's `INFO` (replicas never
+  self-announce — LR-013), so a `SENTINEL RESET` on the captor clears a list that repopulates seconds
+  later — and RESET is the LR-024 hazard. Surgery on the captor cannot work while the cause is alive.
+- **Fix (decision layer) — quarantine the victim, and let the captor heal through paths that already
+  exist.** New pure `planQuarantine` (`internal/controller/quarantine_plan.go`), gated on LR-042's
+  existing `Forsaken` verdict:
+    1. **Quarantine.** While forsaken, desired Redis **and** Sentinel replicas are 0. Sentinel is not
+       optional: the victim's *sentinels* publish hellos on the captor's master's channel under the
+       shared name, so the captor learns them as peers — that is the `num-other-sentinels` inflation
+       that distorts the captor's quorum math and puts foreign sentinels in its elections.
+    2. **The captor then heals itself.** Once the victim's pods vanish, its master's `INFO` reports the
+       right count, the departed entries become ordinary `s_down` ghost replicas (a dead replica never
+       ages out — LR-024), and **Rule D's gates all pass**: living+reachable consensus master (LR-008),
+       ≥1 healthy known replica (LR-011), K8s-grounded wholeness judged against the *captor's own*
+       expected pod count (LR-013). Its `SENTINEL RESET` then prunes them. **This is an inference from
+       three independently-documented gates, not a documented design, and it is the load-bearing
+       assumption of the whole change — it must be verified live before this can be called done.**
+    3. **Settle, then re-bootstrap.** After the settling period the pods are allowed back. They come up
+       with all Sentinels bare, no master and **zero data holders** — exactly **Rule L's no-data reseed
+       signature, which needs no opt-in** (LR-015). "Re-bootstrap" is therefore handing Rule L a state
+       it already handles: no new bootstrap machinery, no re-arming of `bootstrapRequired`.
+    4. **Bounded, then latch.** `status.quarantineAttempts` counts the attempts; at the limit the
+       instance stays at zero instead of being released again.
+- **Not a reversal of the DECLINED automated recovery (ADR-015 §9.2).** Quarantine **reclaims
+  nothing**. §9.2 declined recovery on two grounds — nothing survives to salvage, and the operator
+  cannot outbid the captor's config epoch — and neither is contradicted here: the operator never speaks
+  to a Sentinel about the capture, never issues `MONITOR`, and the victim comes back **empty**. §9.2
+  itself names that outcome ("a recovery restores an *empty* instance, which is precisely what deleting
+  and recreating the CR already achieves") — the difference is only that the operator now does it
+  *without a human*, and the reason it is worth doing is not the victim at all but the healthy
+  neighbour it stops damaging.
+- **The 120s settling period is derived, not guessed** (LR-042's own lesson was that "five minutes" was
+  *"a guess with no relationship to anything real"*). The captor is `Running`, so it reconciles on the
+  **steady 30s interval**; the settle must span Sentinel re-reading the master's `INFO`, the departed
+  replicas becoming `s_down` ghosts, and Rule D's gate chain passing on a couple of those steady
+  passes — so ~4 steady passes. It also shrinks the **warm-IP window**: while the captor still lists
+  the victim's *old* addresses as `s_down` replicas, a fresh victim pod landing on one of those
+  recycled IPs is the exact coincidence that starts a capture (LR-039). 120s additionally matches the
+  existing cluster-mode precedent `status.cluster.wipeDeadlockSince` (LR-023).
+- **Predicate hardening, and what it independently closes.** The quarantine deletes pods, so it carries
+  its own data clauses on top of the verdict (pure `quarantineDataRisk`):
+    - **`atRisk`** — a reachable pod holds keys that are **not** explained by the capture. Keys on a pod
+      that is a link-`up` replica of the *captor's* master are the captor's own dataset, replicated in;
+      the original is still on the captor, so discarding the copy loses nothing. Keys anywhere else may
+      be the only copy in existence. This is what makes the quarantine **provably lossless rather than
+      lossless-by-argument**, and it independently closes a worry the design record could only argue
+      away: §9.2 holds that data cannot survive a capture *except* on a path where replication is
+      blocked before the sync starts, and a scale-down could in principle interrupt a `SLAVEOF`
+      mid-flight. The clause covers that **whatever the timing**, which is why it is load-bearing and
+      not belt-and-braces.
+      **Read this before "simplifying" the clause to "all reachable pods hold 0 keys" — that literal
+      formulation (which is how this hardening was first specified) is INERT in the case that matters
+      most.** A captured victim whose pods completed their full sync holds *the captor's* keyspace, so
+      `Keys > 0` on every one of them and a 0-keys gate would never let the quarantine fire. The field
+      incident only showed 0 keys because an RDB version mismatch broke the sync — and the capture
+      analysis is explicit that this was luck: *"The loud failure was luck. The RDB version mismatch is
+      the only thing separating this from a silent one"*, where a version-compatible victim instead
+      "serves `instance-B`'s keyspace to its own clients" with no alarm at all. The silent case is the
+      common one, and it is the one with `Keys > 0` everywhere. So the discriminator has to be *whose*
+      data the keys are — a link-`up` replica of the captor's master is holding a copy of data that
+      still exists on the captor — not *whether there are* keys.
+    - **`unverified`** — a pod of ours did not answer, so it cannot be proven empty. The operator's own
+      dial is not blackhole-proof (LR-017), so an unreachable pod may still be serving clients.
+      Refusing is the safe direction. It does mean a permanently crash-looping pod holds the quarantine
+      open (and so keeps the captor dirty); the accepted fix, in the wiring milestone, is to feed this
+      input from **kubelet pod readiness** instead of gather reachability — the LR-023 precedent
+      exactly, since a not-Ready redis in a pure in-memory instance holds no data and readiness is
+      blackhole-proof where a remote dial is not.
+    - **Terminating pods are outside the gather**, so a terminating pod holding data is invisible to
+      this clause — the guard is only as good as what the ground truth is allowed to contain (LR-038).
+      Judged harmless rather than overlooked: a terminating pod's RAM is gone whatever the planner
+      decides. Widening the gather to see it would be strictly worse (LR-038: a terminating pod in the
+      gather reads as live topology to every other rule).
+    - **"never quarantine an instance that has a master of its own"** needs no new clause: `planForsaken`
+      clause 4 already refuses the verdict while any **reachable** Redis pod of ours is a master, and the
+      asymmetry is structural — a merge resolves by config epoch, the winner keeps its master, the
+      loser's pods all become replicas of the winner, so "no master of its own" *is* the loser.
+- **Bounded, and why: N = 2, or 1 for a known-dangerous configuration.** Every recapture re-pollutes the
+  captor — the victim's pods re-attach to its master and it is dirty again until its own Rule D cleans
+  up — so an unbounded retry does not merely fail to fix the victim, it repeatedly degrades a healthy
+  neighbour. N=2 gives one re-roll for the lucky case (a capture needs an *address coincidence*, not
+  just a shared name, so most are luck) and stops when the evidence says it is not luck. N=**1** when
+  the instance's own configuration is what makes capture reachable: auth disabled **and** the effective
+  master name is the shared legacy `mymaster`. The predicate deliberately reads the *effective* name
+  (`SentinelMasterName() == LegacySentinelMasterName`) rather than `SentinelMasterNameUnscoped()`, which
+  reports only that the field is *unset* and — correctly for its own purpose — does not flag an instance
+  that sets `mymaster` explicitly. A deliberate `mymaster` is exactly as capturable as an omitted one.
+  **Default-on, with no opt-out knob:** the instance is provably empty and unrecoverable while actively
+  damaging a neighbour, and an opt-in nobody sets protects nobody.
+- **Where the state lives, and why `status` is right here.** The **verdict** needs no persistence — it is
+  re-derived every pass. The **attempt counter** goes in `status`, deliberately and not in an annotation.
+  ADR-006's "nothing is persisted" was about an *internal engine capability* (async slot migration) that
+  a free gather-time probe could answer; "status is a monitoring surface" is exactly why a
+  recapture-attempt count belongs there — it is a monitoring metric, not derived engine state. The
+  governing distinction is **annotation = intent, status = monitoring** (pillar 3.14), and this is
+  monitoring. `status.quarantineAttempts` is also the clearest operational signal this state has:
+  *"quarantined twice"* says "your configuration is the problem" better than any condition message,
+  which is why it is surfaced on the `Forsaken` condition reason (`Quarantined` / `QuarantineLatched` /
+  `QuarantineRefusedDataPresent` / `QuarantineRefusedDataUnknown`) and as one Warning event per
+  transition rather than per reconcile.
+- **The trap that shapes the whole design: the verdict self-clears once quarantined.** With no pods
+  there is no reachable *monitoring* Sentinel, so `planForsaken` clause 1 fails, the state reads "not
+  captured", and `clearForsaken` runs — **every pass of the quarantine**. So the *signature* cannot hold
+  the state; `status.quarantinedSince` and `status.quarantineAttempts` must, and `clearForsaken` must
+  deliberately not touch the counter. Hence the two different lifecycles: `quarantinedSince` is cleared
+  by the planner's release decision, the counter **only on SUCCESS** (`Phase == Running`). A counter
+  that reset whenever the verdict cleared would reset every cycle and never latch — which is the same
+  reason the planner decides an armed quarantine **first and without reference to the verdict**, a
+  property that also lets a caller running *before* the gather compute the same `ScaleToZero`.
+- **Tests:** `internal/controller/quarantine_plan_test.go`, red-first. `TestPlanQuarantine` (11 rows)
+  authored against a zero-value stub and observed **RED on 11 of 11** (10 on `Phase = "", want …`, the
+  `not captured` row on `AttemptLimit = 0, want 2`). Because a deny-everything stub passes the refusal
+  rows vacuously, an **"always quarantine" mutant** was then run and failed exactly the four rows that
+  must never scale to zero — `not captured`, `HoldSuspected`, `HoldDataPresent`, `HoldDataUnknown` — so
+  both directions have teeth. `TestQuarantineDataRisk` (5 rows) observed **RED on 3 of 5**
+  (`atRisk = false, want true` for keys-not-following-the-captor and for a link-`down` replica;
+  `unverified = false, want true` for an unreachable pod). `TestQuarantineConfigDangerous` is green from
+  birth (it pins a two-clause predicate rather than driving new code); its mutation check is weakening
+  the `&&` to `||`, which fails the two mixed rows.
+- **Consequences accepted rather than left open** (reviewed and decided, so a later reader does not
+  re-litigate them): the release lands up to ~150s after arming rather than 120s, because a forsaken
+  instance is polled at the **steady** 30s interval by LR-042's deliberate design and 30s granularity on
+  a 120s timer is immaterial; and `status.quarantineAttempts` is reset on `Phase == Running`, so an
+  instance that genuinely re-bootstrapped, served, and is only *then* recaptured gets a fresh budget.
+  The latch therefore bites when recapture happens *before* the instance is healthy — which is the
+  intended shape ("self-heal the lucky case, latch when it is not luck") — and an instance that
+  oscillates through healthy states between captures will keep re-rolling.
+- **Regresses:** Nothing yet acts on the decision, so behaviour is unchanged except on the `Forsaken`
+  condition's reason/message and two new status fields. `planForsaken` is untouched — the data clauses
+  live in the quarantine planner rather than the verdict, deliberately: LR-042's verdict answers "is
+  this instance still ours to manage", and an instance holding data is still not ours to manage, so
+  weakening the verdict would put the operator back to thrashing it. The sentinel healing chain is
+  untouched apart from the existing early return.
+- **Impacts:** ADR-016 (pending, written from this entry); `docs/API_SPEC.md`
+  (`status.quarantinedSince`, `status.quarantineAttempts`, the new `Forsaken` reasons); LR-042 (closes
+  its "Known gap, NOT fixed here"); LR-015 (Rule L is the re-bootstrap, unchanged); LR-008 / LR-011 /
+  LR-013 (Rule D's gate chain is the captor's healing path, unchanged — and unverified in this role).
