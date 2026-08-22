@@ -503,6 +503,30 @@ func (r *LittleRedReconciler) deleteIfExists(ctx context.Context, littleRed *lit
 	return nil
 }
 
+// requeueAfterNotRunning is the pure decision behind the not-Running requeue cadence,
+// shared by every mode-specific status function (LR-045; see also LR-042). While an
+// instance is CONVERGING the fast cadence is load-bearing: the healing rules are
+// driven by these iterations (LR-012/014/017). The one exception is an instance the
+// operator has declared Forsaken — captured by another Sentinel deployment sharing its
+// master name, recovery declined by design (ADR-015 §9.2) — which is re-examined at
+// the steady cadence instead, since the operator has already stopped managing it and
+// polling it fast forever buys nothing but log noise.
+//
+// Only sentinel mode can ever be Forsaken today, but the predicate is written against
+// the generic (phase, conditions) shape so every future mode-specific status path is
+// safe by construction rather than by omission.
+func requeueAfterNotRunning(
+	phase littleredv1alpha1.LittleRedPhase, conditions []metav1.Condition, fast, steady time.Duration,
+) time.Duration {
+	if phase == littleredv1alpha1.PhaseRunning {
+		return steady
+	}
+	if meta.IsStatusConditionTrue(conditions, littleredv1alpha1.ConditionForsaken) {
+		return steady
+	}
+	return fast
+}
+
 // updateStatus updates the LittleRed status based on current state
 func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
@@ -584,22 +608,10 @@ func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littl
 
 	fast, steady := littleRed.GetRequeueIntervals()
 
-	// Requeue if not running to check status.
-	//
-	// The fast cadence is for an instance that is CONVERGING, and that premise is
-	// load-bearing — the healing rules are driven by these iterations (LR-012/014/017).
-	// It is left exactly as it was for every such instance. The one exception is an
-	// instance that is forsaken: captured by another Sentinel deployment sharing its
-	// master name, where recovery is declined by design (ADR-015 §9.2) and the operator
-	// has already stopped managing it. Polling that at 2s forever buys nothing and
-	// drowns the log a real incident would appear in. It stays Ready=False and loudly
-	// broken either way; it is simply re-examined at the steady cadence, which is also
-	// how a human running the runbook gets picked up.
+	// Requeue if not running to check status. See requeueAfterNotRunning (LR-045,
+	// correcting LR-042) for the cadence choice, shared with updateSentinelStatus.
 	if littleRed.Status.Phase != littleredv1alpha1.PhaseRunning {
-		after := fast
-		if meta.IsStatusConditionTrue(littleRed.Status.Conditions, littleredv1alpha1.ConditionForsaken) {
-			after = steady
-		}
+		after := requeueAfterNotRunning(littleRed.Status.Phase, littleRed.Status.Conditions, fast, steady)
 		log.Info("Not yet Running, requeueing",
 			"phase", littleRed.Status.Phase,
 			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total),
@@ -1608,9 +1620,13 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 
 	fast, steady := latest.GetRequeueIntervals()
 
-	// Requeue if not running
+	// Requeue if not running. See requeueAfterNotRunning (LR-045, correcting LR-042):
+	// this is the path every sentinel-mode instance actually returns through, so it
+	// must honour the same Forsaken-aware cadence choice as updateStatus, not just the
+	// generic non-sentinel path.
 	if latest.Status.Phase != littleredv1alpha1.PhaseRunning {
-		return ctrl.Result{RequeueAfter: fast}, nil
+		after := requeueAfterNotRunning(latest.Status.Phase, latest.Status.Conditions, fast, steady)
+		return ctrl.Result{RequeueAfter: after}, nil
 	}
 
 	// Periodically requeue to update master info, unless disabled via annotation

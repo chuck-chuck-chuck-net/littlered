@@ -555,6 +555,7 @@ loose for the failover cells, which measured 85-96%.
 - **Commit:** (pending)
 - **Problem (measured on t3e):** an instance captured by another Sentinel deployment sharing its master name is unrecoverable **by design** — ADR-015 §9.2 declines recovery, because the dataset is flushed ~1s after the `SLAVEOF` (nothing to salvage) and the operator structurally cannot win the reclaim (`SENTINEL MONITOR` creates the entry at `config_epoch = 0` and loses to the captor's epoch on the next hello). But nothing told the operator that. It kept treating the instance as converging: `Phase != Running` selects the **fast** (2s) interval, so it ran **30 reconciles and ~120 log lines per minute, indefinitely**, re-deriving the same dead end. During the *partial*-capture window it is worse than idle — the LR-008 ghost-master correction reissues `REMOVE`+`MONITOR` every pass, exactly the never-converging thrash §9.2 predicted from `sentinel.c`, each one wiping that Sentinel's replica list (LR-013's ingredient).
 - **Fix — name the state, then gate on it.** New terminal condition **`Forsaken`** (named `SentinelForsaken` in the first draft of this change and renamed before release — the `Sentinel` prefix is redundant with the instance's own `spec.mode`, which is the only mode that can reach this verdict) plus `status.forsakenSince`, decided by the pure `planForsaken`. When the verdict lands the operator (a) stops healing the instance — returning before Rule 0, so no rule fights a battle §9.2 proved is unwinnable, (b) logs once per transition rather than per reconcile, and (c) re-examines it at the **steady** interval instead of the fast one. The instance stays `Ready=False` and loudly broken, which is the intended end state; only the futile churn stops. The verdict is retracted automatically once the signature clears, so a human running the runbook is picked up on the next steady tick and normal management resumes.
+  **⚠ Corrected by LR-045: effect (c) was inert for sentinel mode — the only mode that can ever be forsaken.** The interval switch was wired into `updateStatus`, but sentinel-mode reconciles return through the separate `updateSentinelStatus`, whose not-`Running` branch requeued at the fast interval unconditionally, with no `Forsaken` check at all. Measured live on t3e (LR-044 milestone M4a): **31 reconciles in 114s (~3.7s apart)** while quarantined and `Forsaken=True` — effects (a) and (b) held (no rule fired, one log line per transition), so the churn was cheap rather than noisy, but it was still there. See LR-045.
 - **Rejected first attempt, and why it was wrong:** a *global* stall backoff — fall back to the steady interval for ANY instance not-Ready for five minutes, keyed on the Ready condition's `LastTransitionTime`. It was simpler and needed no new state, and it was wrong on principle: it weakens a load-bearing global invariant (a non-Running instance is polled fast because the healing rules are driven by those iterations — LR-012/LR-014/LR-017) to fix one narrow, nameable case, and it silently reinterprets every *other* slow-converging instance as stalled. A five-minute threshold is also a guess with no relationship to anything real. Reverted in favour of a verdict that says what is actually true about the instance. The general lesson: **do not trade a global invariant for a specific defect that can be named.**
 - **The predicate is conservative in one direction on purpose.** A false positive parks a live instance; a false negative merely leaves today's behaviour. So all four clauses must hold: (1) at least one reachable **monitoring** Sentinel — bare Sentinels are Rule L's business (LR-015); (2) every reachable monitoring Sentinel agrees on ONE master address — disagreement is a transition, and transitions are not verdicts; (3) that address is not one of our pods **and is not flagged down** — the down flag is what keeps ordinary post-failover debris (a dead ex-master, LR-024's subject) out of this, since an address that is not ours and is still answering means something else is alive there; (4) no reachable Redis pod of ours is a master — while one still is, the instance has something to be healed back toward and the existing rules own it. Plus a 30s `forsakenCooldown`, which exists only to absorb a bad read: a legitimate failover moves mastership to one of OUR pods and so can never produce this signature.
 - **Not the controller-side check ADR-015 rejected.** That one was a **collision check** whose silence would have been read as an all-clear it could not give. This condition only ever reports a positive, locally-observed fact — "our own Sentinels are serving someone else's master" — and asserts nothing at all when absent. (Recorded because the first draft of this fix mis-cited Alternative E as forbidding it.)
@@ -747,8 +748,15 @@ loose for the failover cells, which measured 85-96%.
   the `&&` to `||`, which fails the two mixed rows.
 - **Consequences accepted rather than left open** (reviewed and decided, so a later reader does not
   re-litigate them): the release lands up to ~150s after arming rather than 120s, because a forsaken
-  instance is polled at the **steady** 30s interval by LR-042's deliberate design and 30s granularity on
-  a 120s timer is immaterial; and `status.quarantineAttempts` is reset on `Phase == Running`, so an
+  instance is polled at the **steady** 30s interval and 30s granularity on a 120s timer is immaterial.
+  **⚠ Corrected by LR-045.** At the time this was written the reasoning was wrong, not just imprecise:
+  LR-042's steady-cadence promise was inert for sentinel mode (below), so the M4a live run in fact
+  measured the polling as **fast** and the release still landed at 120-122s (see the M4a table above) —
+  the ~150s figure was accidentally-correct arithmetic built on a false premise. LR-045 makes the
+  steady-cadence choice real for sentinel mode, so the ~150s figure is now the true consequence of
+  *this* fix, for the reason originally stated: a forsaken instance is genuinely polled at the steady
+  30s interval, and 30s granularity on a 120s settle timer is immaterial.
+  Separately, `status.quarantineAttempts` is reset on `Phase == Running`, so an
   instance that genuinely re-bootstrapped, served, and is only *then* recaptured gets a fresh budget.
   The latch therefore bites when recapture happens *before* the instance is healthy — which is the
   intended shape ("self-heal the lucky case, latch when it is not luck") — and an instance that
@@ -983,3 +991,81 @@ instance never releases and links 3-4 would have been unobservable); `HoldDataPr
 `HoldDataUnknown` refusing a real capture (both were false throughout, correctly); and a *partial*
 capture (1 of 3 Sentinels), where the expected behaviour is no verdict plus the LR-008 correction
 healing it — the shape LR-041 observed sub-second.
+
+## [LR-045] Forsaken's Steady-Cadence Requeue Was Inert for Sentinel Mode — the Mode That Can Be Forsaken
+- **Date:** 2026-08-22
+- **Commit:** (pending)
+- **Problem — two divergent status/requeue paths, and the generic one was not enough.** LR-042
+  gave a captured-and-declined sentinel instance a terminal `Forsaken` verdict and promised three
+  effects while it holds: stop healing it, log once per transition, and re-examine it at the
+  **steady** requeue interval instead of the fast one. The interval switch was written into
+  `updateStatus` (`internal/controller/littlered_controller.go`, its not-`PhaseRunning` branch): it
+  picks `steady` over `fast` when `meta.IsStatusConditionTrue(..., ConditionForsaken)`. But
+  `ConditionForsaken` is set exclusively in `reconcileSentinelCluster`, i.e. **only sentinel mode can
+  ever be forsaken** — and sentinel-mode reconciles do not return through `updateStatus` at all. They
+  return through the separate `updateSentinelStatus`, whose not-`Running` branch read, verbatim:
+  `if latest.Status.Phase != littleredv1alpha1.PhaseRunning { return ctrl.Result{RequeueAfter: fast}, nil }`
+  — no `Forsaken` check, ever. So the one mode this verdict exists for was polled at the fast (2s)
+  interval forever, indefinitely, exactly the churn LR-042 was written to remove.
+- **Measured (t3e, LR-044 milestone M4a live run, 2026-08-22):** while `Forsaken=True` and
+  quarantined, **31 reconciles in 114s (~3.7s apart)**. LR-042's other two effects held throughout —
+  no healing rule fired, and exactly one log line was written per transition — so this was wasted
+  reconcile/log-write churn, not a correctness defect and not the log spam LR-042 named. Found and
+  recorded by LR-044 as a known-but-deferred gap during its own verification run; this entry is the
+  fix.
+- **This is a rule-11 cross-mode-parity miss of the same shape as LR-041.** LR-041 was a required
+  value (the Sentinel master name) that compiled fine as a construction-state field the sentinel
+  construction site forgot to set — the compiler asked nothing, because an omitted string is a
+  plausible zero value, not an error. This is the same class one level up: a required *behaviour*
+  (honour `Forsaken` when picking the requeue interval) was threaded through the path the reviewer's
+  eye landed on (`updateStatus`, the generic status function) and never carried to the path that
+  actually executes for the only mode the behaviour applies to. Neither the compiler nor a
+  same-file read had any way to catch it — the two functions live ~800 lines apart in the same file,
+  under similar but not identical not-`Running` requeue blocks.
+- **Fix — one pure decision, shared by both call sites.** New `requeueAfterNotRunning(phase,
+  conditions, fast, steady) time.Duration` in `littlered_controller.go`: `Running` → `steady`;
+  otherwise `steady` iff `Forsaken=True`, else `fast`. `updateStatus` and `updateSentinelStatus` both
+  now call it instead of each inlining the condition check. A shared helper was chosen over
+  duplicating the predicate with a cross-reference comment because a duplicated predicate is
+  literally how this defect happened — `updateStatus` had it, `updateSentinelStatus` didn't, and
+  nothing forced the second copy to exist or to match. The helper is written against the generic
+  `(phase, conditions)` shape rather than sentinel-specific types, so it is directly reusable and
+  **safe by construction** for any future mode that might one day set `Forsaken` — a parity audit for
+  the next mode reduces to "does it call the shared helper", not "does it remember the check".
+- **Cross-mode parity audit of the sibling status/requeue paths (CLAUDE.md §7 rule 11):**
+
+  | path | verdict | why |
+  |---|---|---|
+  | `updateStatus` (standalone; also the generic function) | fixed, wired through the helper | already had the check; now shares it instead of inlining it |
+  | `updateSentinelStatus` (sentinel) | **fixed — the reported defect** | the only mode `ConditionForsaken` is ever set for; was requeuing `fast` unconditionally |
+  | `updateClusterStatus` (`cluster_reconcile.go`, ~:980-984) | correct-by-vacuity, not touched | `ConditionForsaken` is never set outside `reconcileSentinelCluster`, so today this path can never see it true; same `fast`/`steady`-on-`Running` shape as the old sentinel code, unowned by this change (outside `littlered_controller.go`) |
+  | `updateFailoverStatus` (`failover_reconcile.go`, ~:975-983) | correct-by-vacuity, not touched | same reasoning — `Forsaken` is a sentinel-only verdict today; unowned by this change |
+
+  Neither cluster nor failover mode has the bug today because neither can reach the state that
+  triggers it; both would silently inherit it the moment (if ever) `Forsaken` — or an equivalent
+  terminal verdict — becomes settable outside sentinel mode, since they inline the same
+  fast-unless-`Running` shape `updateSentinelStatus` used to. They are not touched here (out of this
+  change's owned files), but the shared helper existing in `littlered_controller.go` means wiring
+  them through it later is a one-line change per site rather than a rediscovery of the predicate.
+- **Corrects a wrong explanation in LR-044.** LR-044 recorded an accepted consequence — *"the
+  release lands up to ~150s after arming rather than 120s, because a forsaken instance is polled at
+  the steady 30s interval"* — whose number was right and whose reasoning was not: polling was fast
+  (this defect), which is exactly why M4a measured the release landing at 120-122s, not ~150s. See
+  the `⚠ Corrected by LR-045` marker added to that entry. This fix makes the steady interval real for
+  sentinel mode, so the ~150s figure becomes the true consequence going forward, for the reason
+  LR-044 originally gave.
+- **Regresses:** None. The non-forsaken not-`Running` fast cadence — the LR-042 "do not trade a
+  global invariant for a specific defect that can be named" invariant — is unchanged and covered by
+  `TestRequeueAfterNotRunning`'s `not running, not forsaken -> fast` and `forsaken condition
+  explicitly false -> fast` rows. `Running` still always requeues at `steady` regardless of
+  `Forsaken`, matching LR-042's design (the verdict only ever affects the not-`Running` branch).
+- **Tests:** `internal/controller/requeue_interval_test.go`, red-first. `TestRequeueAfterNotRunning`
+  (4 rows) was authored against a stub mirroring the actual pre-fix `updateSentinelStatus` behaviour
+  (`Running` → `steady`, otherwise unconditionally `fast`) and observed **RED on 1 of 4** —
+  `requeueAfterNotRunning(Initializing, forsaken-conditions) = 2s, want 30s` — the other three rows
+  (not-running-not-forsaken, not-running-forsaken-explicitly-false, running) passed vacuously against
+  the stub, which is expected: they pin behaviour the stub already had right, and only the forsaken
+  row exercises the fix. Implementing the `Forsaken` check turned that row green with no change to
+  the other three.
+- **Impacts:** LR-042 (corrects its third promised effect for the only mode it applies to); LR-044
+  (corrects one accepted-consequence sentence's reasoning, not its number).
