@@ -874,7 +874,7 @@ func TestBuildSentinelConfigMap(t *testing.T) {
 func TestBuildRedisStatefulSetSentinel(t *testing.T) {
 	lr := newTestLittleRed(testLRName, testNamespace)
 	lr.Spec.Mode = ModeSentinel
-	sts := buildRedisStatefulSetSentinel(lr)
+	sts := buildRedisStatefulSetSentinel(lr, littleredv1alpha1.SentinelRedisReplicas)
 
 	// Check replicas (should be 3 for sentinel mode)
 	if *sts.Spec.Replicas != 3 {
@@ -909,7 +909,7 @@ func TestBuildRedisStatefulSetSentinel(t *testing.T) {
 func TestBuildSentinelStatefulSet(t *testing.T) {
 	lr := newTestLittleRed(testLRName, testNamespace)
 	lr.Spec.Mode = ModeSentinel
-	sts := buildSentinelStatefulSet(lr)
+	sts := buildSentinelStatefulSet(lr, sentinelProcessReplicas)
 
 	// Check name
 	if sts.Name != testSentinelName {
@@ -976,7 +976,7 @@ func TestBuildSentinelStatefulSetWithoutMetrics(t *testing.T) {
 	lr.Spec.Mode = ModeSentinel
 	enabled := false
 	lr.Spec.Metrics.Enabled = &enabled
-	sts := buildSentinelStatefulSet(lr)
+	sts := buildSentinelStatefulSet(lr, sentinelProcessReplicas)
 
 	// Should only have the sentinel container, no exporter sidecar
 	containers := sts.Spec.Template.Spec.Containers
@@ -1054,8 +1054,12 @@ func TestStatefulSetBuildersPropagatePodTemplateScheduling(t *testing.T) {
 		build func(*littleredv1alpha1.LittleRed) *appsv1.StatefulSet
 	}{
 		{"standalone", ModeStandalone, buildStatefulSet},
-		{"sentinel-redis", ModeSentinel, buildRedisStatefulSetSentinel},
-		{"sentinel-monitor", ModeSentinel, buildSentinelStatefulSet},
+		{"sentinel-redis", ModeSentinel, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
+			return buildRedisStatefulSetSentinel(lr, littleredv1alpha1.SentinelRedisReplicas)
+		}},
+		{"sentinel-monitor", ModeSentinel, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
+			return buildSentinelStatefulSet(lr, sentinelProcessReplicas)
+		}},
 		{"cluster", ModeCluster, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
 			return buildClusterShardStatefulSet(lr, 0)
 		}},

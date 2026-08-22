@@ -1025,8 +1025,17 @@ func buildConfigMapSentinelMode(lr *littleredv1alpha1.LittleRed) *corev1.ConfigM
 	}
 }
 
-// buildRedisStatefulSetSentinel creates the Redis StatefulSet for sentinel mode (3 replicas)
-func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
+// buildRedisStatefulSetSentinel creates the Redis StatefulSet for sentinel mode.
+//
+// replicas is NOT derived here. Sentinel mode is a fixed 1 master + 2 replicas
+// (littleredv1alpha1.SentinelRedisReplicas), but a quarantined instance's desired count
+// is 0 (LR-044), and that has to be the value this builder stamps: both sentinel
+// StatefulSets are applied with server-side apply and client.ForceOwnership, so whatever
+// .Spec.Replicas is built here wins unconditionally on every pass. Scaling the live
+// object out of band would be force-overwritten right back. The single source of truth is
+// sentinelDesiredReplicas; it is passed in for the same reason the cluster builder takes
+// its shard index — the builder renders a decision, it does not make one.
+func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed, replicas int32) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentRedis
 
@@ -1041,8 +1050,6 @@ func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed) *appsv1.Stat
 	podAnnotations := make(map[string]string)
 	maps.Copy(podAnnotations, lr.Spec.PodTemplate.Annotations)
 	podAnnotations[AnnotationConfigHash] = configHash
-
-	replicas := littleredv1alpha1.SentinelRedisReplicas
 
 	containers := []corev1.Container{buildRedisContainerSentinel(lr)}
 
@@ -1456,8 +1463,14 @@ func buildSentinelVolumes(lr *littleredv1alpha1.LittleRed) []corev1.Volume {
 	return volumes
 }
 
-// buildSentinelStatefulSet creates the Sentinel StatefulSet
-func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
+// buildSentinelStatefulSet creates the Sentinel StatefulSet.
+//
+// replicas is passed in for the same reason as buildRedisStatefulSetSentinel's: a
+// quarantine takes the SENTINEL pods away too, and that is not optional — the victim's
+// sentinels publish hellos on the captor's master's channel under the shared master name,
+// so the captor learns them as peers (the num-other-sentinels inflation that distorts its
+// quorum math). See sentinelDesiredReplicas and LR-044.
+func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed, replicas int32) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentSentinel
 
@@ -1471,8 +1484,6 @@ func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulS
 	podAnnotations := map[string]string{
 		AnnotationConfigHash: configHash,
 	}
-
-	replicas := int32(3)
 
 	containers := []corev1.Container{buildSentinelContainer(lr)}
 	// Add exporter sidecar if metrics enabled — points at the Sentinel port so

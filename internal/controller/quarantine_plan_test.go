@@ -202,39 +202,72 @@ func TestQuarantineDataRisk(t *testing.T) {
 		return s
 	}
 
+	// Kubelet readiness, keyed by pod name exactly as the reconciler builds it.
+	ready := func(names ...string) map[string]bool {
+		m := map[string]bool{"redis-" + ourM: false, "redis-" + ourR1: false}
+		for _, n := range names {
+			m[n] = true
+		}
+		return m
+	}
+	allReady := ready("redis-"+ourM, "redis-"+ourR1)
+
 	cases := []struct {
 		name              string
 		state             *redisclient.ReplicationState
+		ready             map[string]bool
 		atRisk, unverifid bool
 	}{
 		{
 			name:  "all reachable and empty",
 			state: build(node(ourM, true, 0, foreign, "up"), node(ourR1, true, 0, foreign, "up")),
+			ready: allReady,
 		},
 		{
 			name:  "keys held as a link-up replica of the captor are the captor's copy",
 			state: build(node(ourM, true, 500, foreign, "up"), node(ourR1, true, 500, foreign, "up")),
+			ready: allReady,
 		},
 		{
 			name:   "keys on a pod that is NOT following the captor may be the only copy",
 			state:  build(node(ourM, true, 500, "", ""), node(ourR1, true, 0, foreign, "up")),
+			ready:  allReady,
 			atRisk: true,
 		},
 		{
 			name:   "keys on a pod whose link to the captor is down are unexplained",
 			state:  build(node(ourM, true, 500, foreign, "down")),
+			ready:  allReady,
 			atRisk: true,
 		},
 		{
-			name:      "an unreachable pod cannot be proven empty",
+			name:      "a pod we cannot dial but the kubelet reports Ready cannot be proven empty",
 			state:     build(node(ourM, true, 0, foreign, "up"), node(ourR1, false, 0, "", "")),
+			ready:     allReady,
+			unverifid: true,
+		},
+		{
+			name: "a pod we cannot dial and whose redis is NOT Ready is provably empty",
+			// LR-023's signal: the kubelet's local probe is authoritative and
+			// blackhole-proof, and in a pure in-memory instance a not-Ready redis holds
+			// no data. Blocking on it would hold the quarantine open forever on a
+			// crash-looping pod, keeping the captor dirty for exactly as long.
+			state: build(node(ourM, true, 0, foreign, "up"), node(ourR1, false, 0, "", "")),
+			ready: ready("redis-" + ourM),
+		},
+		{
+			name: "a pod the kubelet has no view of at all is NOT assumed empty",
+			// Absent from the map means we could not establish readiness either; the
+			// conservative direction is the same as an unreachable Ready pod.
+			state:     build(node(ourM, true, 0, foreign, "up"), node(ourR1, false, 0, "", "")),
+			ready:     map[string]bool{"redis-" + ourM: true},
 			unverifid: true,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			atRisk, unverified := quarantineDataRisk(tc.state, foreign)
+			atRisk, unverified := quarantineDataRisk(tc.state, foreign, tc.ready)
 			if atRisk != tc.atRisk {
 				t.Errorf("atRisk = %v, want %v", atRisk, tc.atRisk)
 			}

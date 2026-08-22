@@ -644,14 +644,30 @@ func (r *LittleRedReconciler) reconcileSentinel(ctx context.Context, littleRed *
 		return ctrl.Result{}, err
 	}
 
+	// Desired replica counts for BOTH StatefulSets, computed once, here, before either
+	// is applied (LR-044 wiring). This ordering is the whole point: r.apply is
+	// server-side apply with client.ForceOwnership, so .Spec.Replicas as built below is
+	// authoritative every pass. Deciding the quarantine only later (in
+	// reconcileSentinelCluster, which needs the gather) would mean these two applies put
+	// 3 back on every pass and the healing step took it away again — a 0→3→0 flap that
+	// actually schedules pods, which briefly rejoin the captor's quorum: worse than the
+	// log churn LR-042 removed. So zero must genuinely BE the desired state.
+	//
+	// The decision is therefore taken from status alone, which the pure planner supports
+	// by design: an armed quarantine is decided from status.quarantinedSince FIRST and
+	// without reference to the capture verdict (the verdict provably self-clears once the
+	// pods are gone). ARMING still happens after the gather, where the verdict and the
+	// data-risk classification live.
+	redisReplicas, sentinelReplicas := sentinelDesiredReplicas(littleRed, time.Now())
+
 	// Reconcile Redis StatefulSet
-	if err := r.reconcileRedisStatefulSetSentinel(ctx, littleRed); err != nil {
+	if err := r.reconcileRedisStatefulSetSentinel(ctx, littleRed, redisReplicas); err != nil {
 		log.Error(err, "Failed to reconcile Redis StatefulSet")
 		return ctrl.Result{}, err
 	}
 
 	// Reconcile Sentinel StatefulSet
-	if err := r.reconcileSentinelStatefulSet(ctx, littleRed); err != nil {
+	if err := r.reconcileSentinelStatefulSet(ctx, littleRed, sentinelReplicas); err != nil {
 		log.Error(err, "Failed to reconcile Sentinel StatefulSet")
 		return ctrl.Result{}, err
 	}
@@ -725,14 +741,69 @@ func (r *LittleRedReconciler) reconcileSentinelService(ctx context.Context, litt
 	return r.apply(ctx, littleRed, buildSentinelHeadlessService(littleRed))
 }
 
-// reconcileRedisStatefulSetSentinel ensures the Redis StatefulSet exists for sentinel mode
-func (r *LittleRedReconciler) reconcileRedisStatefulSetSentinel(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) error {
-	return r.apply(ctx, littleRed, buildRedisStatefulSetSentinel(littleRed))
+// reconcileRedisStatefulSetSentinel ensures the Redis StatefulSet exists for sentinel mode,
+// at the desired replica count its caller computed (see sentinelDesiredReplicas).
+func (r *LittleRedReconciler) reconcileRedisStatefulSetSentinel(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, replicas int32,
+) error {
+	return r.apply(ctx, littleRed, buildRedisStatefulSetSentinel(littleRed, replicas))
 }
 
-// reconcileSentinelStatefulSet ensures the Sentinel StatefulSet exists
-func (r *LittleRedReconciler) reconcileSentinelStatefulSet(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) error {
-	return r.apply(ctx, littleRed, buildSentinelStatefulSet(littleRed))
+// reconcileSentinelStatefulSet ensures the Sentinel StatefulSet exists, at the desired
+// replica count its caller computed (see sentinelDesiredReplicas).
+func (r *LittleRedReconciler) reconcileSentinelStatefulSet(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, replicas int32,
+) error {
+	return r.apply(ctx, littleRed, buildSentinelStatefulSet(littleRed, replicas))
+}
+
+// sentinelProcessReplicas is the fixed number of Sentinel processes in sentinel mode.
+// Mirrors littleredv1alpha1.SentinelRedisReplicas (3 Redis pods) for the monitoring side:
+// the quorum is fixed at three, sentinel HA is not horizontally scalable. Kept local
+// because the API package has no such constant and the sentinel StatefulSet is the only
+// consumer.
+const sentinelProcessReplicas int32 = 3
+
+// sentinelDesiredReplicas is the single source of truth for the sentinel-mode Redis and
+// Sentinel StatefulSet replica counts. Pure: the CR plus a clock, no I/O.
+//
+// Normally it is simply the fixed sentinel shape (3 Redis pods, 3 Sentinels). The one
+// thing that changes it is an ARMED quarantine (LR-044), and this function is why zero
+// genuinely IS the desired state rather than a value the next apply overwrites: it is
+// called before either StatefulSet is applied, and r.apply is server-side apply with
+// client.ForceOwnership.
+//
+// It deliberately passes NO capture verdict to the planner. That is the planner's
+// documented pre-gather contract — an armed quarantine is decided from
+// status.quarantinedSince first and without reference to the verdict, because the verdict
+// provably self-clears once the pods are gone (no reachable monitoring Sentinel ⇒
+// planForsaken clause 1 fails). Arming still happens after the gather, in
+// reconcileSentinelCluster, where the verdict and the data-risk clauses live.
+//
+// Two safety properties, both pinned by tests:
+//
+//   - A fresh instance can never read as quarantined: with status.quarantinedSince unset
+//     (nil, or a zero-valued marker) the planner's armed branch is not taken at all, and
+//     nothing else in this input can produce ScaleToZero (Captured is false).
+//   - Only sentinel mode can ever be scaled down by this. A quarantine marker left in
+//     status by a mode change, or hand-edited in, cannot take a cluster-, failover- or
+//     standalone-mode instance's pods away — the mode gate is checked here rather than
+//     relying on these builders happening to be sentinel-only callers.
+func sentinelDesiredReplicas(lr *littleredv1alpha1.LittleRed, now time.Time) (redis, sentinel int32) {
+	redis, sentinel = littleredv1alpha1.SentinelRedisReplicas, sentinelProcessReplicas
+	if lr.Spec.Mode != ModeSentinel {
+		return redis, sentinel
+	}
+	q := planQuarantine(quarantineInput{
+		QuarantinedSince: lr.Status.QuarantinedSince,
+		Attempts:         lr.Status.QuarantineAttempts,
+		Dangerous:        quarantineConfigDangerous(lr),
+		Now:              now,
+	})
+	if q.ScaleToZero {
+		return 0, 0
+	}
+	return redis, sentinel
 }
 
 // reconcileMasterService ensures the master Service exists
@@ -773,6 +844,18 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		if p.Status.PodIP != "" && p.DeletionTimestamp.IsZero() {
 			redisMap[p.Status.PodIP] = p.Name
 		}
+	}
+
+	// Kubelet readiness of each Redis pod's redis container, keyed by pod name. This is
+	// the data-safety signal the quarantine's "could not be proven empty" clause is keyed
+	// on (LR-044 wiring): the kubelet's local probe is authoritative and blackhole-proof
+	// where the operator's own remote dial is not (LR-017), and in a pure in-memory
+	// instance a not-Ready redis holds no data (LR-023). Built from the pod list, which
+	// is the same list the gather is built from, so the two cannot disagree about which
+	// pods exist.
+	redisReady := make(map[string]bool, len(redisPods.Items))
+	for i := range redisPods.Items {
+		redisReady[redisPods.Items[i].Name] = redisContainerReady(&redisPods.Items[i])
 	}
 
 	sentinelMap := make(map[string]string)
@@ -822,7 +905,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// self-clears once the pods are gone (no reachable monitoring Sentinel ⇒ planForsaken
 	// clause 1 fails), so status.quarantinedSince and status.quarantineAttempts — not the
 	// signature — are what carry the state across the quarantine.
-	atRisk, unverified := quarantineDataRisk(state, forsakenPlan.ForeignMaster)
+	atRisk, unverified := quarantineDataRisk(state, forsakenPlan.ForeignMaster, redisReady)
 	qPlan := planQuarantine(quarantineInput{
 		Captured:         forsakenPlan.Captured,
 		Forsaken:         forsakenPlan.Forsaken,
@@ -1367,7 +1450,12 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 		} else {
 			latest.Status.Replicas.Ready = 0
 		}
-		latest.Status.Replicas.Total = latest.Status.Redis.Total - 1
+		// Redis.Total is 0 while the instance is quarantined (LR-044), so this must not
+		// go negative: "master minus one" is meaningless when there is no master.
+		latest.Status.Replicas.Total = 0
+		if latest.Status.Redis.Total > 0 {
+			latest.Status.Replicas.Total = latest.Status.Redis.Total - 1
+		}
 
 		// Set master info
 		if latest.Status.Master == nil {
@@ -2044,8 +2132,9 @@ func (r *LittleRedReconciler) setForsaken(
 			msg += " It has NOT been quarantined: a reachable pod still holds keys that the capturing " +
 				"instance does not have, so scaling to 0 could destroy the only copy."
 		case quarantineHoldDataUnknown:
-			msg += " It has NOT been quarantined: a pod of this instance did not answer, so it cannot " +
-				"be proven empty and scaling to 0 could destroy data."
+			msg += " It has NOT been quarantined: a pod of this instance did not answer and the " +
+				"kubelet still reports its redis container Ready, so it cannot be proven empty and " +
+				"scaling to 0 could destroy data."
 		}
 	}
 
@@ -2071,7 +2160,18 @@ func (r *LittleRedReconciler) setForsaken(
 			Type: littleredv1alpha1.ConditionForsaken, Status: status,
 			Reason: reason, Message: msg,
 		})
-		return r.Status().Update(ctx, latest)
+		if err := r.Status().Update(ctx, latest); err != nil {
+			return err
+		}
+		// Mirror the condition list we just persisted onto the in-memory object. Without
+		// this, the rest of the pass reads a condition list that does not contain what was
+		// just written — and updateSentinelStatus, which runs later in the same pass, both
+		// reads the Forsaken condition (to pick the steady requeue interval) and writes the
+		// whole status back from this object. Self-correcting on the next pass, but it
+		// makes the state a human is being asked to act on wrong for one interval, and this
+		// condition is now load-bearing for exactly that human.
+		lr.Status.Conditions = latest.Status.Conditions
+		return nil
 	}); err != nil {
 		return err
 	}
@@ -2146,7 +2246,11 @@ func (r *LittleRedReconciler) clearForsaken(
 			Reason:  reasonNotCaptured,
 			Message: "This instance's Sentinels are serving its own topology.",
 		})
-		return r.Status().Update(ctx, latest)
+		if err := r.Status().Update(ctx, latest); err != nil {
+			return err
+		}
+		lr.Status.Conditions = latest.Status.Conditions // see setForsaken
+		return nil
 	})
 }
 

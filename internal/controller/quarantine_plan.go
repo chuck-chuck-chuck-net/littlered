@@ -42,7 +42,8 @@ const (
 	// the captor's replicated copy. Never quarantined.
 	quarantineHoldDataPresent quarantinePhase = "HoldDataPresent"
 	// quarantineHoldDataUnknown: forsaken, but a pod of ours could not be proven
-	// empty (it did not answer). Never quarantined.
+	// empty (we could not dial it and the kubelet still calls its redis Ready).
+	// Never quarantined.
 	quarantineHoldDataUnknown quarantinePhase = "HoldDataUnknown"
 	// quarantineStart: the pass that arms the quarantine — take the pods away and
 	// count the attempt.
@@ -220,10 +221,23 @@ func planQuarantine(in quarantineInput) quarantinePlan {
 //     path ADR-015 §9.2 could not rule out on timing alone ("replication blocked before
 //     the sync starts"), and it covers it whatever the timing, which is why it is
 //     load-bearing rather than belt-and-braces.
-//   - unverified: a pod of ours did not answer, so it cannot be proven empty. The
-//     operator's own dial is not blackhole-proof (LR-017), so an unreachable pod may
-//     still be serving clients. Refusing is the safe direction: a false negative merely
+//
+//   - unverified: a pod of ours did not answer AND the kubelet still reports its redis
+//     container Ready, so it cannot be proven empty. The operator's own dial is not
+//     blackhole-proof (LR-017), so such a pod may be serving clients perfectly well while
+//     being invisible to us. Refusing is the safe direction: a false negative merely
 //     leaves today's behaviour, while a false positive deletes the last copy.
+//
+//     Readiness, not reachability, is what this clause is keyed on — the correction M2
+//     deferred to the wiring. Keying it on the gather made a permanently crash-looping or
+//     blackholing pod "unverified" forever, holding the quarantine open indefinitely and
+//     so keeping the CAPTOR dirty for exactly as long: a pod that can never answer would
+//     have vetoed the one action that helps the healthy neighbour. LR-023 established the
+//     right signal for precisely this judgement — the kubelet's local readiness probe is
+//     authoritative and blackhole-proof, and in a pure in-memory (EmptyDir) instance a
+//     not-Ready redis holds no data, so discarding it loses nothing by construction. A
+//     pod the kubelet has no view of (absent from the map) is treated like a Ready one:
+//     unknown readiness is not evidence of emptiness.
 //
 // Both are computed over pods the gather knows about, i.e. pods with an IP that are not
 // terminating. A TERMINATING pod holding data is therefore invisible here — the guard is
@@ -232,7 +246,9 @@ func planQuarantine(in quarantineInput) quarantinePlan {
 // planner decides, so the quarantine adds no harm to it. Do not "fix" it by widening the
 // gather; LR-038 records why that is worse than the gap (a terminating pod in the gather
 // reads as live topology to every other rule).
-func quarantineDataRisk(state *redisclient.ReplicationState, foreignMaster string) (atRisk, unverified bool) {
+func quarantineDataRisk(
+	state *redisclient.ReplicationState, foreignMaster string, redisReady map[string]bool,
+) (atRisk, unverified bool) {
 	if state == nil {
 		return false, true
 	}
@@ -241,7 +257,11 @@ func quarantineDataRisk(state *redisclient.ReplicationState, foreignMaster strin
 			continue
 		}
 		if !rn.Reachable {
-			unverified = true
+			// Not-Ready per the kubelet ⇒ redis is down ⇒ no data (LR-023). Only a pod
+			// the kubelet still calls Ready — or one it has no view of — is unverified.
+			if ready, known := redisReady[rn.PodName]; !known || ready {
+				unverified = true
+			}
 			continue
 		}
 		if rn.Keys <= 0 {

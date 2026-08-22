@@ -609,12 +609,12 @@ loose for the failover cells, which measured 85-96%.
 ## [LR-044] The Captor Side of a Capture Was Silently Healthy — Forsaken-Gated Quarantine (decision layer)
 - **Date:** 2026-08-22
 - **Commit:** (pending)
-- **Scope:** **milestone 2 of 4 — the pure decision layer and its status surfaces only.** The planner
-  decides, and nothing yet acts on the decision: wiring `ScaleToZero` into the Redis and Sentinel
-  StatefulSet replica counts is a separate milestone, and the e2e that captures a victim and asserts
-  both sides recover is a later one. So this entry closes the *design* gap and records the reasoning;
-  the behaviour is not yet observable on a cluster. Everything below marked as inference stays
-  inference until that e2e runs.
+- **Scope:** **milestones 2 and 3 of 4 — the pure decision layer, its status surfaces, and the
+  StatefulSet wiring that makes the decision act.** The e2e that captures a victim and asserts both
+  sides recover is a later milestone, so the behaviour is still **not observed on a cluster**:
+  everything below marked as inference stays inference until that run. The wiring half is recorded in
+  its own section at the end of this entry (the two halves landed as separate reviewed commits and the
+  ordering matters, but they are one defect and one feature).
 - **Problem — the gap LR-042 named and deliberately left open.** A capture has two sides and only one
   is loud. Verified on a live pair: the *victim* reports `Initializing` / `Ready=False` (as ADR-015
   §9.2 promises), while the instance whose master was adopted — the **captor** — reports `Running` /
@@ -753,8 +753,9 @@ loose for the failover cells, which measured 85-96%.
   The latch therefore bites when recapture happens *before* the instance is healthy — which is the
   intended shape ("self-heal the lucky case, latch when it is not luck") — and an instance that
   oscillates through healthy states between captures will keep re-rolling.
-- **Regresses:** Nothing yet acts on the decision, so behaviour is unchanged except on the `Forsaken`
-  condition's reason/message and two new status fields. `planForsaken` is untouched — the data clauses
+- **Regresses (decision layer):** Nothing in this half acts on the decision, so its own behaviour change
+  is confined to the `Forsaken` condition's reason/message and two new status fields. What the wiring half
+  adds on top is stated in its own Regresses note below. `planForsaken` is untouched — the data clauses
   live in the quarantine planner rather than the verdict, deliberately: LR-042's verdict answers "is
   this instance still ours to manage", and an instance holding data is still not ours to manage, so
   weakening the verdict would put the operator back to thrashing it. The sentinel healing chain is
@@ -763,3 +764,112 @@ loose for the failover cells, which measured 85-96%.
   (`status.quarantinedSince`, `status.quarantineAttempts`, the new `Forsaken` reasons); LR-042 (closes
   its "Known gap, NOT fixed here"); LR-015 (Rule L is the re-bootstrap, unchanged); LR-008 / LR-011 /
   LR-013 (Rule D's gate chain is the captor's healing path, unchanged — and unverified in this role).
+
+### Wiring half (milestone 3) — desired replicas must BE zero, not be set to zero
+
+The decision layer above computes `ScaleToZero` and nothing consumed it. Consuming it turns out to be
+constrained in a way worth recording, because the obvious implementation produces a failure mode
+strictly worse than the churn LR-042 removed.
+
+- **Why out-of-band scaling cannot work — SSA with `ForceOwnership`.** Both sentinel StatefulSets are
+  applied through `LittleRedReconciler.apply`, which is a server-side apply carrying
+  `client.FieldOwner(fieldManager)` **and `client.ForceOwnership`**. So whatever `.Spec.Replicas` the
+  *build* function computes is authoritative on every pass, unconditionally: scaling the live object
+  (a `Scale` subresource write, or a patch from the healing step) is force-overwritten by the next
+  reconcile. And the two applies happen EARLY — `reconcileRedisStatefulSetSentinel` /
+  `reconcileSentinelStatefulSet` run in `reconcileSentinel` well before `reconcileSentinelCluster`,
+  where the verdict lives. Deciding late and acting out-of-band therefore yields a **0→3→0 flap every
+  pass**: steps 6/7 force 3 back, step 12 takes it away again, and in between pods are genuinely
+  scheduled, come up, and rejoin the captor's quorum — re-polluting the neighbour the quarantine
+  exists to protect. The requirement is consequently stronger than "the operator scales it down":
+  **zero must be the desired state at build time.**
+- **Shape chosen: decide the ARMED quarantine early, from status alone.** New pure
+  `sentinelDesiredReplicas(lr, now) (redis, sentinel int32)` runs before either apply and passes
+  `planQuarantine` **no capture verdict at all** — only `status.quarantinedSince`,
+  `status.quarantineAttempts` and `Dangerous`. That is not a shortcut around the planner, it is the
+  planner's documented pre-gather contract (*"an armed quarantine is decided FIRST and without
+  reference to the verdict"*, pinned by the existing table row `no verdict this pass (pre-gather)`),
+  and it exists because the verdict provably self-clears once the pods are gone. **Arming stays where
+  it was**, after the gather, where the verdict and the data-risk clauses live. Both builders now take
+  the count as a parameter rather than hardcoding `SentinelRedisReplicas` / `int32(3)`, mirroring how
+  the cluster builder takes its shard index: a builder renders a decision, it does not make one.
+- **The rejected alternative was hoisting the gather** above the StatefulSet applies so the full
+  verdict is available there. It needs no pre-gather contract and avoids a second decision point, but
+  it reorders the sentinel reconcile flow — the exact flow whose ordering is load-bearing in LR-013,
+  LR-015, LR-024, LR-040 (*"Rule 0 runs before Rule A"*) and LR-041, and whose gather is deliberately
+  taken **after** the ConfigMaps/Services/StatefulSets exist and behind the `BootstrapRequired`
+  early-out. LR-038's lesson also applies directly: moving or widening the gather changes what every
+  rule sees at once. Since the planner already supports the pre-gather decision by design, the reorder
+  buys nothing that is needed and risks something that is.
+- **What the ordering costs, and why it is not a flap.** Arming happens after the applies, so the
+  *arming* pass still applies 3 and the pods go away on the NEXT pass; the release pass symmetrically
+  applies 0 one last time and the pods return on the next. Both directions are monotone — 3→3→0 and
+  0→0→3 — never 0→3→0, and while a quarantine is armed **every** pass computes 0 before touching the
+  API server. One steady interval (≤30s) of latency on each edge, on a 120s settle.
+- **`DataUnverified` rekeyed onto kubelet readiness** — the correction milestone 2 deferred here
+  because it needs the pod list. Keyed on gather reachability, a permanently crash-looping or
+  blackholing pod is "unverified" forever, so it vetoes the quarantine indefinitely and keeps the
+  CAPTOR dirty for exactly as long: the one pod that can never answer would block the one action that
+  helps the healthy neighbour. LR-023 settled which signal to use for this judgement — the kubelet's
+  local readiness probe is authoritative and blackhole-proof where the operator's remote dial can be
+  fooled (LR-017), and *"in a pure in-memory cluster a not-Ready redis holds no data, so deleting it
+  loses nothing"*. So `quarantineDataRisk` now takes a `map[podName]redisContainerReady` built from the
+  same pod list the gather is built from, and only an **unreachable pod the kubelet still calls Ready**
+  is unverified. A pod absent from the map is treated like a Ready one: unknown readiness is not
+  evidence of emptiness. The seam stays pure — readiness is passed in, no pod is read inside it.
+- **Live-safety properties, each pinned by a test rather than argued.** (1) A **fresh** instance cannot
+  read as quarantined: with `status.quarantinedSince` nil *or* zero-valued the planner's armed branch is
+  not taken and nothing else in the pre-gather input can produce `ScaleToZero` (`Captured` is false).
+  (2) A quarantine marker cannot scale down a **non-sentinel** instance — the mode gate is checked in
+  `sentinelDesiredReplicas` itself rather than resting on these builders happening to be sentinel-only
+  callers, so a mode change or a hand-edited status cannot take a cluster/failover/standalone
+  instance's pods away. (3) The scale-down **cannot outlive the feature**: it is a function of
+  `status.quarantinedSince`, so clearing that field (with `quarantineAttempts`) returns replicas to
+  normal on the next pass — which is also the manual release for a latched instance, and is now stated
+  in `docs/API_SPEC.md`. Clearing only the `Forsaken` condition does *not* release it; the marker is
+  what holds the state, by design.
+- **No `allPodsReady`-style gate was added, deliberately.** `reconcileSentinelCluster` runs
+  unconditionally, which is exactly why the release decision is still reachable with zero pods. Gating
+  it on pods would strand every quarantined instance permanently — the LR-018/LR-023 "repair step that
+  can never fire" trap.
+- **Two consequences of 0 replicas being reachable at all, both handled where they surface.**
+  `updateSentinelStatus` derives `Status.Replicas.Total` as `Redis.Total - 1`, which would report `-1`;
+  it is now floored at 0. And `allReady` requires `Redis.Ready > 0`, so a quarantined instance can
+  never report `Running` — which matters more than it looks: `clearForsaken` resets the attempt counter
+  only on `Phase == Running`, so the counter cannot be reset by the quarantine it is counting, and the
+  latch still bites.
+- **Also fixed, pre-existing (found by milestone 2, in the way of observing this one):**
+  `setForsaken`/`clearForsaken` wrote the `Forsaken` condition onto a freshly-fetched `latest` object
+  and did not mirror it into the in-memory `littleRed.Status.Conditions`. A later
+  `updateSentinelStatus` in the same pass reads that condition (to pick the steady requeue interval)
+  and writes the whole status back from the stale in-memory object. Self-correcting on the next pass,
+  and LR-042 shipped this shape — but it makes the state a human is being asked to act on wrong for one
+  interval, and this condition is now load-bearing for exactly that human. Both functions now mirror
+  the persisted condition list back after a successful update.
+- **Tests:** `internal/controller/quarantine_wiring_test.go`, red-first.
+  `TestQuarantinedInstanceNeverGetsItsPodsPutBackByTheBuilders` is the **flap guard** and is written as
+  a *sequence* rather than a state, because the failure mode is an interleaving that no single-pass
+  assertion can see: it walks fresh → armed → settling → latched → released and asserts what the two
+  **builders** stamp on a pass where no gather has happened. Observed **RED on 3 of 5 rows** against
+  the pre-wiring builders — `redis StatefulSet .spec.replicas = 3, want 0` and
+  `sentinel StatefulSet .spec.replicas = 3, want 0` for the armed, settling and latched rows — i.e. red
+  on precisely the passes that would have re-created the pods. `TestFreshInstanceIsNeverReadAsQuarantined`
+  and `TestQuarantineNeverScalesDownANonSentinelInstance` are green from birth (they assert an absence),
+  so their teeth were shown with an **always-zero mutant**, which failed all five of their rows. In
+  `TestQuarantineDataRisk`, the readiness rekey went **RED on exactly one new row** —
+  `unverified = true, want false` for *"a pod we cannot dial and whose redis is NOT Ready is provably
+  empty"* — against the reachability-keyed body, with the Ready-but-unreachable and
+  kubelet-has-no-view rows green throughout, which is what makes that single red attributable.
+- **Still not verified live, and M4a's job:** that a real quarantine actually scales both StatefulSets
+  to 0 and holds there without a flap; that the captor's Rule D then prunes the departed replicas (the
+  load-bearing inference of the whole change); that release + Rule L re-bootstraps the victim empty;
+  and the arming/release edge latency on a real steady interval. No cluster work was done in this
+  milestone — the operator image tag derives from the git hash, so live validation needs commits.
+- **Regresses (wiring half):** For any instance that is not quarantined, `sentinelDesiredReplicas`
+  returns exactly the constants the two builders hardcoded before (3 and 3), so the applied
+  StatefulSets are byte-identical and no rollout is triggered by this change. The only new behaviour is
+  reachable through `status.quarantinedSince`, which only the quarantine sets, only in sentinel mode.
+  The readiness rekey strictly *relaxes* one refusal — an unreachable pod whose redis the kubelet
+  reports not-Ready no longer blocks — and relaxes it toward the action, so it is the one clause where
+  the conservative direction was deliberately traded for LR-023's stronger evidence. Cluster, failover
+  and standalone paths are untouched; the healing chain is untouched.
