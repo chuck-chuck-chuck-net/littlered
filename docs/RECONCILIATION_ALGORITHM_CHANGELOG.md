@@ -865,6 +865,9 @@ strictly worse than the churn LR-042 removed.
   load-bearing inference of the whole change); that release + Rule L re-bootstraps the victim empty;
   and the arming/release edge latency on a real steady interval. No cluster work was done in this
   milestone — the operator image tag derives from the git hash, so live validation needs commits.
+
+  **Answered by the M4a live run below: all four hold. The load-bearing inference — the captor heals
+  itself through Rule D — is confirmed, twice, and faster than the design assumed.**
 - **Regresses (wiring half):** For any instance that is not quarantined, `sentinelDesiredReplicas`
   returns exactly the constants the two builders hardcoded before (3 and 3), so the applied
   StatefulSets are byte-identical and no rollout is triggered by this change. The only new behaviour is
@@ -873,3 +876,110 @@ strictly worse than the churn LR-042 removed.
   reports not-Ready no longer blocks — and relaxes it toward the action, so it is the one clause where
   the conservative direction was deliberately traded for LR-023's stronger evidence. Cluster, failover
   and standalone paths are untouched; the healing chain is untouched.
+
+### Live verification (milestone 4a) — t3e, 2026-08-22, operator `01e2df3`
+
+Two throwaway sentinel instances in one namespace sharing `masterName: lr044.shared`, auth
+disabled, same image, operator **running** throughout (unlike the LR-039 isolation specs, which
+must pause it — see LR-041's note). A hello advertising the captor's live master at a derived
+epoch was PUBLISHed into **all three** of the victim's Sentinels, because `planForsaken` clause 2
+requires unanimity among reachable monitoring Sentinels and a 1-of-3 injection reads as a
+transition, not a verdict. Every `PUBLISH` answered `1`. Two full cycles were run.
+
+**The capture reproduced the field incident exactly, including the part that makes the data
+clauses necessary.** Within ~6s all three victim Sentinels monitored `10.233.192.152` (the
+captor's master) at the injected epoch, `flags: master`; all three victim Redis pods became
+**link-`up` replicas of the foreign master** and their own 10 keys were **flushed** and replaced
+by the captor's 100. So the live shape is the *silent* case the hardening was written for —
+`Keys > 0` on every victim pod, all of it the captor's dataset — and the literal "all reachable
+pods hold 0 keys" formulation the entry warns about would indeed have been inert. `atRisk` was
+false for the right reason, and the quarantine fired.
+
+**1. The verdict fires — CONFIRMED.** `Forsaken` reached `True/Quarantined` with
+`status.quarantinedSince` set and `quarantineAttempts: 1`, and the operator logged the transition
+**once**, not per reconcile. Both cycles identical.
+
+**2. The wiring takes effect and holds — CONFIRMED, no flap.** Both StatefulSets went to
+`.spec.replicas: 0` in the same pass and stayed. Sampled at **1s** across both edges: cycle 2's
+sampler ran the whole lifecycle and reads `61 × 3, then 104 × 0, then 79 × 3` — one transition each
+way, at a single sample boundary (`23:22:22 → 23:22:23` arming, `23:24:19 → 23:24:20` release), with
+no intermediate and no returning value; cycle 1's covers the release edge the same way
+(`33 × 0, then 83 × 3`). The
+predicted 0→3→0 oscillation was never observed, and the *monotone* ordering the wiring half
+predicted (arming pass still applies 3, pods leave on the next) is what happened.
+
+**3. THE LOAD-BEARING ONE — the captor heals itself: CONFIRMED, and it is Rule D.** Not
+inferred from counts alone; the operator said so, on the captor, 2-4s after the victim's pods
+left:
+
+    Ghost node detected in Sentinel topology  ip=10.233.192.74 flags=s_down,slave sentinel=captor-sentinel-0
+    Issuing SENTINEL RESET to clear ghost nodes from topology  master=lr044.shared reachableRedis=3
+
+`reachableRedis=3` is LR-013's wholeness gate passing against the **captor's own** expected pod
+count, exactly as the inference required. Sentinel counts, cycle 1: `num-slaves 2 → 5`,
+`num-other-sentinels 2 → 5` on capture; then `5 → 0 → 2` and `5 → 2` within ~12s of the pods
+leaving (the 0 is the whole-list RESET, repopulating from the master's `INFO`). Cycle 2 reproduced
+it in ~5s. **The captor's own 100 keys were intact on all three of its pods at every check**, and
+`lrctl verify captor` went `FAIL` (`reports 5 replicas; 2 were deployed`) → `[OK] No foreign
+Sentinel contact observed`.
+
+Two corrections to the settle's derivation fall out, both in the safe direction. The premise was
+"the captor is `Running`, so it reconciles on the steady 30s interval, so allow ~4 passes". In
+practice the captor **briefly leaves `Running`** when its Sentinel-known replica count collapses
+(`reasons: Sentinel knows 0/2 replicas as healthy`), so it is polled *fast* and heals in seconds.
+120s is therefore generous rather than tight — no change proposed, but the number rests on a
+premise that does not hold, and the real bound is the ghost becoming `s_down`
+(`down-after-milliseconds`), not the requeue cadence.
+
+**4. The release re-bootstraps the victim empty — CONFIRMED, and the mechanism is Rule L.** Named
+in the CR, not guessed: condition `LeaderlessRecovery=False/Reseeded`, *"Leaderless recovery: no
+data present, seeded victim-redis-0 as master"*, preceded by `Leaderless bootstrap deadlock
+suspected; starting cooldown` and eight `persists; waiting` passes. **Not** the Rule 0 / LR-008
+interception LR-017 recorded as a hazard for this tier: the victim's Sentinels come back genuinely
+bare and there is no master anywhere to re-register them onto, so nothing can race Rule L. Rule A
+did not block it either — the scale-down's pods were fully gone (`pods=0`) long before the release,
+so `anyTerminating` was false on every pass of the recovery. Victim returned `Running`/`Ready=True`
+with `keys:0` on all three pods, and `quarantineAttempts` dropped back to 0 on `Phase == Running`
+exactly as designed.
+
+**Timings (cycle 1 → cycle 2), one steady interval of granularity on the first edge:**
+
+| edge | cycle 1 | cycle 2 |
+|---|---|---|
+| PUBLISH → all 3 Sentinels captured | ~4s | ~6s |
+| capture → first `Captured` verdict (`forsakenSince`) | 30s | 31s |
+| verdict → armed (`forsakenCooldown`) | 31s | 31s |
+| armed → both `.spec.replicas: 0` | same pass (<1s) | same pass (<1s) |
+| replicas 0 → pods gone | ~7s | ~4s |
+| pods gone → captor's Sentinels clean | **~12s** | **~5s** |
+| armed → release (`quarantineSettlePeriod`) | 122s | 120s |
+| release → victim has a master (Rule L) | ~39s | ~38s |
+| release → `Running` | ~48s | ~56s |
+| **capture → victim serving again** | **~3m51s** | **~3m58s** |
+
+The 30s from capture to the first verdict is not latency in the verdict — the victim was `Running`
+when it was captured, so it was on the **steady** interval and the capture landed just after a
+pass. It is the honest cost of a capture arriving between two steady reconciles.
+
+**One defect found, NOT fixed here (it does not block the verification, and this milestone's remit
+was to observe):** LR-042's third promised effect — *"re-examines it at the steady interval instead
+of the fast one"* — **is not in effect for sentinel mode, the only mode that can be forsaken.** The
+`Forsaken`-aware interval choice lives in `updateStatus` (littlered_controller.go, the not-`Running`
+branch that switches `fast → steady` when the condition is true), but sentinel mode returns through
+**`updateSentinelStatus`**, whose not-`Running` branch returns `fast` unconditionally with no such
+check. Measured while quarantined and `Forsaken=True`: **31 reconciles in 114s (~3.7s apart)**,
+i.e. the churn LR-042 set out to remove is still there. Two consequences: the log-once-per-transition
+half of LR-042 *is* working (one line per cycle, verified), so the churn is cheap rather than noisy;
+and this entry's accepted consequence *"the release lands up to ~150s after arming rather than 120s,
+because a forsaken instance is polled at the steady 30s interval"* is **wrong in its reasoning** and
+accidentally right in its conclusion — the release landed at 120-122s precisely *because* the
+polling is fast. Fixing the cadence would make that 150s real. Tracked for the next change.
+
+**Not exercised live, so still unverified:** the `Latched` phase (`Attempts >= limit`) — the
+counter resets on `Phase == Running` and both cycles recovered, so a second attempt was never
+reached; the `Dangerous` limit of 1 (a shared **`mymaster`** with auth off would latch on the first
+quarantine, which is also why this run deliberately used a non-legacy shared name — a latched
+instance never releases and links 3-4 would have been unobservable); `HoldDataPresent` /
+`HoldDataUnknown` refusing a real capture (both were false throughout, correctly); and a *partial*
+capture (1 of 3 Sentinels), where the expected behaviour is no verdict plus the LR-008 correction
+healing it — the shape LR-041 observed sub-second.
