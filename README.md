@@ -4,6 +4,18 @@ A Kubernetes operator for deploying Redis/Valkey as a pure in-memory data store.
 
 LittleRed is built for workloads where persistence is explicitly disabled and never enabled—not even by accident. It provides a full reconciliation engine to manage node identities and cluster membership across restarts and failures: the class of problem where static Helm charts and startup scripts reach their limits.
 
+## Upgrading to v0.3.1 (Sentinel Mode)
+
+> **`spec.sentinel.masterName` is now required, and must be unique among every Sentinel deployment reachable on the same pod network.** Use `<namespace>.<name>`. **`standalone` and `cluster` instances are unaffected.**
+>
+> The master name is the *only* isolation Sentinel's gossip protocol has: a Sentinel receiving a hello message looks the name up, discards it if unknown, and checks nothing else — no instance identifier, no namespace. Two instances that share a name and can reach each other are, protocol-wise, **one deployment**: the one with the higher config epoch can reassign the other's master to a foreign Redis pod, whose replicas then **flush their datasets** to resynchronise from a stranger. If both run the same Redis version the merge completes silently, and the victim reports healthy while serving someone else's keyspace. This has happened in production.
+>
+> **Enable authentication in the same window.** It is the peer-membership credential too, and it is the only thing that closes the narrower path a unique name leaves open — a foreign Sentinel whose recycled master address is now yours reads its `INFO` directly, with no hello involved.
+>
+> **Existing instances keep running.** They continue on the historic shared name `mymaster` and report a `SentinelMasterNameUnscoped` warning until you set the field; they are only forced to state a value on their next change to `spec.sentinel`. **Changing it is client-visible:** Sentinel-aware clients must be reconfigured in the same maintenance window, and there is no rolling cutover — monitoring one master under two names runs two independent failover state machines that can promote different replicas. Clients using the label-routed `{name}` Service are unaffected. Setting `masterName: mymaster` explicitly is accepted and silences the warning without changing behaviour. See [Isolating Sentinel instances](docs/USAGE.md#isolating-sentinel-instances).
+>
+> **New: `mode: failover` (experimental).** 1 master + N replicas with **no Sentinel processes** — the operator is the sole failure detector and failover decider. We consider it the better design: sentinel mode has two independent failure detectors, the operator and Sentinel, and much of this project's hardest history is the two of them fighting over the same state. One decider removes that class outright. The trade is that HA is coupled to operator liveness. See [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md).
+
 ## Upgrading to v0.3.0 (Cluster Mode)
 
 > v0.3.0 restructures **cluster mode** from a single StatefulSet (`{name}-cluster`) into **one StatefulSet per shard** (`{name}-shard-K`, with pods `{name}-shard-K-0` … `-K-R`), so each shard's master and replica(s) can be pinned to separate failure domains. **`standalone` and `sentinel` instances are unaffected.**
@@ -37,14 +49,19 @@ kind: LittleRed
 metadata:
   name: my-store
 spec:
-  mode: sentinel   # standalone | sentinel | cluster | failover (experimental)
+  mode: cluster   # standalone | sentinel | cluster | failover (experimental)
+  cluster:
+    shards: 3            # minimum 3
+    replicasPerShard: 1  # 3 x (1 master + 1 replica) = 6 pods
 ```
 
 ```bash
 kubectl apply -f my-store.yaml
 ```
 
-`standalone` runs a single Redis pod. `sentinel` runs 3 Redis pods (1 master + 2 replicas) monitored by 3 sentinels for automatic failover. `cluster` runs a sharded Redis Cluster across multiple pods for horizontal scaling. `failover` (**experimental**) runs 1 master + N replicas with no Sentinel processes — the operator itself performs failure detection and failover; it is under active validation, see [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md) for status and trade-offs vs `sentinel`.
+**Choosing a mode.** `cluster` runs a sharded Redis Cluster — horizontal scaling, and each shard survives losing its master. `standalone` is a single Redis pod, for development and for caches that can be rebuilt. `sentinel` runs 3 Redis pods (1 master + 2 replicas) monitored by 3 sentinels; it needs a unique [`spec.sentinel.masterName`](docs/USAGE.md#isolating-sentinel-instances). `failover` (**experimental**) is 1 master + N replicas with no Sentinel processes, the operator deciding failover itself — see [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md).
+
+Every mode takes the same options for resources, authentication, TLS, metrics, placement and disruption budgets — **[USAGE.md](docs/USAGE.md) is the guide to all of them**, and worth a look before your first production instance.
 
 ### 3. Verify Health
 
@@ -96,6 +113,7 @@ spec:
 
   # Mode-specific settings
   sentinel:                 # For mode: sentinel
+    masterName: prod.my-store   # REQUIRED; unique per pod network
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 60000
