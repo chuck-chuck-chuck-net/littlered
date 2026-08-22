@@ -23,6 +23,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -184,6 +185,18 @@ var _ = Describe("Sentinel Cross-Instance Isolation", Label("sentinel"), Ordered
 		return ""
 	}
 
+	// nextEpoch returns a config epoch comfortably above the one the target Sentinel
+	// currently holds. Sentinel acts on an injected hello only when
+	// master_config_epoch is STRICTLY greater than the master's own config epoch, so a
+	// hardcoded constant is a trap: the moment real activity pushes the epoch past it,
+	// the injection silently becomes a no-op and the assertion fails as "did not land"
+	// with no hint that the payload, not the code, is stale. Derived from the target's
+	// own reply, the payload is always credible.
+	nextEpoch := func(mastersOut string) uint64 {
+		cur, _ := strconv.ParseUint(field(mastersOut, "config-epoch"), 10, 64)
+		return cur + 1000
+	}
+
 	podIP := func(pod string) string {
 		out, err := utils.Run(exec.Command("kubectl", "get", "pod", pod, "-n", testNamespace,
 			"-o", "jsonpath={.status.podIP}"))
@@ -238,9 +251,32 @@ spec:
 		instA, instB = fmt.Sprintf("iso-a-%d", stamp), fmt.Sprintf("iso-b-%d", stamp)
 		deploy(instA)
 		deploy(instB)
+
+		By("pausing the operator for the duration of the injections")
+		// Both specs below measure what SENTINEL does with an injected hello. The
+		// operator is a third party to that question and, since LR-041 restored the
+		// gather, an actively interfering one: the advertised foreign master is not
+		// one of the receiving instance's pods, so it reads as a ghost master and the
+		// LR-008 correction issues REMOVE + MONITOR back to the real master. Measured
+		// on a live cluster, that lands in the SAME SECOND as the PUBLISH, so a poll
+		// loop never observes the capture at all.
+		//
+		// This is not only about making the positive control observable. It is what
+		// makes the ISOLATION spec mean anything: with the operator healing captures
+		// sub-second, that spec would pass whether the master name protected instance
+		// A or not, and its conclusion would be unattributable. Pausing removes the
+		// confound from both. (Found exactly this way — the positive control went red
+		// while the isolation spec still passed, which is the failure mode it exists
+		// to catch.)
+		scaleOperator(0)
 	})
 
 	AfterAll(func() {
+		// Unconditionally FIRST, before any early return: an operator left at 0
+		// replicas silently breaks every later spec and the next run of the whole
+		// suite. Mirrors the reshard tier's same discipline.
+		scaleOperator(1)
+
 		if debugOnFailure && suiteOrSpecFailed() {
 			By("skipping cleanup to allow debugging")
 			return
@@ -277,10 +313,11 @@ spec:
 
 		By("injecting a Sentinel hello for B's master into A, at a high config epoch")
 		// ip,port,runid,current_epoch,master_name,master_ip,master_port,master_config_epoch
-		hello := fmt.Sprintf("%s,26379,%s,9999,%s,%s,6379,9999",
+		epoch := nextEpoch(aBefore)
+		hello := fmt.Sprintf("%s,26379,%s,%d,%s,%s,6379,%d",
 			podIP(instB+"-sentinel-0"),
 			"f0000000000000000000000000000000deadbeef",
-			bMasterName, bMasterIP)
+			epoch, bMasterName, bMasterIP, epoch)
 		out, err := sentinelExec(instA, "PUBLISH", "__sentinel__:hello", hello)
 		Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
 		// redis-cli exits 0 on a Redis error reply, so check the reply itself:
@@ -369,10 +406,11 @@ spec:
 		bMasterName := field(before, "name")
 		Expect(field(before, "ip")).NotTo(Equal(foreignMaster))
 
-		hello := fmt.Sprintf("%s,26379,%s,9999,%s,%s,6379,9999",
+		epoch := nextEpoch(before)
+		hello := fmt.Sprintf("%s,26379,%s,%d,%s,%s,6379,%d",
 			podIP(instB+"-sentinel-0"),
 			"f1111111111111111111111111111111deadbeef",
-			bMasterName, foreignMaster)
+			epoch, bMasterName, foreignMaster, epoch)
 		out, err := sentinelExec(instB, "PUBLISH", "__sentinel__:hello", hello)
 		Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
 		Expect(strings.TrimSpace(out)).To(Equal("1"))
