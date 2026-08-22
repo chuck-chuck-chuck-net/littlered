@@ -127,6 +127,19 @@ func TestPlanForsaken(t *testing.T) {
 			return s
 		}(), ago(time.Hour), false, false},
 
+		{"our master merely unreachable does not save us", func() *redisclient.ReplicationState {
+			// Clause 4 asks whether a REACHABLE pod of ours is a master. An
+			// unreachable one does not count, and that is deliberate: combined with
+			// every Sentinel unanimously serving a live foreign address, and held for
+			// the cooldown, "our master stopped answering" is what a capture looks
+			// like from here — the pod was repointed at the captor and its old
+			// mastership is gone. A network blip alone cannot produce the other three
+			// clauses.
+			s := captured()
+			withRedis(s, ourM, false, RoleMaster)
+			return s
+		}(), ago(time.Hour), true, true},
+
 		{"bare sentinels are Rule L's job, not ours", func() *redisclient.ReplicationState {
 			s := forsakenState([]string{ourM}, []string{ourS1, ourS2, ourS3})
 			for _, sip := range []string{ourS1, ourS2, ourS3} {

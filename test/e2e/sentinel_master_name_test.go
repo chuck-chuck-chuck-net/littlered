@@ -269,6 +269,13 @@ spec:
 		// while the isolation spec still passed, which is the failure mode it exists
 		// to catch.)
 		scaleOperator(0)
+		// From here to AfterAll the CR status is FROZEN at whatever the operator last
+		// wrote, which is not necessarily healthy: deploy() waits for phase Running
+		// once, and Ready flaps back to False while Sentinel is still learning the
+		// second replica — so the freeze can capture a transient. Measured: A sat at
+		// Ready=False for a whole spec and went True 4s after the operator returned.
+		// Assert on the data plane or on `lrctl verify` (which gathers live), never on
+		// status, for the rest of this Describe.
 	})
 
 	AfterAll(func() {
