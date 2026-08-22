@@ -992,6 +992,90 @@ instance never releases and links 3-4 would have been unobservable); `HoldDataPr
 capture (1 of 3 Sentinels), where the expected behaviour is no verdict plus the LR-008 correction
 healing it — the shape LR-041 observed sub-second.
 
+### Committed coverage (milestone 4b) — `test/e2e/sentinel_quarantine_test.go`, t3e, 2026-08-23
+
+M4a proved the behaviour by hand; this milestone makes it repeatable. New Describe
+**`Sentinel Forsaken-Gated Quarantine`** (`Label("sentinel")`, three tiers, all three observed
+**green in one run on t3e against operator `47d9482`**: `Ran 3 of 122 Specs in 844.905 seconds
+… 3 Passed | 0 Failed`). It is also the first committed coverage of the **LR-042 verdict itself**,
+which shipped with none and had never executed inside the operator under test — the only other
+place a capture is staged (the LR-039 isolation tier) deliberately *pauses* the operator, which is
+exactly why the verdict had no coverage.
+
+- **Tier 1 `Full cycle`** — the regression guard: capture → `Forsaken=True/Quarantined` +
+  `quarantineAttempts: 1` → both StatefulSets at `.spec.replicas: 0` → held 60s at 2s sampling (the
+  flap guard, asserted as a *sequence* for the same reason the unit flap guard is) → pods gone →
+  **the captor's Sentinels back to `num-slaves: 2` / `num-other-sentinels: 2`** → release → Rule L
+  re-bootstraps the victim empty (`Running`, a master of its own, `DBSIZE 0` on all three, no pod
+  monitoring the foreign master) with the captor's own keys readable on all three captor pods at the
+  end. The captor-side assertion carries a **positive control**: the polluted counts (`5`/`5`) are
+  asserted *before* the healed ones, so "the captor reports 2/2" cannot pass on a capture that never
+  touched the captor.
+- **Tier 2 `Refusal when a victim pod holds data the captor does not have`** — `HoldDataPresent`:
+  reason `QuarantineRefusedDataPresent`, both StatefulSets **stay at 3** and no `quarantinedSince`
+  is armed, held 90s.
+- **Tier 4 `Latched after the attempt budget is spent`** — the `Dangerous` limit of 1 (auth off +
+  effective name `mymaster`) makes the latch deterministic in one cycle: reason `QuarantineLatched`,
+  `quarantineAttempts: 1`, and `Consistently` **200s** at 0 replicas with the marker intact — the
+  whole claim being a non-event, the window has to outlast the 120s timer that would have produced
+  the event.
+
+**Two staging findings, both of which had made a first draft of these specs unsound:**
+
+1. **The three Sentinels are not independent, so "not yet captured" cannot be asserted per pod.**
+   Sentinel propagates a higher-epoch config to its peers in its own hellos, so by the time the
+   second or third injection is issued that Sentinel may already have converged. Observed exactly
+   that: `q-hdp-victim-…-sentinel-2 already monitors the foreign master before the injection`. The
+   helper now asserts the precondition **once, over all three, before any injection**, then skips a
+   peer that has already converged, and requires ≥1 accepted `PUBLISH` (reply `1`) so the payload's
+   positive control stays load-bearing. Worth keeping: injecting all three is still right for
+   *clause 2*, but the reason a 1-of-3 injection reads as a transition is the **operator's** LR-008
+   correction, not Sentinel's own inertia — gossip alone spreads it.
+2. **A data-risk state must be staged BEFORE the capture, not after it.** The first draft broke a
+   victim pod's replication link once the capture had landed and lost the race outright: the operator
+   had already armed the quarantine and the pod was **gone** (`pods "…-redis-1" not found`) before the
+   precondition could be read. `forsakenCooldown` is 30s and staging a capture takes longer than
+   that. The mechanism is now pre-armed and is a **bogus `masterauth`** rather than a
+   `REPLICAOF <blackhole>`: `REPLICAOF NO ONE` would make the pod `role:master` and dissolve
+   `planForsaken` clause 4 entirely; a blackhole address disagrees with what the victim's Sentinels
+   believe and Sentinel's own `+fix-slave-config` repoints it back within ~`failoverTimeout`, after
+   which it full-resyncs and the keys are the captor's again — the refusal would be a race. A wrong
+   `masterauth` against a password-less master keeps `master_host` pointing at the foreign master (so
+   Sentinel sees nothing to fix) while every handshake fails on AUTH forever, and the dataset is
+   retained because a flush only happens on a **successful** resync. So the pod holds the *victim's
+   own* keys — genuinely the only copy in existence, which is what the clause exists to protect —
+   and the clause is true on the very first gather that sees the capture, so the quarantine is never
+   armed at all.
+
+**Measured on t3e (one run, for judging the timeouts):** injection → all 3 Sentinels captured
+**1.3s**; → all victim pods following **5s**; capture → `Quarantined` observed **≤45s** (the arming
+edge is still *fast*-polled, because the condition reads `False/CaptureSuspected` until
+`forsakenCooldown` elapses); verdict → both StatefulSets at 0 **≤29s** (one steady interval — LR-045
+made this real, as it predicted); armed → release **~120-150s**; release → victim `Running` **~46s**;
+**capture → victim serving again ~3m41s**, in line with M4a's 3m51s/3m58s. Tier 4: capture → `Latched`
+**88s** (cooldown + arm + one steady pass). Every `Eventually` carries roughly one extra steady
+interval per edge on top of these, and says so.
+
+**Green from birth, disclosed as such.** These specs assert behaviour that already shipped and was
+already verified live in M4a, so no tier could go red for the right reason against `47d9482` — and
+the honest red was **not obtainable**: building the pre-LR-042 operator (`e26510b`) and deploying it
+to observe tier 1 fail at the verdict assertion was attempted and blocked by the environment's
+permission policy before the deploy. What the tiers have instead of a red is the two intermediate
+positive controls above (the captor's `5`/`5` pollution before its `2`/`2` heal; the `PUBLISH` reply)
+plus tier 2's precondition **re-asserted inside its own `Consistently`**, so a green cannot be earned
+by the staged state quietly decaying into "link up, captor's copy, safe to discard". The two staging
+findings are themselves evidence the specs were run against reality rather than against their own
+assumptions.
+
+**Still uncovered — `HoldDataUnknown` / `QuarantineRefusedDataUnknown`.** Staging it needs a victim
+Redis pod that is **Ready per the kubelet** while being **unreachable from the operator**, which is
+the whole content of the clause (LR-023's blackhole-proof signal versus LR-017's blackhole). The
+kubelet's local exec probe must keep passing while operator→pod traffic is dropped, i.e. a
+traffic-shaping capability this suite does not have. **Deferred by decision to a `feat/e2e-harness`
+branch** rather than pre-built here; a pointer comment sits where the tier would go, and the
+decision matrix stays covered by `TestQuarantineDataRisk` / `TestPlanQuarantine`. Also still
+uncovered: a *partial* capture (1 of 3 Sentinels) producing no verdict.
+
 ## [LR-045] Forsaken's Steady-Cadence Requeue Was Inert for Sentinel Mode — the Mode That Can Be Forsaken
 - **Date:** 2026-08-22
 - **Commit:** (pending)
