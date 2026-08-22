@@ -573,22 +573,12 @@ func (r *LittleRedReconciler) updateStatus(ctx context.Context, littleRed *littl
 
 	fast, steady := littleRed.GetRequeueIntervals()
 
-	// Requeue if not running to check status. The interval backs off once the
-	// instance has been not-Ready long enough to count as stalled rather than
-	// converging — see requeueForNotRunning.
+	// Requeue if not running to check status
 	if littleRed.Status.Phase != littleredv1alpha1.PhaseRunning {
-		var notReadySince *metav1.Time
-		if c := meta.FindStatusCondition(littleRed.Status.Conditions, littleredv1alpha1.ConditionReady); c != nil &&
-			c.Status == metav1.ConditionFalse {
-			notReadySince = &c.LastTransitionTime
-		}
-		after := requeueForNotRunning(notReadySince, time.Now(), fast, steady)
 		log.Info("Not yet Running, requeueing",
 			"phase", littleRed.Status.Phase,
-			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total),
-			"requeueAfter", after,
-			"stalled", after != fast)
-		return ctrl.Result{RequeueAfter: after}, nil
+			"redis", fmt.Sprintf("%d/%d", littleRed.Status.Redis.Ready, littleRed.Status.Redis.Total))
+		return ctrl.Result{RequeueAfter: fast}, nil
 	}
 
 	return ctrl.Result{RequeueAfter: steady}, nil

@@ -505,8 +505,6 @@ spec:
 | `requeueIntervals.fast` | `Duration` | No | `2s` | Interval during init/recovery |
 | `requeueIntervals.steadyState` | `Duration` | No | `30s` | Interval when stable |
 
-**Stall backoff.** `fast` applies while an instance is *converging*. Once it has been `Ready=False` for five minutes the operator treats it as **stalled rather than converging** and falls back to `steadyState`, because an instance that cannot converge — a Sentinel instance captured by another deployment sharing its master name is the worked example, where recovery is declined by design — would otherwise be polled at `fast` forever, achieving nothing and drowning the log. The grace period is fixed (not a knob) and deliberately outlasts every internal recovery cooldown, so backing off can never suppress a rule that was about to fire. Only the timer slows: StatefulSet events and Sentinel events still wake the reconcile immediately. See changelog LR-042.
-
 ### 2.16 PodDisruptionBudget
 
 A [PodDisruptionBudget](https://kubernetes.io/docs/concepts/workloads/pods/disruptions/) (PDB)
