@@ -65,7 +65,16 @@ func (g *operatorGatherer) GetSentinelState(ctx context.Context, podName, ip str
 	// branch below would report every sentinel as reachable-but-bare forever:
 	// silently disabling every sn.Monitoring-gated rule (ghost-master correction,
 	// ghost-replica pruning, HasHealthyKnownReplica) while Rule 0 re-registers the
-	// whole quorum every couple of seconds. Fail loudly instead.
+	// whole quorum every couple of seconds.
+	//
+	// Refusing turns that into a NON-state: GatherReplicationState maps the error to
+	// Reachable:false, which no rule acts on destructively and which `lrctl verify`
+	// shows plainly — instead of a bare-looking sentinel, which is indistinguishable
+	// from ordinary post-restart churn. Note the error itself is swallowed there, so
+	// this is a detectable regression, not a reported one; the enforcing guard is
+	// TestSentinelGatherRequiresMasterName. Moving the check up into
+	// reconcileSentinelCluster (which has a logger and can fail the reconcile) would
+	// make it genuinely loud.
 	if g.masterName == "" {
 		return nil, fmt.Errorf("sentinel gather requires a master name, but the gatherer was built without one")
 	}
