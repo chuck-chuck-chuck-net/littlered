@@ -366,8 +366,36 @@ spec:
 			}
 		}
 
-		By("confirming instance A is still serving")
-		Expect(getPhase(instA)).To(Equal("Running"))
+		By("confirming instance A is still serving — checked on the data plane, not via status")
+		// NOT `getPhase(instA)`. The operator is paused for the duration of the
+		// injections (see BeforeAll), so the CR status is frozen at whatever it held
+		// at pause time and can say nothing at all about the injection. Asserting on
+		// it was a false signal in both directions: it could fail on a healthy
+		// instance frozen mid-flap, and it could equally pass on a captured one.
+		//
+		// "Still serving" is a data-plane claim, so make it against the data plane:
+		// exactly one of A's pods is a master, and it accepts a write and returns it.
+		aMasters := 0
+		for _, p := range []string{instA + "-redis-0", instA + "-redis-1", instA + "-redis-2"} {
+			out, err := utils.Run(exec.Command("kubectl", "exec", p, "-n", testNamespace,
+				"-c", "redis", "--", "redis-cli", "INFO", "replication"))
+			Expect(err).NotTo(HaveOccurred())
+			if !strings.Contains(out, "role:master") {
+				continue
+			}
+			aMasters++
+			key := "iso-serving-" + instA
+			set, err := utils.Run(exec.Command("kubectl", "exec", p, "-n", testNamespace,
+				"-c", "redis", "--", "redis-cli", "SET", key, "ok"))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(set)).To(Equal("OK"), "%s is master but refused a write", p)
+			got, err := utils.Run(exec.Command("kubectl", "exec", p, "-n", testNamespace,
+				"-c", "redis", "--", "redis-cli", "GET", key))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(got)).To(Equal("ok"))
+		}
+		Expect(aMasters).To(Equal(1),
+			"instance A should have exactly one master of its own; found %d", aMasters)
 
 		By("lrctl verify reports the scoped name and no foreign contact")
 		report := lrctlVerify(instA)
