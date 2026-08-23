@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -85,7 +86,17 @@ func NewClusterClient(password string, tlsEnabled bool) *ClusterClient {
 	}
 }
 
-// getClient creates a redis client for the given address
+// getClient creates a redis client with the LONG (DefaultTimeout) budget for the given
+// address. Reserved for the slot-migration primitives that legitimately need it:
+// MIGRATE carries its own per-call transfer budget (spec.cluster.reshardMigrateTimeoutMillis),
+// and the pipelined SETSLOT / COUNTKEYSINSLOT calls issue up to one command per slot of a
+// whole shard range (5461 at shards=3) in a single round trip. Bounding those at
+// ProbeTimeout would abort a legitimate in-flight reshard — the hazard LR-040's exemption
+// was written to avoid — and they are reachable only from the LR-018 reshard executor and
+// the LR-025 migration driver, both re-entrant and resumable from the cluster's own markers.
+//
+// Everything else on this client is a single-round-trip control command and must use
+// getBoundedClient. See LR-046.
 func (c *ClusterClient) getClient(addr string) *redis.Client {
 	return redis.NewClient(&redis.Options{
 		Addr:        addr,
@@ -96,9 +107,54 @@ func (c *ClusterClient) getClient(addr string) *redis.Client {
 	})
 }
 
+// getBoundedClient is the cluster-mode twin of (*SentinelClient).newBoundedClient: a
+// client for ONE single-shot control command against ONE address, with all three of
+// DialTimeout/ReadTimeout/WriteTimeout set to ProbeTimeout.
+//
+// Both halves of the bound are load-bearing and neither is sufficient alone (LR-040's
+// measured finding, re-confirmed here for cluster mode). A context deadline alone is
+// inert: go-redis reports `context deadline exceeded` at the deadline but still spends
+// roughly another DefaultTimeout unwinding, so a 3s ctx over a 5s ReadTimeout still costs
+// ~5s of wall clock. The client timeouts alone leave the pool's dial-retry loop unbounded
+// — it breaks early only on ctx.Done() — which is the ~25s-per-call (5 attempts x
+// DialTimeout) shape that starved a cluster reconcile for ~100s on a blackholing dead pod
+// IP during a rolling update. So the ctx bounds the retry loop, the timeouts bound each
+// individual attempt. See boundedCtx and LR-046.
+func (c *ClusterClient) getBoundedClient(addr string) *redis.Client {
+	return redis.NewClient(&redis.Options{
+		Addr:         addr,
+		Password:     c.password,
+		DialTimeout:  ProbeTimeout,
+		ReadTimeout:  ProbeTimeout,
+		WriteTimeout: ProbeTimeout,
+		TLSConfig:    makeTLSConfig(c.tlsEnabled),
+	})
+}
+
+// boundedCtx caps one single-shot control command at ProbeTimeout. It is applied inside
+// the client rather than left to callers so the bound cannot be forgotten at a call site
+// (LR-041's lesson): the cluster gather already wrapped its three probes (LR-012), but the
+// repair-loop commands — CLUSTER MEET/FORGET/REPLICATE/ADDSLOTS/FAILOVER — had no deadline
+// at all. Nesting inside a caller's own deadline is harmless: the shorter one wins.
+func boundedCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, ProbeTimeout)
+}
+
+// longBudgetCtx caps one deliberately-long slot-migration call. The *per-attempt* budget
+// stays DefaultTimeout (getClient) because the command legitimately needs it, but the
+// pool's retry loop still has to be bounded: measured against a blackholing address a
+// pipelined SETSLOT took 20.15s — four attempts x DefaultTimeout — because go-redis breaks
+// out of its retry loop only on ctx.Done(). `budget` must therefore cover one attempt plus
+// whatever transfer budget the caller asked for, and nothing more. See LR-046.
+func longBudgetCtx(ctx context.Context, budget time.Duration) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(ctx, budget)
+}
+
 // GetMyID returns the cluster node ID for the node at the given address
 func (c *ClusterClient) GetMyID(ctx context.Context, addr string) (string, error) {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	result, err := client.Do(ctx, "CLUSTER", "MYID").Result()
@@ -116,7 +172,9 @@ func (c *ClusterClient) GetMyID(ctx context.Context, addr string) (string, error
 
 // GetClusterNodes returns parsed CLUSTER NODES output
 func (c *ClusterClient) GetClusterNodes(ctx context.Context, addr string) ([]ClusterNodeInfo, error) {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	result, err := client.ClusterNodes(ctx).Result()
@@ -129,7 +187,9 @@ func (c *ClusterClient) GetClusterNodes(ctx context.Context, addr string) ([]Clu
 
 // GetClusterInfo returns parsed CLUSTER INFO output
 func (c *ClusterClient) GetClusterInfo(ctx context.Context, addr string) (*ClusterInfo, error) {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	result, err := client.ClusterInfo(ctx).Result()
@@ -142,7 +202,9 @@ func (c *ClusterClient) GetClusterInfo(ctx context.Context, addr string) (*Clust
 
 // ClusterMeet introduces a new node to the cluster
 func (c *ClusterClient) ClusterMeet(ctx context.Context, addr, newHost string, newPort int) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	err := client.ClusterMeet(ctx, newHost, strconv.Itoa(newPort)).Err()
@@ -155,7 +217,9 @@ func (c *ClusterClient) ClusterMeet(ctx context.Context, addr, newHost string, n
 
 // ClusterForget removes a node from the cluster's known nodes
 func (c *ClusterClient) ClusterForget(ctx context.Context, addr, nodeIDToForget string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	err := client.ClusterForget(ctx, nodeIDToForget).Err()
@@ -168,7 +232,9 @@ func (c *ClusterClient) ClusterForget(ctx context.Context, addr, nodeIDToForget 
 
 // ClusterAddSlots assigns slots to the node at the given address
 func (c *ClusterClient) ClusterAddSlots(ctx context.Context, addr string, slots ...int) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	err := client.ClusterAddSlots(ctx, slots...).Err()
@@ -181,7 +247,9 @@ func (c *ClusterClient) ClusterAddSlots(ctx context.Context, addr string, slots 
 
 // ClusterReplicate makes the node at replicaAddr a replica of the given master
 func (c *ClusterClient) ClusterReplicate(ctx context.Context, replicaAddr, masterNodeID string) error {
-	client := c.getClient(replicaAddr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(replicaAddr)
 	defer func() { _ = client.Close() }()
 
 	err := client.ClusterReplicate(ctx, masterNodeID).Err()
@@ -194,7 +262,9 @@ func (c *ClusterClient) ClusterReplicate(ctx context.Context, replicaAddr, maste
 
 // ClusterResetSoft performs a soft reset of the cluster node
 func (c *ClusterClient) ClusterResetSoft(ctx context.Context, addr string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	err := client.Do(ctx, "CLUSTER", "RESET", "SOFT").Err()
@@ -207,7 +277,9 @@ func (c *ClusterClient) ClusterResetSoft(ctx context.Context, addr string) error
 
 // ClusterFailover initiates a manual failover
 func (c *ClusterClient) ClusterFailover(ctx context.Context, addr string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	err := client.ClusterFailover(ctx).Err()
@@ -221,7 +293,9 @@ func (c *ClusterClient) ClusterFailover(ctx context.Context, addr string) error 
 // ClusterFailoverTakeover initiates a manual failover with TAKEOVER option
 // This is used when the master is not available or quorum is lost
 func (c *ClusterClient) ClusterFailoverTakeover(ctx context.Context, addr string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 
 	// go-redis ClusterFailover doesn't easily support arguments in all versions/wrappers,

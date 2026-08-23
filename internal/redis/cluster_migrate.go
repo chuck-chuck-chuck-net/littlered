@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 )
@@ -55,7 +56,9 @@ const (
 // ClusterSetSlotImporting marks slot as importing from sourceNodeID. Run on the
 // destination (importing) node.
 func (c *ClusterClient) ClusterSetSlotImporting(ctx context.Context, addr string, slot int, sourceNodeID string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	if err := client.Do(ctx, "CLUSTER", "SETSLOT", slot, "IMPORTING", sourceNodeID).Err(); err != nil {
 		return fmt.Errorf("SETSLOT %d IMPORTING %s: %w", slot, sourceNodeID, err)
@@ -66,7 +69,9 @@ func (c *ClusterClient) ClusterSetSlotImporting(ctx context.Context, addr string
 // ClusterSetSlotMigrating marks slot as migrating to destNodeID. Run on the source
 // (migrating) node.
 func (c *ClusterClient) ClusterSetSlotMigrating(ctx context.Context, addr string, slot int, destNodeID string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	if err := client.Do(ctx, "CLUSTER", "SETSLOT", slot, "MIGRATING", destNodeID).Err(); err != nil {
 		return fmt.Errorf("SETSLOT %d MIGRATING %s: %w", slot, destNodeID, err)
@@ -77,7 +82,9 @@ func (c *ClusterClient) ClusterSetSlotMigrating(ctx context.Context, addr string
 // ClusterSetSlotNode assigns definitive ownership of slot to ownerNodeID. Broadcast to
 // every master so gossip converges promptly; issue on source and destination last.
 func (c *ClusterClient) ClusterSetSlotNode(ctx context.Context, addr string, slot int, ownerNodeID string) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	if err := client.Do(ctx, "CLUSTER", "SETSLOT", slot, "NODE", ownerNodeID).Err(); err != nil {
 		return fmt.Errorf("SETSLOT %d NODE %s: %w", slot, ownerNodeID, err)
@@ -88,7 +95,9 @@ func (c *ClusterClient) ClusterSetSlotNode(ctx context.Context, addr string, slo
 // ClusterSetSlotStable clears any importing/migrating state on slot. Used to recover a
 // slot left mid-dance by an interrupted reconcile before restarting the migration.
 func (c *ClusterClient) ClusterSetSlotStable(ctx context.Context, addr string, slot int) error {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	if err := client.Do(ctx, "CLUSTER", "SETSLOT", slot, "STABLE").Err(); err != nil {
 		return fmt.Errorf("SETSLOT %d STABLE: %w", slot, err)
@@ -98,7 +107,9 @@ func (c *ClusterClient) ClusterSetSlotStable(ctx context.Context, addr string, s
 
 // ClusterCountKeysInSlot returns the number of keys currently in slot on the node.
 func (c *ClusterClient) ClusterCountKeysInSlot(ctx context.Context, addr string, slot int) (int, error) {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	n, err := client.ClusterCountKeysInSlot(ctx, slot).Result()
 	if err != nil {
@@ -109,7 +120,9 @@ func (c *ClusterClient) ClusterCountKeysInSlot(ctx context.Context, addr string,
 
 // ClusterGetKeysInSlot returns up to count keys currently stored in slot on the node.
 func (c *ClusterClient) ClusterGetKeysInSlot(ctx context.Context, addr string, slot, count int) ([]string, error) {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	keys, err := client.ClusterGetKeysInSlot(ctx, slot, count).Result()
 	if err != nil {
@@ -125,6 +138,11 @@ func (c *ClusterClient) MigrateKeys(ctx context.Context, addr, destHost string, 
 	if len(keys) == 0 {
 		return nil
 	}
+	// One attempt's worth of dial/protocol overhead plus the transfer budget the caller
+	// asked for: MIGRATE's own timeout is timeoutMS, so the ctx must not be tighter than
+	// that, and bounding the retry loop is all that is needed here (LR-046).
+	ctx, cancel := longBudgetCtx(ctx, DefaultTimeout+time.Duration(timeoutMS)*time.Millisecond)
+	defer cancel()
 	client := c.getClient(addr)
 	defer func() { _ = client.Close() }()
 
@@ -150,6 +168,10 @@ func (c *ClusterClient) setSlotsPipelined(ctx context.Context, addr string, slot
 	if len(slots) == 0 {
 		return nil
 	}
+	// Long per-attempt budget (one round trip carrying up to a whole shard range of
+	// SETSLOTs), but exactly one attempt's worth of wall clock (LR-046).
+	ctx, cancel := longBudgetCtx(ctx, DefaultTimeout)
+	defer cancel()
 	client := c.getClient(addr)
 	defer func() { _ = client.Close() }()
 	_, err := client.Pipelined(ctx, func(pipe redis.Pipeliner) error {
@@ -198,6 +220,9 @@ func (c *ClusterClient) ClusterCountKeysInSlots(ctx context.Context, addr string
 	if len(slots) == 0 {
 		return out, nil
 	}
+	// Same shape as setSlotsPipelined: long per attempt, one attempt of wall clock.
+	ctx, cancel := longBudgetCtx(ctx, DefaultTimeout)
+	defer cancel()
 	client := c.getClient(addr)
 	defer func() { _ = client.Close() }()
 	cmds := make([]*redis.IntCmd, len(slots))
@@ -233,7 +258,9 @@ type MigrationTask struct {
 // Redis 8.4+ only; on older engines this errors (unknown subcommand) and the caller
 // falls back to the baseline dance.
 func (c *ClusterClient) ClusterMigrationImport(ctx context.Context, destAddr string, ranges [][2]int) (string, error) {
-	client := c.getClient(destAddr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(destAddr)
 	defer func() { _ = client.Close() }()
 
 	args := make([]any, 0, 3+2*len(ranges))
@@ -251,7 +278,9 @@ func (c *ClusterClient) ClusterMigrationImport(ctx context.Context, destAddr str
 // ClusterMigrationStatusAll returns all current/completed migration tasks reported by
 // the node. Parsing is lenient (see parseMigrationTasks) to tolerate RESP2/RESP3 shapes.
 func (c *ClusterClient) ClusterMigrationStatusAll(ctx context.Context, addr string) ([]MigrationTask, error) {
-	client := c.getClient(addr)
+	ctx, cancel := boundedCtx(ctx)
+	defer cancel()
+	client := c.getBoundedClient(addr)
 	defer func() { _ = client.Close() }()
 	reply, err := client.Do(ctx, "CLUSTER", "MIGRATION", "STATUS", "ALL").Result()
 	if err != nil {
