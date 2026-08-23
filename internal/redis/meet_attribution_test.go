@@ -66,18 +66,19 @@ func TestAttributeMeetTarget(t *testing.T) {
 			want: MeetAllowFresh,
 		},
 		{
-			// An isolated survivor of ours that still owns EXACTLY the slot range this
-			// instance assigns to its pod name (e.g. its peers were FORGOTten as ghosts
-			// in Step 2). Attributable by slot alignment, and it must be MEETed back or
-			// the partition never heals.
-			name: "isolated survivor owning exactly its own shard range",
+			// An isolated survivor of ours, still owning its shard's range (e.g. its
+			// peers were FORGOTten as ghosts in Step 2). It must be MEETed back or the
+			// partition never heals — admitted because it is isolated, NOT because the
+			// range aligns (slot alignment is not attribution; see the collapse note in
+			// AttributeMeetTarget).
+			name: "isolated survivor owning its own shard range",
 			c: MeetCandidate{
 				PodName: podShard10, PodIP: "10.0.0.11", NodeID: "n1",
 				Identified: true, ViewKnown: true,
 				KnownIDs: []string{"n1"},
 				Slots:    []string{rangeShard1},
 			},
-			want: MeetAllowSurvivor,
+			want: MeetAllowFresh,
 		},
 		{
 			// THE HAZARD FIXTURE (LR-043). A recycled pod IP, handed to us stale by the
@@ -94,37 +95,53 @@ func TestAttributeMeetTarget(t *testing.T) {
 			want: MeetDenyUnattributed,
 		},
 		{
-			// DISCLOSED RESIDUAL, pinned here so it stays visible: GenerateSlotRanges is
-			// a pure function of `shards`, so two instances with the same shard count
-			// have byte-identical ranges. A FOREIGN instance's shard-1 master that is
-			// isolated (peers dead or forgotten — precisely the LR-023 wipe state, which
-			// this operator's own recovery manufactures) and owns exactly 5462-10922 is
-			// therefore indistinguishable from ours by slot alignment, and is ALLOWED
-			// here. Worse than the pristine residual (it arrives owning slots and
-			// carrying a config epoch, so it can take live slots off our masters), which
-			// is why the primary guard is the uncached API-server confirmation that the
-			// address is still our pod's — not this inference. See changelog LR-043.
-			name: "foreign isolated slot owner whose range happens to align (same shards)",
+			// LR-018 CONSOLIDATED-SHARD STATE, seen in the field (debug-0720, stuck ~19h):
+			// an own master owning MORE than one shard range. If it is also isolated and
+			// partitioned, Step 1 must still MEET it back — refusing it is a repair step
+			// that can never fire, the LR-018/LR-023 shape. Allowed as an isolated node.
+			name: "isolated own master owning two consolidated ranges",
+			c: MeetCandidate{
+				PodName: podShard10, PodIP: "10.0.0.111", NodeID: "n1",
+				Identified: true, ViewKnown: true,
+				KnownIDs: []string{"n1"},
+				Slots:    []string{"0-5461", rangeShard1},
+			},
+			want: MeetAllowFresh,
+		},
+		{
+			// THE DELIBERATE CONCESSION, pinned so it stays visible. A FOREIGN
+			// instance's isolated master — peers dead or forgotten, precisely the LR-023
+			// wipe state this operator's own recovery manufactures — is allowed, and no
+			// bus-state predicate can do better: it looks exactly like our own isolated
+			// pods, whatever slots it holds (a slot-alignment check bought ~nothing here,
+			// since GenerateSlotRanges is a pure function of `shards`, while refusing
+			// legitimate own nodes — hence removed). This node arrives owning slots and
+			// carrying a config epoch, so it CAN take live slots off our masters: that is
+			// why confirmPodIP, not this predicate, is the primary guard. LR-043.
+			name: "foreign isolated slot owner (indistinguishable from our own survivor)",
 			c: MeetCandidate{
 				PodName: podShard10, PodIP: ipOurDeadPod, NodeID: "otherinstance",
 				Identified: true, ViewKnown: true,
 				KnownIDs: []string{"otherinstance"},
 				Slots:    []string{rangeShard1},
 			},
-			want: MeetAllowSurvivor,
+			want: MeetAllowFresh,
 		},
 		{
-			// The narrower variant: a foreign single-node cluster (shards:1) that owns
-			// slots and has no peers. Isolated, but the range does not align with what
-			// this instance assigns to that pod name.
-			name: "foreign isolated slot owner with a misaligned range",
+			// THE COST of collapsing the isolated clauses, stated rather than absorbed: a
+			// foreign single-node cluster (shards:1) owning 0-16383 with no peers used to
+			// be DENIED on range mismatch and is now allowed. That deny was the clause's
+			// only genuine one — a foreign cluster with a DIFFERENT shard count — and it
+			// is given up in exchange for never refusing a legitimate isolated own node
+			// (see the LR-018 row). Reachable only inside the confirmPodIP window.
+			name: "foreign isolated slot owner with a misaligned range (deny given up)",
 			c: MeetCandidate{
 				PodName: podShard10, PodIP: ipOurDeadPod, NodeID: "otherid",
 				Identified: true, ViewKnown: true,
 				KnownIDs: []string{"otherid"},
 				Slots:    []string{"0-16383"},
 			},
-			want: MeetDenyUnattributed,
+			want: MeetAllowFresh,
 		},
 		{
 			name: "no address",
@@ -155,22 +172,24 @@ func TestAttributeMeetTarget(t *testing.T) {
 			want: MeetDenyNoView,
 		},
 		{
-			// A legacy ({name}-cluster-N) or otherwise non-per-shard pod name has no
-			// expected range, so the survivor clause cannot attribute it.
-			name: "isolated slot owner with a non-per-shard pod name",
+			// A legacy ({name}-cluster-N) pod name has no per-shard range to compare, so
+			// the removed slot-alignment clause could never attribute it and refused it —
+			// which would have blocked the legacy→per-shard migration's own MEETs. Now
+			// allowed as isolated, uniformly with every other isolated node.
+			name: "isolated slot owner with a legacy (non-per-shard) pod name",
 			c: MeetCandidate{
 				PodName: "lr-cluster-1", PodIP: ipOurDeadPod, NodeID: "n1",
 				Identified: true, ViewKnown: true,
 				KnownIDs: []string{"n1"},
 				Slots:    []string{rangeShard1},
 			},
-			want: MeetDenyUnattributed,
+			want: MeetAllowFresh,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := AttributeMeetTarget(tc.c, ourIDs, 3)
+			got := AttributeMeetTarget(tc.c, ourIDs)
 			if got != tc.want {
 				t.Errorf("AttributeMeetTarget = %q, want %q", got, tc.want)
 			}
@@ -211,7 +230,7 @@ func TestPlanPartitionMeets(t *testing.T) {
 	}
 	gt.Partitions = [][]string{{"n0", "n2"}, {"n1"}, {idForeign1}}
 
-	plan := gt.PlanPartitionMeets(3)
+	plan := gt.PlanPartitionMeets()
 
 	if plan.Seed == nil || plan.Seed.NodeID != "n0" {
 		t.Fatalf("seed = %+v, want the largest partition's node n0 (verdict %q)", plan.Seed, plan.SeedVerdict)
@@ -264,7 +283,7 @@ func TestPlanPartitionMeetsRefusesUnattributableSeed(t *testing.T) {
 	}
 	gt.Partitions = [][]string{{idForeign1}, {"n1"}}
 
-	plan := gt.PlanPartitionMeets(3)
+	plan := gt.PlanPartitionMeets()
 	if plan.Seed != nil {
 		t.Fatalf("seed = %+v, want nil (unattributable seed)", plan.Seed)
 	}

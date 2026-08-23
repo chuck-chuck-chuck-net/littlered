@@ -198,14 +198,15 @@ const (
 	// MeetAllowMember: the candidate already names another node of ours in its own
 	// gossip view — a genuinely partitioned or rejoining node of this instance.
 	MeetAllowMember MeetVerdict = "member"
-	// MeetAllowFresh: the candidate is isolated (single-entry node table) and owns no
-	// slots — what a new, restarted or wiped pod of ours looks like. Bootstrap's
-	// normal case.
-	MeetAllowFresh MeetVerdict = "fresh"
-	// MeetAllowSurvivor: the candidate is isolated but owns exactly the slot range
-	// this instance assigns to its pod name — an own survivor whose peers were
-	// forgotten (Step 2), attributable by slot alignment.
-	MeetAllowSurvivor MeetVerdict = "survivor"
+	// MeetAllowFresh: the candidate is ISOLATED — its node table names nobody but
+	// itself. That is what a new, restarted or wiped pod of ours looks like
+	// (bootstrap's normal case), what a survivor whose peers were FORGOTten looks
+	// like, and what an LR-018 consolidated master cut off from its peers looks
+	// like. It is also what a foreign isolated node looks like: an isolated node
+	// cannot be attributed from bus state at all, because the cluster bus carries
+	// no instance identity. Admitting it is a deliberate concession, and the reason
+	// confirmPodIP (not this predicate) is the primary guard.
+	MeetAllowFresh MeetVerdict = "isolated"
 
 	// MeetDenyNoAddress: no pod IP to dial.
 	MeetDenyNoAddress MeetVerdict = "no-address"
@@ -222,7 +223,7 @@ const (
 
 // Allowed reports whether the verdict permits a CLUSTER MEET.
 func (v MeetVerdict) Allowed() bool {
-	return v == MeetAllowMember || v == MeetAllowFresh || v == MeetAllowSurvivor
+	return v == MeetAllowMember || v == MeetAllowFresh
 }
 
 // MeetCandidate is the evidence AttributeMeetTarget decides on. Every field comes from
@@ -251,15 +252,20 @@ type MeetCandidate struct {
 // because a foreign pod that shares our password answers our probes perfectly well.
 //
 // ourNodeIDs is the set of node IDs the operator identified for its own pod names this
-// pass; shards is the instance's configured shard count (used only by the survivor
-// clause — pass 0 to disable it).
+// pass.
 //
-// Known residual: an address answering as a *pristine* Redis (single-entry node table,
-// no slots) is indistinguishable from our own fresh pod, because that is exactly what
-// our own fresh pods look like and the cluster bus carries no instance identity and no
-// authentication. Merging a pristine node costs nothing (no data, no slots, no epoch);
-// the established-foreign-cluster merge, which does, is closed.
-func AttributeMeetTarget(c MeetCandidate, ourNodeIDs map[string]bool, shards int) MeetVerdict {
+// What this closes and what it concedes. It closes the ESTABLISHED-foreign-cluster
+// merge: a node that names peers, none of them ours, is refused — and that is the case
+// that costs, because such a node arrives owning slots and carrying a config epoch. It
+// concedes the ISOLATED case entirely: an isolated node cannot be attributed from bus
+// state, since the bus carries no instance identity and no authentication, and our own
+// pods are routinely isolated (fresh, wiped, post-FORGET survivor, LR-018 consolidated
+// master cut off from its peers). Slot alignment was tried here and removed: it is a
+// pure function of `shards`, so it admitted an aligned foreign node just as readily
+// (~no safety) while REFUSING a legitimate own master owning more than one range — the
+// LR-018 state, i.e. a repair step that can never fire. The isolated case is protected
+// by confirmPodIP instead, which is why that is the primary guard.
+func AttributeMeetTarget(c MeetCandidate, ourNodeIDs map[string]bool) MeetVerdict {
 	if c.PodIP == "" {
 		return MeetDenyNoAddress
 	}
@@ -288,34 +294,9 @@ func AttributeMeetTarget(c MeetCandidate, ourNodeIDs map[string]bool, shards int
 		return MeetDenyUnattributed
 	}
 
-	// Isolated. A pristine node is our fresh/wiped pod; a slot owner is only ours if it
-	// owns exactly the range this instance assigns to that pod name.
-	if len(c.Slots) == 0 {
-		return MeetAllowFresh
-	}
-	if ownsExactlyItsShardRange(c.PodName, c.Slots, shards) {
-		return MeetAllowSurvivor
-	}
-	return MeetDenyUnattributed
-}
-
-// ownsExactlyItsShardRange reports whether slots is exactly the single slot range this
-// instance assigns to podName's shard. A fragmented or misaligned owner is not
-// attributable this way (Step 3 refuses such topologies anyway).
-func ownsExactlyItsShardRange(podName string, slots []string, shards int) bool {
-	if shards <= 0 || len(slots) != 1 {
-		return false
-	}
-	k := ShardIndexFromPodName(podName)
-	if k < 0 || k >= shards {
-		return false
-	}
-	ranges := GenerateSlotRanges(shards)
-	start, end, err := ParseSlotRange(slots[0])
-	if err != nil {
-		return false
-	}
-	return start == ranges[k].Start && end == ranges[k].End
+	// Isolated: names nobody but itself. Allowed regardless of the slots it holds —
+	// see the concession in the doc comment above.
+	return MeetAllowFresh
 }
 
 // nodeFlagsFailed reports whether a CLUSTER NODES entry's flags exclude it from the
@@ -384,7 +365,7 @@ type MeetPlan struct {
 // MEET is issued *at* the seed, so an unattributable seed would be told to meet all of
 // our pods — the same cluster merge in the other direction. Targets are returned in
 // deterministic pod-name order.
-func (gt *ClusterGroundTruth) PlanPartitionMeets(shards int) MeetPlan {
+func (gt *ClusterGroundTruth) PlanPartitionMeets() MeetPlan {
 	ourIDs := make(map[string]bool, len(gt.Nodes))
 	for _, n := range gt.Nodes {
 		if n.Reachable && n.NodeID != "" {
@@ -398,7 +379,7 @@ func (gt *ClusterGroundTruth) PlanPartitionMeets(shards int) MeetPlan {
 		plan.SeedVerdict = MeetDenyUnidentified
 		return plan
 	}
-	plan.SeedVerdict = AttributeMeetTarget(gt.meetCandidate(seed), ourIDs, shards)
+	plan.SeedVerdict = AttributeMeetTarget(gt.meetCandidate(seed), ourIDs)
 	if !plan.SeedVerdict.Allowed() {
 		return plan
 	}
@@ -415,7 +396,7 @@ func (gt *ClusterGroundTruth) PlanPartitionMeets(shards int) MeetPlan {
 		if n.NodeID != "" && n.NodeID == seed.NodeID {
 			continue
 		}
-		v := AttributeMeetTarget(gt.meetCandidate(n), ourIDs, shards)
+		v := AttributeMeetTarget(gt.meetCandidate(n), ourIDs)
 		if v.Allowed() {
 			plan.Targets = append(plan.Targets, n)
 			continue

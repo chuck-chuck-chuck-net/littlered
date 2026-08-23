@@ -310,7 +310,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		// and LR-039 proved pod IPs really are recycled across unrelated instances on a
 		// shared pod network. So every address (targets AND the seed the command is
 		// issued at) must first be attributed to this instance. See LR-043.
-		plan := gt.PlanPartitionMeets(shards)
+		plan := gt.PlanPartitionMeets()
 		// Report every suppressed MEET — a silently skipped one is what would make a
 		// future partition-healing bug undiagnosable. Split by severity so the routine
 		// churn case (a pod we could not probe this pass) does not bury the one that
@@ -841,9 +841,10 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 //     that pod's current IP at the API server (the primary guard: Kubernetes holds at most
 //     one live pod per IP, so no separate confirm read is needed here);
 //   - attribution as defence in depth, for the residual window where the API server still
-//     reports a terminating pod at an address the CNI has already handed on. At bootstrap
-//     our own pods are pristine (single-entry node table, no slots) or already know the
-//     seed, so nothing legitimate is suppressed.
+//     reports a terminating pod at an address the CNI has already handed on. It refuses a
+//     node that names peers of which none are ours (an established foreign cluster); at
+//     bootstrap our own pods are isolated or already know the seed, so nothing legitimate
+//     is suppressed.
 func (r *LittleRedReconciler) bootstrapMeetRound(
 	ctx context.Context,
 	littleRed *littleredv1alpha1.LittleRed,
@@ -853,7 +854,6 @@ func (r *LittleRedReconciler) bootstrapMeetRound(
 	candidates map[string]redisclient.MeetCandidate,
 ) bool {
 	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
-	shards := clusterShardCount(littleRed)
 
 	seedName := shardMasterPodName(littleRed.Name, 0)
 	seedAddr := fmt.Sprintf("%s:%d", podIPs[seedName], littleredv1alpha1.RedisPort)
@@ -862,7 +862,7 @@ func (r *LittleRedReconciler) bootstrapMeetRound(
 		ourIDs[id] = true
 	}
 
-	if v := redisclient.AttributeMeetTarget(candidates[seedName], ourIDs, shards); !v.Allowed() {
+	if v := redisclient.AttributeMeetTarget(candidates[seedName], ourIDs); !v.Allowed() {
 		auditLog.Info("Bootstrap: refusing to seed CLUSTER MEET from an unattributable address",
 			"pod", seedName, "seed", seedAddr, "verdict", v)
 		return false
@@ -872,7 +872,7 @@ func (r *LittleRedReconciler) bootstrapMeetRound(
 		if ref.Name == seedName {
 			continue
 		}
-		if v := redisclient.AttributeMeetTarget(candidates[ref.Name], ourIDs, shards); !v.Allowed() {
+		if v := redisclient.AttributeMeetTarget(candidates[ref.Name], ourIDs); !v.Allowed() {
 			auditLog.Info("Bootstrap: skipping CLUSTER MEET, target not attributable to this instance",
 				"pod", ref.Name, "target", podIPs[ref.Name], "verdict", v)
 			continue

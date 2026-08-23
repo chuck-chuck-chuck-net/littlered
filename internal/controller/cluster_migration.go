@@ -308,11 +308,14 @@ func (r *LittleRedReconciler) migrateLegacyCluster(
 // the check lives here, where the address can be probed directly — one CLUSTER NODES per
 // un-met pod, in the Meet phase only.
 //
-// The seed is deliberately NOT put through the same predicate: it is a legacy
-// {name}-cluster-N pod of an already self-consistent cluster (identified this pass and
-// gated by the LegacyShapePreserved facts), and the predicate's survivor clause is keyed
-// on per-shard pod names, so a legitimate single-node legacy cluster (shards=1,
-// replicasPerShard=0) would be refused and the migration would never start.
+// The seed is NOT put through the same two guards: it is a legacy {name}-cluster-N pod of
+// an already self-consistent cluster, identified this pass and gated by the
+// LegacyShapePreserved facts, and it is the node the migration's whole ground truth is
+// anchored on (restrictToLegacyMesh keys the mesh off the legacy partition). Note the
+// original reason for this exemption — that the attribution predicate's slot-alignment
+// clause would refuse a legitimate single-node legacy cluster — has since dissolved with
+// that clause's removal; gating the seed too is now cheap and safe, and is left as a
+// follow-up rather than folded in here unreasoned.
 func (r *LittleRedReconciler) executeMigrationMeets(
 	ctx context.Context,
 	lr *littleredv1alpha1.LittleRed,
@@ -357,7 +360,7 @@ func (r *LittleRedReconciler) executeMigrationMeets(
 			auditLog.Info("Migration MEET: could not read the target's own cluster view; not meeting it this pass",
 				"target", host, "error", viewErr)
 		}
-		if v := redisclient.AttributeMeetTarget(cand, ourIDs, clusterShardCount(lr)); !v.Allowed() {
+		if v := redisclient.AttributeMeetTarget(cand, ourIDs); !v.Allowed() {
 			auditLog.Info("Migration MEET: skipping target not attributable to this instance",
 				"target", host, "pod", cand.PodName, "nodeID", cand.NodeID, "verdict", v)
 			continue
