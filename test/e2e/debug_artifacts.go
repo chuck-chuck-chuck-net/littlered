@@ -124,6 +124,12 @@ func CollectDebugArtifacts(testNamespace, crName, chaosPodName string) {
 	// Collect general cluster state
 	collectClusterState(debugDir, testNamespace)
 
+	// Collect each pod's OWN view of the topology, plus the computed verdict when
+	// an lrctl binary is available. See debug_ground_truth.go for why neither the
+	// CR status nor the pod logs can substitute for this.
+	collectRedisGroundTruth(debugDir, testNamespace)
+	collectLrctlVerify(debugDir, testNamespace, crName)
+
 	// Write test metadata
 	writeTestMetadata(debugDir, testNamespace, crName, chaosPodName)
 

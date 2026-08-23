@@ -24,6 +24,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -80,7 +81,57 @@ spec:
 	return podName, err
 }
 
-// waitForChaosClientComplete waits for the chaos client pod to complete
+// chaosClientLogTailLines is how much of the chaos client's log rides along in a
+// failure message. The client prints its configuration, then one line per
+// connection attempt, then its final results — so the last ~20 lines carry either
+// the metrics block or the reason it never got that far, which is precisely the
+// distinction a bare "METRICS_JSON not found" erases.
+const chaosClientLogTailLines = 20
+
+// chaosClientLogTail returns the last chaosClientLogTailLines of the pod's log,
+// prefixed for embedding in an error message. It never fails: a diagnostic that
+// can itself error is a diagnostic that gets dropped from the error path.
+func chaosClientLogTail(namespace, podName string) string {
+	cmd := exec.Command("kubectl", "logs", podName, "-n", namespace,
+		"--tail", strconv.Itoa(chaosClientLogTailLines), "--timestamps")
+	out, err := cmd.CombinedOutput()
+	if err != nil && len(out) == 0 {
+		return fmt.Sprintf("\n--- last %d log lines of %s: unavailable (%v) ---",
+			chaosClientLogTailLines, podName, err)
+	}
+	return fmt.Sprintf("\n--- last %d log lines of %s ---\n%s--- end of log tail ---",
+		chaosClientLogTailLines, podName, string(out))
+}
+
+// chaosClientTerminationDetail describes how the pod's container exited, for the
+// failure message. Best-effort: an empty string when kubectl cannot tell us.
+func chaosClientTerminationDetail(namespace, podName string) string {
+	cmd := exec.Command("kubectl", "get", "pod", podName, "-n", namespace, "-o",
+		"jsonpath={.status.containerStatuses[0].state.terminated.exitCode}"+
+			"{\" \"}{.status.containerStatuses[0].state.terminated.reason}")
+	out, err := utils.Run(cmd)
+	if err != nil || strings.TrimSpace(out) == "" {
+		return ""
+	}
+	return " (container exit: " + strings.TrimSpace(out) + ")"
+}
+
+// waitForChaosClientComplete waits for the chaos client pod to finish and reports
+// whether it finished *successfully*.
+//
+// Succeeded and Failed are deliberately NOT collapsed. A client that exited
+// non-zero is a different fact from one that completed its run, and treating them
+// alike is what turned a client-side connectivity timeout into the opaque
+// "METRICS_JSON not found in pod logs" from the caller's next line — the real
+// cause (`Failed to create client: timeout waiting for Redis connectivity`) was
+// sitting in the pod's log the whole time, so it now rides along in the error.
+//
+// The client exits non-zero in exactly two ways, and both are genuine spec
+// failures: 1 when it never reached the store, 2 when it detected data
+// corruption. The corruption case prints METRICS_JSON *before* exiting, so the
+// log tail below carries the metrics block as well as "CRITICAL: Data corruption
+// detected!" — strictly more than the caller's DataCorruptions assertion would
+// have reported.
 func waitForChaosClientComplete(namespace, podName string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -90,12 +141,19 @@ func waitForChaosClientComplete(namespace, podName string, timeout time.Duration
 		if err != nil {
 			return err
 		}
-		if output == "Succeeded" || output == "Failed" {
+		switch output {
+		case "Succeeded":
 			return nil
+		case "Failed":
+			return fmt.Errorf("chaos client pod %s exited unsuccessfully%s%s",
+				podName,
+				chaosClientTerminationDetail(namespace, podName),
+				chaosClientLogTail(namespace, podName))
 		}
 		time.Sleep(5 * time.Second)
 	}
-	return fmt.Errorf("timeout waiting for pod %s to complete", podName)
+	return fmt.Errorf("timeout waiting for pod %s to complete%s",
+		podName, chaosClientLogTail(namespace, podName))
 }
 
 // getChaosClientMetrics retrieves metrics from a completed chaos client pod
@@ -116,7 +174,15 @@ func getChaosClientMetrics(namespace, podName string) (*chaos.MetricsSnapshot, e
 			return &metrics, nil
 		}
 	}
-	return nil, fmt.Errorf("METRICS_JSON not found in pod logs")
+	// The client only ever omits this line by dying before its traffic window
+	// closed, so the log tail is the diagnosis. Deliberately NOT fixed by making
+	// the client emit a zeroed METRICS_JSON on connect failure: MetricsSnapshot's
+	// WriteAvailability() returns 1.0 when WriteAttempts == 0, so a zeroed record
+	// satisfies every `>= 0.99` availability assertion in the suite and converts
+	// this red into a FALSE GREEN. An opaque error is bad; a passing test for a
+	// client that never connected is far worse. Fix legibility here, never there.
+	return nil, fmt.Errorf("METRICS_JSON not found in pod logs%s",
+		chaosClientLogTail(namespace, podName))
 }
 
 // deleteChaosClient deletes the chaos client pod
