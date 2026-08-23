@@ -26,6 +26,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -183,18 +184,110 @@ func containsClusterSlotsOk(info string) bool {
 	return strings.Contains(info, "cluster_slots_ok:16384")
 }
 
+// clusterReadiness is the pure seam behind the cluster-mode readiness gate: it
+// decides whether a set of per-node CLUSTER INFO replies means "every node this
+// client can route to agrees the cluster is whole".
+//
+// It is deliberately an AND over nodes, not an OR. A node that has not yet
+// learned the other shards' slot assignments answers cluster_state:fail and a
+// partial cluster_slots_ok, and it will answer -CLUSTERDOWN to the very traffic
+// this client is about to send — so "some other node says ok" is not a reason to
+// start measuring availability. The error names the offending node and quotes
+// the two fields, because the previous gate could only report the bare string
+// "cluster not ready (state not ok)" with no way to tell which node said it.
+func clusterReadiness(infos map[string]string) error {
+	if len(infos) == 0 {
+		return fmt.Errorf("cluster not ready (no reachable master answered CLUSTER INFO)")
+	}
+	for _, addr := range sortedKeys(infos) {
+		info := infos[addr]
+		if !containsClusterStateOk(info) {
+			return fmt.Errorf("cluster not ready: %s reports %s", addr, clusterInfoField(info, "cluster_state"))
+		}
+		if !containsClusterSlotsOk(info) {
+			return fmt.Errorf("cluster not ready: %s reports %s (an incomplete slot view)",
+				addr, clusterInfoField(info, "cluster_slots_ok"))
+		}
+	}
+	return nil
+}
+
+// sortedKeys keeps the readiness error deterministic when several nodes are bad.
+func sortedKeys(m map[string]string) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// clusterInfoField extracts one "name:value" line from a CLUSTER INFO reply for
+// the failure message, falling back to naming the field as absent.
+func clusterInfoField(info, name string) string {
+	for line := range strings.SplitSeq(info, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if strings.HasPrefix(line, name+":") {
+			return line
+		}
+	}
+	return name + ":<absent>"
+}
+
+// gatherClusterInfo asks every master the client can currently route to for its
+// CLUSTER INFO.
+//
+// ForEachMaster is used deliberately: it goes through ReloadOrGet, so each call
+// re-reads the topology from the server instead of serving the cached slot map.
+// That is the whole point during a bootstrap race. go-redis caches the cluster
+// state for ClusterStateReloadInterval (60s by default since v9.22, previously a
+// hardcoded 10s) and Get() only *lazily* refreshes past that interval while
+// still returning the stale snapshot; a keyless command against a snapshot with
+// zero masters fails with "redis: cluster has no nodes" and triggers no reactive
+// reload at all. A gate polling every 2s therefore has an effective retry
+// granularity of one reload interval, not 2s — measured in the field as 62s of
+// identical failures against a cluster that had been healthy for 60 of them.
+func gatherClusterInfo(ctx context.Context, client *redis.ClusterClient) (map[string]string, error) {
+	var mu sync.Mutex
+	infos := make(map[string]string)
+
+	err := client.ForEachMaster(ctx, func(ctx context.Context, node *redis.Client) error {
+		info, err := node.Do(ctx, "CLUSTER", "INFO").Text()
+		if err != nil {
+			return err
+		}
+		mu.Lock()
+		infos[node.Options().Addr] = info
+		mu.Unlock()
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return infos, nil
+}
+
 // NewTestClient creates a new test client
 func NewTestClient(cfg Config) (*TestClient, error) {
 	var client redis.UniversalClient
 
+	var clusterClient *redis.ClusterClient
+
 	if cfg.ClusterMode {
-		client = redis.NewClusterClient(&redis.ClusterOptions{
+		clusterClient = redis.NewClusterClient(&redis.ClusterOptions{
 			Addrs:        cfg.Addrs,
 			Password:     cfg.Password,
 			ReadTimeout:  cfg.OperationTimeout,
 			WriteTimeout: cfg.OperationTimeout,
 			DialTimeout:  cfg.OperationTimeout,
+			// Pin the topology cache instead of inheriting go-redis's default,
+			// which moved from a hardcoded 10s to 60s in v9.22. This client is a
+			// measuring instrument pointed at a cluster whose topology changes on
+			// purpose; how long it may keep believing a stale slot map is part of
+			// what the availability numbers mean, so it belongs here explicitly.
+			ClusterStateReloadInterval: 10 * time.Second,
 		})
+		client = clusterClient
 	} else if cfg.SentinelMaster != "" {
 		client = redis.NewFailoverClient(&redis.FailoverOptions{
 			MasterName:    cfg.SentinelMaster,
@@ -236,27 +329,23 @@ ConnectLoop:
 		case <-ticker.C:
 			// Create a context for the duration of this check (Ping + Cluster Info)
 			checkCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-			lastErr = client.Ping(checkCtx).Err()
+
+			if cfg.ClusterMode {
+				// PING is not enough, and neither is one node's opinion: ask every
+				// master this client can route to, over a freshly reloaded topology.
+				var infos map[string]string
+				infos, lastErr = gatherClusterInfo(checkCtx, clusterClient)
+				if lastErr == nil {
+					lastErr = clusterReadiness(infos)
+				}
+			} else {
+				lastErr = client.Ping(checkCtx).Err()
+			}
 
 			if lastErr == nil {
-				// For cluster mode, PING is not enough. We must ensure the cluster is healthy.
-				if cfg.ClusterMode {
-					var info string
-					info, lastErr = client.Do(checkCtx, "CLUSTER", "INFO").Text()
-					if lastErr == nil {
-						if !containsClusterStateOk(info) {
-							lastErr = fmt.Errorf("cluster not ready (state not ok)")
-						} else if !containsClusterSlotsOk(info) {
-							lastErr = fmt.Errorf("cluster not ready (slots not fully ok)")
-						}
-					}
-				}
-
-				if lastErr == nil {
-					cancel()
-					fmt.Println("Successfully connected to Redis")
-					break ConnectLoop
-				}
+				cancel()
+				fmt.Println("Successfully connected to Redis")
+				break ConnectLoop
 			}
 			cancel()
 			fmt.Printf("Connection attempt failed: %v (retrying...)\n", lastErr)
