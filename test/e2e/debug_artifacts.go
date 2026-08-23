@@ -36,7 +36,41 @@ import (
 var (
 	// testStartTime tracks when the current test started
 	testStartTime time.Time
+
+	// suiteStartTime is when this test binary started. It is a package-level
+	// initializer rather than a BeforeSuite assignment so it cannot be forgotten by a
+	// wiring site, and because process start is what we actually want: everything the
+	// operator has done to any instance in this run happened after it.
+	suiteStartTime = time.Now()
 )
+
+// operatorLogFloor is the minimum log window collected for a failing spec, whatever
+// the arithmetic below produces. See operatorLogWindow.
+const operatorLogFloor = 30 * time.Minute
+
+// operatorLogWindow returns the `kubectl logs --since` window for a failing spec.
+//
+// It used to be derived from the *spec's* elapsed time (`int(time.Since(testStartTime)
+// .Minutes()) + 2`), which collapses for exactly the specs that most need artifacts: a
+// spec that fails 0.4s in yielded `--since 2m`. In the LR-046 investigation that window
+// opened **33 seconds after the pod under investigation was created and well after the
+// stall had begun** — the whole early rollout, and the reconcile pass that chose the MEET
+// seed, were simply absent, so only one of four observed dial cycles could be attributed
+// to a named call site. Spec elapsed time is the wrong unit anyway: an instance created
+// in an `Ordered` container's `BeforeAll` outlives every individual spec in it.
+//
+// So: cover the whole run (process start plus a 2m buffer for clock skew and the
+// pre-spec deploy), with a generous floor so a fast failure early in the suite still
+// gets useful history. It stays bounded — the log is also capped by `--tail`, and a
+// window measured in tens of minutes of one operator's output is megabytes, not
+// gigabytes.
+func operatorLogWindow(now time.Time) time.Duration {
+	window := now.Sub(suiteStartTime) + 2*time.Minute
+	if window < operatorLogFloor {
+		return operatorLogFloor
+	}
+	return window
+}
 
 // CollectDebugArtifacts collects logs and state information for debugging failed tests.
 // It creates a timestamped directory with all relevant information.
@@ -130,10 +164,8 @@ func collectOperatorLogs(debugDir string) {
 		return
 	}
 
-	// Calculate duration since test start
-	duration := time.Since(testStartTime)
-	// Round up to nearest minute and add buffer to ensure we get all logs
-	durationStr := fmt.Sprintf("%dm", int(duration.Minutes())+2)
+	// Cover the whole run, not just this spec — see operatorLogWindow.
+	durationStr := fmt.Sprintf("%dm", int(operatorLogWindow(time.Now()).Minutes())+1)
 
 	_, _ = fmt.Fprintf(GinkgoWriter, "Fetching operator logs for pod %s (--since %s)...\n", podName, durationStr)
 
@@ -144,7 +176,12 @@ func collectOperatorLogs(debugDir string) {
 		"-c", "manager",
 		"--since", durationStr,
 		"--timestamps",
-		"--tail", "10000") // Limit to last 10k lines as safety
+		// Safety cap. Raised with the window: --tail keeps the LAST N lines, so a
+		// 10k cap on a suite-length window would re-truncate exactly the early
+		// history the wider window was opened to capture. 50k lines of the
+		// operator's JSON output is tens of megabytes, still an artifact rather
+		// than a dump.
+		"--tail", "50000")
 	logs, err := cmd.CombinedOutput()
 
 	if err != nil || len(logs) == 0 {
