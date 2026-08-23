@@ -50,6 +50,15 @@ func TestConfirmPodIP(t *testing.T) {
 			Status:     corev1.PodStatus{PodIP: ip},
 		}
 	}
+	// A pod under deletion. The fake client requires a finalizer for the object to
+	// persist with a deletionTimestamp rather than being removed outright.
+	terminating := func(name, ip string) *corev1.Pod {
+		p := pod(name, ip)
+		p.Finalizers = []string{"littlered.test/hold"}
+		now := metav1.Now()
+		p.DeletionTimestamp = &now
+		return p
+	}
 
 	tests := []struct {
 		name    string
@@ -78,6 +87,19 @@ func TestConfirmPodIP(t *testing.T) {
 			objects: nil,
 			podName: podMeetTarget, ip: ipMeetTarget,
 			wantOK: false, wantWhy: podIPGone,
+		},
+		{
+			// The one residual LR-043 left open, now closed. The kubelet writes
+			// Status.PodIP, so a TERMINATING pod's object can still report an address the
+			// CNI has already released and handed to somebody else — the only window in
+			// which "our pod object claims this IP" is not the same as "this IP is ours".
+			// Closing it here is what earns the demotion of attribution to a warning:
+			// Kubernetes is allowed to be the sole authority on ownership only if its
+			// answer is about a pod that still holds its address.
+			name:    "pod is terminating (its address may already be handed on)",
+			objects: []*corev1.Pod{terminating(podMeetTarget, ipMeetTarget)},
+			podName: podMeetTarget, ip: ipMeetTarget,
+			wantOK: false, wantWhy: podIPTerminating,
 		},
 		{
 			name:    "pod exists but has no address yet",

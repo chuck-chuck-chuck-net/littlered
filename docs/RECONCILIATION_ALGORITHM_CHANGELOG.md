@@ -610,6 +610,146 @@ loose for the failover cells, which measured 85-96%.
 - **Regresses:** None expected. The uncached reads are confined to the MEET paths (partition healing, bootstrap, migration Meet) — the steady loop, the gather and every other mode are untouched, and `APIReader` needs no additional RBAC. **The reader is defaulted in `SetupWithManager`, and that is deliberate belt-and-braces — do not "clean it up".** Left to the wiring site alone, `APIReader` would be exactly the shape LR-041 warns about: a required value held as optional-looking construction state, with no enforcement. Drop the assignment in `main.go` in some future refactor and the MEET guard silently degrades to the cached read — back to this very bug — with every test still green. `SetupWithManager` already receives the manager, so it defaults the field (`if r.APIReader == nil { r.APIReader = mgr.GetAPIReader() }`); every production path goes through it, so production can no longer forget. The explicit `APIReader: mgr.GetAPIReader()` in `main.go` is kept as intent documentation at the wiring site (redundant but correct), and `apiReader()`'s nil fallback to `Client` remains for the unit/envtest reconcilers that never call `SetupWithManager` — and whose `Client` is itself a direct, uncached client, so the fallback is not a silent downgrade there. **Rejected: making it a constructor parameter**, which is what LR-041's lesson literally prescribes. It would force edits to ~10 unit/envtest constructors for a value those tests do not need; defaulting at the one place the manager is available buys the same enforcement where it matters at a fraction of the blast radius. `TestSetupWithManagerDefaultsAPIReader` pins it (mutation-checked: removing the default fails it with "APIReader is nil after SetupWithManager"). No gate, cadence or decision outside the MEET target set changed; every own-pod state that Step 1 legitimately heals is admitted by one of the three clauses (an own pod reachable enough to gather a view either knows a peer of ours, is pristine, or owns exactly its own range — a lone minority node keeps its peers in view as `fail?`, which the gather does not filter). LR-014's `NodeKnows` adjacency is now read by a second consumer but unchanged; the `fail`/`noaddr`/`handshake` filter was extracted to one definition (`nodeFlagsFailed`) shared by the gather and attribution, behaviour-preserving.
 - **Impacts:** `CLAUDE.md` pillar 3.4 (the pod list is only as trustworthy as the cached IP; MEET is where an unattributed address is destructive); `docs/RECONCILIATION_LOOP_CLUSTER.md` Step 1. Completes for cluster mode what LR-039 established for sentinel mode: **a recycled pod IP is a cross-instance identity hazard in every mode, and the operation to guard is the one that creates a new identity binding.**
 
+### Regression and correction — the attribution layer refused a legitimate own node, and a partial wipe could never re-converge (t3e, 2026-08-23)
+
+**The entry above says, twice, that the failure mode of this change is over-suppression and
+that unit tests cannot prove its absence. It was right. The e2e caught it on the first
+full-suite run after landing, in the one tier whose entire purpose is to protect a surviving
+data-holder.**
+
+- **Failing spec:** `Cluster Total-Wipe Re-Bootstrap > Partial wipe keeps a surviving
+  data-holder > preserves the surviving replica's data and never recycles it`
+  (`test/e2e/cluster_totalwipe_test.go`). Timed out after 480s at `status.phase:
+  Initializing`, expected `Running`. All six pods were `2/2 Running`, so `allPodsReady` held
+  and `repairCluster` was running every 2s — not a crash-loop, not scheduling.
+- **What the operator logged, 180 times, for the same target:**
+  `Skipping CLUSTER MEET: address answers as a cluster node not attributable to this
+  instance … wipe-partial-…-shard-0-1@10.233.192.143 (unattributed)
+  nodeID=66a19469b0bb546caa94c511bd980504648993a5`, with
+  `partitions:2 ghosts:5 emptyMasters:true masters:1 allNodesView:11` on every pass, plus one
+  `no attributable MEET seed this pass`. **`shard-0-1` is the survivor** — the pod the tier
+  exists to prove is preserved and never recycled (8m54s old against the recycled pods'
+  6m24s).
+- **Mechanism, confirmed on the live cluster rather than inferred.** `kubectl exec` on the
+  survivor: its own `CLUSTER NODES` names four former peers as `master,fail?` / `slave,fail?`
+  and one as `slave,noaddr`; `cluster myid` on each of the five recycled pods returns a
+  **new** ID (`2372383b…`, `36f74258…`, `a3e52b2f…`, `1474c0dd…`, `1ba11fa7…`), none of them
+  the ghosts the survivor still lists. `nodeFlagsFailed` filters `fail`/`noaddr`/`handshake`
+  but deliberately **not** `fail?` (PFAIL) — that non-filter is what makes a partitioned own
+  node vouch for itself, and here it is what keeps the ghosts in the peer set. So in
+  `AttributeMeetTarget` the survivor has `peers > 0` and no ID in `ourNodeIDs` ⇒
+  `MeetDenyUnattributed`. **And it can never acquire an anchor:** that would require the fresh
+  pods to appear in its view, which requires exactly the MEET being refused. Deadlock, not a
+  slow convergence. The five fresh pods meanwhile MEETed each other into their own five-node
+  partition with `cluster_slots_assigned:0`; Step 1 returns early while partitioned, so Steps
+  2-4 stayed suspended for the whole eight minutes.
+- **The `MeetAllowMember` clause tolerates ghost IDs *alongside* a known-ours anchor. A wipe
+  leaves no anchor at all.** That is the gap: the clause was designed against the partition
+  case (peers alive, merely unreachable) and never against the recycle case (peers gone,
+  replaced under new identities) — which is the state this operator's own LR-023 wipe
+  recovery *manufactures*.
+- **Data was NOT lost.** The tier timed out before its data assertion, so this had to be
+  checked rather than assumed: on the live instance the survivor reports `dbsize 1` and holds
+  `survivor-shard-key`, still owning `0-5461` as `myself,master` — Step 0/1 promoted it and
+  `planClusterWipeRecovery` never recycled it, both exactly as LR-023 intends. So the
+  severity is **availability and convergence**, not durability. The guard broke the tier that
+  protects the data-holder without ever endangering the data.
+- **Same failure class as the clause deleted in `f5d0e98` one commit earlier**
+  (`ownsExactlyItsShardRange`, which refused an isolated own master owning more than one
+  range — the LR-018 state). That deletion was caught in review; this one was not, because
+  the surviving clauses were reasoned about one candidate at a time and nobody asked what a
+  *recycled* peer set looks like. Two clauses, two ways to deny a legitimate own node, in one
+  change.
+- **Fix — put the two guards in the right order of authority.** They were never equal in
+  evidentiary strength, and the code let the weaker one veto the stronger.
+  1. **`confirmPodIP` now also refuses a pod carrying a `deletionTimestamp`**
+     (`podIPTerminating`). That closes precisely the residual the entry above named — the
+     kubelet writes `Status.PodIP`, so a *terminating* pod's object can keep naming an address
+     the CNI has released and handed on — which is the only window in which "our pod object
+     claims this IP" is not "this IP is ours". The same check is applied inline in
+     `bootstrapCluster`'s uncached per-pod read, which has no `confirmPodIP` call.
+  2. **`MeetDenyUnattributed` is demoted from a veto to a logged warning** on an address that
+     has been positively confirmed (`MeetVerdict.AdmissibleWhenConfirmed`). Kubernetes decides
+     ownership — it holds at most one live pod per IP, so a confirmed address *is* attribution,
+     a fact rather than an inference; the bus may inform but not overrule. `PlanPartitionMeets`
+     keeps such a node in `Targets` and records it in the new `Unattributed` list, and the
+     caller logs the disagreement next to the MEET it describes, so a genuine merge stays
+     diagnosable. The **seed** is demoted identically: with two single-node partitions
+     `GetLargestPartitionSeed` can pick the survivor, and refusing the seed refuses the whole
+     pass — `no attributable MEET seed this pass` is that path, observed once in this very run.
+  **The hard denials are NOT relaxed.** `no-address` / `unidentified` / `no-gossip-view` mean
+  there is no evidence at all, which no API-server read can supply, and unlike `unattributed`
+  they are self-clearing: partitions are computed only over operator-reachable nodes, so an
+  unidentified address is in no detected partition and re-enters the plan on the pass where it
+  answers. A dedicated test pins that an unidentified seed is still refused.
+- **Why this layer and not another clause.** The alternatives were weighed and rejected: admit
+  a node whose peers are *all unreachable* (extra probing, and it is one more special case),
+  or admit a node whose peer set is disjoint from every address we can see (same). Both add a
+  clause to a predicate whose two previous clauses each turned out to deny some legitimate
+  state; the pattern to break is the growing pile, not to extend it. Demotion removes the
+  *authority* of the weaker evidence instead of patching its content.
+- **What the demotion costs, stated exactly.** We give up the deny for a **foreign
+  *established* cluster answering at an address our own non-terminating pod object still
+  reports**. The claim that no such path remains is *too strong* and is not made here: a pod
+  object whose IP is stale without a `deletionTimestamp` is reachable on hard node loss (the
+  kubelet is gone, so `Status.PodIP` freezes and no deletion is recorded until the node
+  lifecycle controller or a human forces it), and in that window the frozen IP could in
+  principle be reallocated. It is narrower than it sounds — most CNIs allocate from a
+  node-local pool, and that node is the one that is down — but it is a residual, not a
+  closure. Accepted knowingly, because of the asymmetry below.
+- **The generalizable lesson, and the reason the trade is not close.** **A guard that can deny
+  a legitimate own node is more dangerous here than one that admits a foreign node inside a
+  narrow window: the deny is a permanent stall, the admit needs a rare coincidence.** The deny
+  cost eight minutes of a suspended repair loop in a tier that was *designed* to exercise this
+  exact state, on ordinary hardware, with no adversary and nothing recycled across instances.
+  The admit needs a stale-but-not-terminating pod object, an IP reallocated out from under it,
+  and another instance's *established* cluster answering there. Corollary for this predicate
+  specifically: **bus-state attribution is inference over a protocol that carries no instance
+  identity, so it can never be the deciding vote over a Kubernetes fact.** And a second one,
+  about method: the first landing reasoned about each clause against each candidate shape it
+  could think of, which is exactly how both denials survived review — the missing question was
+  not "is this clause right?" but "which legitimate own-node states does the *conjunction*
+  refuse, including the ones this operator's own recovery paths create?"
+- **Parity audit (CLAUDE.md §7 rule 11) — all three sites call the same predicate:**
+
+  | site | verdict | why |
+  |---|---|---|
+  | Step 1 partition heal (`PlanPartitionMeets`) | **FIXED** | the reported hole; targets *and* seed demoted, `Unattributed` audited |
+  | `bootstrapMeetRound` | **FIXED** | same hole, reachable: `bootstrapCluster` runs on `TotalSlots == 0 && no replicas`, and a mass container-crash that keeps `nodes.conf` on some pods while others are recycled with new IDs yields `peers > 0, none ours`. A refused **seed** there is `return false` ⇒ requeue forever, i.e. the same permanent stall. Its addresses come from the uncached read, so they are confirmed by construction — the terminating check was added inline to make that true |
+  | migration Meet (`executeMigrationMeets`) | **FIXED** | same predicate behind the same `confirmPodIP`. `restrictToLegacyMesh` deletes un-met pods from `gt.Nodes`, so `ourIDs` is the legacy mesh plus already-met pods; a new pod that crashed mid-migration (the LR-025 chaos shape) can therefore name peers none of which are in `ourIDs` |
+  | `CLUSTER REPLICATE` / `FORGET` / `TAKEOVER` | unchanged | not MEET paths; their audit stands as recorded above, including the deliberately out-of-scope TAKEOVER sites |
+
+- **Tests, red-first, and the red is the real shape.** `internal/redis/meet_attribution_test.go`:
+  two new `TestAttributeMeetTarget` rows built from the live survivor's own `CLUSTER NODES`
+  (identified, reachable, `peers > 0`, every peer absent from `ourNodeIDs`) in both shapes —
+  promoted master owning `0-5461`, and the pre-promotion slotless replica — observed **RED**
+  as `AdmissibleWhenConfirmed() = false, want true`. `TestPlanPartitionMeetsAdmitsPostWipeSurvivor`
+  rebuilds the whole t3e topology (five fresh isolated pods with the real new node IDs in one
+  partition, the survivor with its four ghost peers in the other) and was **RED** with the
+  production message: `survivor wipe-shard-0-1 is not a MEET target;
+  skipped=[wipe-shard-0-1=unattributed] — the partition can never heal`. The seed half —
+  `TestPlanPartitionMeetsAdmitsUnattributedSeedForConfirmation`, which deliberately **inverts**
+  what `TestPlanPartitionMeetsRefusesUnattributableSeed` asserted — was **RED** as `seed = nil
+  (verdict "unattributed"), want it admitted for confirmPodIP to rule on`. `TestPlanPartitionMeets`
+  was **RED** as `targets = [lr-shard-1-0 lr-shard-2-0], want [lr-shard-0-1 lr-shard-1-0
+  lr-shard-2-0]`. `TestConfirmPodIP` gained a terminating row, **RED** as `confirmPodIP ok =
+  true (""), want false` / `reason = "", want "pod-terminating"`. Mutation-checked in the other
+  direction: an "always admissible" mutant fails the three no-evidence rows plus
+  `TestPlanPartitionMeetsRefusesUnidentifiedSeed`, so the demotion is not a blanket allow.
+- **Still unproven, honestly.** The only real proof is this tier going green on `t3e`, and it
+  has not been re-run. Everything above is unit-level plus a confirmed diagnosis on the live
+  instance; the e2e tiers that would catch a *remaining* over-suppression are the same ones
+  the entry above lists (`Cluster Mode Chaos Testing`, `Failover Recovery`, `Cluster
+  Total-Wipe Re-Bootstrap`, the migration chaos tier). The `Unattributed` audit line is the
+  operational tell: if it ever fires in a healthy steady state, attribution and Kubernetes are
+  disagreeing and one of them is wrong.
+- **Regresses:** the LR-043 attribution half is strictly weakened, by design and only where
+  `confirmPodIP` says yes; the primary guard is strictly strengthened (terminating pods now
+  denied everywhere a MEET address is derived). No gate, cadence or decision outside the MEET
+  target set changed. `TestPlanPartitionMeetsRefusesUnattributableSeed` is **deleted** — it
+  pinned the behaviour this correction removes; its replacement pins the new contract and a
+  separate test keeps the unidentified-seed refusal.
+
 ## [LR-044] The Captor Side of a Capture Was Silently Healthy — Forsaken-Gated Quarantine (decision layer)
 - **Date:** 2026-08-22
 - **Commit:** (pending)

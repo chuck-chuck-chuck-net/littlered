@@ -221,9 +221,40 @@ const (
 	MeetDenyUnattributed MeetVerdict = "unattributed"
 )
 
-// Allowed reports whether the verdict permits a CLUSTER MEET.
+// Allowed reports whether the verdict permits a CLUSTER MEET on bus evidence alone.
 func (v MeetVerdict) Allowed() bool {
 	return v == MeetAllowMember || v == MeetAllowFresh
+}
+
+// AdmissibleWhenConfirmed reports whether the verdict permits a CLUSTER MEET once the
+// address has been POSITIVELY CONFIRMED at the API server (`confirmPodIP`): our own,
+// non-terminating pod object reports this exact address right now.
+//
+// The two guards are not equal in evidentiary strength, and the first landing of LR-043
+// let the weaker one veto the stronger. Kubernetes holds at most one live pod per IP, so
+// a confirmed address IS attribution — a fact, not an inference. Bus-state attribution is
+// inference over a protocol that carries no instance identity, and its stated purpose is
+// narrower: to catch a confirmed-ours address where something FOREIGN is nonetheless
+// answering, which is reachable only in the window where a pod object still reports an
+// address the CNI has released. `confirmPodIP` now refuses a terminating pod, which closes
+// exactly that window — so `unattributed` becomes a WARNING on a confirmed address rather
+// than a veto.
+//
+// Why the demotion is the right direction (regression section of changelog LR-043): a
+// guard that can deny a legitimate own node is strictly more dangerous here than one that
+// admits a foreign node inside a narrow window. The deny is a PERMANENT stall — a partial
+// wipe leaves the surviving data-holder naming only ghosts of recycled peers, so it has no
+// "known-ours" anchor and can never acquire one, because acquiring one requires the very
+// MEET being refused. The admit needs a rare coincidence of an unattributed address that
+// Kubernetes still reports as our own live pod's.
+//
+// The hard denials are NOT relaxed. `no-address` / `unidentified` / `no-gossip-view` mean
+// there is no evidence at all, which no API-server read can supply, and they are
+// self-clearing: partitions are computed only over operator-reachable nodes, so an
+// unidentified address is in no detected partition and re-enters the plan on the pass where
+// it answers. Only `unattributed` is a verdict ABOUT a node we can see.
+func (v MeetVerdict) AdmissibleWhenConfirmed() bool {
+	return v.Allowed() || v == MeetDenyUnattributed
 }
 
 // MeetCandidate is the evidence AttributeMeetTarget decides on. Every field comes from
@@ -358,13 +389,24 @@ type MeetPlan struct {
 	SeedVerdict MeetVerdict
 	Targets     []*ClusterNodeState
 	Skipped     []MeetSkip
+	// Unattributed lists the entries of Targets that bus-state attribution alone would
+	// have refused, and which are admitted only because the caller confirms the address
+	// at the API server. Reported so a genuine cross-instance merge stays diagnosable:
+	// these are the MEETs where Kubernetes and the cluster bus disagreed.
+	Unattributed []MeetSkip
 }
 
-// PlanPartitionMeets builds the Step 1 MEET plan from gathered ground truth, admitting
-// only attributable addresses (see AttributeMeetTarget). The seed is attributed too: the
-// MEET is issued *at* the seed, so an unattributable seed would be told to meet all of
-// our pods — the same cluster merge in the other direction. Targets are returned in
-// deterministic pod-name order.
+// PlanPartitionMeets builds the Step 1 MEET plan from gathered ground truth. Targets and
+// the seed are both screened by AttributeMeetTarget — the seed too, because the MEET is
+// issued *at* the seed, so an unattributable seed would be told to meet all of our pods
+// (the same cluster merge in the other direction). Targets are returned in deterministic
+// pod-name order.
+//
+// A verdict of `unattributed` does NOT remove a candidate from Targets; it records it in
+// Unattributed and leaves the decision to the caller's API-server confirmation, which is
+// the stronger evidence (see AdmissibleWhenConfirmed). Only the no-evidence verdicts are
+// hard-skipped. THE CALLER MUST CALL confirmPodIP FOR THE SEED AND EVERY TARGET — this
+// plan is admissibility, not permission.
 func (gt *ClusterGroundTruth) PlanPartitionMeets() MeetPlan {
 	ourIDs := make(map[string]bool, len(gt.Nodes))
 	for _, n := range gt.Nodes {
@@ -380,7 +422,7 @@ func (gt *ClusterGroundTruth) PlanPartitionMeets() MeetPlan {
 		return plan
 	}
 	plan.SeedVerdict = AttributeMeetTarget(gt.meetCandidate(seed), ourIDs)
-	if !plan.SeedVerdict.Allowed() {
+	if !plan.SeedVerdict.AdmissibleWhenConfirmed() {
 		return plan
 	}
 	plan.Seed = seed
@@ -397,13 +439,15 @@ func (gt *ClusterGroundTruth) PlanPartitionMeets() MeetPlan {
 			continue
 		}
 		v := AttributeMeetTarget(gt.meetCandidate(n), ourIDs)
-		if v.Allowed() {
+		skip := MeetSkip{PodName: n.PodName, PodIP: n.PodIP, NodeID: n.NodeID, Verdict: v}
+		if v.AdmissibleWhenConfirmed() {
 			plan.Targets = append(plan.Targets, n)
+			if !v.Allowed() {
+				plan.Unattributed = append(plan.Unattributed, skip)
+			}
 			continue
 		}
-		plan.Skipped = append(plan.Skipped, MeetSkip{
-			PodName: n.PodName, PodIP: n.PodIP, NodeID: n.NodeID, Verdict: v,
-		})
+		plan.Skipped = append(plan.Skipped, skip)
 	}
 	return plan
 }

@@ -360,10 +360,19 @@ func (r *LittleRedReconciler) executeMigrationMeets(
 			auditLog.Info("Migration MEET: could not read the target's own cluster view; not meeting it this pass",
 				"target", host, "error", viewErr)
 		}
-		if v := redisclient.AttributeMeetTarget(cand, ourIDs); !v.Allowed() {
-			auditLog.Info("Migration MEET: skipping target not attributable to this instance",
+		// Advisory, not a veto (changelog LR-043, regression section): confirmPodIP above
+		// is uncached and refuses a terminating pod, so it is the deciding evidence. A veto
+		// here could permanently refuse a legitimate own node — a new pod that crashed and
+		// restarted mid-migration keeps a nodes.conf naming peers that may since have been
+		// replaced with new node IDs, and `restrictToLegacyMesh` keeps un-met pods out of
+		// ourIDs, so "names peers, none of them ours" is a reachable own-node state here.
+		if v := redisclient.AttributeMeetTarget(cand, ourIDs); !v.AdmissibleWhenConfirmed() {
+			auditLog.Info("Migration MEET: skipping target not identified this pass",
 				"target", host, "pod", cand.PodName, "nodeID", cand.NodeID, "verdict", v)
 			continue
+		} else if v == redisclient.MeetDenyUnattributed {
+			auditLog.Info("Migration MEET: target's cluster view names no node of ours; its address is API-server-confirmed, meeting anyway",
+				"target", host, "pod", cand.PodName, "nodeID", cand.NodeID)
 		}
 		auditLog.Info("Migration MEET: joining new pod into the legacy cluster", "seed", seed, "target", host)
 		if err := clusterClient.ClusterMeet(ctx, seed, host, littleredv1alpha1.RedisPort); err != nil {
