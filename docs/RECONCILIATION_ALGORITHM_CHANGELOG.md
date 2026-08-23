@@ -995,6 +995,47 @@ instance never releases and links 3-4 would have been unobservable); `HoldDataPr
 capture (1 of 3 Sentinels), where the expected behaviour is no verdict plus the LR-008 correction
 healing it — the shape LR-041 observed sub-second.
 
+### First full-suite run: one spec flake, and what it says about the operator (t3e, 2026-08-23)
+
+The tier-1 full-cycle spec **failed on its first full-suite run** — and the failure is a **test**
+defect, on the *last* assertion in the tier, after every load-bearing step had already passed
+(the captor's prune at 15:01:04, Rule L's reseed at 15:02:32). Recorded because the investigation
+killed five plausible causes with evidence and the one that survived is a property of the
+operator worth knowing.
+
+**What failed:** a bare `Expect(quarantineAttempts(victim)).To(BeEmpty())` — *"the attempt counter
+must be reset once the instance is Running again"* — read `1`.
+
+**Why, and it is by construction:** `clearForsaken` gates the reset on
+`lr.Status.Phase == PhaseRunning`, i.e. the phase **persisted by the previous pass**. It is called
+from `reconcileSentinelCluster` (`littlered_controller.go`:708) while the phase itself is written at
+the tail of the same pass by `updateSentinelStatus` (:733). **So the pass that first reports
+`Running` structurally cannot also clear the counter; the next pass does.** Measured: phase
+`Running` at 13:02:31Z, counter still `1` when the spec read it 0.9s later, cleared by the pass at
+13:02:33Z. A bare assertion was racing a ~2s window sampled by a 5s poll — roughly a 40% failure
+rate per run, so M4b's single green was ~60% luck rather than evidence. Fixed by making it an
+`Eventually` bounded at 90s (one steady interval, LR-045, plus margin); the assertion's intent is
+unchanged and it still fails if the counter never clears.
+
+**Not a product defect, and the reasoning matters:** the lag is intentional, bounded by the next
+watch event or at worst one steady interval, and touches only a monitoring-surface field. It cannot
+re-arm a quarantine, because a quarantined instance can never report `Running` (the `Redis.Ready > 0`
+clause), so the latch still bites.
+
+**What the run positively confirmed**, on the first full-suite attempt and with no favourable
+ordering: every edge landed inside the previously measured envelope — injection→quorum captured
+1.2s, capture→`Quarantined` 41s, verdict→both StatefulSets at 0 29.5s, armed→release 133s,
+release→`Running` 46s, **capture→serving 3m40s** against M4a's 3m51s/3m58s and M4b's 3m41s. Suite
+load cost nothing measurable. Five hypotheses were killed on evidence: the operator was up for the
+whole window (image `f5d0e98`, 0 restarts, continuous logging), no recycled-IP stall, no leftover
+state, and `f5d0e98` touches cluster-mode files only.
+
+**Diagnosability gap this exposed:** `clearForsaken` logs **nothing** when it clears, so the
+clearing pass had to be *inferred* from a reconcile timestamp plus the CR's final state rather than
+read. A state transition that emits no line is a transition someone will have to re-derive next
+time. Tracked, not fixed here (a test-only fix keeps the suite re-runnable without rebuilding the
+image).
+
 ### Committed coverage (milestone 4b) — `test/e2e/sentinel_quarantine_test.go`, t3e, 2026-08-23
 
 M4a proved the behaviour by hand; this milestone makes it repeatable. New Describe

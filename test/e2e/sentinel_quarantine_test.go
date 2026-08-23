@@ -485,7 +485,20 @@ spec:
 				g.Expect(getMasterPod(victim)).NotTo(BeEmpty())
 			}, 6*time.Minute, 5*time.Second).Should(Succeed())
 
-			Expect(quarantineAttempts(victim)).To(BeEmpty(),
+			// Eventually, not a bare Expect: the reset LAGS the phase by at least one
+			// reconcile pass, by construction. clearForsaken (littlered_controller.go)
+			// runs inside reconcileSentinelCluster and reads lr.Status.Phase — the value
+			// PERSISTED BY THE PREVIOUS PASS — while the phase itself is written at the
+			// tail of the same pass by updateSentinelStatus. So the pass that first
+			// reports Running cannot also clear the counter; the next one does. Measured
+			// on t3e 2026-08-23: phase Running at 13:02:31Z, counter still 1 when read
+			// 0.9s later, cleared by the pass at 13:02:33Z. A bare Expect here is a race
+			// against a ~2s window sampled by a 5s poll, and it lost. The upper bound is
+			// one steady interval (30s, LR-045) if no watch event arrives sooner, hence
+			// 90s — still tight enough to fail a counter that never clears.
+			Eventually(func(g Gomega) {
+				g.Expect(quarantineAttempts(victim)).To(BeEmpty())
+			}, 90*time.Second, 2*time.Second).Should(Succeed(),
 				"the attempt counter must be reset once the instance is Running again")
 
 			By("the victim came back empty, and monitoring its OWN master")
