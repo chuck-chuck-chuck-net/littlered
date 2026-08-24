@@ -22,5 +22,12 @@ jobs:
           go mod tidy
           git diff --exit-code go.mod go.sum
 
+      # Same class of check as `go mod tidy` above: the repo carries generated
+      # files (CRDs, RBAC, the chart's copies of both, and zz_generated.deepcopy.go)
+      # that nothing used to verify -- edit a kubebuilder marker, forget
+      # `make manifests generate`, and CI stayed green on a stale tree.
+      - name: Check generated files are up to date
+        run: make verify-generated
+
       - name: Running Tests
         run: make test
