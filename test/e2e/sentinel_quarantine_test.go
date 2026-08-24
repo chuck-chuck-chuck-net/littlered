@@ -87,6 +87,29 @@ import (
 // this suite. Deferred to the `feat/e2e-harness` branch rather than pre-built here;
 // the decision matrix itself stays covered by TestQuarantineDataRisk /
 // TestPlanQuarantine.
+//
+// ============================ DELIBERATELY AUTH-FREE ==========================
+//
+// Every other sentinel-mode fixture in this suite defaults to auth-ON
+// (auth_utils_test.go). All THREE tiers here must stay auth-free, and a future
+// sweep of "the last few stragglers" must leave them alone. Three independent
+// reasons, any one of which is sufficient:
+//
+//  1. AUTH IS ONE OF THE CONDITIONS THAT PREVENTS A CAPTURE. Every tier stages a
+//     real one by PUBLISHing a hello at the victim's sentinel port; with
+//     `requirepass` set that connection answers NOAUTH before the payload reaches
+//     sentinelProcessHelloMessage(), so the capture never lands and every tier
+//     below silently degrades into asserting a non-event.
+//  2. The Latched tier is deterministic ONLY because the configuration is
+//     dangerous: quarantineConfigDangerous is `auth disabled` AND the legacy
+//     shared master name, which sets the attempt budget to 1. Enabling auth moves
+//     the budget to 2 and that tier stops being reachable at all.
+//  3. The HoldDataPresent tier stages its permanently-failing sync with a bogus
+//     `masterauth` against a foreign master that has NO password ("Client sent
+//     AUTH, but no password is set"). Give the foreign master a real password and
+//     the mechanism changes underneath the tier.
+//
+// ==============================================================================
 var _ = Describe("Sentinel Forsaken-Gated Quarantine", Label("sentinel"), func() {
 
 	// --- helpers -------------------------------------------------------------
@@ -198,8 +221,11 @@ var _ = Describe("Sentinel Forsaken-Gated Quarantine", Label("sentinel"), func()
 		// that exercises the data clauses honestly (a version mismatch leaves the
 		// victim at 0 keys, which LR-044 records as the luck the field incident had).
 		//
-		// No spec.auth either: auth disabled is half of quarantineConfigDangerous, so
-		// the attempt limit is decided purely by the master name. See the Latched tier.
+		// No spec.auth either, and that is load-bearing rather than an omission —
+		// see the DELIBERATELY AUTH-FREE block at the top of this file. In short:
+		// auth disabled is half of quarantineConfigDangerous, so the attempt limit
+		// is decided purely by the master name (see the Latched tier), and an
+		// authenticated Sentinel would refuse the injected hello outright.
 		return fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed

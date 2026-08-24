@@ -84,11 +84,18 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 	}
 
 	// newSentinelCR returns a minimal sentinel LittleRed CR.
+	//
+	// Auth-ON, like every other sentinel-mode fixture in this suite
+	// (auth_utils_test.go). These specs never speak to Redis, so the password
+	// changes no assertion here — it is set so the suite has ONE sentinel posture
+	// rather than two, and so the PDB path is exercised on the same instance shape
+	// every other tier deploys.
 	newSentinelCR := func(name string) *littleredv1alpha1.LittleRed {
 		return &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
 			Spec: littleredv1alpha1.LittleRedSpec{
 				Mode: "sentinel",
+				Auth: e2eTypedAuthSpec(ctx, k8sClient, name),
 				Sentinel: &littleredv1alpha1.SentinelSpec{
 					MasterName:            e2eMasterName(testNamespace, name),
 					Quorum:                2,
@@ -107,10 +114,14 @@ var _ = Describe("LittleRed PodDisruptionBudget", Label("pdb"), func() {
 	// also exercises the nil-spec.failover path. The default of 2 replicas means
 	// 3 data pods, so a failover instance is redundant by construction and always
 	// qualifies for a PDB (unlike standalone or a 0-replica cluster above).
+	// Auth-ON for the same reason as newSentinelCR above.
 	newFailoverCR := func(name string) *littleredv1alpha1.LittleRed {
 		return &littleredv1alpha1.LittleRed{
 			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: testNamespace},
-			Spec:       littleredv1alpha1.LittleRedSpec{Mode: "failover"},
+			Spec: littleredv1alpha1.LittleRedSpec{
+				Mode: "failover",
+				Auth: e2eTypedAuthSpec(ctx, k8sClient, name),
+			},
 		}
 	}
 

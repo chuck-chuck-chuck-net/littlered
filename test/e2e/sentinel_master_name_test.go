@@ -53,8 +53,14 @@ var _ = Describe("Sentinel Master Name Scoping", Label("sentinel"), func() {
 		return utils.Run(cmd)
 	}
 
+	// Auth-ON, like every other sentinel-mode fixture in this suite
+	// (auth_utils_test.go). The awkward-name spec below therefore queries Sentinel
+	// with a credential; the point it proves — that an awkward but legal master
+	// name survives sentinel.conf, the startup script and the preStop hook — is
+	// independent of auth, and running it in the suite's default posture means it
+	// also proves the two do not interact.
 	sentinelCR := func(crName, masterNameLine string) string {
-		return fmt.Sprintf(`
+		return e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -62,7 +68,7 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  resources:
+%s  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -73,7 +79,7 @@ spec:
 %s    quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, masterNameLine)
+`, crName, testNamespace, e2eAuthSpecYAML(crName), masterNameLine)
 	}
 
 	// --- Admission -----------------------------------------------------------
@@ -121,10 +127,8 @@ spec:
 
 			By("confirming Sentinel actually monitors it")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0", "-n", testNamespace,
-					"-c", "sentinel", "--", "redis-cli", "-p", "26379",
+				out, err := sentinelPortExec(testNamespace, crName+"-sentinel-0",
 					"SENTINEL", "get-master-addr-by-name", awkward)
-				out, err := utils.Run(cmd)
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(strings.TrimSpace(out)).NotTo(BeEmpty(),
 					"Sentinel does not know master %q", awkward)
@@ -153,6 +157,29 @@ spec:
 // knows. Before per-instance naming both instances answered to "mymaster", so this
 // payload flipped A onto B's master and A's replicas flushed to resync from it. That
 // is the red this spec must produce against pre-fix code.
+//
+// ============================ DELIBERATELY AUTH-FREE ==========================
+//
+// Every other sentinel-mode fixture in this suite defaults to auth-ON
+// (auth_utils_test.go). This Describe must NOT be flipped, and a future sweep of
+// "the last few stragglers" must leave it alone.
+//
+// AUTHENTICATION IS ONE OF THE CONDITIONS THAT PREVENTS A CAPTURE. Both specs
+// below work by PUBLISHing a hello straight at a Sentinel's port
+// (`redis-cli -p 26379 PUBLISH __sentinel__:hello ...`). With `requirepass` set,
+// that connection is answered with NOAUTH before the payload ever reaches
+// sentinelProcessHelloMessage(), so:
+//
+//   - the isolation spec would pass having tested NOTHING (it asserts a
+//     non-event, and a rejected connection looks exactly like a discarded hello);
+//   - the positive control — the thing that makes the isolation result
+//     attributable at all — could not land, and would fail on its PUBLISH reply.
+//
+// Auth would also be the wrong variable to hold: LR-039 records auth as the
+// remaining mitigation for the ADDRESS-ADOPTION path, whereas what these specs
+// measure is the master NAME closing the gossip-fusion path. Turning auth on here
+// would confound the two and destroy the coverage.
+// ==============================================================================
 var _ = Describe("Sentinel Cross-Instance Isolation", Label("sentinel"), Ordered, func() {
 	var instA, instB, lrctlBin string
 

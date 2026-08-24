@@ -55,7 +55,22 @@ const (
 // sentinel-mode YAML shape used across the suite. downAfterMs 3000 matches the
 // sentinel failover tier's fast-detection setting. metaAnnotations lands under
 // metadata.annotations (e.g. the disable-event-monitoring kill switch).
+//
+// AUTH IS ON unless withAuth is false. In failover mode the password is a real
+// mesh-isolation control, not decoration: a masterauth mismatch aborts the
+// replication handshake BEFORE the RDB transfer, which closes the path where a
+// stale `replicaof <ip>` adopts a foreign master after an IP recycle (pillar 3.7).
+// The default posture of this mode's fixtures should therefore be the protected
+// one. See auth_utils_test.go for the full rationale and for why cluster mode is
+// deliberately NOT flipped. The rendered manifest carries the instance's Secret as
+// a leading YAML document, so `kubectl apply -f -` creates both in one call.
 func failoverCR(name string, replicas, downAfterMs int, metaAnnotations map[string]string, extraFailoverFields string) string {
+	return failoverCRWithAuth(name, replicas, downAfterMs, metaAnnotations, extraFailoverFields, true)
+}
+
+// failoverCRWithAuth is failoverCR with the auth posture made explicit. Only the
+// deliberately auth-free tier (Minimum Topology) passes withAuth=false.
+func failoverCRWithAuth(name string, replicas, downAfterMs int, metaAnnotations map[string]string, extraFailoverFields string, withAuth bool) string {
 	ann := ""
 	if len(metaAnnotations) > 0 {
 		ann = "  annotations:\n"
@@ -63,7 +78,12 @@ func failoverCR(name string, replicas, downAfterMs int, metaAnnotations map[stri
 			ann += fmt.Sprintf("    %s: %q\n", k, v)
 		}
 	}
-	return fmt.Sprintf(`
+	prefix, authBlock := "", ""
+	if withAuth {
+		registerE2EAuth(name)
+		prefix, authBlock = e2eAuthSecretDoc(name), e2eAuthSpecYAML(name)
+	}
+	return prefix + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -71,7 +91,7 @@ metadata:
   namespace: %s
 %sspec:
   mode: failover
-  resources:
+%s  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -87,7 +107,7 @@ metadata:
   failover:
     replicas: %d
     downAfterMilliseconds: %d
-%s`, name, testNamespace, ann, replicas, downAfterMs, extraFailoverFields)
+%s`, name, testNamespace, ann, authBlock, replicas, downAfterMs, extraFailoverFields)
 }
 
 // deployFailover applies a failover-mode CR and waits for phase Running.

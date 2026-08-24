@@ -50,7 +50,7 @@ var _ = Describe("Sentinel Advanced Failover", Label("sentinel"), func() {
 			crName = fmt.Sprintf("event-driven-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s with polling disabled", crName))
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -60,12 +60,12 @@ metadata:
     redis.chuck-chuck-chuck.net/disable-polling: "true"
 spec:
   mode: sentinel
-  sentinel:
+%s  sentinel:
     masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -148,7 +148,7 @@ spec:
 			crName = fmt.Sprintf("polling-only-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s with events disabled", crName))
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -158,12 +158,12 @@ metadata:
     redis.chuck-chuck-chuck.net/disable-event-monitoring: "true"
 spec:
   mode: sentinel
-  sentinel:
+%s  sentinel:
     masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			utils.Run(cmd)
@@ -239,7 +239,7 @@ spec:
 			crName = fmt.Sprintf("hybrid-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s with standard settings", crName))
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -247,12 +247,12 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  sentinel:
+%s  sentinel:
     masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			utils.Run(cmd)
@@ -315,7 +315,7 @@ spec:
 			crName = fmt.Sprintf("sentinel-death-%d", time.Now().Unix())
 			AddReportEntry("cr:" + crName)
 			By(fmt.Sprintf("deploying cluster %s for sentinel death testing", crName))
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -323,12 +323,12 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  sentinel:
+%s  sentinel:
     masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			utils.Run(cmd)

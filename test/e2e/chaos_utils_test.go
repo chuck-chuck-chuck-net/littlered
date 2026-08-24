@@ -51,6 +51,21 @@ func deployChaosClient(namespace, name, addresses, keyPrefix string, clusterMode
 		clusterArg = "\n    - \"-cluster\""
 	}
 
+	// Auth: sentinel- and failover-mode fixtures default to auth-ON
+	// (auth_utils_test.go), and the chaos client is a first-class Redis client —
+	// without a credential it fails its connectivity probe and the spec dies as
+	// "METRICS_JSON not found", nowhere near the cause. `addresses` is always
+	// "{crName}:6379" (the label-routed master Service is named after the CR), so
+	// the instance is identified from the first address rather than by threading a
+	// password parameter through all thirteen call sites — which is exactly the
+	// kind of optional-looking plumbing LR-041 warns about, and cluster/standalone
+	// callers would all have to pass "".
+	authArg := ""
+	chaosHost := strings.Split(strings.Split(addresses, ",")[0], ":")[0]
+	if pw := e2ePasswordForResource(chaosHost); pw != "" {
+		authArg = fmt.Sprintf("\n    - \"-password=%s\"", pw)
+	}
+
 	pod := fmt.Sprintf(`
 apiVersion: v1
 kind: Pod
@@ -72,8 +87,8 @@ spec:
     - "-duration=%s"
     - "-status-interval=5s"
     - "-write-rate=100ms"
-    - "-timeout=500ms"%s
-`, podName, namespace, name, image, addresses, keyPrefix, duration.String(), clusterArg)
+    - "-timeout=500ms"%s%s
+`, podName, namespace, name, image, addresses, keyPrefix, duration.String(), clusterArg, authArg)
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(pod)

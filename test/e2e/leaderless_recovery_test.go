@@ -40,7 +40,8 @@ var _ = Describe("Sentinel Leaderless Bootstrap Deadlock Recovery", Label("senti
 
 	deploySentinel := func(crName string, allowUnsafe bool) {
 		AddReportEntry("cr:" + crName)
-		cr := fmt.Sprintf(`
+		registerE2EAuth(crName)
+		cr := e2eAuthSecretDoc(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -48,13 +49,13 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  sentinel:
+%s  sentinel:
     masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
     allowUnsafeRebootstrapOnDeadlock: %t
-`, crName, testNamespace, e2eMasterName(testNamespace, crName), allowUnsafe)
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName), allowUnsafe)
 		cmd := exec.Command("kubectl", "apply", "-f", "-")
 		cmd.Stdin = strings.NewReader(cr)
 		_, err := utils.Run(cmd)
@@ -265,8 +266,27 @@ func getConditionField(crName, condType, field string) (string, error) {
 	return strings.TrimSpace(out), err
 }
 
+// redisExec runs redis-cli in a pod's `redis` container.
+//
+// It authenticates automatically: sentinel- and failover-mode fixtures default to
+// auth-ON (see auth_utils_test.go), and a missed credential surfaces as an opaque
+// NOAUTH far from its cause. The password is looked up from the pod name, so
+// auth-free instances (cluster, standalone, and the deliberately auth-free
+// capture-staging tiers) get exactly the bare invocation they had before.
 func redisExec(namespace, pod string, args ...string) (string, error) {
-	full := append([]string{"exec", pod, "-n", namespace, "-c", "redis", "--", "redis-cli"}, args...)
+	full := []string{"exec", pod, "-n", namespace, "-c", "redis", "--", "redis-cli"}
+	full = append(full, redisCliAuthArgs(pod)...)
+	full = append(full, args...)
+	return utils.Run(exec.Command("kubectl", full...))
+}
+
+// sentinelPortExec is redisExec's sibling for a sentinel pod's sentinel port. Same
+// auth story, same reason it exists: every SENTINEL query in a flipped tier goes
+// through here rather than hand-rolling `kubectl exec ... redis-cli -p 26379`.
+func sentinelPortExec(namespace, pod string, args ...string) (string, error) {
+	full := []string{"exec", pod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379"}
+	full = append(full, redisCliAuthArgs(pod)...)
+	full = append(full, args...)
 	return utils.Run(exec.Command("kubectl", full...))
 }
 

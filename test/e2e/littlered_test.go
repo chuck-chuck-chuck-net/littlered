@@ -202,7 +202,7 @@ spec:
 		BeforeAll(func() {
 			AddReportEntry("cr:" + crName)
 			By("Test ID: SEN-001 - applying the LittleRed CR with sentinel mode")
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -210,7 +210,7 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  resources:
+%s  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -222,7 +222,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -281,10 +281,8 @@ spec:
 
 			Eventually(func(g Gomega) {
 				// Query sentinel-0 for master info to verify quorum
-				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
-					"-n", testNamespace, "-c", "sentinel", "--",
-					"redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(testNamespace, crName))
-				output, err := utils.Run(cmd)
+				output, err := sentinelPortExec(testNamespace, crName+"-sentinel-0",
+					"SENTINEL", "master", e2eMasterName(testNamespace, crName))
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("num-slaves"))
 				g.Expect(output).To(ContainSubstring("num-other-sentinels"))
@@ -327,10 +325,7 @@ spec:
 			Expect(masterPod).NotTo(BeEmpty())
 
 			By("writing to master")
-			cmd = exec.Command("kubectl", "exec", masterPod,
-				"-n", testNamespace, "-c", "redis", "--",
-				"redis-cli", "SET", "repl-test-key", "repl-test-value")
-			output, err := utils.Run(cmd)
+			output, err := redisExec(testNamespace, masterPod, "SET", "repl-test-key", "repl-test-value")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(strings.TrimSpace(output)).To(Equal("OK"))
 
@@ -347,10 +342,7 @@ spec:
 			Expect(replicaPod).NotTo(BeEmpty())
 
 			Eventually(func(g Gomega) {
-				cmd = exec.Command("kubectl", "exec", replicaPod,
-					"-n", testNamespace, "-c", "redis", "--",
-					"redis-cli", "GET", "repl-test-key")
-				output, err = utils.Run(cmd)
+				output, err = redisExec(testNamespace, replicaPod, "GET", "repl-test-key")
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(strings.TrimSpace(output)).To(Equal("repl-test-value"))
 			}, 30*time.Second, 2*time.Second).Should(Succeed())
@@ -594,7 +586,7 @@ spec:
 
 		It("should create a sentinel cluster for rolling update testing", func() {
 			By("applying the LittleRed CR with sentinel mode")
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -602,7 +594,7 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  resources:
+%s  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -614,7 +606,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -637,10 +629,7 @@ spec:
 			Expect(err).NotTo(HaveOccurred())
 			masterPod = strings.TrimSpace(masterPod)
 
-			cmd = exec.Command("kubectl", "exec", masterPod,
-				"-n", testNamespace, "-c", "redis", "--",
-				"redis-cli", "SET", "sentinel-rolling-key", "test-value")
-			output, err := utils.Run(cmd)
+			output, err := redisExec(testNamespace, masterPod, "SET", "sentinel-rolling-key", "test-value")
 			Expect(err).NotTo(HaveOccurred())
 			Expect(strings.TrimSpace(output)).To(Equal("OK"))
 		})
@@ -657,7 +646,7 @@ spec:
 			}
 
 			By("updating the sentinel resources")
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -665,7 +654,7 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  resources:
+%s  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -684,7 +673,7 @@ spec:
       limits:
         cpu: "50m"
         memory: "48Mi"
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -723,10 +712,8 @@ spec:
 		It("should maintain sentinel quorum after rolling update", func() {
 			By("verifying sentinel quorum is established")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
-					"-n", testNamespace, "-c", "sentinel", "--",
-					"redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(testNamespace, crName))
-				output, err := utils.Run(cmd)
+				output, err := sentinelPortExec(testNamespace, crName+"-sentinel-0",
+					"SENTINEL", "master", e2eMasterName(testNamespace, crName))
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("num-slaves"))
 				g.Expect(output).To(ContainSubstring("num-other-sentinels"))
@@ -763,7 +750,7 @@ spec:
 
 		It("should create a sentinel cluster for failover testing", func() {
 			By("applying the LittleRed CR with fast failover settings")
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -771,7 +758,7 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  resources:
+%s  resources:
     requests:
       cpu: "100m"
       memory: "128Mi"
@@ -783,7 +770,7 @@ spec:
     quorum: 2
     downAfterMilliseconds: 3000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)
@@ -827,10 +814,7 @@ spec:
 				Expect(originalMasterUID).NotTo(BeEmpty())
 
 				By("writing test data to master before failover")
-				cmd = exec.Command("kubectl", "exec", originalMaster,
-					"-n", testNamespace, "-c", "redis", "--",
-					"redis-cli", "SET", "failover-test-key", "failover-test-value")
-				output, err := utils.Run(cmd)
+				output, err := redisExec(testNamespace, originalMaster, "SET", "failover-test-key", "failover-test-value")
 				Expect(err).NotTo(HaveOccurred())
 				Expect(strings.TrimSpace(output)).To(Equal("OK"))
 
@@ -864,10 +848,8 @@ spec:
 
 				By("verifying sentinel reports new master")
 				Eventually(func(g Gomega) {
-					cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
-						"-n", testNamespace, "-c", "sentinel", "--",
-						"redis-cli", "-p", "26379", "SENTINEL", "get-master-addr-by-name", e2eMasterName(testNamespace, crName))
-					output, err := utils.Run(cmd)
+					output, err := sentinelPortExec(testNamespace, crName+"-sentinel-0",
+						"SENTINEL", "get-master-addr-by-name", e2eMasterName(testNamespace, crName))
 					g.Expect(err).NotTo(HaveOccurred())
 					g.Expect(output).NotTo(BeEmpty())
 					_, _ = fmt.Fprintf(GinkgoWriter, "Sentinel reports master: %s\n", output)
@@ -876,20 +858,15 @@ spec:
 				By("Test ID: SEN-012 - verifying data is preserved after failover")
 				Eventually(func(g Gomega) {
 					// Query sentinel for current master address
-					cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
-						"-n", testNamespace, "-c", "sentinel", "--",
-						"redis-cli", "-p", "26379", "SENTINEL", "get-master-addr-by-name", e2eMasterName(testNamespace, crName))
-					masterInfo, err := utils.Run(cmd)
+					masterInfo, err := sentinelPortExec(testNamespace, crName+"-sentinel-0",
+						"SENTINEL", "get-master-addr-by-name", e2eMasterName(testNamespace, crName))
 					g.Expect(err).NotTo(HaveOccurred())
 					_, _ = fmt.Fprintf(GinkgoWriter, "Master info: %s\n", masterInfo)
 
 					// Try reading from any available pod
 					for i := 0; i < 3; i++ {
 						podName := fmt.Sprintf("%s-redis-%d", crName, i)
-						cmd = exec.Command("kubectl", "exec", podName,
-							"-n", testNamespace, "-c", "redis", "--",
-							"redis-cli", "GET", "failover-test-key")
-						output, err := utils.Run(cmd)
+						output, err := redisExec(testNamespace, podName, "GET", "failover-test-key")
 						if err == nil && strings.TrimSpace(output) == "failover-test-value" {
 							_, _ = fmt.Fprintf(GinkgoWriter, "Data found on %s\n", podName)
 							return
@@ -921,10 +898,8 @@ spec:
 
 			By("verifying sentinel sees 2 replicas")
 			Eventually(func(g Gomega) {
-				cmd := exec.Command("kubectl", "exec", crName+"-sentinel-0",
-					"-n", testNamespace, "-c", "sentinel", "--",
-					"redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(testNamespace, crName))
-				output, err := utils.Run(cmd)
+				output, err := sentinelPortExec(testNamespace, crName+"-sentinel-0",
+					"SENTINEL", "master", e2eMasterName(testNamespace, crName))
 				g.Expect(err).NotTo(HaveOccurred())
 				g.Expect(output).To(ContainSubstring("num-slaves"))
 				// Parse output to verify num-slaves is 2

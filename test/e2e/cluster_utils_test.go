@@ -180,8 +180,7 @@ func verifySentinelTopologySync(namespace, crName string, expectedSentinels, exp
 		var masterIPs []string
 		for i := 0; i < expectedSentinels; i++ {
 			sentinelPod := fmt.Sprintf("%s-sentinel-%d", crName, i)
-			cmd := exec.Command("kubectl", "exec", sentinelPod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379", "SENTINEL", "master", e2eMasterName(namespace, crName))
-			sentinelOutput, err := utils.Run(cmd)
+			sentinelOutput, err := sentinelPortExec(namespace, sentinelPod, "SENTINEL", "master", e2eMasterName(namespace, crName))
 			g.Expect(err).NotTo(HaveOccurred(), fmt.Sprintf("Failed to execute SENTINEL master on %s", sentinelPod))
 
 			// Parse Sentinel output
@@ -202,8 +201,7 @@ func verifySentinelTopologySync(namespace, crName string, expectedSentinels, exp
 
 		// 1b. Get replicas info from one sentinel to count only healthy ones
 		sentinelPod := fmt.Sprintf("%s-sentinel-0", crName)
-		cmd := exec.Command("kubectl", "exec", sentinelPod, "-n", namespace, "-c", "sentinel", "--", "redis-cli", "-p", "26379", "SENTINEL", "replicas", e2eMasterName(namespace, crName))
-		replicasOutput, err := utils.Run(cmd)
+		replicasOutput, err := sentinelPortExec(namespace, sentinelPod, "SENTINEL", "replicas", e2eMasterName(namespace, crName))
 		g.Expect(err).NotTo(HaveOccurred(), "Failed to execute SENTINEL replicas on sentinel pod")
 
 		// Parse replicas output more robustly
@@ -230,7 +228,7 @@ func verifySentinelTopologySync(namespace, crName string, expectedSentinels, exp
 			fmt.Sprintf("Sentinel reports %d up replicas, but expected %d", actualNumUpReplicas, expectedReplicas))
 
 		// 2. Get Operator Status
-		cmd = exec.Command("kubectl", "get", "littlered", crName, "-n", namespace, "-o", "json")
+		cmd := exec.Command("kubectl", "get", "littlered", crName, "-n", namespace, "-o", "json")
 		output, err := utils.Run(cmd)
 		g.Expect(err).NotTo(HaveOccurred(), "Failed to get LittleRed CR")
 
@@ -281,8 +279,7 @@ func getPodNodeID(namespace, podName string) (string, error) {
 // getPodRunID returns the current Redis RunID of a pod.
 // This is useful for Standalone and Sentinel modes where NodeID is not available.
 func getPodRunID(namespace, podName string) (string, error) {
-	cmd := exec.Command("kubectl", "exec", podName, "-n", namespace, "-c", "redis", "--", "redis-cli", "INFO", "server")
-	output, err := utils.Run(cmd)
+	output, err := redisExec(namespace, podName, "INFO", "server")
 	if err != nil {
 		return "", err
 	}

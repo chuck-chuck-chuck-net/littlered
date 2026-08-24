@@ -114,7 +114,15 @@ func collectRedisGroundTruth(debugDir, namespace string) {
 	b.WriteString("at cluster_state:fail for 122s, refusing the traffic a client sent it. So\n")
 	b.WriteString("when this file and lrctl-verify-*.txt disagree about whether the instance is\n")
 	b.WriteString("whole, THIS file is the one to trust: lrctl adds the computed verdict\n")
-	b.WriteString("(authority master, ghosts, partitions, colocation), not per-node dissent.\n")
+	b.WriteString("(authority master, ghosts, partitions, colocation), not per-node dissent.\n\n")
+	b.WriteString("SECOND reason to prefer this file, and a sharper one: for an AUTH-ENABLED\n")
+	b.WriteString("instance -- which sentinel- and failover-mode e2e fixtures now are by default\n")
+	b.WriteString("-- `lrctl verify` is BLIND. Its exec gatherer runs a bare `redis-cli` with no\n")
+	b.WriteString("credential (unlike `lrctl debug-dump`, which builds $AUTH from $REDIS_PASSWORD\n")
+	b.WriteString("and IS correct), so every probe answers NOAUTH and it renders a plausible LIE:\n")
+	b.WriteString("empty roles, keys:0, bare sentinels and \"Authority Master: NONE\". Measured on\n")
+	b.WriteString("t3e, 2026-08-24, against a perfectly healthy 1-master/2-replica instance. The\n")
+	b.WriteString("probes below authenticate, so THIS file is the ground truth for those runs.\n")
 
 	probed := 0
 	for _, pod := range pods {
@@ -216,7 +224,14 @@ func probesFor(pod podContainers) []groundTruthProbe {
 // answer is itself a finding worth recording (a pod that refuses redis-cli is
 // usually a pod parked in a startup wait-loop).
 func execInPod(namespace, podName string, p groundTruthProbe) string {
-	args := append([]string{"exec", podName, "-n", namespace, "-c", p.container, "--"}, p.args...)
+	// Authenticate where the instance is auth-enabled (sentinel and failover
+	// fixtures default to auth-ON — auth_utils_test.go). Without this the whole
+	// artifact degrades to a wall of NOAUTH on exactly the runs where it matters
+	// most. The credential goes in right after the binary, before the probe's own
+	// arguments, so `-p 26379` and the subcommand are unaffected.
+	args := []string{"exec", podName, "-n", namespace, "-c", p.container, "--", p.args[0]}
+	args = append(args, redisCliAuthArgs(podName)...)
+	args = append(args, p.args[1:]...)
 	out, err := exec.Command("kubectl", args...).CombinedOutput()
 	text := strings.TrimRight(string(out), "\n")
 	if err != nil {
@@ -299,6 +314,34 @@ computed verdict (authority master, ghosts, partitions, shard colocation).
 
 	_, _ = fmt.Fprintf(GinkgoWriter, "Collecting lrctl verify for %s...\n", crName)
 	out, _ := exec.Command(bin, "verify", crName, "-n", namespace).CombinedOutput()
+
+	// AUTH WARNING, stamped into the artifact itself rather than left for the
+	// reader to work out. `lrctl verify`'s exec gatherer runs a bare `redis-cli`
+	// with no credential (unlike `lrctl debug-dump`, which builds $AUTH from
+	// $REDIS_PASSWORD), so against an AUTH-ENABLED instance every probe answers
+	// NOAUTH and the report below is a plausible LIE: empty roles, keys:0, bare
+	// sentinels, "Authority Master: NONE". Sentinel- and failover-mode fixtures are
+	// auth-ON by default (auth_utils_test.go), so that is most of this suite.
+	// Measured on t3e, 2026-08-24, against a healthy 1-master/2-replica instance.
+	if pw := e2ePasswordForResource(crName); pw != "" {
+		header := fmt.Sprintf(`!! READ THIS BEFORE BELIEVING ANYTHING BELOW !!
+
+Instance %q is AUTH-ENABLED, and 'lrctl verify' does not authenticate: its exec
+gatherer runs a bare 'redis-cli', which answers NOAUTH. The report below is
+therefore NOT ground truth -- expect empty roles, keys:0, bare sentinels and
+"Authority Master: NONE" even on a perfectly healthy instance.
+
+Use redis-ground-truth.txt (whose probes DO authenticate) or 'lrctl debug-dump'
+instead. Reproduce by hand with:
+
+    kubectl exec %s-redis-0 -n %s -c redis -- redis-cli -a %s --no-auth-warning INFO replication
+
+--------------------------------------------------------------------------------
+
+`, crName, crName, namespace, pw)
+		out = append([]byte(header), out...)
+	}
+
 	if err := os.WriteFile(outFile, out, 0644); err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Failed to write lrctl verify output: %v\n", err)
 	}

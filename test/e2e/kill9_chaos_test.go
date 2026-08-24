@@ -182,7 +182,7 @@ spec:
 			const testDuration = 120 * time.Second
 
 			By("creating Sentinel cluster and chaos client simultaneously")
-			cr := fmt.Sprintf(`
+			cr := e2eAuthPreamble(crName) + fmt.Sprintf(`
 apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
@@ -190,12 +190,12 @@ metadata:
   namespace: %s
 spec:
   mode: sentinel
-  sentinel:
+%s  sentinel:
     masterName: %s
     quorum: 2
     downAfterMilliseconds: 5000
     failoverTimeout: 10000
-`, crName, testNamespace, e2eMasterName(testNamespace, crName))
+`, crName, testNamespace, e2eAuthSpecYAML(crName), e2eMasterName(testNamespace, crName))
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(cr)
 			_, err := utils.Run(cmd)

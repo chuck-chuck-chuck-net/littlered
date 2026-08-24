@@ -923,7 +923,20 @@ var _ = Describe("Failover Mode Minimum Topology", Label("failover-mode"), Order
 		// resyncs, so writes would be refused for the whole recovery rather than
 		// just the handover. Setting it makes the spec assert the OPT-OUT path,
 		// which is the one a replicas: 1 user is told to take.
-		cmd.Stdin = strings.NewReader(failoverCR(crName, 1, 5000, nil, "    minReplicasToWrite: 0\n"))
+		//
+		// DELIBERATELY AUTH-FREE — do not "finish the flip" here.
+		//
+		// Every other failover-mode fixture in this suite defaults to auth-ON
+		// (auth_utils_test.go), because in this mode the password is a real
+		// mesh-isolation control. That default would leave the NO-AUTH path — which
+		// is what `spec.auth.enabled: false`, the CRD default, gives every user who
+		// has not opted in — with no functional coverage outside security_test.go's
+		// single negative/positive PING pair. This tier is the one that keeps it:
+		// it stands an instance up, replicates, kills the master, promotes and
+		// asserts the data survived, all with no credential anywhere. It is also the
+		// cheapest place to spend that coverage (2 pods, and it was already here).
+		cmd.Stdin = strings.NewReader(
+			failoverCRWithAuth(crName, 1, 5000, nil, "    minReplicasToWrite: 0\n", false))
 		_, err := utils.Run(cmd)
 		Expect(err).NotTo(HaveOccurred())
 
