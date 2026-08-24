@@ -231,34 +231,62 @@ func execInPod(namespace, podName string, p groundTruthProbe) string {
 	return text
 }
 
+// lrctlBinPath returns the absolute path to the repo's own `bin/lrctl`,
+// rooted at the project directory (test/utils.GetProjectDir, the same
+// mechanism the rest of the suite uses to find the repo root).
+//
+// This is the ONLY place in the suite that names the lrctl binary path.
+// Every call site MUST go through this helper — never exec.LookPath("lrctl")
+// and never a bare "lrctl" command name. The point is that a stale
+// `/usr/local/bin/lrctl` from an old `make install-lrctl` (or any other
+// PATH-resolved copy) must never be able to influence a test result; only
+// this repo's own freshly-built binary may.
+//
+// Freshness is make's job, not this suite's: `make lrctl` (a prerequisite of
+// `run-test-e2e`) is a real file target keyed on lrctl's actual Go sources,
+// so `bin/lrctl` is guaranteed up to date before the suite ever runs. This
+// helper deliberately does not stat mtimes or re-check staleness — that
+// would be a second, and possibly conflicting, source of truth. BeforeSuite
+// asserts the binary exists at all (see e2e_suite_test.go); by the time any
+// spec or the debug collector calls this helper, existence is already
+// guaranteed.
+func lrctlBinPath() (string, error) {
+	projectDir, err := utils.GetProjectDir()
+	if err != nil {
+		return "", fmt.Errorf("failed to determine project dir: %w", err)
+	}
+	return filepath.Join(projectDir, "bin", "lrctl"), nil
+}
+
 // collectLrctlVerify captures `lrctl verify`, the project's designated ground-truth
 // tool (CLAUDE.md §7 rule 8): it gathers the operator-side view, computes the
 // authority master and flags ghosts, partitions and cross-shard colocation
 // breakage — conclusions no raw CLUSTER NODES dump states outright.
 //
-// It is opportunistic by design. lrctl is a separate binary that the suite does
-// not build for every spec, and the collector must not build it: this runs on the
-// failure path, where a two-second artifact sweep turning into a Go build that can
-// itself fail is a bad trade. So: use bin/lrctl if a previous `make lrctl` or
-// `make build` left one there, and otherwise record the one command that would
-// have produced it.
+// This runs on the failure path, AFTER a spec has already failed, so it must
+// never turn a missing binary into a masked or replaced failure. The
+// BeforeSuite assertion (e2e_suite_test.go) makes a missing binary
+// unreachable in practice, but this stays defensive: if the binary is
+// somehow absent here anyway, record the anomaly in the artifact and
+// continue — never fail or panic the run over a debug-collection problem.
 func collectLrctlVerify(debugDir, namespace, crName string) {
 	if crName == "" {
 		return
 	}
 
-	projectDir, err := utils.GetProjectDir()
+	bin, err := lrctlBinPath()
 	if err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping lrctl verify (project dir unknown): %v\n", err)
 		return
 	}
-	bin := filepath.Join(projectDir, "bin", "lrctl")
 
 	outFile := filepath.Join(debugDir, fmt.Sprintf("lrctl-verify-%s.txt", crName))
 	if _, statErr := os.Stat(bin); statErr != nil {
 		note := fmt.Sprintf(`lrctl verify was not captured: no binary at %s.
 
-Build it and re-run to get this artifact on the next failure:
+This should be unreachable -- BeforeSuite asserts bin/lrctl exists before any
+spec runs. If you are seeing this, something removed the binary mid-run.
+Rebuild it with:
 
     make lrctl
 

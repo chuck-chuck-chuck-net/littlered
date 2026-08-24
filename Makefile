@@ -246,7 +246,7 @@ test-e2e-all: ## Run ALL e2e tests, including 'extended'/opt-in tiers.
 	$(MAKE) test-e2e E2E_ALL=true
 
 .PHONY: run-test-e2e
-run-test-e2e: manifests generate fmt vet
+run-test-e2e: manifests generate fmt vet bin/lrctl
 	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
 
 # list-e2e previews the spec selection of an e2e run WITHOUT running anything. It reuses the
@@ -313,9 +313,30 @@ helm-lint: ## Lint the Helm chart and render it in every scoping mode.
 build: manifests generate fmt vet lrctl ## Build manager and lrctl binaries.
 	go build -o bin/manager cmd/littlered/main.go
 
+## bin/lrctl is a real file target: its prerequisite list is the actual Go
+## sources lrctl is built from (found via `go list -deps ./cmd/lrctl/...`),
+## plus go.mod/go.sum, so `make lrctl` is a genuine no-op when nothing
+## changed. Deliberately NOT depending on manifests/generate/fmt/vet here:
+## those are phony (always re-run) and would defeat the point. `generate`'s
+## output (zz_generated.deepcopy.go, used by api/v1alpha1) is checked in, so
+## an ordinary build is correct off the checked-in file; a developer who
+## edits API types without regenerating is caught by `make manifests
+## generate` idempotence in CI, not by rebuilding lrctl. fmt/vet are hygiene
+## checks, not build inputs, so they don't belong on a build target's
+## dependency list either. This is a `$(shell find ...)` list, evaluated
+## once at Makefile parse time -- fine here since these directories aren't
+## generated mid-run.
+## NOTE: if lrctl ever imports a new directory outside this list, `go build`
+## still works (it doesn't need make), but `make lrctl` will not know to
+## rebuild on changes confined to that new directory alone. Cross-check with
+## `go list -deps ./cmd/lrctl/...` if that's ever suspected.
+LRCTL_SRCS := $(shell find cmd/lrctl internal/cli internal/redis api -type f -name '*.go' ! -name '*_test.go') go.mod go.sum
+
+bin/lrctl: $(LRCTL_SRCS)
+	go build -o bin/lrctl ./cmd/lrctl
+
 .PHONY: lrctl
-lrctl: manifests generate fmt vet ## Build lrctl binary.
-	go build -o bin/lrctl cmd/lrctl/main.go
+lrctl: bin/lrctl ## Build lrctl binary (up to date if sources haven't changed).
 
 .PHONY: helm-package
 helm-package: manifests ## Package the Helm chart into dist/ with the current version tag.

@@ -22,7 +22,6 @@ package e2e
 import (
 	"fmt"
 	"os/exec"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -237,15 +236,11 @@ spec:
 	}
 
 	BeforeAll(func() {
-		By("building lrctl")
-		// utils.Run executes from the project root (it also chdirs there), so paths
-		// handed to it must be root-relative — and the resulting binary path must be
-		// absolute, because later invocations run from that same root.
-		projectDir, err := utils.GetProjectDir()
+		// bin/lrctl is guaranteed fresh by make (BeforeSuite already asserted it
+		// exists) — the suite never builds its own copy. See lrctlBinPath.
+		var err error
+		lrctlBin, err = lrctlBinPath()
 		Expect(err).NotTo(HaveOccurred())
-		lrctlBin = filepath.Join(projectDir, "bin", "lrctl")
-		out, err := utils.Run(exec.Command("go", "build", "-o", lrctlBin, "./cmd/lrctl"))
-		Expect(err).NotTo(HaveOccurred(), "build output: %s", out)
 
 		stamp := time.Now().Unix()
 		instA, instB = fmt.Sprintf("iso-a-%d", stamp), fmt.Sprintf("iso-b-%d", stamp)

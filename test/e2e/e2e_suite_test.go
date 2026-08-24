@@ -100,6 +100,26 @@ var _ = BeforeSuite(func() {
 	// Initialize streaming log tmp directory (suite-wide)
 	initE2ETmpDir()
 
+	// Assert bin/lrctl exists, ONCE, up front, rather than at each use. lrctl
+	// is the project's designated ground-truth CLI (CLAUDE.md §7 rule 8) and
+	// this suite must always invoke its own freshly-built ./bin/lrctl,
+	// rooted at the repo, never a PATH-installed copy (e.g. a stale
+	// `make install-lrctl` at /usr/local/bin/lrctl). Freshness is `make`'s
+	// job — `run-test-e2e` depends on the real `bin/lrctl` file target — so
+	// by the time we get here the binary should already be built and
+	// current. Failing loudly here, instead of opportunistically at each
+	// call site, is what lets every downstream use (specs and the failure-
+	// path debug collector) skip existence/fallback handling entirely.
+	By("verifying bin/lrctl was built by make")
+	{
+		lrctlBin, err := lrctlBinPath()
+		Expect(err).NotTo(HaveOccurred(), "failed to determine bin/lrctl path")
+		_, statErr := os.Stat(lrctlBin)
+		Expect(statErr).NotTo(HaveOccurred(),
+			"bin/lrctl not found at %s — build it before running e2e:\n\n    make lrctl\n\n"+
+				"(the test-e2e/run-test-e2e make targets do this automatically)", lrctlBin)
+	}
+
 	// Pin kubeconfig so that switching contexts in another terminal during a
 	// long-running test suite doesn't break anything.
 	//   KUBECONTEXT_PINNING=true             — pin the current active context
