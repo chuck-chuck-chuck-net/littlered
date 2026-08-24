@@ -177,9 +177,6 @@ func collectRedisState(
 		return
 	}
 
-	// Build auth args for redis-cli.
-	authShell := `AUTH=""; [ -n "$REDIS_PASSWORD" ] && AUTH="-a $REDIS_PASSWORD --no-auth-warning";`
-
 	for _, pod := range podList.Items {
 		if pod.Status.Phase != corev1.PodRunning {
 			continue
@@ -191,16 +188,17 @@ func collectRedisState(
 		case "redis":
 			// Sentinel-mode Redis pod.
 			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "redis",
-				[]string{"sh", "-c", authShell + ` redis-cli $AUTH INFO replication`})
+				redisCliArgs(infoSubcommand, "replication"))
 			writeFile(dir, fmt.Sprintf("redis-%s-info-replication.txt", pod.Name), out)
 
 		case modeCluster:
 			// Cluster-mode Redis pod.
-			clusterCmd := authShell + ` redis-cli $AUTH INFO replication` +
-				` && echo "---" && redis-cli $AUTH CLUSTER NODES` +
-				` && echo "---" && redis-cli $AUTH CLUSTER INFO`
 			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "redis",
-				[]string{"sh", "-c", clusterCmd})
+				redisCliChainArgs(
+					[]string{infoSubcommand, "replication"},
+					[]string{clusterSubcommand, "nodes"},
+					[]string{clusterSubcommand, infoSubcommand},
+				))
 			writeFile(dir, fmt.Sprintf("redis-%s-cluster-state.txt", pod.Name), out)
 
 		case modeSentinel:
@@ -208,10 +206,11 @@ func collectRedisState(
 			// Per-instance master name: a hardcoded one would report "No such master"
 			// on any correctly-scoped instance.
 			mn := lr.SentinelMasterName()
-			sentinelCmd := authShell + ` redis-cli $AUTH -p 26379 SENTINEL MASTER ` + mn +
-				` && echo "---" && redis-cli $AUTH -p 26379 SENTINEL REPLICAS ` + mn
 			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "sentinel",
-				[]string{"sh", "-c", sentinelCmd})
+				redisCliChainArgs(
+					[]string{"-p", "26379", modeSentinel, roleMaster, mn},
+					[]string{"-p", "26379", modeSentinel, "replicas", mn},
+				))
 			writeFile(dir, fmt.Sprintf("sentinel-%s-state.txt", pod.Name), out)
 		}
 	}

@@ -58,9 +58,7 @@ Works with both LittleRed-managed and unmanaged instances (--unmanaged).`,
 		}
 
 		// -- Collect CONFIG GET * ------------------------------------------------
-		configCmd := []string{"sh", "-c",
-			`AUTH=""; [ -n "$REDIS_PASSWORD" ] && AUTH="-a $REDIS_PASSWORD --no-auth-warning"; redis-cli $AUTH CONFIG GET "*"`,
-		}
+		configCmd := redisCliArgs("config", "get", "*")
 		stdout, stderr, err := k8s.Exec(ctx, coreClient, config, cCtx.Namespace, pod.Name, cCtx.RedisContainer, configCmd)
 		if err != nil {
 			return fmt.Errorf("CONFIG GET failed on pod %s: %v (stderr: %s)", pod.Name, err, stderr)
@@ -68,9 +66,7 @@ Works with both LittleRed-managed and unmanaged instances (--unmanaged).`,
 		redisConfig := parseAlternatingKV(stdout)
 
 		// -- Collect INFO server --------------------------------------------------
-		infoCmd := []string{"sh", "-c",
-			`AUTH=""; [ -n "$REDIS_PASSWORD" ] && AUTH="-a $REDIS_PASSWORD --no-auth-warning"; redis-cli $AUTH INFO server`,
-		}
+		infoCmd := redisCliArgs(infoSubcommand, "server")
 		stdout, _, err = k8s.Exec(ctx, coreClient, config, cCtx.Namespace, pod.Name, cCtx.RedisContainer, infoCmd)
 		if err != nil {
 			// Non-fatal: we can still generate CR without version info.
@@ -84,9 +80,7 @@ Works with both LittleRed-managed and unmanaged instances (--unmanaged).`,
 		// -- Cluster topology (if cluster mode) -----------------------------------
 		var shards, replicasPerShard int
 		if mode == modeCluster {
-			nodesCmd := []string{"sh", "-c",
-				`AUTH=""; [ -n "$REDIS_PASSWORD" ] && AUTH="-a $REDIS_PASSWORD --no-auth-warning"; redis-cli $AUTH CLUSTER NODES`,
-			}
+			nodesCmd := redisCliArgs(clusterSubcommand, "nodes")
 			stdout, _, err = k8s.Exec(ctx, coreClient, config, cCtx.Namespace, pod.Name, cCtx.RedisContainer, nodesCmd)
 			if err == nil {
 				shards, replicasPerShard = inferClusterTopology(redisclient.ParseClusterNodes(stdout))
