@@ -206,19 +206,21 @@ func TestBuildShardRolloutInputRedundancy(t *testing.T) {
 	if len(in.Pods) != 3 {
 		t.Fatalf("expected 3 pods, got %d", len(in.Pods))
 	}
-	want := []struct{ attached, synced bool }{
-		{false, false}, // ordinal 0 IS the owner — a master is nobody's replica
-		{true, true},   // ordinal 1: link up
-		{true, false},  // ordinal 2: attached, mid full sync
+	// IsOwner is what keeps a shard's own owner out of the STALL survey: it fails clause (c)
+	// structurally (a master is nobody's replica) and must not be reported as blocked.
+	want := []struct{ attached, synced, isOwner bool }{
+		{false, false, true}, // ordinal 0 IS the owner — a master is nobody's replica
+		{true, true, false},  // ordinal 1: link up
+		{true, false, false}, // ordinal 2: attached, mid full sync
 	}
 	for i, w := range want {
 		p := in.Pods[i]
 		if p.Ordinal != i {
 			t.Fatalf("pods must be in ordinal order; got %d at index %d", p.Ordinal, i)
 		}
-		if p.AttachedToOwner != w.attached || p.SyncedWithOwner != w.synced {
-			t.Errorf("ordinal %d: attached=%v synced=%v, want attached=%v synced=%v",
-				i, p.AttachedToOwner, p.SyncedWithOwner, w.attached, w.synced)
+		if p.AttachedToOwner != w.attached || p.SyncedWithOwner != w.synced || p.IsOwner != w.isOwner {
+			t.Errorf("ordinal %d: attached=%v synced=%v isOwner=%v, want attached=%v synced=%v isOwner=%v",
+				i, p.AttachedToOwner, p.SyncedWithOwner, p.IsOwner, w.attached, w.synced, w.isOwner)
 		}
 	}
 }

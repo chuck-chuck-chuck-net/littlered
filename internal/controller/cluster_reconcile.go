@@ -1377,7 +1377,24 @@ func (r *LittleRedReconciler) reportClusterRolloutGate(
 	if !plan.Blocked {
 		return r.clearClusterRolloutBlocked(ctx, littleRed)
 	}
-	msg := fmt.Sprintf(
+	msg := clusterRolloutBlockedMessage(shardIdx, plan,
+		clusterShardStatefulSetName(littleRed, shardIdx), littleRed.Namespace)
+	return r.setClusterRolloutBlocked(ctx, littleRed, metav1.ConditionTrue, "ShardNotRedundant", msg)
+}
+
+// clusterRolloutBlockedMessage renders the operator-facing text for a blocked hold. Pure, so
+// the sentence and the pod it names can be pinned by a unit test.
+func clusterRolloutBlockedMessage(shardIdx int, plan shardRolloutPlan, stsName, namespace string) string {
+	// plan.Hold/HoldPod name the FIRST failing clause (lowest ordinal); plan.BlockedPods name
+	// the pods that are actually stalled, and the two are independent. The sentence below
+	// asserts "updated and Ready but not attached", which is true only of a blocked pod — so
+	// it must be rendered from BlockedPods. Rendering HoldPod produced a message observed live
+	// naming an ABSENT pod as "updated and Ready ... (clause PodAbsent)".
+	ordinal := plan.HoldPod
+	if len(plan.BlockedPods) > 0 {
+		ordinal = plan.BlockedPods[0]
+	}
+	return fmt.Sprintf(
 		"Rolling update of shard %d is held: pod ordinal %d is updated and Ready but is not attached to the "+
 			"shard's slot owner at all (clause %s), and has been in that state for longer than %s. "+
 			"The shard's remaining pods — including its master — are NOT being taken down, so the instance "+
@@ -1385,9 +1402,7 @@ func (r *LittleRedReconciler) reportClusterRolloutGate(
 			"Release by hand with `kubectl patch statefulset %s -n %s --type=json -p "+
 			"'[{\"op\":\"replace\",\"path\":\"/spec/updateStrategy/rollingUpdate/partition\",\"value\":0}]'` "+
 			"— which forfeits the guarantee (ADR-017, LR-047).",
-		shardIdx, plan.HoldPod, plan.Hold, clusterRolloutReattachBudget,
-		clusterShardStatefulSetName(littleRed, shardIdx), littleRed.Namespace)
-	return r.setClusterRolloutBlocked(ctx, littleRed, metav1.ConditionTrue, "ShardNotRedundant", msg)
+		shardIdx, ordinal, holdRedundancy, clusterRolloutReattachBudget, stsName, namespace)
 }
 
 // clearClusterRolloutBlocked records that nothing is blocked, but only if the condition is

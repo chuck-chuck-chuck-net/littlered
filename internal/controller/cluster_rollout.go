@@ -145,6 +145,8 @@ type shardRolloutPod struct {
 	AttachedToOwner bool
 	// SyncedWithOwner: clause (c) — a link-up replica of the shard's slot owner (LR-025).
 	SyncedWithOwner bool
+	// IsOwner: this pod IS the shard's slot owner. Reporting only.
+	IsOwner bool
 }
 
 // shardRolloutInput is everything planShardRolloutPartition decides from: one shard StatefulSet,
@@ -349,7 +351,15 @@ func (p *shardRolloutPlan) hold(reason shardRolloutHold, ordinal int) {
 // slot owner at all, that the hold is worth naming as a stall. Reporting only — see
 // planShardRolloutPartition's doc comment.
 func (in shardRolloutInput) podStalled(pod shardRolloutPod) bool {
-	if pod.AttachedToOwner || pod.ReadySince.IsZero() {
+	// A pod that IS the shard's slot owner is a replica of nobody by construction — it is the
+	// thing everything else attaches TO — so its failing clause (c) is structural, not a stall.
+	// This is reachable on the ordinary path, not only in the exotic case ADR-017 anticipated:
+	// once the partition reaches 0 the StatefulSet deletes the master, its preStop hands
+	// mastership to the replica, and that promoted replica sits inside this survey with a
+	// ReadySince from when IT was replaced — deliberately long ago, because waiting for it to
+	// sync is what the gate does. Observed firing falsely on t3e (2026-08-25) 8s before the
+	// rollout completed normally.
+	if pod.IsOwner || pod.AttachedToOwner || pod.ReadySince.IsZero() {
 		return false
 	}
 	return !in.Now.Before(pod.ReadySince.Add(clusterRolloutReattachBudget))
@@ -473,6 +483,7 @@ func buildShardRolloutInput(
 		if node := gtNode(gt, podName); node != nil && ownerID != "" {
 			p.SyncedWithOwner = redisclient.IsLinkUpReplicaOf(node, ownerID)
 			p.AttachedToOwner = node.Role == RoleReplica && node.MasterNodeID == ownerID
+			p.IsOwner = node.NodeID == ownerID
 		}
 		in.Pods = append(in.Pods, p)
 	}

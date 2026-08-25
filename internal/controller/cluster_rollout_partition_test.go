@@ -18,6 +18,7 @@ package controller
 
 import (
 	"reflect"
+	"strings"
 	"testing"
 	"time"
 )
@@ -304,5 +305,78 @@ func TestPlanShardRolloutPartitionIsMonotone(t *testing.T) {
 					applied, len(subset), *got.Partition, want)
 			}
 		}
+	}
+}
+
+// ownerPod is the shard's own slot OWNER sitting at or above the partition. It is at
+// UpdateRevision and Ready, but it is a replica of nobody — it is the thing every other pod
+// attaches TO — so clause (c) is unsatisfiable for it by construction (ADR-017 Consequences,
+// "the named residual of the gate's formulation").
+//
+// Reaching this shape is ordinary rather than exotic. Once the gate lowers the partition to 0
+// the StatefulSet deletes the shard's master, its preStop hands mastership to the replica, and
+// that promoted replica IS the owner while sitting at ordinal >= 0 — i.e. inside the survey.
+// Its ReadySince is when IT was replaced, which on a gated rollout is deliberately long ago,
+// because waiting for it to sync is the whole point of the gate.
+func ownerPod(ordinal int, readyFor time.Duration) shardRolloutPod {
+	return shardRolloutPod{
+		Ordinal: ordinal, Revision: rolloutRevNew, Ready: true,
+		ReadySince:      rolloutNow.Add(-readyFor),
+		AttachedToOwner: false, SyncedWithOwner: false, IsOwner: true,
+	}
+}
+
+// TestShardOwnerIsNeverReportedBlocked is the regression guard for a FALSE ClusterRolloutBlocked
+// observed live on t3e (2026-08-25, operator 43517a8, instance lr047-blk/blk):
+//
+//	Cluster rollout gate  shard=0 verdict=Holding partition=0 hold=PodAbsent holdPod=0 blocked=true
+//
+// The blocked verdict was computed for ordinal 1 — the pod that had just BECOME shard 0's slot
+// owner when the master was released — which had been kubelet-Ready for 3m10s, i.e. past the
+// 120s reattach budget. Nothing was stalled: the rollout finished 8s later.
+//
+// The condition exists to distinguish a genuine stall from ordinary convergence, and ADR-017 is
+// explicit that it must not cry wolf on the topology large deployments have. A shard's own owner
+// is not a pod waiting to attach to something, so it can never be evidence of a stall.
+func TestShardOwnerIsNeverReportedBlocked(t *testing.T) {
+	// The live shape: partition already at 0, ordinal 0 absent (the master mid-replacement),
+	// ordinal 1 promoted to owner and Ready far longer than the budget.
+	got := planShardRolloutPartition(rolling(1, new(int32(0)), ownerPod(1, 3*time.Minute+10*time.Second)))
+
+	if got.Hold != holdPodAbsent || got.HoldPod != 0 {
+		t.Errorf("Hold = %q holdPod = %d, want %q 0 (the absent master is the first failing clause)",
+			got.Hold, got.HoldPod, holdPodAbsent)
+	}
+	if got.Blocked || len(got.BlockedPods) != 0 {
+		t.Errorf("Blocked = %v %v, want not blocked: ordinal 1 IS the shard's slot owner, "+
+			"so failing clause (c) is structural and not a stall", got.Blocked, got.BlockedPods)
+	}
+}
+
+// TestClusterRolloutBlockedMessageNamesABlockedPod pins that the operator-facing message
+// describes a pod that is actually blocked. plan.Hold/HoldPod name the FIRST failing clause
+// (lowest ordinal) while plan.BlockedPods name the stalled pods, and the two are independent —
+// so rendering HoldPod into a sentence that asserts "is updated and Ready but is not attached"
+// can produce a message that is simply false. Observed verbatim on t3e:
+//
+//	"pod ordinal 0 is updated and Ready but is not attached to the shard's slot owner at all
+//	 (clause PodAbsent)"
+//
+// Ordinal 0 was ABSENT — neither updated nor Ready — and "clause PodAbsent" contradicts the
+// sentence it sits in.
+func TestClusterRolloutBlockedMessageNamesABlockedPod(t *testing.T) {
+	plan := shardRolloutPlan{
+		Verdict: rolloutHold, Hold: holdPodAbsent, HoldPod: 0,
+		Blocked: true, BlockedPods: []int{1},
+	}
+	msg := clusterRolloutBlockedMessage(0, plan, "blk-shard-0", "lr047-blk")
+	if !strings.Contains(msg, "pod ordinal 1 ") {
+		t.Errorf("message does not name the blocked pod (ordinal 1):\n%s", msg)
+	}
+	if strings.Contains(msg, string(holdPodAbsent)) {
+		t.Errorf("message names clause %q, which contradicts \"updated and Ready\":\n%s", holdPodAbsent, msg)
+	}
+	if !strings.Contains(msg, "blk-shard-0") || !strings.Contains(msg, "lr047-blk") {
+		t.Errorf("message lost the manual-release instruction:\n%s", msg)
 	}
 }
