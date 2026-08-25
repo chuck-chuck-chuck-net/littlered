@@ -1401,9 +1401,110 @@ uncovered: a *partial* capture (1 of 3 Sentinels) producing no verdict.
     - **Tier 2, the pure seam:** `planShardRolloutPartition` as a table (`cluster_rollout_partition_test.go`, red-first at M2) plus the wiring seams `shardSlotOwner` / `buildShardRolloutInput` and the pre-gather hold-or-raise property (`cluster_rollout_wiring_test.go`). The wiring tests were authored **after** the implementation (disclosed) and their teeth shown by five mutations, each observed failing for its own reason: exact-range owner matching (shard 2 unresolvable ⇒ permanent stall), owner taken as the *intended* master pod rather than the serving node (shard 1 resolves to the wrong node after a failover), `Ready` read from the pod-level condition instead of the redis container, `SyncedWithOwner` dropping LR-025's link-`up` clause, and an absent pod satisfying every clause (the pre-gather call then **Advances** instead of Holding — i.e. lowers the partition with no evidence at all). The partition's exclusion from `AnnotationPodSpecHash` is pinned by its own test, green from birth, with a mutation that folds the rendered `rollingUpdate` block into the hashed template.
 - **Regresses:** Rollouts get **slower**, and the shape of the bound changes from `shards × pods × (ready + minReadySeconds)` to `shards × pods × (schedule + FORGET/MEET/REPLICATE + full sync)`. For a large dataset the full sync dominates and can be minutes per pod; that is the correct trade and it must be documented, because a user watching a 3-shard cluster take twenty minutes to roll will otherwise file it as a hang. `minReadySeconds: 30` is retained as pure defence in depth and must never again be presented as the safety mechanism. Nothing else changes: the create-missing path is untouched (a fresh StatefulSet is built with no partition), the repair loop, gather, requeue cadences and every other mode are untouched, and no new RBAC is needed — the reconciler already owns the StatefulSets it applies and the cursor is one of their own fields.
 - **Unverified / accepted residuals, stated plainly:**
-    - **`partition` governs operator-triggered rollouts only** — LR-021's documented limitation, inherited verbatim. Node drains, evictions and a manual `kubectl rollout restart` bypass the operator and are covered by nothing here. ADR-017 Decision 4 (a pod-local preStop self-fence, `CONFIG SET min-replicas-to-write 99` on the last-copy branch) is the mitigation for those and **has not been implemented in this change**; it must ship in the same image as this gate and never before it, because it lives in the pod template and so triggers one rolling update of every cluster instance on upgrade.
+    - **`partition` governs operator-triggered rollouts only** — LR-021's documented limitation, inherited verbatim. Node drains, evictions and a manual `kubectl rollout restart` bypass the operator and are covered by nothing here. ADR-017 Decision 4 (a pod-local preStop self-fence, `CONFIG SET min-replicas-to-write 99` on the last-copy branch) is the mitigation for those; it landed immediately after this, in the same image — see the addendum below.
     - **`ClusterRolloutBlocked` has never fired in anger.** It was not reachable in the live runs — every hold was discharged within seconds — so the condition, its message and its once-per-transition event are exercised only by the code path, not by observation. The failure mode of this whole change is **over-suppression**, and as with LR-043 unit tests cannot prove its absence; this condition firing outside a genuine sync failure is the operational tell, and it is untested in the field.
     - **The `replicasPerShard: 0` Warning is likewise unobserved live** — the validation cluster runs `replicasPerShard: 1`.
     - **The named residual of the gate's formulation is still open** (ADR-017 Consequences): clause (c) asks each pod at or above the partition to be a *replica* of the shard's owner, which is unsatisfiable for a pod that IS the owner. It did not bite in the live runs, and structurally it cannot bite above partition 0 in the normal flow — such a pod is the one the StatefulSet is about to replace — but if a repair path promotes a freshly-replaced pod back into ownership *while the partition is still above it*, the gate holds forever. That degrades to the chosen behaviour, a loud stall, rather than to loss. Not pre-emptively special-cased, because every extra clause on this predicate is what LR-043 warns about.
     - **The wipe tiers were not re-run.** ADR-017's verification plan asks for `Cluster Mode Chaos Testing` and `Cluster Total-Wipe Re-Bootstrap` as well, precisely because they exercise the bootstrap and fresh-pod paths this change touches and LR-043's regression was found by exactly that tier. Only the repro tier and `Cluster Mode Rolling Update` were run.
 - **Impacts:** New pillar §3.16 material and ADR-017. Completes the pair with LR-046 (the latency half of the same 2026-08-23 incident). Extends ADR-007 / LR-021 without modifying it. Uses LR-025's `IsLinkUpReplicaOf` as the single shared definition of "synced", LR-023's kubelet readiness as the redundancy-independent data signal, LR-044's build-time/SSA reasoning for the pre/post-gather split, and LR-043's uncached-read discipline for the cursor. New surfaces: the `ClusterRolloutBlocked` condition, its Warning event, and the `ClusterRolloutUngated` Warning. No new status fields.
+
+### Addendum — the preStop fence half, and what it does and does not close (t3e, 2026-08-25)
+
+The gate above closes the rollouts the operator drives. It closes nothing else, and "everything
+else" is not a corner: a node drain, an eviction and a manual `kubectl rollout restart` all reach
+a shard's master without passing through `reconcileClusterStatefulSet` at all. ADR-017 Decision 4
+is the mitigation for those, and it is now implemented.
+
+- **What changed.** The cluster preStop's last-copy branch — the one reached when the replica
+  lookup finds nobody, which said `preStop: No healthy replica found to take over. Proceeding
+  with restart.` and exited — now issues `CONFIG SET min-replicas-to-write 99` first and *then*
+  exits as before. `minReadySeconds`' comment was reworded in the same change: it presented a
+  wall-clock timer as the safety mechanism, which is the reading that let this defect exist. The
+  value is unchanged and is now documented as pure defence in depth.
+- **What it converts, which is the whole point.** Nothing about the data changes: that shard's
+  range still dies with the pod, because with no second copy there is nothing anywhere else. What
+  changes is that the writes in the departure window stop being **acknowledged** first. Pillar
+  3.2's "errors rather than silent data loss", applied to a rollout instead of to memory pressure
+  — the same move LR-038 made for failover mode's graceful handover, where the measured conversion
+  was 202 acknowledged-and-lost writes into 202 visible failures.
+- **Target-free, and that is not an implementation detail.** `min-replicas-to-write 99` cannot be
+  satisfied, so the write path closes on the spot without the pod ever having to learn who its
+  successor is. Needing a successor would reintroduce exactly the race the fence exists to remove,
+  and in this branch there IS no successor. It is also the entire reason the pod may act at all:
+  LR-016 forbids a pod inferring the state of OTHER nodes, and *"I am being terminated"* is local
+  knowledge that cannot be wrong (LR-038 Addendum 2). The one lookup the branch does make — is
+  there a healthy replica — was already there and already load-bearing for the `CLUSTER FAILOVER`
+  path; the fence adds no new inference. Nothing is persisted (no `CONFIG REWRITE`), so the
+  replacement container starts unfenced.
+- **It keeps the `exit 0`, deliberately.** A preStop that refuses to leave does not prevent the
+  loss, it postpones it by `terminationGracePeriodSeconds` (unset on cluster pods, so the
+  Kubernetes default 30s) and then pays the SIGKILL anyway — while making *every* rollout pay the
+  full grace window per pod. This is a mitigation and it is documented as one.
+- **The ordering hazard, which is why this shipped second and never first.** The preStop lives in
+  the pod template, so changing it changes `AnnotationPodSpecHash` and **triggers one rolling
+  update of every cluster instance on upgrade** — the exact operation that was unsafe. It is safe
+  here only because the gate landed first, in the same image, so the rollout this change triggers
+  is already governed by it. Shipping the fence ahead of the gate would have turned the fix into
+  the incident.
+- **Live evidence (t3e, throwaway `replicasPerShard: 0` cluster, operator `0fbfb45`).** With no
+  replicas every master is by construction the last copy of its range, so the branch is taken
+  deterministically. A writer looping `SET` against the shard-0 master across a graceful
+  `kubectl delete pod` recorded the conversion at the millisecond:
+
+  ```
+  20:23:34.055532911 6096 OK
+  20:23:34.059308931 6097 NOREPLICAS Not enough good replicas to write.
+  ...
+  20:23:34.147584425 6124 NOREPLICAS Not enough good replicas to write.
+  20:23:34.150928454 6125 Could not connect to Redis at 10.233.192.28:6379: Connection refused
+  ```
+
+  **28 writes that this build refused are 28 writes the previous build would have acknowledged and
+  then destroyed** — the fence took hold ~140ms after the delete was issued, and the socket closed
+  ~90ms later. The pod's own log for the same departure:
+
+  ```
+  preStop hook starting at Tue Aug 25 20:24:44 UTC 2026, PID 51
+  preStop: my node ID is a01b6f54230a01613ec0c8b54efd6a3168570906, master=yes
+  preStop: WARNING no healthy replica for this shard — I am the last copy of my slots.
+  preStop: writes fenced (-NOREPLICAS); this shard's range dies with this pod, but no further write is acknowledged and then lost
+  preStop: Proceeding with restart.
+  ```
+
+  A subsequent template change rolled all three shards and produced that same five-line sequence on
+  each, so the branch is reached on the operator-driven path too, not only on a direct delete.
+- **Decision 3's `replicasPerShard: 0` Warning was observed live for the first time in the same
+  run** (it is listed above as unobserved). The message is emitted per shard and the operator's
+  audit log carries all three (`Ungated cluster rollout (replicasPerShard: 0)` at `shard` 0, 1 and
+  2). **The API surface does not: three emissions produced two Event objects**, the second carrying
+  `count: 2` and shard 1's message, with shard 2 folded into that series — Kubernetes treats
+  same-reason, same-object Warnings as one series and the note is not part of the key. So `kubectl
+  get events` names shard 0 and shard 1 and never shard 2. Not a defect in the verdict and not
+  changed here; recorded because an operator reading events will undercount the shards, and the log
+  is the reliable surface. The same folding will apply to `ClusterRolloutBlocked`.
+- **The erasure reproduced exactly as described above**, incidentally and usefully: after the
+  ungated roll the CR reported `phase: Running`, `Ready=True/ClusterHealthy`, with `DBSIZE 0` on
+  the shard whose key had been written before the roll. The gate exists because that is what
+  success looks like from every surface the product exposes.
+- **Tests:** `TestBuildClusterPreStopFencesLastCopy` and `TestBuildClusterPreStopFenceTLSFlags`
+  (`internal/controller/resources_test.go`). **Both are green from birth and this is disclosed
+  rather than dressed up** — a shell script embedded in a Go string has no honest red available;
+  asserting the built script contains the fence can only ever guard against a future edit deleting
+  it, and the behaviour itself is observable only live, which is what the capture above is for.
+  Their teeth were shown by three mutations, each observed failing for its own reason: restoring
+  the old two-line branch body (fence assertion), hoisting the fence above the `IS_MASTER` early
+  exit (placement assertion — the fence must not fire for a master that *does* have a replica, or
+  it refuses writes for the whole hand-over window `CLUSTER FAILOVER` exists to make seamless), and
+  stripping the TLS flags from the fence command (TLS assertion — a fence that cannot connect is a
+  fence that silently is not there).
+- **Regresses:** one rolling update of every existing cluster instance on upgrade, by design and
+  under the gate (above). On the last-copy path, writes in the departure window now fail instead of
+  succeeding — which is the intended conversion, but it *is* an availability change on a path that
+  previously looked available, and `replicasPerShard: 0` users will see it. No other path is
+  touched: a master with a healthy replica hands over exactly as before, and a replica still exits
+  immediately.
+- **Still not closed.** The fence does not save the data and never could; with one copy there is
+  nothing to save. Drains, evictions and manual restarts remain outside the gate — the fence makes
+  their loss loud, not absent. The properly closing alternative is ADR-017's deferred
+  readiness-probe redesign, which would govern those paths too and is declined there for the
+  `allPodsReady` bootstrap trap, not on merit.
