@@ -1181,11 +1181,60 @@ The `minReadySeconds` setting ensures:
 2. Failover (if needed) completes successfully
 3. Cluster stabilizes before next pod restarts
 
+### Cluster Mode: Rollouts Wait for Redundancy, Not for a Timer
+
+In cluster mode an operator-triggered rolling update is gated on **state**. Before the StatefulSet
+is allowed to take the next pod of a shard down — and the last one down is that shard's master —
+the operator requires the pod it just replaced to be:
+
+1. at the StatefulSet's `UpdateRevision` (it really was replaced),
+2. Ready per the kubelet, **and**
+3. a link-`up` replica of that shard's slot owner — i.e. an actual, synced copy of the shard's slots.
+
+Mechanically the operator holds the shard's StatefulSet at
+`spec.updateStrategy.rollingUpdate.partition` and lowers it by one ordinal only when all three hold
+(ADR-017). Clause 3 is the one that matters: a replaced cluster pod comes back on an empty
+`emptyDir` with a **new** Redis node ID, so it has to be re-admitted to the cluster
+(`CLUSTER FORGET` of the old ID, `CLUSTER MEET`, `CLUSTER REPLICATE`) and then **full-sync** the
+shard's dataset before it is a copy of anything. Readiness only says a process answers `PING`.
+
+**Expect rollouts to take noticeably longer than they used to.** The bound changed shape:
+
+| | Bound per pod |
+|---|---|
+| Before | ready + `minReadySeconds` |
+| Now | schedule + `CLUSTER FORGET`/`MEET`/`REPLICATE` + **full sync** |
+
+Total is still `shards × pods × (per-pod bound)`, but the per-pod bound is now dominated by the
+full sync for anything but a small dataset, and a full sync of a large shard can take **minutes**.
+A three-shard cluster holding a lot of data can therefore spend twenty minutes rolling and be
+working correctly the whole time. This is not a hang: watch the partition come down
+(`kubectl get statefulset <name>-shard-K -o jsonpath='{.spec.updateStrategy.rollingUpdate.partition}'`)
+and the operator's `Cluster rollout gate` log lines. A rollout that is genuinely stuck says so —
+see [When a cluster rollout is held (`ClusterRolloutBlocked`)](#when-a-cluster-rollout-is-held-clusterrolloutblocked).
+
+On a small dataset the cost is small: a full three-shard rollout on the validation cluster
+completed in about two minutes, and one shard was observed holding for 14 consecutive reconcile
+passes before it advanced.
+
+**`replicasPerShard: 0` cannot be gated, and the operator says so.** With one copy per shard, any
+rollout takes that copy down; storage is `emptyDir` (never persisted), so that shard's data is lost
+and the operator will reassign its slot range to the empty replacement. No operator-side gate can
+prevent this, and refusing the rollout would make a documented topology un-upgradable — so the
+operator emits a `ClusterRolloutUngated` Warning event naming the shard and proceeds. Set
+`replicasPerShard: >= 1` if you want a data-safe rollout.
+
+**The gate governs operator-triggered rollouts only.** A manual
+`kubectl rollout restart`, a node drain and an eviction all bypass the operator and are gated by
+nothing — the same limitation the cross-shard serialization has always had. For those, roll the
+shard StatefulSets one at a time by hand as shown under
+[Trigger via kubectl](#trigger-via-kubectl), and prefer a CR update where you can.
+
 ### Default Behavior
 
 | Mode | Default minReadySeconds | Reason |
 |------|------------------------|--------|
-| Cluster with replicas | 30s | Allows automatic failover (cluster-node-timeout + promotion + buffer) |
+| Cluster with replicas | 30s | Defence in depth on top of the state gate above — **not** the safety mechanism. Allows automatic failover (cluster-node-timeout + promotion + buffer) |
 | Sentinel mode | 35s | Allows sentinel-managed failover (down-after-milliseconds + promotion) |
 | Failover mode | 15s | Operator-led handover is faster than Sentinel's (default 5s detection window + promote/repoint); 15s lets a transition settle before the next pod rolls |
 | Standalone or 0-replica | 0s | No failover mechanism, immediate restart is safe |
@@ -1579,6 +1628,53 @@ kubectl scale -n littlered-system deployment/littlered-operator --replicas=1
 
 **Then fix the cause**, or it recurs on the next pod-IP recycle: give the instance a unique
 `masterName` and enable authentication with a password not shared with the neighbouring instance.
+
+### When a cluster rollout is held (`ClusterRolloutBlocked`)
+
+```bash
+kubectl get littlered my-cluster -n default -o jsonpath='{.status.conditions[?(@.type=="ClusterRolloutBlocked")]}' | jq
+# True  ShardNotRedundant  Rolling update of shard 1 is held: pod ordinal 1 is updated and Ready
+#                          but is not attached to the shard's slot owner at all ...
+```
+
+**What it means.** The operator is holding shard 1's StatefulSet at its current
+`rollingUpdate.partition` because the replaced pod has been Ready for longer than the 120s reattach
+budget while having **no** attachment to the shard's slot owner at all. The remaining pods of that
+shard — including its master — have **not** been taken down, so the instance is still serving and
+its data is intact. The update simply cannot finish safely.
+
+A pod that *is* attached to the owner but whose replication link is still down never produces this
+condition, however long it takes: that is a full sync in flight, and it is progress.
+
+**There is deliberately no timer that releases the hold.** A time-released rollout is exactly the
+data-losing behaviour this gate removes, so the stall is permanent until either the shard becomes
+redundant or a human intervenes.
+
+**Diagnose first** — the usual cause is that the replacement never got re-admitted to the cluster:
+
+```bash
+# What the operator decided, each pass
+kubectl logs -n littlered-system deploy/littlered-operator | grep "Cluster rollout gate"
+
+# Ground truth: is the replaced pod a replica of its shard's slot owner?
+lrctl verify my-cluster -n default
+lrctl inspect my-cluster -n default
+```
+
+**Manual release, and what it costs.** Raising the partition by hand hands the shard back to the
+StatefulSet controller, which will take the next pod down on readiness plus `minReadySeconds`
+alone — i.e. it forfeits the redundancy guarantee, and if the shard really has no synced copy that
+is the data loss the gate was preventing:
+
+```bash
+kubectl patch statefulset my-cluster-shard-1 -n default --type=json \
+  -p '[{"op":"replace","path":"/spec/updateStrategy/rollingUpdate/partition","value":0}]'
+```
+
+The release sticks: the operator never raises a partition again for a rollout already in flight
+(it rises only on first sight of a *new* template change), so do this only after confirming the
+shard is redundant by another route — or when you have accepted the loss, for example on a shard
+whose data you can rebuild.
 
 ### Cluster diagnostics
 

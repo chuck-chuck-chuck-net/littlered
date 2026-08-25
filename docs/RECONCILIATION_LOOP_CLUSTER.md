@@ -30,7 +30,8 @@ graph TD
     STSReady -- No --> WaitPods["Set Phase: Initializing<br/>Requeue @ fast"]
     STSReady -- Yes --> GatherGT["gatherGroundTruth<br/><i>Query CLUSTER INFO + CLUSTER NODES<br/>on every pod</i>"]
 
-    GatherGT --> HealthCheck{"Cluster healthy?<br/><i>all nodes known, 16384 slots,<br/>correct master count, no partitions,<br/>no empty masters</i>"}
+    GatherGT --> RolloutGate["Rollout Gate<br/><i>advanceClusterRollout: lower one shard's<br/>rollingUpdate.partition iff every pod at or above it<br/>is updated, Ready and a link-up replica of the<br/>shard's slot owner</i>"]
+    RolloutGate --> HealthCheck{"Cluster healthy?<br/><i>all nodes known, 16384 slots,<br/>correct master count, no partitions,<br/>no empty masters</i>"}
 
     HealthCheck -- Yes --> UpdateStatus["updateClusterStatus<br/><i>Phase: Running</i>"]
     HealthCheck -- No --> NeedsRepair{"Partitions? Ghosts?<br/>Orphaned slots?<br/>Empty masters?"}
@@ -86,6 +87,80 @@ Any NodeID that appears in `CLUSTER NODES` output but does NOT have a correspond
 5. If a new pod is MEETed in before the ghost is forgotten, Redis's internal epoch conflict resolution can **demote the new pod to a replica of the ghost**
 
 By using the K8s pod list, the operator detects and FORGETs ghosts immediately — before gossip catches up and before the new pod joins.
+
+---
+
+## State-Gated Rolling Updates
+
+An operator-triggered pod-template change is gated twice: **across** shards (LR-021 — one shard
+rolls at a time, `reconcileClusterStatefulSet` defers the rest until the current one settles) and,
+since ADR-017 / LR-047, **within** a shard.
+
+The intra-shard gate is `spec.updateStrategy.rollingUpdate.partition` on the shard StatefulSet.
+Without it the intra-shard sequence belongs entirely to the StatefulSet controller, whose only
+gates — readiness and `minReadySeconds` — are blind to redundancy: readiness is
+`[ ! -f /data/bootstrap-in-progress ]` plus a local `PING`, which says nothing about cluster
+membership, slot ownership or a replication link. A replaced pod returns on a wiped EmptyDir with a
+**new node ID**, so it is a copy of nothing until the operator has `FORGET`/`MEET`/`REPLICATE`-d it
+and it has full-synced. The invariant the gate enforces is LR-025's, applied to the rollout: *the
+unsafe "owns slots, no synced replica" state never exists*.
+
+**The decision** (pure `planShardRolloutPartition`, `internal/controller/cluster_rollout.go`), per
+shard:
+
+| Verdict | When | Partition emitted |
+|---------|------|-------------------|
+| `Ungated` | `replicasPerShard == 0` | none (no `rollingUpdate` block at all) |
+| `Started` | first sight of a template-hash change | the shard's highest ordinal — **the only rise** |
+| `Advanced` | every pod at or above the partition is (a) at `UpdateRevision`, (b) Ready per the kubelet, (c) a link-`up` replica of the shard's slot owner | current − 1 |
+| `Holding` | any clause unsatisfied | current, unchanged |
+| `Complete` | the shard has settled on the desired template | 0 |
+
+`Complete` is evaluated **before** the clauses: a settled shard's own master owns the slots and is
+therefore nobody's replica, so testing clause (c) against it would report a healthy shard as stuck.
+The template-change check precedes `Complete` for the mirror reason — at first sight of a change the
+shard is still settled on the *old* template.
+
+**Two halves, one cursor.** Clause (c) is Redis-level state that only exists after the gather, but
+the StatefulSet is written at step 1 by a server-side apply with `ForceOwnership`, so the partition
+must be authoritative at build time or it flaps back to 0 every pass:
+
+- **Pre-gather** (`reconcileClusterStatefulSet`) calls the seam with no pods and no ground truth, so
+  it takes the structural branches only and can therefore only **hold or raise**.
+- **Post-gather** (`advanceClusterRollout`, `reconcileCluster` step 4a) is the only place it comes
+  **down**, one ordinal per pass, for the first shard in shard order that is not settled at the
+  desired template. It runs *before* the repair branch, which returns and would otherwise skip the
+  gate for the whole rollout.
+
+The live StatefulSet's own `partition` field **is** the cursor — no status field, no annotation. It
+is read **uncached** (`apiReader`) while a rollout is in flight, along with the shard's pods,
+because a stale-low value would release the shard's master early; the steady loop keeps its cached
+read. `shardSlotOwner` resolves the owner by slot **containment** of the shard's aligned range start
+rather than exact range equality, so a fragmented or mid-reshard range (LR-018) does not resolve to
+"no owner" — which would make clause (c) unsatisfiable forever. When no owner resolves at all,
+nobody is synced and the gate holds: the safe direction.
+
+**Why it cannot deadlock the cluster.** Holding leaves the *old* pods running and serving, so the
+failure direction is a stalled upgrade, never an outage. The clause it waits on is discharged by the
+operator's own repair loop (Step 4's shard-aware reattach), which runs on the fast requeue interval
+for the whole rollout because a not-yet-reattached replacement is an empty master ⇒
+`HasEmptyMasters()` ⇒ not healthy (LR-014). At partition 0 a hold is inert.
+
+**Reporting is separate from acting.** `reportClusterRolloutGate` sets the
+`ClusterRolloutBlocked` condition (`ShardNotRedundant`) and a once-per-transition Warning event when
+a pod at `UpdateRevision` has been kubelet-Ready for longer than `clusterRolloutReattachBudget`
+(120s) with **no attachment to the owner at all**. It is advisory — the emitted partition is
+identical either way. An attached-but-link-down pod is a full sync in flight and is never reported
+blocked however long it takes; a pod with no readiness timestamp is never reported blocked either,
+because unknown is not evidence. There is deliberately **no timer that releases the hold**: manual
+release is raising the partition by hand.
+
+`replicasPerShard: 0` is ungated by construction, and the pass that triggers the roll emits a
+`ClusterRolloutUngated` Warning stating that the shard's data will be lost.
+
+**Residual:** the partition governs operator-triggered rollouts only. A manual
+`kubectl rollout restart`, a node drain and an eviction bypass the operator entirely — LR-021's
+documented limitation, inherited.
 
 ---
 
@@ -346,5 +421,6 @@ The operator reports `Phase: Running` when:
 
 ## References
 - [ADR-001: Strict IP-Only Identity (Cluster Amendment)](adr/001-strict-ip-identity.md#cluster-mode-has-an-active-fix-nodesconf-deletion)
+- [ADR-017: State-Gated Intra-Shard Rolling Updates](adr/017-state-gated-cluster-rolling-updates.md)
 - [Reconciliation Algorithm Changelog](RECONCILIATION_ALGORITHM_CHANGELOG.md)
 - [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md) — high-level view
