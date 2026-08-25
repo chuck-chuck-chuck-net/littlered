@@ -1508,3 +1508,98 @@ is the mitigation for those, and it is now implemented.
   their loss loud, not absent. The properly closing alternative is ADR-017's deferred
   readiness-probe redesign, which would govern those paths too and is declined there for the
   `allPodsReady` bootstrap trap, not on merit.
+
+### Addendum 2 — `ClusterRolloutBlocked` fired falsely, and named the wrong pod (t3e, 2026-08-25)
+
+The entry above records the condition as *"never fired in anger"* and its own honest caveat as
+*"this condition firing outside a genuine sync failure is the operational tell."* The M5
+verification sweep made it fire — first deliberately, then by accident — and both halves of the
+report were wrong. **Advisory layer only: the emitted partition is byte-identical either way, so
+neither defect ever endangered data or held a pod it should not have.**
+
+**How it was made to fire at all.** No suite tier reaches it, because every hold in the live runs
+discharged within seconds. The reachable lever is the one ADR-017 already names as a consequence —
+*"an operator outage stalls a rollout instead of losing a shard"*: trigger a template change, wait
+for the gate to apply `partition: 1`, scale the operator to 0 before it can reattach the fresh
+replica, and hold it down past `clusterRolloutReattachBudget`. The replacement comes back Ready on
+its own kubelet probe with nothing to attach it to; on the first pass after the operator returns
+the hold is already past the budget. (A NetworkPolicy-based isolation was tried first and is a dead
+end here: this cluster does not enforce them.)
+
+**The true positive is correct, and is recorded here because it had never been seen:**
+
+    Rolling update of shard 0 is held: pod ordinal 1 is updated and Ready but is not attached to
+    the shard's slot owner at all (clause PodNotSyncedReplica), and has been in that state for
+    longer than 2m0s. The shard's remaining pods — including its master — are NOT being taken
+    down, so the instance keeps serving and its data is intact; the update simply cannot finish
+    safely. Release by hand with `kubectl patch statefulset blk-shard-0 -n lr047-blk --type=json
+    -p '[{"op":"replace","path":"/spec/updateStrategy/rollingUpdate/partition","value":0}]'`
+    — which forfeits the guarantee (ADR-017, LR-047).
+
+Condition `ClusterRolloutBlocked=True/ShardNotRedundant`, one Warning event, the master **not**
+taken down for the whole outage, and the key intact throughout — i.e. the stall is availability-safe
+exactly as designed, and it self-clears (`False/RolloutProgressing`) seconds after the operator
+returns and reattaches.
+
+**Defect 1 — a FALSE block on the ordinary path, which ADR-017 predicted could not happen there.**
+The Consequences name the residual — *"clause (c) asks each pod at or above the partition to be a
+replica of the shard's owner, which is unsatisfiable for a pod that IS the owner"* — and judge that
+it *"structurally cannot bite above partition 0 in the normal flow."* True, and the wrong bound: it
+bites **at** partition 0. When the gate lowers the partition to 0 the StatefulSet deletes the
+shard's master, its preStop hands mastership to the replica, and that **promoted replica is now the
+owner while still inside the survey** (`ord` runs from `currentPartition()`, i.e. 0, to the highest
+ordinal). Its `ReadySince` is when *it* was replaced — deliberately long ago, because waiting for it
+to sync is the entire job of the gate — so `podStalled` fires. Observed:
+
+    Cluster rollout gate  shard=0 verdict=Holding partition=0 hold=PodAbsent holdPod=0 blocked=true
+
+with the rollout completing normally **8s later**. The precondition is only that the replica was
+Ready more than 120s before the master finished being replaced, which is the **large-dataset case
+the condition is supposed to distinguish itself from** — so left alone it would have cried wolf
+first on exactly the deployments the alarm exists for.
+
+**Defect 2 — the message described a pod that was not blocked.** `plan.Hold`/`HoldPod` record the
+FIRST failing clause (lowest ordinal wins, deliberately) while `plan.Blocked`/`BlockedPods` record
+which pods are stalled, and the two are independent. `reportClusterRolloutGate` rendered `HoldPod`
+and `Hold` into a sentence that asserts *"is updated and Ready but is not attached"*, which is only
+ever true of a blocked pod. The result, verbatim from the live Event:
+
+    pod ordinal 0 is updated and Ready but is not attached to the shard's slot owner at all
+    (clause PodAbsent)
+
+Ordinal 0 was **absent** — neither updated nor Ready — and *"clause PodAbsent"* contradicts the
+sentence it sits in. An operator following that message would look at the wrong pod.
+
+**Fix, confined to reporting.** (1) `shardRolloutPod.IsOwner`, set in `buildShardRolloutInput` from
+the resolved owner's node ID, and `podStalled` returns false for it: a shard's own owner is a replica
+of nobody by construction, so its failing clause (c) is structural and can never be evidence of a
+stall. **The gate is untouched** — the hold is still emitted, still correct, and still self-clears at
+`Complete`; only the advisory verdict changes. Special-casing the *gate* was considered and not done,
+because that is a safety-relevant semantics change and ADR-017 declines it on the LR-043 "every extra
+clause on this predicate" ground; the residual therefore stands as documented, minus its false alarm.
+(2) The message is built by the pure `clusterRolloutBlockedMessage` from `BlockedPods[0]` and states
+the redundancy clause, which is definitionally the blocked one.
+
+**Red-first.** `TestShardOwnerIsNeverReportedBlocked` was authored from the live gate line and
+observed **RED** as `Blocked = true [1], want not blocked`;
+`TestClusterRolloutBlockedMessageNamesABlockedPod` was observed **RED** reproducing the live message
+verbatim (`pod ordinal 0 ... (clause PodAbsent)`). The `IsOwner` wiring assertion in
+`TestBuildShardRolloutInputRedundancy` is green from birth and is disclosed as such; its teeth were
+shown by deleting the assignment, which fails it with `isOwner=false, want isOwner=true`.
+
+**Verified live on the fixed build (t3e, operator `737f3f9`), same lever, same instance shape:** the
+genuine block still fires with the correct pod and clause, and the pass that previously read
+`hold=PodAbsent holdPod=0 blocked=true` now reads `blocked=false`. One Warning event for the whole
+rollout instead of two, the key intact, `Ready=True/ClusterHealthy` at the end.
+
+**Two observations kept rather than acted on.** (a) The pre-fix run produced **two** Warning events
+with the same reason and the same object but different notes, and Kubernetes stored them as **two
+distinct Event objects** — so the reason+object series folding that Addendum 1 measured for
+`ClusterRolloutUngated` did **not** reproduce here. It is largely moot for this condition anyway,
+because `setClusterRolloutBlocked` emits only on a genuine False/absent→True transition, so two
+shards blocked in succession produce one event and the second shard's name reaches the *condition*
+but never `kubectl get events`. The log line remains the reliable per-shard surface, as Addendum 1
+says. (b) On one shard of the post-fix run the reattach took **96s of the 120s budget** — margin
+rather than invariant, for the *reporting* layer only. If a slow reattach ever crosses it the result
+is a false alarm, not a lost pod; the carve-out that keeps a genuine full sync out of the alarm does
+not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
