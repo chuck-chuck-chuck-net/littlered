@@ -761,14 +761,34 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 			log.Info("Bootstrap: pod is terminating; its address is not confirmable", "pod", ref.Name)
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
+		// Accept EITHER of this StatefulSet's own revisions (ADR-017). With a state-gated
+		// rolling update the partition sits above 0 for as long as the shard is not
+		// redundant, and the StatefulSet controller does not advance CurrentRevision while
+		// a rollout is incomplete — so every pod already replaced at UpdateRevision would
+		// fail a CurrentRevision-only gate and bootstrap would requeue forever. That is
+		// unreachable on the normal path (bootstrap runs only with zero slots assigned, and
+		// a populated cluster mid-rollout has slots) but reachable in exactly the aftermath
+		// of the defect the gate exists to prevent: a rollout that has already dropped all
+		// of a cluster's slots. Introducing a permanent stall on the recovery path for the
+		// failure being fixed is not acceptable.
+		//
+		// The gate's stated purpose is preserved intact: it exists because "terminating
+		// pods from the old deployment may still exist with stale IPs and the same names",
+		// and BOTH revisions are this StatefulSet's own, so neither is the stale foreign
+		// deployment it is aimed at. Freshness of the address is done by the uncached read
+		// and the deletionTimestamp refusal above, which is what LR-043 says actually does
+		// that work.
 		currentRevision := shardSTSs[ref.ShardIdx].Status.CurrentRevision
-		podRevision := pod.Labels["controller-revision-hash"]
-		if pod.Status.PodIP == "" || currentRevision == "" || podRevision != currentRevision {
+		updateRevision := shardSTSs[ref.ShardIdx].Status.UpdateRevision
+		podRevision := pod.Labels[labelControllerRevisionHash]
+		knownRevision := (currentRevision != "" && podRevision == currentRevision) ||
+			(updateRevision != "" && podRevision == updateRevision)
+		if pod.Status.PodIP == "" || !knownRevision {
 			log.Info("Bootstrap: pod not ready (no IP or stale revision)",
-				"pod", ref.Name, "podRevision", podRevision, "stsRevision", currentRevision)
+				"pod", ref.Name, "podRevision", podRevision,
+				"stsCurrentRevision", currentRevision, "stsUpdateRevision", updateRevision)
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
-
 		podIPs[ref.Name] = pod.Status.PodIP
 
 		addr := fmt.Sprintf("%s:%d", pod.Status.PodIP, littleredv1alpha1.RedisPort)
