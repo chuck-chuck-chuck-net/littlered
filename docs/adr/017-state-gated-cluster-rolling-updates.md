@@ -329,6 +329,17 @@ its own decision if ever wanted.
   the gate holds forever. That degrades to the chosen behaviour, a loud stall, rather than to loss;
   it is named here as a live-verification target rather than pre-emptively special-cased, since
   every extra clause on this predicate is what LR-043 warns about.
+
+  *Amended after the M5 live sweep (2026-08-25, LR-047 Addendum 2).* The bound above is wrong in one
+  direction and the reporting consequence was real. The owner-in-the-survey case does not need a
+  repair path to promote anything: when the partition reaches 0 the StatefulSet deletes the shard's
+  master, its preStop hands mastership to the replica, and that **promoted replica is the owner while
+  still at an ordinal at-or-above the partition** — so it bites *at* partition 0, on every rollout, as
+  a matter of course. The **gate** consequence is exactly as predicted and benign (a hold that
+  self-clears when the shard reaches `Complete`, never a loss). The **report** consequence was not
+  benign and is fixed: such a pod was counted as a stalled pod and produced a false
+  `ClusterRolloutBlocked` seconds before a normal rollout finished. `podStalled` now excludes the
+  shard's own owner (`shardRolloutPod.IsOwner`). The gate's clauses are deliberately unchanged.
 - **A cross-mode note (§7 rule 11):** sentinel mode has the same "rollout gated by readiness plus
   `minReadySeconds`" shape and is safe only because **its readiness probe happens to be
   redundancy-aware** — it requires `role:master` or `link:up`, which LR-016 explicitly *kept* while
@@ -356,6 +367,14 @@ An honest caveat recorded in advance: the failure mode of this change is **over-
 rollout that stalls when it should have proceeded — and, as with LR-043, unit tests cannot prove
 its absence. The `ClusterRolloutBlocked` condition firing outside a genuine sync failure is the
 operational tell.
+
+*After M5 (2026-08-25):* the tell worked, and it was the condition itself that was wrong rather than
+the gate — see LR-047 Addendum 2. The **gate** has not been observed over-suppressing: the full
+cluster sweep (rolling update at `replicasPerShard: 1`, both wipe flavors plus partial wipe, all
+three chaos contexts, functional, reshard, the repro tier, and an operator upgrade across the preStop
+template change) completed with no stalled rollout and no lost key. The condition is now reachable on
+demand by holding the operator down past `clusterRolloutReattachBudget` mid-rollout, which is how it
+was first exercised.
 
 ## Alternatives considered
 
