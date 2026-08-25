@@ -178,6 +178,44 @@ check precedes `Complete`, because at first sight of a change the shard is still
 default — rather than as "no gate". The `replicasPerShard: 0` verdict emits **no partition field at
 all** rather than 0, so that StatefulSet stays byte-identical to today's.
 
+### Resolving "the shard's slot owner", and the reads the gate may trust
+
+*Amended after the wiring was built and verified live (M3).*
+
+**Ownership is resolved by slot containment, not by exact range equality.** The seam's comment
+named `ownerOfRange`, which requires an exact match and therefore returns *no owner* on a
+fragmented or mid-reshard range (LR-018) — and no owner means clause (c) can never be satisfied,
+i.e. a permanent stall on a cluster that is merely resharding. `shardSlotOwner` keys on the START
+of the shard's expected aligned range and accepts any master whose ranges contain that slot;
+containment degrades to the exact case and covers the rest. It iterates `ClusterPodRefs` rather
+than the `gt.Nodes` map, so that when two nodes transiently claim a slot mid-failover the verdict
+does not depend on Go's map hash seeding.
+
+**When no owner can be resolved, nobody is synced and the gate holds.** That is the safe direction
+and it is explicit in the wiring (`ownerID != ""`), not an accident of the predicate.
+
+**Which reads the gate may trust.** The cursor is read **uncached** — from the API server, both
+pre-gather and post-gather — because a stale-*low* partition would release the shard's master while
+its replacement is still unsynced: the defect itself, arriving through a cached read. The shard's
+*pods* are read uncached for the same reason, since clauses (a) and (b) come off them and a cached
+pod that has not caught up with a deletion could satisfy both on behalf of a pod that no longer
+exists. Both are confined to the in-flight window, so the steady loop keeps its cached read and
+LR-043's cost argument for not making the steady path uncached is untouched.
+
+The *in-flight test itself* is taken from the cached object, and that is sound rather than
+circular: `clusterShardRolloutSettled` requires `ObservedGeneration == Generation`, and every write
+that starts or steps a rollout bumps `Generation`, so a cached object that is behind either still
+carries the old template hash or carries the new spec with a status that has not observed it.
+"Settled **and** at the desired hash" is not a state a mid-rollout object can present — and an
+informer cache only ever lags *backwards* in time, so it cannot show a settled future. The single
+exception is a rollout started at an **unchanged** operator template hash, which is what a manual
+`kubectl rollout restart` is; that path is already outside this gate by LR-021's scope, and falls
+back to today's ungoverned behaviour rather than to something worse.
+
+**`Complete` emits `partition: 0` rather than no partition at all,** so a shard that has rolled once
+carries the field thereafter. It costs one extra `Generation` bump the first time and no rollout,
+since the partition is outside the hashed pod template.
+
 ### Stall forever, loudly — and why a fallback would be worse than the defect
 
 LR-043's correction is the governing precedent, and its lesson generalizes directly: **a guard
