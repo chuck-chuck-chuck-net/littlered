@@ -700,6 +700,19 @@ func (r *LittleRedReconciler) gatherGroundTruth(ctx context.Context, littleRed *
 }
 
 // bootstrapCluster initializes a new Redis Cluster
+// podAtOwnStatefulSetRevision reports whether a pod carries EITHER of its own shard
+// StatefulSet's revisions. See the call site in bootstrapCluster for why both count.
+func podAtOwnStatefulSetRevision(pod *corev1.Pod, sts *appsv1.StatefulSet) bool {
+	if pod == nil || sts == nil {
+		return false
+	}
+	rev := pod.Labels[labelControllerRevisionHash]
+	if rev == "" {
+		return false
+	}
+	return rev == sts.Status.CurrentRevision || rev == sts.Status.UpdateRevision
+}
+
 func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
@@ -778,15 +791,12 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 		// deployment it is aimed at. Freshness of the address is done by the uncached read
 		// and the deletionTimestamp refusal above, which is what LR-043 says actually does
 		// that work.
-		currentRevision := shardSTSs[ref.ShardIdx].Status.CurrentRevision
-		updateRevision := shardSTSs[ref.ShardIdx].Status.UpdateRevision
 		podRevision := pod.Labels[labelControllerRevisionHash]
-		knownRevision := (currentRevision != "" && podRevision == currentRevision) ||
-			(updateRevision != "" && podRevision == updateRevision)
-		if pod.Status.PodIP == "" || !knownRevision {
+		if pod.Status.PodIP == "" || !podAtOwnStatefulSetRevision(pod, shardSTSs[ref.ShardIdx]) {
+			sts := shardSTSs[ref.ShardIdx]
 			log.Info("Bootstrap: pod not ready (no IP or stale revision)",
 				"pod", ref.Name, "podRevision", podRevision,
-				"stsCurrentRevision", currentRevision, "stsUpdateRevision", updateRevision)
+				"stsCurrentRevision", sts.Status.CurrentRevision, "stsUpdateRevision", sts.Status.UpdateRevision)
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		podIPs[ref.Name] = pod.Status.PodIP

@@ -28,6 +28,9 @@ import (
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
+// rolloutOwnerLR is the instance name the shard-pod-name fixtures below are built from.
+const rolloutOwnerLR = "my-cache"
+
 func clusterLRWithReplicas(rps int) *littleredv1alpha1.LittleRed {
 	lr := newTestLittleRed(testLRName, testNamespace)
 	lr.Spec.Mode = ModeCluster
@@ -131,15 +134,28 @@ func rolloutPodObj(name, revision string, redisReady bool, readySince time.Time)
 // live answer or it waits for a replication link to a node that owns nothing.
 func TestShardSlotOwnerResolvesTheServingNode(t *testing.T) {
 	// GenerateSlotRanges(3) = 0-5461 / 5462-10922 / 10923-16383.
-	gt := &redisclient.ClusterGroundTruth{Nodes: map[string]*redisclient.ClusterNodeState{
-		"my-cache-shard-0-0": {PodName: "my-cache-shard-0-0", NodeID: "A", Role: RoleMaster, Slots: []string{"0-5461"}},
-		"my-cache-shard-0-1": {PodName: "my-cache-shard-0-1", NodeID: "a", Role: RoleReplica, MasterNodeID: "A"},
-		"my-cache-shard-1-0": {PodName: "my-cache-shard-1-0", NodeID: "B", Role: RoleReplica, MasterNodeID: "b"},
+	node := func(shard, ord int, id, role, masterID string, slots ...string) (string, *redisclient.ClusterNodeState) {
+		name := clusterShardPodName(rolloutOwnerLR, shard, ord)
+		return name, &redisclient.ClusterNodeState{
+			PodName: name, NodeID: id, Role: role, MasterNodeID: masterID, Slots: slots,
+		}
+	}
+	nodes := map[string]*redisclient.ClusterNodeState{}
+	for _, f := range []func() (string, *redisclient.ClusterNodeState){
+		func() (string, *redisclient.ClusterNodeState) { return node(0, 0, "A", RoleMaster, "", "0-5461") },
+		func() (string, *redisclient.ClusterNodeState) { return node(0, 1, "a", RoleReplica, "A") },
 		// Shard 1's range is served by the REPLICA ordinal after a failover.
-		"my-cache-shard-1-1": {PodName: "my-cache-shard-1-1", NodeID: "b", Role: RoleMaster, Slots: []string{"5462-10922"}},
+		func() (string, *redisclient.ClusterNodeState) { return node(1, 0, "B", RoleReplica, "b") },
+		func() (string, *redisclient.ClusterNodeState) { return node(1, 1, "b", RoleMaster, "", "5462-10922") },
 		// Shard 2 owns a FRAGMENTED range that merely contains its start slot.
-		"my-cache-shard-2-0": {PodName: "my-cache-shard-2-0", NodeID: "C", Role: RoleMaster, Slots: []string{"10923-12000", "12001-16383"}},
-	}}
+		func() (string, *redisclient.ClusterNodeState) {
+			return node(2, 0, "C", RoleMaster, "", "10923-12000", "12001-16383")
+		},
+	} {
+		name, n := f()
+		nodes[name] = n
+	}
+	gt := &redisclient.ClusterGroundTruth{Nodes: nodes}
 
 	for _, tc := range []struct {
 		shard int
@@ -149,7 +165,7 @@ func TestShardSlotOwnerResolvesTheServingNode(t *testing.T) {
 		{1, "b"},
 		{2, "C"},
 	} {
-		got := shardSlotOwner(gt, "my-cache", 3, 1, tc.shard)
+		got := shardSlotOwner(gt, rolloutOwnerLR, 3, 1, tc.shard)
 		if got == nil {
 			t.Fatalf("shard %d: no owner resolved; clause (c) could never be satisfied and the rollout would stall forever", tc.shard)
 		}
@@ -158,10 +174,10 @@ func TestShardSlotOwnerResolvesTheServingNode(t *testing.T) {
 		}
 	}
 
-	if shardSlotOwner(nil, "my-cache", 3, 1, 0) != nil {
+	if shardSlotOwner(nil, rolloutOwnerLR, 3, 1, 0) != nil {
 		t.Error("a nil ground truth must resolve no owner, not panic")
 	}
-	if shardSlotOwner(gt, "my-cache", 3, 1, 7) != nil {
+	if shardSlotOwner(gt, rolloutOwnerLR, 3, 1, 7) != nil {
 		t.Error("an out-of-range shard index must resolve no owner")
 	}
 }
@@ -172,19 +188,20 @@ func TestShardSlotOwnerResolvesTheServingNode(t *testing.T) {
 // flight — progress, never reported blocked), and a fresh empty master is neither.
 func TestBuildShardRolloutInputRedundancy(t *testing.T) {
 	lr := clusterLRWithReplicas(2)
-	lr.Name = "my-cache"
-	gt := &redisclient.ClusterGroundTruth{Nodes: map[string]*redisclient.ClusterNodeState{
-		"my-cache-shard-0-0": {NodeID: "A", Role: RoleMaster, Slots: []string{"0-5461"}},
-		"my-cache-shard-0-1": {NodeID: "a1", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "up"},
-		"my-cache-shard-0-2": {NodeID: "a2", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "down"},
-	}}
+	lr.Name = rolloutOwnerLR
+	owner := &redisclient.ClusterNodeState{NodeID: "A", Role: RoleMaster, Slots: []string{"0-5461"}}
+	upReplica := &redisclient.ClusterNodeState{NodeID: "a1", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "up"}
+	syncing := &redisclient.ClusterNodeState{NodeID: "a2", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "down"}
+	gt := &redisclient.ClusterGroundTruth{Nodes: map[string]*redisclient.ClusterNodeState{}}
 	now := time.Now()
 	pods := map[string]*corev1.Pod{}
-	for _, n := range []string{"my-cache-shard-0-0", "my-cache-shard-0-1", "my-cache-shard-0-2"} {
-		pods[n] = rolloutPodObj(n, "rev2", true, now.Add(-time.Minute))
+	for ord, n := range []*redisclient.ClusterNodeState{owner, upReplica, syncing} {
+		name := clusterShardPodName(rolloutOwnerLR, 0, ord)
+		gt.Nodes[name] = n
+		pods[name] = rolloutPodObj(name, "rev2", true, now.Add(-time.Minute))
 	}
 
-	in := buildShardRolloutInput(lr, 0, 2, "want", rolloutSTS("my-cache-shard-0", "have", 3, 2, "rev1", "rev2", nil), pods, gt, now)
+	in := buildShardRolloutInput(lr, 0, 2, "want", rolloutSTS("s", "have", 3, 2, "rev1", "rev2", nil), pods, gt, now)
 
 	if len(in.Pods) != 3 {
 		t.Fatalf("expected 3 pods, got %d", len(in.Pods))
@@ -212,17 +229,17 @@ func TestBuildShardRolloutInputRedundancy(t *testing.T) {
 // kubelet (not the pod-level condition), and a missing ordinal is simply absent.
 func TestBuildShardRolloutInputStructuralFacts(t *testing.T) {
 	lr := clusterLRWithReplicas(1)
-	lr.Name = "my-cache"
+	lr.Name = rolloutOwnerLR
 	now := time.Now()
 	readySince := now.Add(-90 * time.Second)
 
 	// Pod 0 is Ready at the pod level but its REDIS container is not — the gate must not
 	// take that as clause (b) satisfied. Pod 1 is missing entirely.
-	pod0 := rolloutPodObj("my-cache-shard-0-0", "revX", false, readySince)
+	pod0 := rolloutPodObj(clusterShardPodName(rolloutOwnerLR, 0, 0), "revX", false, readySince)
 	pod0.Status.Conditions[0].Status = corev1.ConditionTrue
 
 	in := buildShardRolloutInput(lr, 0, 1, "want",
-		rolloutSTS("my-cache-shard-0", "have", 5, 4, "rev1", "rev2", ptrInt32(1)),
+		rolloutSTS("s", "have", 5, 4, "rev1", "rev2", new(int32(1))),
 		map[string]*corev1.Pod{pod0.Name: pod0}, nil, now)
 
 	if in.AppliedPartition == nil || *in.AppliedPartition != 1 {
@@ -278,7 +295,7 @@ func TestPreGatherPlanOnlyHoldsOrRaises(t *testing.T) {
 		}
 	}
 	// Settled: nothing left to gate.
-	if p := preGather(rolloutSTS("s", "want", 4, 4, "rev2", "rev2", ptrInt32(2))); p.Verdict != rolloutComplete ||
+	if p := preGather(rolloutSTS("s", "want", 4, 4, "rev2", "rev2", new(int32(2)))); p.Verdict != rolloutComplete ||
 		p.Partition == nil || *p.Partition != 0 {
 		t.Errorf("settled: verdict=%v partition=%v, want Complete/0", p.Verdict, p.Partition)
 	}
@@ -289,5 +306,3 @@ func TestPreGatherPlanOnlyHoldsOrRaises(t *testing.T) {
 		t.Errorf("replicasPerShard 0: verdict=%v partition=%v, want Ungated/nil", zero.Verdict, zero.Partition)
 	}
 }
-
-func ptrInt32(v int32) *int32 { return &v }
