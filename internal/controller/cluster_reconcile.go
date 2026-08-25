@@ -1081,7 +1081,7 @@ func (r *LittleRedReconciler) reconcileClusterStatefulSet(ctx context.Context, l
 	shards := clusterShardCount(littleRed)
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	for k := range shards {
-		desired := buildClusterShardStatefulSet(littleRed, k)
+		desired := buildClusterShardStatefulSet(littleRed, k, nil)
 		existing := &appsv1.StatefulSet{}
 		err := r.Get(ctx, types.NamespacedName{
 			Name:      clusterShardStatefulSetName(littleRed, k),

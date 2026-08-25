@@ -1061,7 +1061,7 @@ func TestStatefulSetBuildersPropagatePodTemplateScheduling(t *testing.T) {
 			return buildSentinelStatefulSet(lr, sentinelProcessReplicas)
 		}},
 		{"cluster", ModeCluster, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
-			return buildClusterShardStatefulSet(lr, 0)
+			return buildClusterShardStatefulSet(lr, 0, nil)
 		}},
 	}
 
@@ -1652,7 +1652,7 @@ func TestClusterShardStatefulSetMergesShardSpread(t *testing.T) {
 		},
 	}
 
-	tsc := buildClusterShardStatefulSet(lr, 1).Spec.Template.Spec.TopologySpreadConstraints
+	tsc := buildClusterShardStatefulSet(lr, 1, nil).Spec.Template.Spec.TopologySpreadConstraints
 	if len(tsc) != 2 {
 		t.Fatalf("expected 2 constraints (user + operator), got %d: %+v", len(tsc), tsc)
 	}
@@ -1670,7 +1670,7 @@ func TestClusterShardStatefulSetMergesShardSpread(t *testing.T) {
 
 	// Knob unset → only the user's constraints pass through (no operator injection).
 	lr.Spec.Placement = nil
-	plain := buildClusterShardStatefulSet(lr, 1).Spec.Template.Spec.TopologySpreadConstraints
+	plain := buildClusterShardStatefulSet(lr, 1, nil).Spec.Template.Spec.TopologySpreadConstraints
 	if len(plain) != 1 {
 		t.Errorf("without placement, expected only the user constraint, got %d", len(plain))
 	}
@@ -1682,7 +1682,7 @@ func TestBuildClusterShardStatefulSet(t *testing.T) {
 	replicas := 1
 	lr.Spec.Cluster = &littleredv1alpha1.ClusterSpec{Shards: 3, ReplicasPerShard: &replicas}
 
-	sts := buildClusterShardStatefulSet(lr, 2)
+	sts := buildClusterShardStatefulSet(lr, 2, nil)
 
 	// One StatefulSet per shard, named {name}-shard-K.
 	if sts.Name != "my-cache-shard-2" {

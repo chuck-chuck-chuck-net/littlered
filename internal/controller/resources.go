@@ -1943,7 +1943,24 @@ func buildShardSpreadConstraint(lr *littleredv1alpha1.LittleRed, shardIdx int) *
 // label. Pod {name}-shard-K-0 is the shard's intended master; -1..R are its replicas.
 // All shard StatefulSets share the one headless Service ({name}-cluster) as their
 // governing service, so peer discovery and pod DNS keep resolving across every shard.
-func buildClusterShardStatefulSet(lr *littleredv1alpha1.LittleRed, shardIdx int) *appsv1.StatefulSet {
+//
+// partition is the state-gated intra-shard rollout cursor (ADR-017, LR-047) and is
+// RENDERED here, never computed here — exactly as replicas are for the sentinel builders
+// (LR-044: a builder renders a decision, it does not make one). It has to be a build-time
+// parameter because r.apply is server-side apply with client.ForceOwnership, so whatever
+// this function emits wins unconditionally on every pass; a partition patched out of band
+// would be force-overwritten back to whatever was built here on the next reconcile, which
+// for this field means releasing the shard's master while its replacement replica is still
+// unsynced — today's defect, on a 2s cycle.
+//
+// nil means "emit no rollingUpdate block at all", which is byte-identical to the shape
+// this builder produced before ADR-017. That is the replicasPerShard == 0 case (with one
+// copy per shard, gating is vacuous — the caller warns and proceeds) and the pre-gate
+// baseline. Note that the partition lives in spec.updateStrategy, OUTSIDE the pod template
+// hashed into AnnotationPodSpecHash, so neither introducing it nor stepping it down is
+// itself a template change — pinned by
+// TestClusterShardPartitionIsOutsideThePodTemplateHash.
+func buildClusterShardStatefulSet(lr *littleredv1alpha1.LittleRed, shardIdx int, partition *int32) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentCluster
 	labels[LabelShard] = clusterShardLabelValue(shardIdx)
@@ -2039,6 +2056,11 @@ func buildClusterShardStatefulSet(lr *littleredv1alpha1.LittleRed, shardIdx int)
 			},
 			PodManagementPolicy: appsv1.ParallelPodManagement,
 		},
+	}
+
+	if partition != nil {
+		p := *partition
+		sts.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{Partition: &p}
 	}
 
 	// Stamp a hash of the operator-authored pod template so the serialized rollout can
