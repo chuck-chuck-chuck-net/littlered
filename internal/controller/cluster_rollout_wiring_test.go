@@ -18,10 +18,14 @@ package controller
 
 import (
 	"testing"
+	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
 func clusterLRWithReplicas(rps int) *littleredv1alpha1.LittleRed {
@@ -91,3 +95,199 @@ func TestClusterShardPartitionIsOutsideThePodTemplateHash(t *testing.T) {
 		}
 	}
 }
+
+// --- buildShardRolloutInput: live objects → the seam's facts ------------------------
+
+func rolloutSTS(name, appliedHash string, gen, observed int64, cur, upd string, partition *int32) *appsv1.StatefulSet {
+	sts := &appsv1.StatefulSet{}
+	sts.Name = name
+	sts.Generation = gen
+	sts.Spec.Template.Annotations = map[string]string{AnnotationPodSpecHash: appliedHash}
+	sts.Status.ObservedGeneration = observed
+	sts.Status.CurrentRevision = cur
+	sts.Status.UpdateRevision = upd
+	if partition != nil {
+		p := *partition
+		sts.Spec.UpdateStrategy.RollingUpdate = &appsv1.RollingUpdateStatefulSetStrategy{Partition: &p}
+	}
+	return sts
+}
+
+func rolloutPodObj(name, revision string, redisReady bool, readySince time.Time) *corev1.Pod {
+	pod := &corev1.Pod{}
+	pod.Name = name
+	pod.Labels = map[string]string{labelControllerRevisionHash: revision}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: ComponentRedis, Ready: redisReady}}
+	pod.Status.Conditions = []corev1.PodCondition{{
+		Type: corev1.PodReady, LastTransitionTime: metav1.NewTime(readySince),
+	}}
+	return pod
+}
+
+// TestShardSlotOwnerResolvesTheServingNode pins what "the shard's slot owner" means: the
+// master actually serving shard K's range as the cluster reports it, NOT the pod the
+// operator intends to be the master. After the master ordinal has been replaced and Redis
+// has failed the range over, the owner is a different pod, and the gate must key on the
+// live answer or it waits for a replication link to a node that owns nothing.
+func TestShardSlotOwnerResolvesTheServingNode(t *testing.T) {
+	// GenerateSlotRanges(3) = 0-5461 / 5462-10922 / 10923-16383.
+	gt := &redisclient.ClusterGroundTruth{Nodes: map[string]*redisclient.ClusterNodeState{
+		"my-cache-shard-0-0": {PodName: "my-cache-shard-0-0", NodeID: "A", Role: RoleMaster, Slots: []string{"0-5461"}},
+		"my-cache-shard-0-1": {PodName: "my-cache-shard-0-1", NodeID: "a", Role: RoleReplica, MasterNodeID: "A"},
+		"my-cache-shard-1-0": {PodName: "my-cache-shard-1-0", NodeID: "B", Role: RoleReplica, MasterNodeID: "b"},
+		// Shard 1's range is served by the REPLICA ordinal after a failover.
+		"my-cache-shard-1-1": {PodName: "my-cache-shard-1-1", NodeID: "b", Role: RoleMaster, Slots: []string{"5462-10922"}},
+		// Shard 2 owns a FRAGMENTED range that merely contains its start slot.
+		"my-cache-shard-2-0": {PodName: "my-cache-shard-2-0", NodeID: "C", Role: RoleMaster, Slots: []string{"10923-12000", "12001-16383"}},
+	}}
+
+	for _, tc := range []struct {
+		shard int
+		want  string
+	}{
+		{0, "A"},
+		{1, "b"},
+		{2, "C"},
+	} {
+		got := shardSlotOwner(gt, "my-cache", 3, 1, tc.shard)
+		if got == nil {
+			t.Fatalf("shard %d: no owner resolved; clause (c) could never be satisfied and the rollout would stall forever", tc.shard)
+		}
+		if got.NodeID != tc.want {
+			t.Errorf("shard %d owner = %q, want %q", tc.shard, got.NodeID, tc.want)
+		}
+	}
+
+	if shardSlotOwner(nil, "my-cache", 3, 1, 0) != nil {
+		t.Error("a nil ground truth must resolve no owner, not panic")
+	}
+	if shardSlotOwner(gt, "my-cache", 3, 1, 7) != nil {
+		t.Error("an out-of-range shard index must resolve no owner")
+	}
+}
+
+// TestBuildShardRolloutInputRedundancy is the wiring the seam's doc comment specifies in two
+// lines, exercised against the shapes that matter: only a link-UP replica of the owner is
+// Synced (LR-025), an attached-but-link-down replica is Attached-not-Synced (a full sync in
+// flight — progress, never reported blocked), and a fresh empty master is neither.
+func TestBuildShardRolloutInputRedundancy(t *testing.T) {
+	lr := clusterLRWithReplicas(2)
+	lr.Name = "my-cache"
+	gt := &redisclient.ClusterGroundTruth{Nodes: map[string]*redisclient.ClusterNodeState{
+		"my-cache-shard-0-0": {NodeID: "A", Role: RoleMaster, Slots: []string{"0-5461"}},
+		"my-cache-shard-0-1": {NodeID: "a1", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "up"},
+		"my-cache-shard-0-2": {NodeID: "a2", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "down"},
+	}}
+	now := time.Now()
+	pods := map[string]*corev1.Pod{}
+	for _, n := range []string{"my-cache-shard-0-0", "my-cache-shard-0-1", "my-cache-shard-0-2"} {
+		pods[n] = rolloutPodObj(n, "rev2", true, now.Add(-time.Minute))
+	}
+
+	in := buildShardRolloutInput(lr, 0, 2, "want", rolloutSTS("my-cache-shard-0", "have", 3, 2, "rev1", "rev2", nil), pods, gt, now)
+
+	if len(in.Pods) != 3 {
+		t.Fatalf("expected 3 pods, got %d", len(in.Pods))
+	}
+	want := []struct{ attached, synced bool }{
+		{false, false}, // ordinal 0 IS the owner — a master is nobody's replica
+		{true, true},   // ordinal 1: link up
+		{true, false},  // ordinal 2: attached, mid full sync
+	}
+	for i, w := range want {
+		p := in.Pods[i]
+		if p.Ordinal != i {
+			t.Fatalf("pods must be in ordinal order; got %d at index %d", p.Ordinal, i)
+		}
+		if p.AttachedToOwner != w.attached || p.SyncedWithOwner != w.synced {
+			t.Errorf("ordinal %d: attached=%v synced=%v, want attached=%v synced=%v",
+				i, p.AttachedToOwner, p.SyncedWithOwner, w.attached, w.synced)
+		}
+	}
+}
+
+// TestBuildShardRolloutInputStructuralFacts pins the rest of the translation: the applied
+// partition IS the cursor (read off the live object, nil when absent), the revision comes
+// from the pod's controller-revision-hash, readiness is the REDIS CONTAINER's per the
+// kubelet (not the pod-level condition), and a missing ordinal is simply absent.
+func TestBuildShardRolloutInputStructuralFacts(t *testing.T) {
+	lr := clusterLRWithReplicas(1)
+	lr.Name = "my-cache"
+	now := time.Now()
+	readySince := now.Add(-90 * time.Second)
+
+	// Pod 0 is Ready at the pod level but its REDIS container is not — the gate must not
+	// take that as clause (b) satisfied. Pod 1 is missing entirely.
+	pod0 := rolloutPodObj("my-cache-shard-0-0", "revX", false, readySince)
+	pod0.Status.Conditions[0].Status = corev1.ConditionTrue
+
+	in := buildShardRolloutInput(lr, 0, 1, "want",
+		rolloutSTS("my-cache-shard-0", "have", 5, 4, "rev1", "rev2", ptrInt32(1)),
+		map[string]*corev1.Pod{pod0.Name: pod0}, nil, now)
+
+	if in.AppliedPartition == nil || *in.AppliedPartition != 1 {
+		t.Errorf("applied partition = %v, want 1 (the cursor is the StatefulSet's own field)", in.AppliedPartition)
+	}
+	if in.AppliedHash != "have" || in.DesiredHash != "want" {
+		t.Errorf("hashes = %q/%q, want have/want", in.AppliedHash, in.DesiredHash)
+	}
+	if in.Generation != 5 || in.ObservedGeneration != 4 || in.CurrentRevision != "rev1" || in.UpdateRevision != "rev2" {
+		t.Errorf("statefulset facts not carried through: %+v", in)
+	}
+	if len(in.Pods) != 1 || in.Pods[0].Ordinal != 0 {
+		t.Fatalf("expected only ordinal 0 to be present, got %+v", in.Pods)
+	}
+	if in.Pods[0].Ready {
+		t.Error("clause (b) must be the kubelet's verdict on the REDIS container, not the pod-level Ready condition")
+	}
+	if in.Pods[0].Revision != "revX" {
+		t.Errorf("revision = %q, want revX", in.Pods[0].Revision)
+	}
+	if !in.Pods[0].ReadySince.Equal(readySince) {
+		t.Errorf("readySince = %v, want %v", in.Pods[0].ReadySince, readySince)
+	}
+
+	// No StatefulSet at all: no cursor, no facts, no panic.
+	if empty := buildShardRolloutInput(lr, 0, 1, "want", nil, nil, nil, now); empty.AppliedPartition != nil {
+		t.Error("a nil StatefulSet must yield a nil cursor")
+	}
+}
+
+// TestPreGatherPlanOnlyHoldsOrRaises is the ADR-017 pre/post-gather split, pinned. The
+// step-1 apply runs before the gather, so it has NO redundancy facts; it must therefore be
+// unable to lower the partition. If it could, a shard mid-rollout would have its master
+// released on every pass by the very apply that is supposed to be holding it — the LR-044
+// flap, on the one field where flapping is the defect itself.
+func TestPreGatherPlanOnlyHoldsOrRaises(t *testing.T) {
+	lr := clusterLRWithReplicas(2) // highest ordinal 2
+
+	preGather := func(sts *appsv1.StatefulSet) shardRolloutPlan {
+		return planShardRolloutPartition(buildShardRolloutInput(lr, 0, 2, "want", sts, nil, nil, time.Now()))
+	}
+
+	// Template change: gate at the highest ordinal. The one legal raise.
+	if p := preGather(rolloutSTS("s", "have", 3, 3, "rev1", "rev1", nil)); p.Verdict != rolloutStart ||
+		p.Partition == nil || *p.Partition != 2 {
+		t.Errorf("first sight of a template change: verdict=%v partition=%v, want Started/2", p.Verdict, p.Partition)
+	}
+	// Mid-rollout at the desired template: re-emit the cursor UNCHANGED.
+	for _, cursor := range []int32{2, 1} {
+		p := preGather(rolloutSTS("s", "want", 4, 4, "rev1", "rev2", &cursor))
+		if p.Verdict != rolloutHold || p.Partition == nil || *p.Partition != cursor {
+			t.Errorf("cursor %d: verdict=%v partition=%v, want Holding at %d", cursor, p.Verdict, p.Partition, cursor)
+		}
+	}
+	// Settled: nothing left to gate.
+	if p := preGather(rolloutSTS("s", "want", 4, 4, "rev2", "rev2", ptrInt32(2))); p.Verdict != rolloutComplete ||
+		p.Partition == nil || *p.Partition != 0 {
+		t.Errorf("settled: verdict=%v partition=%v, want Complete/0", p.Verdict, p.Partition)
+	}
+	// replicasPerShard 0: no partition field at all, and the caller's Warning verdict.
+	zero := planShardRolloutPartition(buildShardRolloutInput(clusterLRWithReplicas(0), 0, 0, "want",
+		rolloutSTS("s", "have", 1, 1, "rev1", "rev1", nil), nil, nil, time.Now()))
+	if zero.Verdict != rolloutUngated || zero.Partition != nil {
+		t.Errorf("replicasPerShard 0: verdict=%v partition=%v, want Ungated/nil", zero.Verdict, zero.Partition)
+	}
+}
+
+func ptrInt32(v int32) *int32 { return &v }

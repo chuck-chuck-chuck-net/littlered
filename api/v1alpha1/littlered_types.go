@@ -708,6 +708,28 @@ const (
 	// bare-Sentinel deadlock) keeps the sentinel-vs-failover graduation-gate
 	// comparison honest.
 	ConditionFailoverRecovery = "FailoverRecovery"
+
+	// ConditionClusterRolloutBlocked reports that a cluster shard's rolling update is
+	// HELD because the shard is not redundant: a replaced pod is at the StatefulSet's
+	// UpdateRevision and Ready per the kubelet, but has no attachment at all to its
+	// shard's slot owner, and has been in that state past the operator's reattach
+	// budget. While it holds, the shard's remaining pods — including its master — are
+	// not taken down, so the instance keeps serving and its data is intact; the update
+	// simply does not finish. Manual release is raising the StatefulSet's
+	// spec.updateStrategy.rollingUpdate.partition by hand.
+	//
+	// A dedicated condition rather than Ready=False, deliberately (ADR-017): a stalled
+	// rollout is a rollout that has not finished, not an unhealthy instance, and
+	// conflating them trains an operator to ignore the one signal that matters. Ready
+	// will nonetheless read false for the ordinary LR-014 reason (a not-yet-reattached
+	// replacement is an empty master); this condition is what distinguishes
+	// "converging" from "stuck".
+	//
+	// It is never set for a pod that is attached to the owner but whose replication
+	// link is still down. That is a full sync in flight — dataset-dependent, genuinely
+	// unbounded, and real progress — and reporting it would make the one alarm that
+	// must not cry wolf cry wolf on exactly the topology large deployments have.
+	ConditionClusterRolloutBlocked = "ClusterRolloutBlocked"
 )
 
 // LittleRedStatus defines the observed state of LittleRed

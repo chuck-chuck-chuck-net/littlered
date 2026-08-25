@@ -31,6 +31,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -127,6 +128,17 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 
 	// 4. All pods are ready. Gather Ground Truth.
 	gt := r.gatherGroundTruth(ctx, littleRed)
+
+	// 4a. State-gated rolling update (ADR-017, LR-047). This is the ONLY place the
+	// intra-shard rollout partition comes down, and it has to be here rather than at the
+	// step-1 apply because the clause it turns on — "the replacement is a link-`up` replica
+	// of this shard's slot owner" — is Redis-level state that only exists after a gather.
+	// It runs BEFORE the repair branch below because a not-yet-reattached replacement is an
+	// empty master, so repairCluster returns and this would otherwise be skipped for the
+	// whole rollout. Never fatal: holding is the safe direction.
+	if err := r.advanceClusterRollout(ctx, littleRed, gt); err != nil {
+		log.Error(err, "Failed to advance the cluster rollout gate (the rollout holds)")
+	}
 
 	// Analyze state
 	isHealthy := gt.IsHealthy(expectedReplicas, int32(cluster.Shards))
@@ -756,6 +768,7 @@ func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *l
 				"pod", ref.Name, "podRevision", podRevision, "stsRevision", currentRevision)
 			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
+
 		podIPs[ref.Name] = pod.Status.PodIP
 
 		addr := fmt.Sprintf("%s:%d", pod.Status.PodIP, littleredv1alpha1.RedisPort)
@@ -1079,17 +1092,21 @@ func (r *LittleRedReconciler) reconcileClusterHeadlessService(ctx context.Contex
 // operator and is not serialized — roll shards one at a time by hand instead.
 func (r *LittleRedReconciler) reconcileClusterStatefulSet(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) error {
 	shards := clusterShardCount(littleRed)
+	rps := clusterReplicasPerShard(littleRed.Spec.Cluster)
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
+	now := time.Now()
 	for k := range shards {
-		desired := buildClusterShardStatefulSet(littleRed, k, nil)
+		desiredHash := desiredClusterShardTemplateHash(littleRed, k)
 		existing := &appsv1.StatefulSet{}
 		err := r.Get(ctx, types.NamespacedName{
 			Name:      clusterShardStatefulSetName(littleRed, k),
 			Namespace: littleRed.Namespace,
 		}, existing)
 		if apierrors.IsNotFound(err) {
-			// Create-missing: immediate and parallel (bootstrap).
-			if err := r.apply(ctx, littleRed, desired); err != nil {
+			// Create-missing: immediate and parallel (bootstrap). A StatefulSet that does
+			// not exist has no rollout to gate and no cursor to preserve, so it is created
+			// with no partition at all — byte-identical to the pre-ADR-017 shape.
+			if err := r.apply(ctx, littleRed, buildClusterShardStatefulSet(littleRed, k, nil)); err != nil {
 				return err
 			}
 			continue
@@ -1098,26 +1115,50 @@ func (r *LittleRedReconciler) reconcileClusterStatefulSet(ctx context.Context, l
 			return err
 		}
 
+		// The rollout cursor must not come from a stale read (LR-012 documented the cache
+		// returning stale object state during churn, and here a stale-LOW partition would
+		// release the shard's master while its replacement is still unsynced — the exact
+		// defect, arrived at through a cached read). So while a rollout is in flight the
+		// StatefulSet is re-read UNCACHED, the way LR-043 re-reads a pod whose address is
+		// about to be acted on. The steady loop keeps the cached read: LR-043 explicitly
+		// declined to make the steady path uncached on per-pass cost, and that reasoning is
+		// unchanged.
+		if existing, err = r.refreshShardSTSForRollout(ctx, littleRed, k, existing, desiredHash); err != nil {
+			return err
+		}
+
+		// Pre-gather partition (ADR-017 Rationale (b)). The seam is called with no pods and
+		// no ground truth, so it takes its structural branches only: first sight of a
+		// template change gates at the shard's highest ordinal, a settled shard reads 0,
+		// and anything else re-emits the live object's own partition unchanged. Redundancy
+		// is Redis-level state that only exists after the gather, so LOWERING happens there
+		// (advanceClusterRollout) — this call can only hold or raise.
+		plan := planShardRolloutPartition(buildShardRolloutInput(
+			littleRed, k, rps, desiredHash, existing, nil, nil, now))
+		desired := buildClusterShardStatefulSet(littleRed, k, plan.Partition)
+
 		// Serialize updates. If the applied template differs from desired, roll only this
 		// shard and stop until it settles. The hash lives on the pod template (so changing
 		// it is itself part of the roll) and is compared cache-safely as a stored value.
-		desiredHash := desired.Spec.Template.Annotations[AnnotationPodSpecHash]
 		appliedHash := existing.Spec.Template.Annotations[AnnotationPodSpecHash]
 		if appliedHash != desiredHash {
 			if err := r.apply(ctx, littleRed, desired); err != nil {
 				return err
 			}
+			r.warnUngatedClusterRollout(ctx, littleRed, k, plan)
 			log.Info("Serialized cluster rollout: rolling shard, deferring later shards until it settles",
-				"shard", k, "sts", desired.Name)
+				"shard", k, "sts", desired.Name, "verdict", plan.Verdict, "partition", partitionValue(plan.Partition))
 			return nil
 		}
 
 		// Template already desired. If it is still converging (including the window right
 		// after our own apply, where ObservedGeneration lags Generation), wait before the
-		// next shard so at most one shard rolls at a time.
+		// next shard so at most one shard rolls at a time. Deliberately NO apply here: the
+		// partition is stepped down only by advanceClusterRollout, after the gather has
+		// shown the shard to be redundant.
 		if !clusterShardRolloutSettled(existing) {
 			log.Info("Serialized cluster rollout: waiting for shard to settle before rolling the next",
-				"shard", k, "sts", existing.Name)
+				"shard", k, "sts", existing.Name, "partition", partitionValue(plan.Partition))
 			return nil
 		}
 
@@ -1127,6 +1168,271 @@ func (r *LittleRedReconciler) reconcileClusterStatefulSet(ctx context.Context, l
 		}
 	}
 	return nil
+}
+
+// desiredClusterShardTemplateHash is the AnnotationPodSpecHash of shard k's DESIRED pod
+// template. The partition is rendered into spec.updateStrategy, outside the hashed
+// template, so it is irrelevant to this value — which is why nil is passed and why the
+// gate can step the partition down without that step counting as a template change
+// (pinned by TestClusterShardPartitionIsOutsideThePodTemplateHash).
+func desiredClusterShardTemplateHash(lr *littleredv1alpha1.LittleRed, shardIdx int) string {
+	return buildClusterShardStatefulSet(lr, shardIdx, nil).Spec.Template.Annotations[AnnotationPodSpecHash]
+}
+
+// refreshShardSTSForRollout re-reads shard k's StatefulSet from the API server, bypassing
+// the informer cache, but ONLY while a rollout is in flight — the applied template differs
+// from desired, or the shard has not settled. See the call site for why.
+//
+// Note that the in-flight test is itself taken from the possibly-stale cached object, and
+// that this is sound rather than circular: clusterShardRolloutSettled requires
+// ObservedGeneration == Generation, and every write that starts or steps a rollout bumps
+// Generation. A cached object that is behind therefore either still carries the OLD
+// template hash (caught by the first clause) or carries the new spec with a status that has
+// not observed it (caught by the second). "Settled AND at the desired hash" is not a state
+// a mid-rollout object can present.
+func (r *LittleRedReconciler) refreshShardSTSForRollout(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, shardIdx int,
+	cached *appsv1.StatefulSet, desiredHash string,
+) (*appsv1.StatefulSet, error) {
+	appliedHash := cached.Spec.Template.Annotations[AnnotationPodSpecHash]
+	if appliedHash == desiredHash && clusterShardRolloutSettled(cached) {
+		return cached, nil
+	}
+	fresh := &appsv1.StatefulSet{}
+	err := r.apiReader().Get(ctx, types.NamespacedName{
+		Name:      clusterShardStatefulSetName(littleRed, shardIdx),
+		Namespace: littleRed.Namespace,
+	}, fresh)
+	if apierrors.IsNotFound(err) {
+		// Deleted between the two reads. Nothing to gate; the next pass recreates it.
+		return cached, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return fresh, nil
+}
+
+// partitionValue renders a partition for a log line ("none" for the ungated nil).
+func partitionValue(p *int32) string {
+	if p == nil {
+		return "none"
+	}
+	return strconv.Itoa(int(*p))
+}
+
+// ---- state-gated intra-shard rolling updates (ADR-017, LR-047) ----
+
+// advanceClusterRollout is the POST-gather half of the state gate. The pre-gather apply can
+// only hold or raise the partition (it has no Redis-level state to judge redundancy by);
+// this is the only place it ever comes DOWN, and it lowers it by exactly one step, only
+// once every pod at or above the current partition is simultaneously at UpdateRevision,
+// Ready per the kubelet, and a link-`up` replica of the shard's slot owner.
+//
+// It runs in reconcileCluster's allPodsReady branch, which is precisely the window the
+// 2026-08-23 loss raced: the replacement pod has passed its local PING (so the kubelet
+// calls it Ready and minReadySeconds has started counting down towards the master's
+// deletion) but has not been FORGOT/MEET/REPLICATE-ed by the operator yet, so it is an
+// empty master holding no copy of anything.
+//
+// Only ONE shard is evaluated per pass — the first, in shard order, that is not settled at
+// the desired template. That mirrors LR-021's cross-shard serialization exactly, and the
+// two gates nest: at most one shard rolls, within it at most one pod, and only when the
+// shard is redundant.
+//
+// Errors are returned but a caller may treat them as non-fatal: holding is the safe
+// direction, and a pass that fails to lower the partition costs a rollout one cycle.
+func (r *LittleRedReconciler) advanceClusterRollout(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth,
+) error {
+	shards := clusterShardCount(littleRed)
+	rps := clusterReplicasPerShard(littleRed.Spec.Cluster)
+	if rps <= 0 {
+		// Ungated by construction (ADR-017 Decision 3): with one copy per shard no
+		// operator-side gate can make a rollout safe. The Warning is emitted where the
+		// roll is triggered, not here.
+		return r.clearClusterRolloutBlocked(ctx, littleRed)
+	}
+	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
+	now := time.Now()
+
+	for k := range shards {
+		desiredHash := desiredClusterShardTemplateHash(littleRed, k)
+		sts := &appsv1.StatefulSet{}
+		// UNCACHED: this read produces the cursor the next partition is computed FROM
+		// (plan.Partition = cursor - 1), so a stale-low value here would release the
+		// shard's master early — the defect, through a cached read. Only reached while a
+		// rollout is in flight, so the steady loop pays nothing (LR-043's cost argument).
+		if err := r.apiReader().Get(ctx, types.NamespacedName{
+			Name:      clusterShardStatefulSetName(littleRed, k),
+			Namespace: littleRed.Namespace,
+		}, sts); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return err
+		}
+		if sts.Spec.Template.Annotations[AnnotationPodSpecHash] == desiredHash && clusterShardRolloutSettled(sts) {
+			continue // this shard is at rest; look at the next one
+		}
+
+		pods, err := r.shardRolloutPods(ctx, littleRed, k, rps)
+		if err != nil {
+			return err
+		}
+		plan := planShardRolloutPartition(buildShardRolloutInput(
+			littleRed, k, rps, desiredHash, sts, pods, gt, now))
+
+		log.Info("Cluster rollout gate",
+			"shard", k, "verdict", plan.Verdict, "partition", partitionValue(plan.Partition),
+			"hold", plan.Hold, "holdPod", plan.HoldPod, "blocked", plan.Blocked)
+
+		if plan.Verdict == rolloutAdvance {
+			if err := r.apply(ctx, littleRed, buildClusterShardStatefulSet(littleRed, k, plan.Partition)); err != nil {
+				return err
+			}
+			r.getLogger(ctx, littleRed, LogCategoryAudit).Info(
+				"Cluster rollout gate: shard is redundant, releasing the next pod",
+				"shard", k, "partition", partitionValue(plan.Partition))
+		}
+
+		// Blocked is ADVISORY (ADR-017): it changes what the operator SAYS, never the
+		// partition it applies. Exactly one shard is reported on per pass — the one being
+		// rolled — which is also the only one that can be blocked.
+		return r.reportClusterRolloutGate(ctx, littleRed, k, plan)
+	}
+	return r.clearClusterRolloutBlocked(ctx, littleRed)
+}
+
+// shardRolloutPods reads shard k's pods for the gate, keyed by name. Absent ordinals are
+// simply missing from the map (the seam reads that as holdPodAbsent).
+//
+// UNCACHED, for the same reason as the StatefulSet: clause (a) compares each pod's
+// controller-revision-hash against the StatefulSet's UpdateRevision, and clause (b) is the
+// kubelet's readiness verdict — a cached pod object that still shows the OLD revision as
+// Ready would satisfy neither clause, but a cached object that has not yet caught up with a
+// deletion could satisfy both on behalf of a pod that no longer exists. Bounded cost: at
+// most 1+replicasPerShard reads, and only while a rollout is in flight.
+func (r *LittleRedReconciler) shardRolloutPods(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, shardIdx, replicasPerShard int,
+) (map[string]*corev1.Pod, error) {
+	pods := make(map[string]*corev1.Pod, replicasPerShard+1)
+	for ord := 0; ord <= replicasPerShard; ord++ {
+		name := clusterShardPodName(littleRed.Name, shardIdx, ord)
+		pod := &corev1.Pod{}
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Name: name, Namespace: littleRed.Namespace}, pod); err != nil {
+			if apierrors.IsNotFound(err) {
+				continue
+			}
+			return nil, err
+		}
+		// A terminating pod is on its way out; it is not the replacement the gate is
+		// waiting for, and counting it would let a doomed pod satisfy a clause. Same
+		// reasoning as bootstrapCluster's deletionTimestamp refusal (LR-043).
+		if pod.DeletionTimestamp != nil {
+			continue
+		}
+		pods[name] = pod
+	}
+	return pods, nil
+}
+
+// reportClusterRolloutGate maintains the ClusterRolloutBlocked condition and its Warning
+// event for one shard. The event fires ONCE PER TRANSITION (the condition's own status is
+// the transition memory), never per reconcile — at a 2s cadence a per-pass event would bury
+// the API server's event store in minutes and train everyone to ignore it.
+func (r *LittleRedReconciler) reportClusterRolloutGate(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, shardIdx int, plan shardRolloutPlan,
+) error {
+	if !plan.Blocked {
+		return r.clearClusterRolloutBlocked(ctx, littleRed)
+	}
+	msg := fmt.Sprintf(
+		"Rolling update of shard %d is held: pod ordinal %d is updated and Ready but is not attached to the "+
+			"shard's slot owner at all (clause %s), and has been in that state for longer than %s. "+
+			"The shard's remaining pods — including its master — are NOT being taken down, so the instance "+
+			"keeps serving and its data is intact; the update simply cannot finish safely. "+
+			"Release by hand with `kubectl patch statefulset %s -n %s --type=json -p "+
+			"'[{\"op\":\"replace\",\"path\":\"/spec/updateStrategy/rollingUpdate/partition\",\"value\":0}]'` "+
+			"— which forfeits the guarantee (ADR-017, LR-047).",
+		shardIdx, plan.HoldPod, plan.Hold, clusterRolloutReattachBudget,
+		clusterShardStatefulSetName(littleRed, shardIdx), littleRed.Namespace)
+	return r.setClusterRolloutBlocked(ctx, littleRed, metav1.ConditionTrue, "ShardNotRedundant", msg)
+}
+
+// clearClusterRolloutBlocked records that nothing is blocked, but only if the condition is
+// already present — it never introduces a False condition on an instance that has never
+// been blocked, so a healthy cluster's status stays as quiet as it is today.
+func (r *LittleRedReconciler) clearClusterRolloutBlocked(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) error {
+	if meta.FindStatusCondition(littleRed.Status.Conditions, littleredv1alpha1.ConditionClusterRolloutBlocked) == nil {
+		return nil
+	}
+	return r.setClusterRolloutBlocked(ctx, littleRed, metav1.ConditionFalse, "RolloutProgressing",
+		"No cluster shard rollout is blocked on redundancy.")
+}
+
+// setClusterRolloutBlocked writes the condition against the LATEST object (retry on
+// conflict, the ghost-master/leaderless pattern) and emits the Warning event only on a
+// genuine status transition.
+func (r *LittleRedReconciler) setClusterRolloutBlocked(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed,
+	status metav1.ConditionStatus, reason, message string,
+) error {
+	transitioned := false
+	err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &littleredv1alpha1.LittleRed{}
+		if err := r.Get(ctx, types.NamespacedName{Name: littleRed.Name, Namespace: littleRed.Namespace}, latest); err != nil {
+			return err
+		}
+		cur := meta.FindStatusCondition(latest.Status.Conditions, littleredv1alpha1.ConditionClusterRolloutBlocked)
+		if cur != nil && cur.Status == status && cur.Reason == reason && cur.Message == message {
+			transitioned = false
+			return nil // already exactly this; no write, no event
+		}
+		transitioned = cur == nil || cur.Status != status
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type:    littleredv1alpha1.ConditionClusterRolloutBlocked,
+			Status:  status,
+			Reason:  reason,
+			Message: message,
+		})
+		meta.SetStatusCondition(&littleRed.Status.Conditions, metav1.Condition{
+			Type: littleredv1alpha1.ConditionClusterRolloutBlocked, Status: status, Reason: reason, Message: message,
+		})
+		return r.Status().Update(ctx, latest)
+	})
+	if err != nil {
+		return err
+	}
+	if transitioned && status == metav1.ConditionTrue {
+		r.event(littleRed, corev1.EventTypeWarning, "ClusterRolloutBlocked", message)
+	}
+	return nil
+}
+
+// warnUngatedClusterRollout says out loud, once per rollout, that a replicasPerShard: 0
+// cluster is about to lose every shard's data (ADR-017 Decision 3). With one copy per shard
+// any rollout takes that copy down; refusing would make a documented topology
+// un-upgradable, and proceeding silently leaves a data-losing operation unannounced — so
+// the operator warns and proceeds. This is the first time the product says it anywhere.
+//
+// "Once per transition" is the pass that TRIGGERS the roll (the applied template hash still
+// differs from desired), not every pass of it: the very next reconcile sees the new hash on
+// the object and this is not reached again for that rollout.
+func (r *LittleRedReconciler) warnUngatedClusterRollout(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, shardIdx int, plan shardRolloutPlan,
+) {
+	if plan.Verdict != rolloutUngated {
+		return
+	}
+	msg := fmt.Sprintf(
+		"Rolling update of shard %d proceeds UNGATED: spec.cluster.replicasPerShard is 0, so this shard has "+
+			"exactly one copy of its slots and the update takes it down. Storage is EmptyDir (never persisted), "+
+			"so that shard's data is lost and the operator will reassign its slot range to the replacement, "+
+			"empty. No operator-side gate can prevent this — set replicasPerShard >= 1 for a data-safe rollout.",
+		shardIdx)
+	r.getLogger(ctx, littleRed, LogCategoryAudit).Info("Ungated cluster rollout (replicasPerShard: 0)", "shard", shardIdx)
+	r.event(littleRed, corev1.EventTypeWarning, "ClusterRolloutUngated", msg)
 }
 
 // reconcileClusterClientService ensures the client Service exists

@@ -20,7 +20,27 @@ import (
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+
+	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
+
+// labelControllerRevisionHash is the label the StatefulSet controller stamps on each pod
+// with the ControllerRevision (pod template revision) that pod was created from. Named
+// here rather than repeated as a literal because the rollout gate's clause (a) — "this pod
+// has actually been replaced" — is exactly a comparison of this label against the
+// StatefulSet's UpdateRevision.
+const labelControllerRevisionHash = "controller-revision-hash"
+
+// gtNode is a nil-safe lookup into a gather's node map. The rollout gate's input builder is
+// deliberately callable with gt == nil (the pre-gather apply), so this must not panic.
+func gtNode(gt *redisclient.ClusterGroundTruth, podName string) *redisclient.ClusterNodeState {
+	if gt == nil {
+		return nil
+	}
+	return gt.Nodes[podName]
+}
 
 // clusterShardRolloutSettled reports whether a shard StatefulSet has fully converged on its
 // desired pod template: the controller has observed the latest spec (ObservedGeneration ==
@@ -333,4 +353,128 @@ func (in shardRolloutInput) podStalled(pod shardRolloutPod) bool {
 		return false
 	}
 	return !in.Now.Before(pod.ReadySince.Add(clusterRolloutReattachBudget))
+}
+
+// ---- turning live objects into the seam's input (ADR-017 wiring, LR-047) ----
+
+// shardSlotOwner resolves "the shard's slot owner": the node that currently serves shard
+// K's slot range, as the cluster itself reports it. It is the master side of clause (c) —
+// the thing a replaced pod has to be a link-`up` replica OF before the StatefulSet may take
+// the next pod down.
+//
+// It keys on the START of the shard's expected aligned range (redisclient.GenerateSlotRanges,
+// the same pure function that assigns them) and accepts any owner whose ranges CONTAIN that
+// slot, rather than requiring an exact range match. Exact matching would silently return
+// "no owner" on a fragmented or mid-reshard range (LR-018) — and no owner means clause (c)
+// can never be satisfied, i.e. a permanent stall on a cluster that is merely resharding.
+// Containment degrades to the exact case and covers the rest.
+//
+// Iteration is over ClusterPodRefs rather than the gt.Nodes map so the answer is
+// deterministic when two nodes transiently claim the same slot (a mid-failover view): map
+// order would make the gate's verdict depend on hash seeding.
+func shardSlotOwner(gt *redisclient.ClusterGroundTruth, name string, shards, replicasPerShard, shardIdx int) *redisclient.ClusterNodeState {
+	if gt == nil {
+		return nil
+	}
+	ranges := redisclient.GenerateSlotRanges(shards)
+	if shardIdx < 0 || shardIdx >= len(ranges) {
+		return nil
+	}
+	want := ranges[shardIdx].Start
+	for _, ref := range ClusterPodRefs(name, shards, replicasPerShard) {
+		n := gt.Nodes[ref.Name]
+		if n == nil || n.Role != RoleMaster {
+			continue
+		}
+		for _, s := range n.Slots {
+			st, en, err := redisclient.ParseSlotRange(s)
+			if err == nil && want >= st && want <= en {
+				return n
+			}
+		}
+	}
+	return nil
+}
+
+// buildShardRolloutInput assembles planShardRolloutPartition's input from live objects. It
+// is pure — the caller does the reads — so the whole translation (ordinal parsing, which
+// readiness signal counts, and the two redundancy booleans) is unit-testable without a
+// cluster.
+//
+// pods is keyed by pod name and may be missing entries: an ordinal the StatefulSet has
+// deleted and not recreated is simply absent, which the seam reads as holdPodAbsent.
+//
+// gt may be nil. That is the PRE-GATHER call: with no pods and no ground truth the seam
+// takes its structural branches only (template change ⇒ gate at the highest ordinal;
+// settled ⇒ 0; otherwise re-emit the cursor unchanged), which is exactly what the
+// build-time apply needs and nothing more. The clause reporting from such a call is
+// meaningless and the caller ignores it.
+func buildShardRolloutInput(
+	lr *littleredv1alpha1.LittleRed,
+	shardIdx, replicasPerShard int,
+	desiredHash string,
+	sts *appsv1.StatefulSet,
+	pods map[string]*corev1.Pod,
+	gt *redisclient.ClusterGroundTruth,
+	now time.Time,
+) shardRolloutInput {
+	in := shardRolloutInput{
+		ShardIdx:         shardIdx,
+		ReplicasPerShard: replicasPerShard,
+		DesiredHash:      desiredHash,
+		Now:              now,
+	}
+	if sts != nil {
+		in.AppliedHash = sts.Spec.Template.Annotations[AnnotationPodSpecHash]
+		in.Generation = sts.Generation
+		in.ObservedGeneration = sts.Status.ObservedGeneration
+		in.UpdateRevision = sts.Status.UpdateRevision
+		in.CurrentRevision = sts.Status.CurrentRevision
+		if ru := sts.Spec.UpdateStrategy.RollingUpdate; ru != nil && ru.Partition != nil {
+			p := *ru.Partition
+			in.AppliedPartition = &p
+		}
+	}
+
+	shards := clusterShardCount(lr)
+	owner := shardSlotOwner(gt, lr.Name, shards, replicasPerShard, shardIdx)
+	ownerID := ""
+	if owner != nil {
+		ownerID = owner.NodeID
+	}
+
+	for ord := 0; ord <= replicasPerShard; ord++ {
+		podName := clusterShardPodName(lr.Name, shardIdx, ord)
+		pod := pods[podName]
+		if pod == nil {
+			continue
+		}
+		p := shardRolloutPod{
+			Ordinal:  ord,
+			Revision: pod.Labels[labelControllerRevisionHash],
+			// The kubelet's verdict on the redis container specifically — LR-023's
+			// blackhole-proof signal, never the operator's own dial (LR-017).
+			Ready: redisContainerReady(pod),
+		}
+		// ReadySince comes from the POD-level Ready condition's LastTransitionTime, because
+		// container statuses carry no timestamp at all. It is only ever used to decide
+		// whether a hold has lasted long enough to be REPORTED as a stall, and a zero value
+		// is never treated as evidence, so the small imprecision between "pod Ready" and
+		// "redis container Ready" cannot change a partition.
+		for i := range pod.Status.Conditions {
+			if c := &pod.Status.Conditions[i]; c.Type == corev1.PodReady {
+				p.ReadySince = c.LastTransitionTime.Time
+				break
+			}
+		}
+		// The two redundancy questions, per the shardRolloutPod contract. Synced is the
+		// gate (LR-025's one shared definition of "synced"); Attached only refines the
+		// blocked/holding report, and is deliberately false when the owner is unknown.
+		if node := gtNode(gt, podName); node != nil && ownerID != "" {
+			p.SyncedWithOwner = redisclient.IsLinkUpReplicaOf(node, ownerID)
+			p.AttachedToOwner = node.Role == RoleReplica && node.MasterNodeID == ownerID
+		}
+		in.Pods = append(in.Pods, p)
+	}
+	return in
 }
