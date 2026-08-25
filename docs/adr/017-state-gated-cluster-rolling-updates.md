@@ -136,6 +136,48 @@ no slots), so `HasEmptyMasters()` is true, so `IsHealthy` is false, so the insta
 doing exactly the job it was added for. The repair loop that makes the replica sync is thus
 already running at the cadence the gate depends on.
 
+### What the gate waits for, and what it merely reports
+
+*Amended after the seam was built (M2); the original Decision 1 named one redundancy clause and
+left the holding-versus-blocked boundary open.*
+
+Clause (c) is **two questions, and only one of them is the gate.** `SyncedWithOwner` — the LR-025
+predicate, a link-`up` replica of the shard's slot owner — is the gate, unchanged.
+`AttachedToOwner` — a replica of the owner at all, link state aside — is **reporting only**.
+
+The split exists because a flat "Ready for longer than T while failing clause (c)" would fire on a
+legitimate large-dataset **full sync**, which this ADR's own Consequences say can run for minutes
+per pod. The one alarm that must not cry wolf would then cry wolf on exactly the topology we tell
+users to expect, and no choice of T fixes it, because the sync is genuinely unbounded. The two
+failure shapes are distinguishable from live state, so they are distinguished:
+
+- **not attached at all** — what has to happen is the *operator's* reattach (FORGET the old node
+  ID, MEET, `CLUSTER REPLICATE`), all of it on the **fast 2s cadence** for the whole rollout,
+  because a not-yet-reattached pod is an empty master ⇒ `HasEmptyMasters()` ⇒ `IsHealthy` false
+  (LR-014's clause, doing the job it was added for), with gossip converging ~1-2s after the MEET.
+  That has a real, dataset-independent bound.
+- **attached, link down** — a full sync in flight. Dataset-dependent, unbounded, and genuine
+  progress. **Never reported blocked, however long it takes.**
+
+So: blocked ⟺ at `UpdateRevision`, kubelet-Ready for ≥ `clusterRolloutReattachBudget` (**120s**,
+matching `status.cluster.wipeDeadlockSince`, LR-023), **and** not attached to the owner at all.
+`ReadySince` comes from the pod's own `Ready` condition `LastTransitionTime`; a zero value is never
+blocked, because unknown is not evidence. Nothing is persisted, and the emitted partition is
+byte-identical whether a hold is blocked or not — **the distinction changes what the operator says,
+never what it does.**
+
+**Decision order, which turned out to be load-bearing.** `Complete` is checked *before* the clauses:
+a settled shard's own master **owns** the slots and is therefore nobody's replica, so evaluating
+clause (c) against it would report a healthy steady-state shard as holding, and after 120s as
+`ClusterRolloutBlocked` — a permanent false alarm on every healthy cluster. And the template-change
+check precedes `Complete`, because at first sight of a change the shard is still settled on the
+*old* template, so the other order would emit `Complete` and never gate at all.
+
+**Two edges resolved toward "never raise":** a partition above the highest ordinal is clamped
+**down** (a `replicasPerShard` decrease), and an absent partition reads as 0 — Kubernetes' own
+default — rather than as "no gate". The `replicasPerShard: 0` verdict emits **no partition field at
+all** rather than 0, so that StatefulSet stays byte-identical to today's.
+
 ### Stall forever, loudly — and why a fallback would be worse than the defect
 
 LR-043's correction is the governing precedent, and its lesson generalizes directly: **a guard
@@ -236,6 +278,19 @@ its own decision if ever wanted.
   evictions and `kubectl rollout restart` remain outside it and are covered only by the preStop
   fence, which converts loss into visible failure rather than preventing it. Closing that properly
   is the deferred readiness-probe alternative below.
+- **`lrctl verify` reports `[OK] Cluster is healthy and consistent.` on a cluster whose shard has
+  been destroyed** — captured on the M1 repro. This is *not* the OR-aggregation blindness tracked
+  separately in `BACKLOG.md`: here every node agrees and every node is right about the topology.
+  The project's designated ground-truth tool simply has no data-survival predicate. Recorded
+  because it is why nothing caught the field incident either.
+- **A residual of the gate's formulation, found in review and not closed:** clause (c) asks each pod
+  at or above the partition to be a *replica* of the shard's owner, which is unsatisfiable for a pod
+  that IS the owner. In the normal flow this never bites — such a pod is the one the StatefulSet is
+  about to replace, and after replacement it is a replica — but if a repair path promotes a
+  freshly-replaced pod back into ownership (a Step 3 `SafeMissingShardTarget` assignment onto it),
+  the gate holds forever. That degrades to the chosen behaviour, a loud stall, rather than to loss;
+  it is named here as a live-verification target rather than pre-emptively special-cased, since
+  every extra clause on this predicate is what LR-043 warns about.
 - **A cross-mode note (§7 rule 11):** sentinel mode has the same "rollout gated by readiness plus
   `minReadySeconds`" shape and is safe only because **its readiness probe happens to be
   redundancy-aware** — it requires `role:master` or `link:up`, which LR-016 explicitly *kept* while

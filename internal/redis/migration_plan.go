@@ -258,10 +258,17 @@ func ownerOfRange(gt *ClusterGroundTruth, start, end int) *ClusterNodeState {
 	return nil
 }
 
-// isLinkUpReplicaOf is the LR-025 "synced" gate: rep is a replica of masterNodeID with its
+// IsLinkUpReplicaOf is the LR-025 "synced" gate: rep is a replica of masterNodeID with its
 // replication link reported up. A replica whose link is still down is not yet synced, so it
 // is neither Failover-promotable nor a satisfied redundancy copy.
-func isLinkUpReplicaOf(rep *ClusterNodeState, masterNodeID string) bool {
+//
+// Exported because the state-gated rolling update (ADR-017, internal/controller) asks the same
+// question of a replaced shard pod before the StatefulSet is allowed to take the next one down.
+// One definition, deliberately: the rollout gate and the migration planner must not be able to
+// disagree about what "synced" means. LinkStatus here is INFO's master_link_status (see
+// gatherNodeIdentities), i.e. the replication link, not the cluster-bus link — so a replica
+// mid-full-sync reads down, which is exactly the state both callers must wait out.
+func IsLinkUpReplicaOf(rep *ClusterNodeState, masterNodeID string) bool {
 	return rep != nil && rep.Role == roleReplica && rep.MasterNodeID == masterNodeID && rep.LinkStatus == "up"
 }
 
@@ -372,7 +379,7 @@ func planReplicates(gt *ClusterGroundTruth, name string, shards, rps int,
 			if nodeOwnsRange(node, r.Start, r.End) {
 				continue
 			}
-			if isLinkUpReplicaOf(node, ownerNodeID(owner)) {
+			if IsLinkUpReplicaOf(node, ownerNodeID(owner)) {
 				continue // already a synced replica of the current owner
 			}
 			unsynced = true
@@ -408,7 +415,7 @@ func nextFailover(gt *ClusterGroundTruth, name string, shards int,
 			continue // already owns its range
 		}
 		owner := ownerOfRange(gt, r.Start, r.End)
-		force := owner != nil && !owner.Reachable && isLinkUpReplicaOf(m0, owner.NodeID)
+		force := owner != nil && !owner.Reachable && IsLinkUpReplicaOf(m0, owner.NodeID)
 		return FailoverAction{Addr: addrs[masterName], Force: force}, k, true
 	}
 	return FailoverAction{}, 0, false
@@ -424,7 +431,7 @@ func shardNewPods(name string, k, rps int) []string {
 	return pods
 }
 
-// ownerNodeID returns owner.NodeID, or "" when owner is nil (so isLinkUpReplicaOf, which
+// ownerNodeID returns owner.NodeID, or "" when owner is nil (so IsLinkUpReplicaOf, which
 // requires a non-empty MasterNodeID match, cleanly reports "not settled").
 func ownerNodeID(owner *ClusterNodeState) string {
 	if owner == nil {

@@ -42,7 +42,7 @@ func mgt(nodes ...*ClusterNodeState) *ClusterGroundTruth {
 }
 
 // rReplicaUp is a reachable, link-UP replica of masterID (the LR-025 "synced" gate:
-// isLinkUpReplicaOf requires LinkStatus == "up"). The reshard-era rReplica leaves
+// IsLinkUpReplicaOf requires LinkStatus == "up"). The reshard-era rReplica leaves
 // LinkStatus == "" (not synced), which the new plan treats as still-syncing.
 func rReplicaUp(pod, id, masterID string) *ClusterNodeState {
 	n := rReplica(pod, id, masterID)
@@ -487,8 +487,8 @@ func TestIsLinkUpReplicaOf(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := isLinkUpReplicaOf(tc.node, "M"); got != tc.want {
-				t.Errorf("isLinkUpReplicaOf = %v, want %v", got, tc.want)
+			if got := IsLinkUpReplicaOf(tc.node, "M"); got != tc.want {
+				t.Errorf("IsLinkUpReplicaOf = %v, want %v", got, tc.want)
 			}
 		})
 	}
