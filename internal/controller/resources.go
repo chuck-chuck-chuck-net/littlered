@@ -1997,13 +1997,18 @@ func buildClusterShardStatefulSet(lr *littleredv1alpha1.LittleRed, shardIdx int,
 		containers = append(containers, buildExporterContainer(lr, int32(littleredv1alpha1.RedisPort)))
 	}
 
-	// MinReadySeconds ensures pods are stable before next pod is restarted during rolling updates.
-	// For cluster mode with replicas, this allows time for automatic failover to complete
-	// before the next master is taken down.
-	// - cluster-node-timeout (default 15000ms) for replica to detect master is down
-	// - A few seconds for election and promotion
-	// - Buffer for operator reconciliation
-	// Total: 30 seconds is a safe default for replica mode
+	// MinReadySeconds is PURE DEFENCE IN DEPTH and is NOT the safety mechanism
+	// (ADR-017 Consequences). It is wall-clock, so it is blind to the only thing that
+	// matters before a shard's master is taken down — whether the replacement is a
+	// link-`up` replica of that shard's slot owner (LR-025). Presenting it as the
+	// guarantee is exactly what let LR-047 happen: an entire shard's data died in a
+	// rolling update that reported complete success, because "answers PING and has
+	// done so for 30 seconds" was mistaken for "a copy exists". The guarantee is now
+	// carried by the state gate — the operator-computed
+	// `spec.updateStrategy.rollingUpdate.partition` (`planShardRolloutPartition`) —
+	// which holds the handover until redundancy is proven from live Redis state.
+	// The number is retained unchanged as margin; whether to lower it now that a real
+	// gate exists is a later question. It must never again be read as a guarantee.
 	minReadySeconds := int32(0)
 	if lr.Spec.UpdateStrategy.MinReadySeconds != nil {
 		// User-specified value takes precedence
@@ -2215,6 +2220,35 @@ exec redis-server /data/redis.conf \
 	}
 	script := buf.String()
 
+	// The cluster-mode preStop hook. A master with a healthy replica hands its shard
+	// over with CLUSTER FAILOVER and waits for the role swap; a replica has nothing to
+	// hand over and leaves at once.
+	//
+	// THE LAST-COPY BRANCH SELF-FENCES (ADR-017 Decision 4, LR-047). When the lookup
+	// finds no healthy replica, this pod's departure ends the only copy of its slot
+	// range, and until now it said so in a log line and exited — so writes kept being
+	// acknowledged right up to the SIGTERM and then died with the process. That is
+	// LR-047's shape: silent loss under a routine operation. The branch now issues
+	// CONFIG SET min-replicas-to-write 99 first, converting those writes into visible
+	// -NOREPLICAS failures. Pillar 3.2's "errors rather than silent data loss",
+	// applied to a rollout instead of to memory pressure.
+	//
+	// The fence is TARGET-FREE on purpose, exactly as in failover mode (LR-038
+	// Addendum 2): min-replicas-to-write 99 cannot be satisfied, so writes fail
+	// immediately and we never need to know a successor — needing one would
+	// reintroduce the race the fence exists to remove. It rests only on local
+	// knowledge, which is what LR-016 permits a pod to act on: "I am being
+	// terminated" cannot be wrong, and the pod is the only party holding it
+	// instantly. Nothing is persisted (no CONFIG REWRITE), so the replacement
+	// container starts unfenced.
+	//
+	// It is a MITIGATION, not a closure, and it deliberately keeps the exit 0. The
+	// kubelet SIGKILLs at terminationGracePeriodSeconds (unset on cluster pods, so
+	// the Kubernetes default 30s), so refusing to exit would only delay the loss
+	// while making every rollout pay the full grace window. The closure for
+	// operator-triggered rollouts is the state gate (planShardRolloutPartition);
+	// node drains, evictions and a manual kubectl rollout restart bypass the
+	// operator entirely and have nothing but this.
 	preStopTmpl := template.Must(template.New("cluster-prestop").Delims("[[", "]]").Parse(`
 # Redirect all output from this point forward
 exec >/proc/1/fd/1 2>&1
@@ -2240,7 +2274,15 @@ fi
 REPLICA_IP=$(redis-cli $AUTH_ARGS [[.TLSFlags]] cluster nodes | grep "$MY_ID" | grep "slave" | grep -v "fail" | head -n 1 | awk '{print $2}' | cut -d: -f1 | cut -d@ -f1)
 
 if [ -z "$REPLICA_IP" ]; then
-  echo "preStop: No healthy replica found to take over. Proceeding with restart."
+  # LAST COPY OF THIS SHARD: self-fence, then leave. See the Go comment on
+  # preStopTmpl above for why this is a mitigation and why it keeps the exit 0.
+  echo "preStop: WARNING no healthy replica for this shard — I am the last copy of my slots."
+  if redis-cli $AUTH_ARGS [[.TLSFlags]] -t 2 CONFIG SET min-replicas-to-write 99 >/dev/null 2>&1; then
+    echo "preStop: writes fenced (-NOREPLICAS); this shard's range dies with this pod, but no further write is acknowledged and then lost"
+  else
+    echo "preStop: WARNING could not fence writes — acknowledged writes may be lost silently"
+  fi
+  echo "preStop: Proceeding with restart."
   exit 0
 fi
 

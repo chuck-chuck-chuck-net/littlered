@@ -1745,3 +1745,94 @@ func TestBuildClusterShardPDB(t *testing.T) {
 		t.Errorf("PDB selector shard = %q, want %q", pdb.Spec.Selector.MatchLabels[LabelShard], "1")
 	}
 }
+
+// --- cluster preStop last-copy self-fence (ADR-017 Decision 4, LR-047) -------
+//
+// HONEST TIER NOTE. This is a shell script embedded in a Go string: asserting the
+// built script contains the fence is GREEN FROM BIRTH and can only ever be a
+// structural guard against a future edit quietly deleting it. The behaviour — a
+// write against the departing master failing -NOREPLICAS instead of being
+// acknowledged and lost — is only observable live, and was validated on t3e with
+// a `replicasPerShard: 0` cluster, where every master is by construction the last
+// copy of its range. Teeth here were shown by mutation: restoring the old
+// two-line branch body (the bare log + `exit 0`) fails the fence assertion, and
+// hoisting the fence above the `if [ "$IS_MASTER" != "yes" ]` early exit fails
+// the placement assertion.
+func TestBuildClusterPreStopFencesLastCopy(t *testing.T) {
+	lr := newTestLittleRed(testLRName, testNamespace)
+	lr.Spec.Mode = ModeCluster
+	container := buildClusterRedisContainer(lr)
+
+	if container.Lifecycle == nil || container.Lifecycle.PreStop == nil ||
+		container.Lifecycle.PreStop.Exec == nil {
+		t.Fatal("cluster container missing preStop exec hook")
+	}
+	script := strings.Join(container.Lifecycle.PreStop.Exec.Command, " ")
+
+	const fence = "CONFIG SET min-replicas-to-write 99"
+	if !strings.Contains(script, fence) {
+		t.Fatalf("cluster preStop must self-fence on the last-copy branch; missing %q\n%s", fence, script)
+	}
+
+	// The fence is target-free (LR-038 Addendum 2): it must not need to know a
+	// successor, because needing one reintroduces the race the fence removes.
+	if strings.Contains(script, "min-replicas-to-write $") {
+		t.Error("the fence must be target-free: no computed successor may appear in it")
+	}
+
+	// PLACEMENT. The fence belongs to the last-copy branch only. It must sit after
+	// the master check (a replica has no slots to lose and must leave at once) and
+	// after the replica lookup, inside the `-z "$REPLICA_IP"` branch — fencing a
+	// master that DOES have a healthy replica would refuse writes for the whole
+	// hand-over window that the CLUSTER FAILOVER below is there to make seamless.
+	masterCheckAt := strings.Index(script, `if [ "$IS_MASTER" != "yes" ]`)
+	lookupAt := strings.Index(script, "REPLICA_IP=$(redis-cli")
+	branchAt := strings.Index(script, `if [ -z "$REPLICA_IP" ]`)
+	failoverAt := strings.Index(script, "CLUSTER FAILOVER")
+	fenceAt := strings.Index(script, fence)
+	if masterCheckAt < 0 || lookupAt < 0 || branchAt < 0 || failoverAt < 0 {
+		t.Fatalf("cluster preStop no longer has the expected shape:\n%s", script)
+	}
+	if !(masterCheckAt < lookupAt && lookupAt < branchAt && branchAt < fenceAt && fenceAt < failoverAt) {
+		t.Errorf("fence must live inside the last-copy branch only "+
+			"(masterCheck=%d lookup=%d branch=%d fence=%d failover=%d)",
+			masterCheckAt, lookupAt, branchAt, fenceAt, failoverAt)
+	}
+
+	// A mitigation, not a refusal: the kubelet SIGKILLs at the grace period, so
+	// blocking would only delay the loss and make every rollout pay the window.
+	tail := script[fenceAt:failoverAt]
+	if !strings.Contains(tail, "exit 0") {
+		t.Error("the last-copy branch must still exit 0 after fencing — it is a mitigation, not a refusal")
+	}
+	if strings.Contains(tail, "sleep") || strings.Contains(tail, "while ") {
+		t.Errorf("the last-copy branch must not wait after fencing:\n%s", tail)
+	}
+
+	// Loud: the operator has to be able to find this in the pod's logs afterwards.
+	if !strings.Contains(script, "last copy of my slots") {
+		t.Error("the last-copy branch must log loudly that this pod is the last copy")
+	}
+}
+
+func TestBuildClusterPreStopFenceTLSFlags(t *testing.T) {
+	lr := newTestLittleRed(testLRName, testNamespace)
+	lr.Spec.Mode = ModeCluster
+	plain := strings.Join(buildClusterRedisContainer(lr).Lifecycle.PreStop.Exec.Command, " ")
+	if strings.Contains(plain, "--tls") {
+		t.Error("cluster preStop must not pass --tls when TLS is disabled")
+	}
+
+	lr.Spec.TLS.Enabled = true
+	secure := strings.Join(buildClusterRedisContainer(lr).Lifecycle.PreStop.Exec.Command, " ")
+	fenceAt := strings.Index(secure, "CONFIG SET min-replicas-to-write 99")
+	if fenceAt < 0 {
+		t.Fatal("fence missing from the TLS-enabled cluster preStop")
+	}
+	// The fence command itself must carry the TLS flags, or it silently fails to
+	// connect on a TLS instance and the branch degrades to today's silent loss.
+	line := secure[strings.LastIndex(secure[:fenceAt], "\n")+1 : fenceAt]
+	if !strings.Contains(line, "--tls") {
+		t.Errorf("the fence command must pass TLS flags to redis-cli, got %q", line)
+	}
+}
