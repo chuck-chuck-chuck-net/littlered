@@ -244,6 +244,58 @@ first e2e run refuse a perfectly ordinary chain.
 
 ---
 
+### Forsaken Verdict and Quarantine (LR-042, LR-044, ADR-016)
+
+The one **terminal** verdict in sentinel mode, and the only path that stops the healing chain
+rather than adding to it. It applies to an instance **captured** by another Sentinel deployment
+sharing its master name (ADR-015, LR-039), which is unrecoverable by design.
+
+**Verdict** (`planForsaken`, pure). All four clauses must hold, plus a 30s `forsakenCooldown`
+tracked in `status.forsakenSince`:
+1. At least one reachable, **monitoring** Sentinel (bare Sentinels are Rule L's business).
+2. Every reachable monitoring Sentinel agrees on ONE master address (disagreement is a
+   transition, and transitions are not verdicts).
+3. That address is not one of our pods **and is not flagged down** (the down flag keeps ordinary
+   post-failover debris — LR-024's dead ghost — out of this).
+4. No reachable Redis pod of ours is a master (while one is, the existing rules own it).
+
+Conservative in one direction on purpose: a false positive parks a live instance, a false negative
+merely leaves the previous behaviour.
+
+**Effect of the verdict**: the operator returns **before Rule 0**, so no rule fights a battle
+ADR-015 §9.2 proved unwinnable; it logs once per transition; and it requeues at the **steady**
+interval (`requeueAfterNotRunning`, shared by `updateStatus` and `updateSentinelStatus` — LR-045
+found the switch was inert for sentinel mode, the only mode that can be forsaken). The instance
+stays `Ready=False`. The verdict is retracted automatically once the signature clears.
+
+**Quarantine** (`planQuarantine`, pure — gated on the verdict): desired Redis **and** Sentinel
+replicas are 0 while it is armed, so the **captor** heals through Rule D above (its gates all pass
+once the departed pods are merely `s_down` ghosts judged against the captor's own expected count);
+after a 120s settle the pods return with all Sentinels bare and zero data holders, which is Rule L's
+no-data reseed signature. Bounded to 2 attempts (1 when auth is off **and** the effective master
+name is the legacy `mymaster`), then latched at zero.
+
+Two refusals of its own (`quarantineDataRisk`), because this planner deletes pods:
+- `HoldDataPresent` — a reachable pod holds keys **not** explained by the capture. Keys on a
+  link-`up` replica of the captor's master are the captor's own dataset, still present on the
+  captor; keys anywhere else may be the only copy.
+- `HoldDataUnknown` — a pod could not be *proven* empty: unreachable to the operator while the
+  kubelet still reports its redis container Ready (LR-023's blackhole-proof signal, not LR-017's
+  dial).
+
+**Ordering constraint**: zero must be the **desired** replica count at build time, not a
+scale-down. Both StatefulSets are server-side-applied with `ForceOwnership` *before* the verdict is
+computed, so the *armed* quarantine is decided pre-gather from `status.quarantinedSince` alone
+(`sentinelDesiredReplicas`); arming stays after the gather. Otherwise the applies force the pods
+back every pass and they rejoin the captor's quorum in between.
+
+`status.quarantinedSince` and `status.quarantineAttempts` hold the state, because the verdict
+provably self-clears while quarantined (no pods ⇒ no reachable monitoring Sentinel ⇒ clause 1
+fails). The counter clears only on `Phase == Running`; clearing the two fields is also the manual
+release for a latched instance.
+
+---
+
 ## Pod-Level Safety: Kill-9 / Crash Protection
 
 The Redis startup script (in the container entrypoint) implements its own crash detection independent of the operator:
@@ -310,5 +362,6 @@ This prevents premature "Running" status before Sentinel has fully discovered th
 - [ADR-003: Low-Interference Sentinel Reconciliation](adr/003-low-interference-sentinel-reconciliation.md)
 - [ADR-005: Leaderless Bootstrap-Deadlock Recovery](adr/005-leaderless-bootstrap-recovery.md)
 - [ADR-015: Per-Instance Sentinel Master Name](adr/015-per-instance-sentinel-master-name.md)
+- [ADR-016: Forsaken-Gated Quarantine](adr/016-forsaken-gated-quarantine.md)
 - [Reconciliation Algorithm Changelog](RECONCILIATION_ALGORITHM_CHANGELOG.md)
 - [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md) — high-level view

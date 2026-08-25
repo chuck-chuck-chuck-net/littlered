@@ -735,6 +735,8 @@ With 3 shards, slots are distributed as:
 - **In-memory mode**: No persistence. Data will be lost on full cluster restart. By default, 'noeviction' is used, so data is not forgotten when memory is full (Redis will return errors instead).
 - **No PVCs**: Cluster state stored in CR status, not nodes.conf.
 - **Runtime scaling**: reducing `spec.cluster.shards` is refused (`ShardScaleDownRefused` — the operator never deletes data). Automated shard scale-up (resharding slots onto new shards) is not yet supported; treat the shard count as fixed after creation.
+- **Known open — cluster health is an OR over nodes, so `Ready=True` can overstate it.** `status.cluster.state` is "ok if **any** reachable node says ok", the slot count is a MAX and the node-ID set a union, so a cluster where two of three shards are whole reads as perfectly healthy while the third still serves `-CLUSTERDOWN`. Observed: `Ready=True`/`ClusterHealthy` 17s after apply while one master took **122s** to reach `cluster_state:ok`. `lrctl verify` inherits the same aggregation. Until this is changed, confirm a fresh or recovering cluster per pod (`redis-cli CLUSTER INFO` on every master), not from the CR condition. Open, tracked for a decision.
+- **Known open — a cluster rolling update is time-gated, not state-gated.** The operator serialises shard rollouts (LR-021) but advances on elapsed time rather than on the shard having actually converged, and a measured rollout lost two keys while reporting complete success. LR-046 removed the ~100s reconcile starvation that made it likely, but the design is unchanged. Roll shards by hand, one at a time, waiting for each to settle, when the data matters. Open, tracked for an ADR.
 
 ### Upgrading a pre-0.3 cluster
 
@@ -977,13 +979,44 @@ already covers master/replica domain diversity — see above).
 
 ### With authentication
 
-In sentinel mode, authentication is **strongly recommended** and is not only a client-edge
-control: the same password is Sentinel's peer-membership credential, so it also stops a foreign
-Sentinel deployment on the same pod network from talking to yours, and stops your replicas
-completing a sync against a foreign master. See "Isolating Sentinel instances" above — it is
-the only thing that closes the address-adoption path, which a unique master name does not.
-Give co-located instances **different** passwords; one shared platform secret gives no
-isolation.
+Authentication is a client-edge control in every mode. In **sentinel** and **failover** mode it is
+additionally a **mesh-isolation** control, and it is strongly recommended there. In **cluster**
+mode it is not — the advice below is differentiated because the modes genuinely differ, not by
+oversight.
+
+**Sentinel mode — strongly recommended.** The same password is Sentinel's peer-membership
+credential (`sentinel-pass`, falling back to `requirepass`), so it stops a foreign Sentinel
+deployment on the same pod network from talking to yours, and stops your replicas completing a
+sync against a foreign master. See "Isolating Sentinel instances" above: it is the **only** thing
+that closes the address-adoption path, which a unique master name does not.
+
+**Failover mode — strongly recommended, for the same class of reason at the same strength.** A
+`masterauth` mismatch aborts the replication handshake **before** the RDB transfer, so a stale
+`replicaof <ip>` that lands on a foreign master after a pod IP is recycled can never complete a
+sync and can never flush. There is no peer-to-peer topology protocol in this mode — role intent
+comes from the operator's pod annotations — so replication is the only cross-instance path, and
+the password closes it.
+
+**Cluster mode — a password does not protect the mesh, and we will not claim it does.** The
+cluster bus has **zero** password authentication at every supported version: grepping
+`requirepass` and `masterauth` in the cluster implementation returns no hits at all — Redis 8.4.2
+and Valkey 8.1 (`src/cluster_legacy.c`) and Redis 7.2 (`src/cluster.c`) — and a cross-instance
+merge travels on the bus. So enable auth in cluster mode for the
+client edge, if your platform wants it — but not in the belief that it isolates the mesh. Cluster
+mode's protection against a cross-instance merge is elsewhere and does not depend on a password:
+before issuing a `CLUSTER MEET` the operator re-reads the target pod **uncached** from the API
+server and requires it to still hold that IP, and additionally attributes the address from the
+target's own bus state (LR-043). (`tls-cluster` with per-instance CAs is a plausible mesh boundary
+and is **unverified** — the TLS verification path was never read and never tested — so treat it as
+an open question, not as advice.)
+
+**Give co-located instances different passwords.** A platform that templates one shared secret
+across every Redis instance in a namespace gets none of the isolation above — a shared password is
+one of the conditions under which foreign Sentinel gossip is accepted in the first place.
+
+The apparent asymmetry resolves in cluster mode's favour rather than against it: after LR-043 it
+is the **structurally strongest** mode against a cross-instance merge, because Kubernetes — not a
+credential on an unauthenticated protocol — decides which address is ours.
 
 ```bash
 # Create password secret
@@ -1417,8 +1450,19 @@ kubectl logs store-sentinel-0
 
 ### Recovering a sentinel instance captured by another Sentinel deployment
 
-**Symptoms.** The instance sits at `Ready=False` / `phase: Initializing` and `status.master` is
-empty. `lrctl verify` names it directly:
+**Symptoms.** The instance sits at `Ready=False` / `phase: Initializing` with an empty
+`status.master`, and the operator names the state outright — condition **`Forsaken=True`**:
+
+```bash
+kubectl get littlered store -o jsonpath='{range .status.conditions[?(@.type=="Forsaken")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+# True Quarantined  Captured by another Sentinel deployment sharing this master name; ...
+```
+
+The `reason` says what the operator did about it: `Captured` (verdict only), `Quarantined`,
+`QuarantineLatched`, or `QuarantineRefusedDataPresent` / `QuarantineRefusedDataUnknown`. See
+"Quarantine: why your pods are gone" below before touching anything.
+
+`lrctl verify` names the cause directly:
 
 ```bash
 lrctl verify store -n apps
@@ -1453,14 +1497,65 @@ topology.** See "Isolating Sentinel instances" above for how it happens and how 
 
 **The data is already gone.** The flush happens about a second after the takeover, long before
 anything can react. Recovery restores service on an empty instance — it does not restore data.
-The operator deliberately does **not** attempt this automatically: an operator-issued
+The operator deliberately does **not** try to take the mastership back: an operator-issued
 `SENTINEL MONITOR` starts at config epoch 0 and loses to the other deployment's epoch within
-seconds, so it could only loop, and each attempt would wipe the Sentinel replica list.
+seconds, so it could only loop, and each attempt would wipe the Sentinel replica list. Quarantine
+is not that — it reclaims nothing and speaks to no Sentinel; it just stops the instance and brings
+it back empty.
 
-**Recovery.** Because the outcome is an empty instance either way, the simplest correct fix is to
-delete and recreate the CR with a unique `masterName` (and auth) — do that if you can. If you must
-repair in place, first make sure the other deployment can no longer reach yours, or it will simply
-take over again:
+**Quarantine: why your pods are gone, and why that is intended.** Once the capture has held for
+30s the operator declares the instance `Forsaken` and **quarantines** it: both StatefulSets are
+held at `.spec.replicas: 0`, so `kubectl get pods` shows none. This looks alarming and is
+deliberate. The victim's pods are what pollute the *other* instance — they replicate from its
+master and its Sentinels count them as failover candidates, so its next master death could promote
+one of yours. Taking them away is what lets that instance heal itself; the operator issues no
+Sentinel command to either side.
+
+```bash
+kubectl get littlered store -o jsonpath='{.status.quarantinedSince}{"\n"}{.status.quarantineAttempts}{"\n"}'
+kubectl get statefulset -l app.kubernetes.io/instance=store   # both at 0/0 while quarantined
+```
+
+After a 120s settling period the pods are allowed back and the instance re-bootstraps itself
+**empty** — a normal `Running`/`Ready=True` instance with no data. Expect roughly four minutes
+from capture to serving again. Do **not** scale the StatefulSets up by hand: they are re-applied
+from this decision every reconcile, so an out-of-band scale-up is reverted on the next pass (at
+most one steady 30s interval later), and the pods rejoin the other instance's quorum in between.
+
+`status.quarantineAttempts` is the signal that matters. `1` is an ordinary cycle — a capture needs
+an address coincidence as well as a shared name, so most are luck. `2` means it was captured again
+after coming back, and the instance is then **latched**: it stays at 0 replicas, reason
+`QuarantineLatched`, and is not released again, because every recapture also re-pollutes the
+healthy neighbour. The budget is **1** instead of 2 when the instance's own configuration is what
+makes capture reachable (auth disabled **and** the effective master name is the legacy shared
+`mymaster`), so such an instance latches on its first quarantine. A latched instance is telling
+you to fix the configuration, not to retry.
+
+**Releasing a latched instance by hand** means clearing the two status fields — not editing the
+StatefulSets, and not clearing the `Forsaken` condition, which does not hold the state:
+
+```bash
+kubectl patch littlered store --subresource=status --type=merge \
+  -p '{"status":{"quarantinedSince":null,"quarantineAttempts":0}}'
+```
+
+Fix the cause first (unique `masterName` and auth, below), or it will simply be recaptured.
+
+**If it is `QuarantineRefusedDataPresent` or `QuarantineRefusedDataUnknown`**, the operator has
+declined to quarantine, and that is also intended: a reachable pod holds keys that are not merely a
+replicated copy of the other instance's dataset, or a pod could not be *proven* empty (the
+operator could not reach it and the kubelet still reports its redis container Ready). Deleting
+those pods could destroy the only copy of that data, so nothing is taken away. Rescue whatever is
+there by hand before proceeding.
+
+**Recovery by hand.** Usually there is nothing to do: the quarantine cycle above already returns
+the instance to service, empty, in about four minutes. Act by hand when it is **latched**, when it
+refused to quarantine (`QuarantineRefusedData*`), or when you want the outcome sooner. Because the
+outcome is an empty instance either way, the simplest correct fix is to delete and recreate the CR
+with a unique `masterName` (and auth) — do that if you can. If you must repair in place, first
+make sure the other deployment can no longer reach yours, or it will simply take over again. If
+the instance is currently quarantined it has no pods, so release it first (clear the two status
+fields above) and wait for them:
 
 ```bash
 # 1. Stop the operator fighting the manual repair.

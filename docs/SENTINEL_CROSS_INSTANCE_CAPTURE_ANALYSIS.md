@@ -386,12 +386,24 @@ explicit `maxmemory` bypasses `CalculateMaxmemory` (90 % of limit) with no sanit
   return a **stale `Status.PodIP`**. A stale IP now held by a foreign cluster-mode pod would be
   MEETed onto our cluster bus. Same root cause (IP identity + recycling), smaller window. Two
   cluster-mode instances were co-located in the same namespace in this environment.
+  **⚠ Closed by LR-043 (2026-08-23).** Checked, not assumed: source-confirmed **reachable** at
+  three versions (MEET validates only the address syntax; the receiver trusts an inbound MEET and
+  ingests the sender's whole gossip section; the initiator adopts the responder's node ID; the
+  cluster bus has no password authentication, so auth is not the mitigation it is here), and
+  guarded prophylactically — an **uncached** API-server confirmation that our own pod still holds
+  the address (`confirmPodIP`), plus bus-state attribution (`AttributeMeetTarget`) as a second
+  layer, on the MEET paths only. Never observed in the field. Residual: an API-server staleness
+  window (a terminating pod's object naming a released address), which is why the terminating
+  check was added.
 - **Standalone** — no peer protocol, no exposure.
 - **Failover mode (ADR-011)** — structurally immune. Role intent is stamped by the operator into
   pod annotations and consumed through a downward-API volume; there is no peer-to-peer topology
   protocol available to capture, and the operator is the sole authority. This is a genuine
   argument in the mode's favour that ADR-011 does not currently make, and it belongs in the
   graduation-gate discussion.
+  **Qualified (2026-08-24):** immune to *this* class, not to IP recycling as such — a stale
+  `replicaof <ip>` can adopt a foreign master, and `masterauth` is what closes it (a mismatch
+  aborts the handshake before the RDB transfer, so nothing syncs and nothing flushes).
 
 ---
 
@@ -457,6 +469,20 @@ existing instance's master on its next write, breaking every Sentinel-aware clie
 action to correlate the outage to.
 
 ### 9.2 Recovery for an already-captured instance — DECLINED
+
+> **⚠ Amended 2026-08-22 (ADR-016 / LR-044).** *Reclaim* of identity and data is still declined,
+> exactly as argued below. What is now automated is **availability recovery by empty reseed**: the
+> operator quarantines a captured instance (Redis **and** Sentinel StatefulSets at 0) so the
+> **captor** heals through the pre-existing Rule D, then releases it so Rule L re-bootstraps it
+> **empty** — the outcome this section itself names as the only achievable one. Quarantine fights
+> neither ground below: it salvages nothing and never contests the config epoch, so it is the
+> automation of the fallback this section accepts, not the rejected reclaim. Two sentences here
+> also need qualifying: *"which is precisely what deleting and recreating the CR already achieves"*
+> now happens without a human, and *"detection is not the gap: a captured instance sits at
+> `Ready=False`"* is true for the **victim** and false for the **captor**, which reports
+> `Running`/`Ready=True` while holding the victim's pods as failover candidates. The captor is the
+> reason to act at all. See §9.5, ADR-016 and changelog LR-044/LR-045.
+
 
 An earlier draft of this section proposed one: split LR-024's `HasHealthyKnownReplica` veto on
 whether the ghost master is flagged down (`s_down`/`o_down` → LR-024's dead ghost, veto correct;
@@ -550,6 +576,36 @@ it names a *dead* address, the `SLAVEOF` never completes a sync, and the flush t
 runs. That degrades to LR-024's ghost-master deadlock: a liveness failure we already detect and
 recover, not data loss. A random or UID-derived name would close it, at the cost of not being
 derivable by a chart at render time — disqualifying, given clients must carry the string.
+
+### 9.5 The captor side, and quarantine (added 2026-08-22)
+
+A capture has two sides and §9.2 only characterised one. Verified on a live pair: the victim
+reports `Initializing`/`Ready=False` as promised, while the instance whose master was adopted —
+the **captor** — reports `Running`/`Ready=True`/*"All Redis and Sentinel pods are ready"* with its
+Sentinels holding **5 replicas where 2 were deployed**, three of them the victim's pods. Its own
+topology is intact, so no healing rule fires; but its **failover-candidate set is poisoned** and
+on its next master death Sentinel can promote a *foreign* pod as its master. `lrctl verify` flags
+it (`FAIL`); the operator did not.
+
+The captor cannot be operated on directly. Its Sentinels are not confused — the victim's pods are
+*genuinely* replicating from its master, so its master's `INFO replication` genuinely reports five
+replicas, and Sentinel rebuilds that list from the master's `INFO` (§3.2, and LR-013: replicas
+never self-announce). A `SENTINEL RESET` there clears a list that repopulates seconds later, and
+RESET is the LR-024 hazard. Surgery on the captor cannot work while the cause is alive.
+
+So the operator removes the **cause**: while the `Forsaken` verdict (LR-042) holds, the victim's
+Redis **and** Sentinel StatefulSets are held at 0 replicas. Sentinel is not optional — the
+victim's *sentinels* publish hellos on the captor's master's channel under the shared name (§3.2),
+which is the `num-other-sentinels` inflation that distorts the captor's quorum math. With the pods
+gone the captor's departed entries become ordinary `s_down` ghost replicas and its own Rule D
+prunes them; after a 120s settle the victim's pods return, all Sentinels bare with zero data
+holders, and Rule L reseeds it empty. Bounded to two attempts (one when the instance's own
+configuration is what makes capture reachable), then latched.
+
+Verified live on t3e, twice: the captor's Sentinels were clean 5-12s after the victim's pods left,
+and capture → victim serving again took ~3m51s. Full design and its accepted residuals — chiefly
+that cycling through zero pods releases pod IPs and so reopens §9.4's address-adoption path for
+that window — are in ADR-016.
 
 ---
 
@@ -671,10 +727,13 @@ misses.
    supported fallback indefinitely or is a defect carried for compatibility with an intent to
    stop shipping it, and whether the documentation reads as advice or as disclosure of a known
    defect with an upgrade obligation.
-4. **Cluster-mode sibling** (development rule §7.11). No shared-name gossip channel, so no direct
-   analogue — but `CLUSTER MEET` is issued against pod IPs from the informer cache, and LR-012
-   established that cache can return a stale `Status.PodIP`. A stale IP now held by a foreign
-   cluster-mode pod would be MEETed onto our bus. Needs checking, not assuming.
+4. ~~**Cluster-mode sibling** (development rule §7.11). `CLUSTER MEET` is issued against pod IPs
+   from the informer cache, and LR-012 established that cache can return a stale `Status.PodIP`. A
+   stale IP now held by a foreign cluster-mode pod would be MEETed onto our bus. Needs checking,
+   not assuming.~~ **ANSWERED — checked, and closed. See §8 and LR-043.** Source-confirmed
+   reachable at three versions, then guarded by an uncached API-server address confirmation plus
+   bus-state attribution. Auth is *not* the mitigation there: the cluster bus carries no password
+   authentication at any supported version.
 
 ---
 

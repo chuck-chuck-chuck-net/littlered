@@ -159,6 +159,54 @@ Separately, every spec carries a **deployment-mode** label (`standalone`, `senti
 outermost mode-pure container and run `make verify-e2e-mode-labels`; the mode labels are
 orthogonal to the tier labels, so a spec normally has one of each.
 
+### Auth posture of the fixtures
+
+**Sentinel and failover tiers default to auth-ON**, each instance carrying its own Secret
+`{crName}-auth` (password derived from the CR name, so it is reproducible from a debug artifact
+without reading the Secret back). Per-instance rather than one suite-wide secret on purpose: LR-039
+lists a **shared** password among the conditions under which foreign Sentinel gossip is accepted,
+so a single secret would have the suite modelling the hazard instead of the mitigation. The Secret
+rides as a leading YAML document in the same `kubectl apply` stream as the CR, so it costs no extra
+round trip.
+
+**Cluster and standalone tiers stay auth-free**, and that is a statement about what a password
+buys, not an omission. In failover mode auth is a genuine mesh-isolation control (a `masterauth`
+mismatch aborts the replication handshake before the RDB transfer, closing the path where a stale
+`replicaof <ip>` adopts a foreign master after an IP recycle); in sentinel mode it is the only
+thing closing the address-adoption path a unique master name leaves open (ADR-015 §9.4). In cluster
+mode a password does **not** protect the mesh — the cluster bus has zero password authentication at
+every supported version — so defaulting it on there would assert something false about what it
+buys. Cluster mode's protection is LR-043's uncached MEET-time address confirmation plus bus-state
+attribution.
+
+**No auth coverage is lost.** `security_test.go` still proves password auth *and* TLS in all four
+modes, and it deliberately builds its own fixture rather than using these helpers: it is the spec
+that proves auth works, so it must not depend on the helpers that assume it.
+
+**Three deliberate auth-free exemptions**, each carrying a `DELIBERATELY AUTH-FREE` block at the
+fixture naming its reason, so a later "flip the last stragglers" sweep leaves them alone:
+
+1. `Sentinel Cross-Instance Isolation` (both specs) — they inject a bare
+   `PUBLISH __sentinel__:hello` at the sentinel port. Under `requirepass` the connection answers
+   `NOAUTH` **before** `sentinelProcessHelloMessage()` ever runs, so the isolation spec would pass
+   having tested nothing (it asserts a non-event, and a refused connection is indistinguishable
+   from a discarded hello) and its positive control could not land. Auth is also the wrong variable
+   to hold fixed here: these specs measure the master *name* closing gossip fusion.
+2. `Sentinel Forsaken-Gated Quarantine` (all three tiers) — the same NOAUTH-before-hello problem,
+   plus two more. The `Latched` tier is deterministic in a single cycle **only** because
+   `quarantineConfigDangerous` (auth off **and** the legacy `mymaster`) sets the attempt budget to
+   1; and the `HoldDataPresent` tier stages its permanently-failing sync with a **bogus
+   `masterauth`** against a foreign master that has no password.
+3. `Failover Mode Minimum Topology` — the deliberate failover no-auth spec: the cheapest tier that
+   still exercises bringup, replication, master kill, promotion of the sole replica and data
+   survival with no credential anywhere. It calls `failoverCRWithAuth(..., false)`, so the posture
+   is stated at the call site rather than by omission.
+
+Auth does not move the durability numbers: re-validated on t3e (`MODE=failover` 25/25,
+`MODE=sentinel` 43/43), the failover chaos tiers report 0 MISSING and 0 corruptions on all three
+disruption shapes, with availability inside the previously recorded bands (graceful 96.24% against
+96.07% recorded; kill-9 87.39% inside the recorded 85.13-95.73%).
+
 ### Additional Flags
 
 Pass extra arguments to `go test` via `ARGS`:
@@ -203,6 +251,8 @@ make test-e2e ARGS="-timeout 90m"
 | `sentinel_standalone_chaos_test.go` | Sentinel and Standalone Chaos Testing | Sentinel rapid double failover under load (graceful + crash), standalone pod restart |
 | `security_test.go` | LittleRed Security Features | Password authentication enforcement, TLS encryption enforcement |
 | `failover_mode_test.go` | Failover Mode / Failover Mode Deadlock Recovery | `mode: failover` (ADR-011): functional (resources, assignment annotations, experimental event), graceful+crash failover (UID-asserted), event-path (<15s) and polling-only tiers, hybrid double-failover (the graduation scenario), kill-9 epoch-gate yield under chaos load, deadlock tiers (total-loss / single-survivor / multi-holder same-lineage), rolling update. Label: `failover-mode` |
+| `sentinel_master_name_test.go` | Sentinel Cross-Instance Isolation / master-name admission | `spec.sentinel.masterName` admission specs, and the injected-hello isolation pair with its positive control (ADR-015, LR-039). **Auth-free by decision** — see "Auth posture of the fixtures" |
+| `sentinel_quarantine_test.go` | Sentinel Forsaken-Gated Quarantine | Full cycle (capture → `Forsaken`/`Quarantined` → both StatefulSets at 0 → captor's Sentinels heal → release → Rule L reseeds empty), `HoldDataPresent` refusal, `Latched` after the attempt budget (ADR-016, LR-044). **Auth-free by decision** |
 
 > Naming caveat: `sentinel_advanced_failover_test.go` (Describe: *Sentinel Advanced
 > Failover*, formerly `failover_test.go`) tests **sentinel-mode** label mechanics and

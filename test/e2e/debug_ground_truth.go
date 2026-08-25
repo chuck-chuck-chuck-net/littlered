@@ -315,33 +315,6 @@ computed verdict (authority master, ghosts, partitions, shard colocation).
 	_, _ = fmt.Fprintf(GinkgoWriter, "Collecting lrctl verify for %s...\n", crName)
 	out, _ := exec.Command(bin, "verify", crName, "-n", namespace).CombinedOutput()
 
-	// AUTH WARNING, stamped into the artifact itself rather than left for the
-	// reader to work out. `lrctl verify`'s exec gatherer runs a bare `redis-cli`
-	// with no credential (unlike `lrctl debug-dump`, which builds $AUTH from
-	// $REDIS_PASSWORD), so against an AUTH-ENABLED instance every probe answers
-	// NOAUTH and the report below is a plausible LIE: empty roles, keys:0, bare
-	// sentinels, "Authority Master: NONE". Sentinel- and failover-mode fixtures are
-	// auth-ON by default (auth_utils_test.go), so that is most of this suite.
-	// Measured on t3e, 2026-08-24, against a healthy 1-master/2-replica instance.
-	if pw := e2ePasswordForResource(crName); pw != "" {
-		header := fmt.Sprintf(`!! READ THIS BEFORE BELIEVING ANYTHING BELOW !!
-
-Instance %q is AUTH-ENABLED, and 'lrctl verify' does not authenticate: its exec
-gatherer runs a bare 'redis-cli', which answers NOAUTH. The report below is
-therefore NOT ground truth -- expect empty roles, keys:0, bare sentinels and
-"Authority Master: NONE" even on a perfectly healthy instance.
-
-Use redis-ground-truth.txt (whose probes DO authenticate) or 'lrctl debug-dump'
-instead. Reproduce by hand with:
-
-    kubectl exec %s-redis-0 -n %s -c redis -- redis-cli -a %s --no-auth-warning INFO replication
-
---------------------------------------------------------------------------------
-
-`, crName, crName, namespace, pw)
-		out = append([]byte(header), out...)
-	}
-
 	if err := os.WriteFile(outFile, out, 0644); err != nil {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Failed to write lrctl verify output: %v\n", err)
 	}

@@ -202,6 +202,19 @@ spec:
 - If `auth.enabled=true`, `existingSecret` is required
 - Inline passwords are not supported (must use Secret)
 
+**What a password buys, per mode** — differentiated on purpose; full guidance in
+`docs/USAGE.md` ("With authentication"):
+
+| Mode | Client edge | Mesh isolation |
+|------|-------------|----------------|
+| standalone | yes | n/a |
+| sentinel | yes | **yes** — the same password is Sentinel's peer-membership credential and is the only thing closing the address-adoption path a unique `sentinel.masterName` leaves open (ADR-015 §9.4) |
+| failover | yes | **yes** — a `masterauth` mismatch aborts the replication handshake before the RDB transfer, so a stale `replicaof <ip>` cannot adopt a foreign master after an IP recycle |
+| cluster | yes | **no** — the cluster bus has no password authentication at any supported version, and a cross-instance merge travels on the bus. Cluster mode's protection is the operator's uncached MEET-time address confirmation plus bus-state attribution (LR-043), not a credential |
+
+Give co-located instances **different** passwords; one shared platform secret provides no
+isolation in any mode.
+
 ### 2.6 TLS
 
 ```yaml

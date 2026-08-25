@@ -165,10 +165,13 @@ reported `flags: master` — healthy, hence never failed over. Details in LR-039
   master directly, reading its `INFO`, adopting our replicas and issuing `SLAVEOF` to them — no
   hello, so the name is never consulted. Only distinct passwords close it. This is the concrete
   reason auth is recommended rather than merely nice.
-- **A captured instance is not recovered automatically, by decision.** It stays at `Ready=False` /
-  `Initializing` — loud to ordinary alerting — until a human runs the runbook, and comes back
-  empty. Automated recovery was designed and then **declined**, not deferred; see Alternative J,
-  which is the one rejection where building the thing would have made matters actively worse.
+- **A captured instance's identity and data are not recovered automatically, by decision.**
+  Automated *reclaim* was designed and then **declined**, not deferred; see Alternative J, which
+  is the one rejection where building the thing would have made matters actively worse.
+  *(Amended 2026-08-22, ADR-016 / LR-044: its **availability** now is recovered automatically —
+  the operator quarantines the instance at 0 replicas and re-bootstraps it **empty**, which is
+  the outcome §9.2 already accepted. The declined reclaim is unchanged. See the Amendment
+  below.)*
 - **Self-capture on delete-and-recreate is accepted.** A terminating previous generation holds a
   higher epoch and can repoint the fresh one — but at a *dead* address, so the `SLAVEOF` never
   completes a sync and no flush occurs. That degrades to LR-024's ghost-master deadlock: a liveness
@@ -190,10 +193,30 @@ The alternatives are structurally different, not merely newer:
   not immune to IP recycling in general (a stale `Status.PodIP` from the informer cache could be
   MEETed — untested, tracked in the analysis doc's cross-mode audit), but the fusion-by-name class
   does not exist there.
+  *(Amended 2026-08-23, LR-043: no longer untested, and no longer open. The hazard was confirmed
+  **reachable** from the Redis/Valkey sources at three versions — `CLUSTER MEET` validates nothing
+  but the address syntax, the receiver trusts an inbound MEET and ingests the stranger's whole
+  gossip section, the initiator adopts whatever node ID answers, and the cluster bus has **no
+  password authentication at any supported version**, so `spec.auth` does not close it — and then
+  closed prophylactically: every MEET target and the seed it is issued at are re-read **uncached**
+  from the API server and required to still hold that IP (`confirmPodIP`), with bus-state
+  attribution (`AttributeMeetTarget`) as a second layer. Never observed in the field. Two sites are
+  deliberately still ungated and tracked separately — the `CLUSTER FAILOVER TAKEOVER` calls, which
+  are node-ID-free but issued *at* an address, and the migration's MEET **seed** — so the class is
+  closed where it creates an identity binding, not everywhere. Two
+  consequences for this ADR's comparison: the residual is now an API-server staleness window
+  rather than unbounded informer lag, and after LR-043 cluster mode is the **structurally
+  strongest** mode against a cross-instance merge, because Kubernetes — not a credential on an
+  unauthenticated protocol — decides which address is ours.)*
 - **Failover mode (ADR-011)** is structurally immune to *this* class: role intent is stamped by the
   operator into pod annotations and read through a downward-API volume, and there is no
   peer-to-peer topology protocol available to capture. This is a genuine argument in that mode's
   favour that ADR-011 does not currently make, and it belongs in its graduation discussion.
+  *(Qualified 2026-08-24: immune to the fusion-by-name class, yes — but not to IP recycling as
+  such. A stale `replicaof <ip>` can still land on a foreign master, and **replication** is then
+  the cross-instance path. `masterauth` closes it: a mismatch aborts the handshake before the RDB
+  transfer, so no sync completes and no flush occurs. So Decision 6's recommendation to enable auth
+  applies to failover mode at the same strength as to sentinel mode, for a different mechanism.)*
 
 **This ADR does not deprecate sentinel mode, nor promise promotion of any alternative.** Sentinel
 remains fully supported. What it records is that operators choosing between modes should weigh this
@@ -409,6 +432,39 @@ Reopen if any of these becomes true:
 If revisited, the constraints are fixed: **stamp on CREATE only** (stamping on UPDATE would silently
 rename an existing instance's master and break its clients), and **keep the required field
 underneath** so a skipped webhook degrades to a loud rejection rather than a silent wrong value.
+
+## Amendment (2026-08-22, ADR-016 / LR-044): quarantine is not the reclaim this ADR declined
+
+Alternative J and the Consequences bullet above are easy to read as *"the operator does nothing
+about a captured instance"*. That is no longer true, and the distinction is worth stating
+precisely, because the two things look alike:
+
+- **Reclaim of identity and data — still declined, unchanged.** No `SENTINEL REMOVE` +
+  `MONITOR` against a captor holding a higher config epoch, on either side of a capture. Both of
+  Alternative J's grounds stand: nothing survives to salvage, and the operator provably cannot
+  win the epoch fight (its `MONITOR` creates the entry at `config_epoch = 0`), whose failure mode
+  is LR-013's replica-list wipe every reconcile.
+- **Availability recovery by empty reseed — now automated.** ADR-016 quarantines a captured
+  instance (Redis **and** Sentinel StatefulSets at 0) so the **captor** heals through the
+  pre-existing Rule D, then releases it after a settling period so Rule L re-bootstraps it
+  **empty**.
+
+Quarantine fights neither of Alternative J's grounds: it **salvages nothing** and it **never
+contests the epoch** — the operator issues no Sentinel command about the capture at all. §9.2 of
+the analysis names the outcome it produces as the only achievable one (*"a recovery restores an
+empty instance, which is precisely what deleting and recreating the CR already achieves"*), so
+quarantine is the **automation of the accepted fallback**, not the rejected reclaim.
+
+What changed is the motivation, not the verdict on reclaim. A capture has two sides and only the
+victim is loud: the **captor** reports `Running`/`Ready=True` while its Sentinels hold the
+victim's pods as replicas, so its failover-candidate set is poisoned and its next master death
+can promote a foreign pod. This ADR's "detection is not the gap — a captured instance sits at
+`Ready=False`" is true for the victim and false for the captor. The victim is worthless either
+way; the reason to stop it is the healthy neighbour it is damaging.
+
+The USAGE runbook remains correct and remains the documented manual path — a quarantined instance
+will simply already be at 0 replicas when a human arrives, and a **latched** one is released by
+clearing `status.quarantinedSince` and `status.quarantineAttempts`. See ADR-016 and LR-044/LR-045.
 
 ## References
 
