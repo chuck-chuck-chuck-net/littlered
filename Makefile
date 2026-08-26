@@ -293,13 +293,42 @@ kind-load: ## Load built images into the Kind cluster.
 	@echo "Loading chaos client image into Kind cluster $(KIND_CLUSTER)..."
 	$(CONTAINER_TOOL) save $(CHAOS_CLIENT_IMAGE) | $(KIND) load image-archive /dev/stdin --name $(KIND_CLUSTER)
 
+# Lint against the Go version the project TARGETS, not whatever the developer's
+# distro happens to ship. staticcheck (bundled into golangci-lint) supports the Go
+# releases that were current at its own release and panics building IR for a newer
+# stdlib -- observed with golangci-lint 2.12.2 / staticcheck 0.7.0 against the Go
+# 1.27 stdlib, which aborts the whole run:
+#
+#   [runner] Panic: fact_purity: package "poll": interface conversion:
+#   interface {} is nil, not *buildir.IR
+#   buildir: panic during analysis: unexpected expr: *ast.KeyValueExpr
+#
+# go.mod's `go` directive is what CI lints with (every workflow uses
+# actions/setup-go with go-version-file: go.mod), so pinning to it also makes a
+# local run agree with CI instead of checking a configuration we do not ship.
+#
+# The pin is applied ONLY when the local toolchain's major.minor is NEWER than the
+# target; otherwise GOTOOLCHAIN stays `auto`, which is the default, so this changes
+# nothing anywhere else. In CI the two match, so its installed toolchain is used and
+# no toolchain is ever downloaded; on a machine OLDER than the target, `auto` still
+# upgrades per the `go` directive exactly as it does today (`local` would instead
+# fail outright, which is why it is not used here).
+GO_TARGET_VERSION := $(shell sed -n 's/^go \([0-9][0-9.]*\)$$/\1/p' go.mod)
+GO_TARGET_MINOR := $(shell echo '$(GO_TARGET_VERSION)' | cut -d. -f1,2)
+GO_LOCAL_MINOR := $(shell go env GOVERSION | sed 's/^go//' | cut -d. -f1,2)
+LINT_GOTOOLCHAIN ?= $(shell \
+	if [ "$(GO_LOCAL_MINOR)" != "$(GO_TARGET_MINOR)" ] && \
+	   [ "$$(printf '%s\n%s\n' '$(GO_TARGET_MINOR)' '$(GO_LOCAL_MINOR)' | sort -V | tail -1)" = "$(GO_LOCAL_MINOR)" ]; \
+	then echo 'go$(GO_TARGET_VERSION)'; else echo auto; fi)
+
 .PHONY: lint
 lint: golangci-lint ## Run golangci-lint linter
-	"$(GOLANGCI_LINT)" run
+	@echo "Linting with GOTOOLCHAIN=$(LINT_GOTOOLCHAIN) (go.mod targets $(GO_TARGET_VERSION), local toolchain is $(GO_LOCAL_MINOR).x)"
+	GOTOOLCHAIN=$(LINT_GOTOOLCHAIN) "$(GOLANGCI_LINT)" run
 
 .PHONY: lint-fix
 lint-fix: golangci-lint ## Run golangci-lint linter and perform fixes
-	"$(GOLANGCI_LINT)" run --fix
+	GOTOOLCHAIN=$(LINT_GOTOOLCHAIN) "$(GOLANGCI_LINT)" run --fix
 
 .PHONY: lint-config
 lint-config: golangci-lint ## Verify golangci-lint linter configuration
