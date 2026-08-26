@@ -65,6 +65,23 @@ type SentinelNodeState struct {
 	// available sign that another Sentinel deployment has joined our quorum.
 	NumOtherSentinels int
 	NumSlaves         int
+
+	// MonitoredMasters is EVERY master name this Sentinel monitors, not only the
+	// one we asked about (`SENTINEL MASTERS`).
+	//
+	// The rest of this struct is the answer to a single-name question, which can
+	// confirm or deny the name we passed and nothing else. A Sentinel carrying a
+	// leftover name alongside the desired one answers `Monitoring: true` either
+	// way, so the leftover is invisible to every field above — and that is the
+	// state a half-finished master-name change leaves behind, which is why this is
+	// gathered unconditionally rather than only when a Sentinel reads bare.
+	//
+	// An EMPTY list means "we could not read it", not "this Sentinel monitors
+	// nothing": the extra round trip degrades to empty rather than to
+	// Reachable:false, because a Sentinel that cannot answer one added question is
+	// not a dead Sentinel (LR-041's class of mistake). Callers must therefore not
+	// read emptiness as evidence of absence.
+	MonitoredMasters []MonitoredMaster
 }
 
 // ReplicationState represents the combined "Ground Truth" of a replication-based

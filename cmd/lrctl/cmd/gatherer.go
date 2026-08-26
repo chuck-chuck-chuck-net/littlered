@@ -86,20 +86,22 @@ func (g *cliGatherer) GetSentinelState(
 	if err != nil {
 		if strings.Contains(err.Error(), "ERR No such master") {
 			return &redisclient.SentinelNodeState{
-				PodName:    podName,
-				IP:         ip,
-				Monitoring: false,
-				Reachable:  true,
+				PodName:          podName,
+				IP:               ip,
+				Monitoring:       false,
+				Reachable:        true,
+				MonitoredMasters: g.monitoredMasters(ctx, podName),
 			}, nil
 		}
 		return nil, err
 	}
 
 	state := &redisclient.SentinelNodeState{
-		PodName:    podName,
-		IP:         ip,
-		Monitoring: true,
-		Reachable:  true,
+		PodName:          podName,
+		IP:               ip,
+		Monitoring:       true,
+		Reachable:        true,
+		MonitoredMasters: g.monitoredMasters(ctx, podName),
 	}
 
 	// Parse SENTINEL MASTER output
@@ -141,6 +143,23 @@ func (g *cliGatherer) GetSentinelState(
 	}
 
 	return state, nil
+}
+
+// monitoredMasters reads EVERY master name this Sentinel monitors, so `lrctl` and
+// the operator cannot disagree about it (LR-041's parity rule). Read
+// unconditionally and in both branches: a Sentinel carrying a leftover name
+// alongside the desired one answers `Monitoring: true`, so a probe triggered by
+// bareness would never see it, and the not-monitoring branch is precisely where a
+// leftover name is the only thing left to see.
+//
+// A failure degrades to an empty list, never to unreachable.
+func (g *cliGatherer) monitoredMasters(ctx context.Context, podName string) []redisclient.MonitoredMaster {
+	cmd := redisCliArgs("-p", "26379", modeSentinel, "masters")
+	stdout, _, err := k8s.Exec(ctx, g.coreClient, g.config, g.cCtx.Namespace, podName, g.cCtx.SentinelContainer, cmd)
+	if err != nil {
+		return nil
+	}
+	return parseSentinelMasters(stdout, g.resolveIdentityToIP)
 }
 
 // resolveIdentityToIP takes an identity (IP, pod name, or FQDN) and tries to resolve it to a Pod IP

@@ -79,10 +79,11 @@ func (g *operatorGatherer) GetSentinelState(
 	if err != nil {
 		if strings.Contains(err.Error(), "ERR No such master") || strings.Contains(err.Error(), "redis: nil") {
 			return &redisclient.SentinelNodeState{
-				PodName:    podName,
-				IP:         ip,
-				Monitoring: false,
-				Reachable:  true,
+				PodName:          podName,
+				IP:               ip,
+				Monitoring:       false,
+				Reachable:        true,
+				MonitoredMasters: g.monitoredMasters(ctx, sc, podAddr),
 			}, nil
 		}
 		return nil, err
@@ -92,6 +93,7 @@ func (g *operatorGatherer) GetSentinelState(
 		PodName:           podName,
 		IP:                ip,
 		Monitoring:        true,
+		MonitoredMasters:  g.monitoredMasters(ctx, sc, podAddr),
 		MasterIP:          masterInfo.IP,
 		MasterFlags:       masterInfo.Flags,
 		FailoverStatus:    masterInfo.FailoverStatus,
@@ -105,6 +107,32 @@ func (g *operatorGatherer) GetSentinelState(
 	}
 
 	return state, nil
+}
+
+// monitoredMasters reads every master name this Sentinel monitors.
+//
+// Issued UNCONDITIONALLY — one extra bounded round trip per Sentinel per pass —
+// rather than lazily only when a Sentinel reads bare. A Sentinel carrying BOTH a
+// leftover name and the desired one answers `Monitoring: true`, so a probe
+// triggered by bareness would never see the two-name state, which is the state a
+// previous half-finished rename actually leaves behind. Deriving the trigger from
+// `Monitoring` would also couple it to the one field that lies during a rename.
+//
+// A failure degrades to an empty list, never to Reachable:false. Reporting a
+// perfectly healthy Sentinel as dead because one added question went unanswered is
+// exactly the LR-041 class of mistake — a plausible-looking lie that silently
+// disables every rule gated on the Sentinel's state.
+//
+// Called only once the Sentinel has already answered GetMasterState, so a dead or
+// blackholing address costs no extra probe.
+func (g *operatorGatherer) monitoredMasters(
+	ctx context.Context, sc *redisclient.SentinelClient, podAddr string,
+) []redisclient.MonitoredMaster {
+	masters, err := sc.GetMonitoredMasters(ctx, podAddr)
+	if err != nil {
+		return nil
+	}
+	return masters
 }
 
 func (g *operatorGatherer) GetClusterID(ctx context.Context, podName, ip string) (string, error) {

@@ -23,6 +23,13 @@ import (
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
+// Sentinel reply field keys, shared by the replica and master parsers below.
+const (
+	fieldName  = "name"
+	fieldIP    = "ip"
+	fieldFlags = "flags"
+)
+
 // atoiSafe parses an integer, yielding 0 rather than an error. Every caller is reading
 // a Sentinel reply field for reporting purposes, where a malformed value should degrade
 // to "unknown" and not abort a diagnostic.
@@ -56,10 +63,10 @@ func parseSentinelReplicas(out string, resolve func(string) string) []redisclien
 		key := strings.TrimSpace(lines[i])
 		val := strings.TrimSpace(lines[i+1])
 		switch key {
-		case "name":
+		case fieldName:
 			flush()
 			cur = &redisclient.ReplicaInfo{}
-		case "ip":
+		case fieldIP:
 			if cur != nil {
 				if resolve != nil {
 					val = resolve(val)
@@ -70,7 +77,7 @@ func parseSentinelReplicas(out string, resolve func(string) string) []redisclien
 			if cur != nil {
 				cur.Port = val
 			}
-		case "flags":
+		case fieldFlags:
 			if cur != nil {
 				cur.Flags = val
 			}
@@ -78,4 +85,61 @@ func parseSentinelReplicas(out string, resolve func(string) string) []redisclien
 	}
 	flush()
 	return reps
+}
+
+// parseSentinelMasters turns the flat key/value reply of `SENTINEL masters` into
+// one record per monitored master name.
+//
+// It is the CLI half of the operator/CLI parity rule (LR-041): the operator reads
+// the same reply over the wire, and the two must not be able to disagree about
+// which names a Sentinel carries.
+//
+// Records are delimited by the `name` key, which Sentinel emits first for every
+// entry — the same property parseSentinelReplicas relies on. resolve maps a
+// reported identity (which may be a hostname) to an IP; pass nil to keep the
+// reported value verbatim.
+func parseSentinelMasters(out string, resolve func(string) string) []redisclient.MonitoredMaster {
+	lines := strings.Split(strings.ReplaceAll(out, "\r", ""), "\n")
+	var (
+		masters []redisclient.MonitoredMaster
+		cur     *redisclient.MonitoredMaster
+	)
+	flush := func() {
+		// A record with no name is unusable — the name is the whole point of the
+		// call — and cannot occur in a well-formed reply, since `name` is what
+		// opens each record.
+		if cur != nil && cur.Name != "" {
+			masters = append(masters, *cur)
+		}
+		cur = nil
+	}
+	for i := 0; i < len(lines)-1; i++ {
+		key := strings.TrimSpace(lines[i])
+		val := strings.TrimSpace(lines[i+1])
+		switch key {
+		case fieldName:
+			flush()
+			cur = &redisclient.MonitoredMaster{Name: val}
+		case fieldIP:
+			if cur != nil {
+				if resolve != nil {
+					val = resolve(val)
+				}
+				cur.IP = val
+			}
+		case fieldFlags:
+			if cur != nil {
+				cur.Flags = val
+			}
+		case "failover-state":
+			// Source-confirmed field name; there is no `failover-status` in
+			// either Redis or Valkey. It is emitted ONLY while a failover is in
+			// progress — see redisclient.MonitoredMaster.
+			if cur != nil {
+				cur.FailoverState = val
+			}
+		}
+	}
+	flush()
+	return masters
 }
