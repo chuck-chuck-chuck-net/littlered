@@ -19,6 +19,7 @@ package v1alpha1
 import (
 	_ "embed"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -501,4 +502,66 @@ func ParseMaxmemory(maxmemory string) (int64, error) {
 		return 0, err
 	}
 	return q.Value(), nil
+}
+
+// MinMaxmemoryBytes is the smallest maxmemory the operator accepts. Anything below this
+// is a unit mistake rather than an intent: a Redis instance capped under 1Mi evicts (or
+// refuses writes) on essentially every command.
+const MinMaxmemoryBytes = 1024 * 1024
+
+var (
+	// subByteSuffixRe matches the Kubernetes quantity suffixes below one byte — milli,
+	// micro, nano. Redis reads "375m" as 375 MB; Kubernetes reads it as 0.375 bytes, and
+	// CalculateMaxmemory rounds that up to 1. The collision is silent, so it is rejected
+	// by suffix rather than only by the size floor, to keep the message specific.
+	subByteSuffixRe = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?[mun]$`)
+
+	// redisSuffixRe matches the memory suffixes redis-server parses itself (memtoull:
+	// b, k/kb, m/mb, g/gb). These are not Kubernetes quantities, so CalculateMaxmemory
+	// hands them to redis.conf verbatim, where they work.
+	redisSuffixRe = regexp.MustCompile(`^[0-9]+(\.[0-9]+)?([bB]|[kK][bB]?|[mM][bB]|[gG][bB]?)$`)
+)
+
+// ValidateMaxmemory rejects spec.config.maxmemory values that would render into a
+// redis.conf Redis cannot use as intended. It accepts an empty value (the operator
+// derives maxmemory from the memory limit), "0" (Redis: no limit), any Kubernetes
+// quantity at or above MinMaxmemoryBytes, and the Redis-native suffixes that
+// CalculateMaxmemory passes through untouched.
+func ValidateMaxmemory(maxmemory string) error {
+	if maxmemory == "" {
+		return nil
+	}
+
+	if subByteSuffixRe.MatchString(maxmemory) {
+		digits := maxmemory[:len(maxmemory)-1]
+		return fmt.Errorf("spec.config.maxmemory %q: %q is the Kubernetes milli/micro/nano suffix, "+
+			"so this is less than one byte (%q renders as maxmemory 1); use %sMi for mebibytes or %sM for megabytes",
+			maxmemory, maxmemory[len(maxmemory)-1:], maxmemory, digits, digits)
+	}
+
+	qty, err := resource.ParseQuantity(maxmemory)
+	if err != nil {
+		// Not a Kubernetes quantity. CalculateMaxmemory forwards such values to
+		// redis.conf as written, so only the suffixes Redis itself parses are safe;
+		// anything else makes redis-server fail to start with a config error.
+		if redisSuffixRe.MatchString(maxmemory) {
+			return nil
+		}
+		return fmt.Errorf("spec.config.maxmemory %q is neither a Kubernetes quantity (e.g. \"375Mi\", \"375M\") "+
+			"nor a Redis memory value (e.g. \"375mb\"): %w", maxmemory, err)
+	}
+
+	if qty.Sign() < 0 {
+		return fmt.Errorf("spec.config.maxmemory %q must not be negative", maxmemory)
+	}
+	// Redis treats maxmemory 0 as unlimited; that is a deliberate choice, not a unit slip.
+	if qty.IsZero() {
+		return nil
+	}
+	if bytes := qty.Value(); bytes < MinMaxmemoryBytes {
+		return fmt.Errorf("spec.config.maxmemory %q resolves to %d bytes, which is too small "+
+			"(minimum %d, i.e. 1Mi); check the unit suffix", maxmemory, bytes, MinMaxmemoryBytes)
+	}
+
+	return nil
 }

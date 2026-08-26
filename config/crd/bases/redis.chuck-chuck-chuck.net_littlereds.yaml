@@ -156,8 +156,17 @@ spec:
                 description: Config defines Redis configuration
                 properties:
                   maxmemory:
-                    description: Maxmemory sets Redis maxmemory (e.g., "1Gi")
+                    description: |-
+                      Maxmemory sets Redis maxmemory as a Kubernetes quantity (e.g., "1Gi", "375Mi", "375M").
+                      Note that "m" is the milli suffix in Kubernetes notation, so "375m" means 0.375 bytes,
+                      not 375 MB; use "375Mi" or "375M" instead. Values below 1Mi are rejected.
                     type: string
+                    x-kubernetes-validations:
+                    - message: '''m''/''u''/''n'' are the Kubernetes milli/micro/nano
+                        suffixes, so this is less than one byte (375m = 0.375 bytes,
+                        rendered as maxmemory 1). Use mebibytes (375Mi) or megabytes
+                        (375M).'
+                      rule: '!self.matches(''^[0-9.]+[mun]$'')'
                   maxmemoryPolicy:
                     default: noeviction
                     description: MaxmemoryPolicy sets the eviction policy

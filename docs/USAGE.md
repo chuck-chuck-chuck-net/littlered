@@ -1053,6 +1053,13 @@ spec:
     maxmemoryPolicy: noeviction
 ```
 
+> **Mind the `m` in `maxmemory`.** The value is read as a Kubernetes quantity, where
+> `m` means *milli* — `maxmemory: 375m` is 0.375 bytes, not 375 MB, even though Redis's
+> own config parser would read it as the latter. Write `375Mi` (mebibytes) or `375M`
+> (megabytes). The CRD rejects `m`/`u`/`n` suffixes, and anything under `1Mi`, at
+> `kubectl apply` time. Redis-native forms like `6gb` or `512kb` are not Kubernetes
+> quantities and are passed straight to `redis.conf`, so they keep working.
+
 > **Why a CPU request but no CPU limit?** Redis's CPU usage is *bounded by its
 > thread count*, not unbounded. Command execution runs on a single main thread;
 > enabling `io-threads` adds a fixed number of I/O threads for socket
