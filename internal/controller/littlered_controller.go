@@ -21,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -1008,6 +1009,38 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 			}
 			applySentinelSettings(ctx, podSC, littleRed.Spec.Sentinel, sentinelMasterName)
 		}
+	}
+
+	// Rule N: prune stale Sentinel master names (LR-048).
+	//
+	// Placed AFTER Rule 0 so the desired name is already registered on a bare Sentinel in
+	// this same pass — that is what makes the two-name window intra-pass rather than
+	// multi-pass, and what makes the prune's own precondition (G6) pass on the first
+	// attempt.
+	//
+	// Placed BEFORE Rule A, i.e. it runs while anyTerminating is true, and that is
+	// deliberate rather than an oversight. The churn Rule A sits out is EXACTLY when a
+	// rename is in flight: editing spec.sentinel.masterName rewrites the Redis pod
+	// template, so a pod is terminating from the moment of the edit. Gating on
+	// !anyTerminating would hold the two-name window open for the whole multi-minute
+	// roll — the one window in which redis-0's baked, stale-name preStop can fire a real
+	// `SENTINEL failover <old>` under the old name, which was MEASURED doing exactly that
+	// (design §4.1: two names naming two different live pods as master for 56.6s).
+	//
+	// LR-040's actual lesson applies in full and is discharged rather than inherited: an
+	// action that runs during churn must be BOUNDED. Every call this rule makes goes
+	// through newBoundedClient (Dial/Read/WriteTimeout = ProbeTimeout) AND carries a
+	// per-call context deadline; a ctx alone is inert against go-redis.
+	//
+	// G0 is fed the verdict this pass ALREADY computed (never re-derived, never computed
+	// twice), and it is fed `Captured` rather than `Forsaken` deliberately: a settled
+	// Forsaken returns from the switch above long before this line, so passing it would
+	// make the gate structurally dead. `Captured` is the reachable — and strictly more
+	// conservative — reading of "a capture is in evidence": while one is, Rule N stands
+	// down entirely and ADR-016 owns the instance.
+	if err := r.reconcileStaleMasterNames(ctx, littleRed, state, sentinelMasterName,
+		sentinelQuorum(littleRed), password, forsakenPlan.Captured, now); err != nil {
+		auditLog.Error(err, "failed to reconcile stale Sentinel master names")
 	}
 
 	// Rule A: Guardrails
@@ -2268,6 +2301,237 @@ func (r *LittleRedReconciler) clearForsaken(
 		lr.Status.Conditions = latest.Status.Conditions // see setForsaken
 		return nil
 	})
+}
+
+// sentinelQuorum is the configured Sentinel quorum, defaulting to 2 (the value the
+// three-Sentinel topology bootstraps with).
+func sentinelQuorum(lr *littleredv1alpha1.LittleRed) int {
+	if lr.Spec.Sentinel != nil && lr.Spec.Sentinel.Quorum > 0 {
+		return lr.Spec.Sentinel.Quorum
+	}
+	return 2
+}
+
+// staleNamesForeignSuspected is the caller-side fifth reason for the StaleMasterName
+// condition. It is not one of the planner's four (design §8) on purpose: the planner is
+// pure and has no clock, and this reason exists ONLY to hold the Foreign reading below a
+// settling period. It is deliberately neutral — it reports that the operator is waiting,
+// and accuses nobody.
+const staleNamesForeignSuspected = "ForeignSuspected"
+
+// staleMasterNameForeignCooldown is how long the Foreign reading must persist before it
+// is reported as a possible capture. It mirrors forsakenCooldown, and the value is not
+// arbitrary: WP0 measured a just-replaced pod's address reading as "not ours and not
+// flagged down" for up to a full down-after-milliseconds (30s by default), so anything
+// shorter would not close the false-positive window it exists for.
+const staleMasterNameForeignCooldown = forsakenCooldown
+
+// staleNameReport is the caller's half of Rule N's verdict: what to put on the
+// condition, and whether the operator is entitled to raise its voice yet.
+type staleNameReport struct {
+	Status  metav1.ConditionStatus
+	Reason  string
+	Message string
+	// Warn: emit a Warning event on transition. Only ever true for a settled Foreign.
+	Warn bool
+	// ForeignSince is what status.staleMasterNameForeignSince must hold after this
+	// pass: the arming instant while the Foreign reading persists, nil otherwise.
+	ForeignSince *metav1.Time
+}
+
+// planStaleMasterNameReport turns the pure plan into the condition the operator
+// publishes, and owns the ONE thing the planner cannot: the clock.
+//
+// The planner's G5 discriminator — an address that is neither one of our pods nor
+// flagged down — is byte-identical to planForsaken clause 3, and WP0 measured that
+// predicate going true during an ORDINARY rename: at t0+89.1s the just-replaced
+// redis-0's address had already left the pod list while Sentinel had not yet flagged
+// it down (down-after-milliseconds, 30s). A just-replaced pod of ours and a captor's
+// master are structurally indistinguishable from Sentinel's vantage.
+//
+// Reported naively, that would fire a Warning reading "this instance may be captured —
+// do not rename to escape a capture" at the exact moment the owner is performing the
+// rename the runbook asked for. Nothing is pruned in that state either way, so this is
+// an observability defect rather than a safety one — but an alarming, wrong warning on
+// the documented happy path is not shippable.
+//
+// So Foreign is held as a SUSPICION until it has persisted, mirroring
+// forsakenSince/forsakenCooldown: below the cooldown the condition says it is waiting
+// and names nothing as a captor, and no event is emitted at all.
+func planStaleMasterNameReport(
+	plan StaleMasterNamePlan, foreignSince *metav1.Time, now time.Time,
+) staleNameReport {
+	switch plan.Reason {
+	case staleNamesConverged:
+		return staleNameReport{Status: metav1.ConditionFalse, Reason: plan.Reason, Message: plan.Message}
+	case staleNamesForeign:
+		since := foreignSince
+		if since == nil || since.IsZero() {
+			armed := metav1.NewTime(now)
+			since = &armed
+		}
+		if now.Sub(since.Time) >= staleMasterNameForeignCooldown {
+			return staleNameReport{
+				Status: metav1.ConditionTrue, Reason: staleNamesForeign, Message: plan.Message,
+				Warn: true, ForeignSince: since,
+			}
+		}
+		return staleNameReport{
+			Status: metav1.ConditionTrue, Reason: staleNamesForeignSuspected, ForeignSince: since,
+			Message: fmt.Sprintf("A stale Sentinel master name points at an address that is not "+
+				"currently one of this instance's pods and that Sentinel has not flagged down. A pod "+
+				"the rename has just replaced looks exactly like this until down-after-milliseconds "+
+				"elapses, so the operator waits %s before reading it as anything else. Nothing is "+
+				"pruned in this state either way; the operator log names the entry.",
+				staleMasterNameForeignCooldown),
+		}
+	default:
+		return staleNameReport{Status: metav1.ConditionTrue, Reason: plan.Reason, Message: plan.Message}
+	}
+}
+
+// reconcileStaleMasterNames is Rule N: it reconciles the SCOPE of what this instance's
+// Sentinels monitor — desired state is "every Sentinel monitors exactly the desired
+// name, and nothing else" — and reports what it did.
+//
+// The decision is the pure planStaleMasterNames; this function executes it and owns the
+// two things a pure function cannot: the re-confirmation immediately before a
+// destructive command, and the clock behind the Foreign settling period.
+//
+// Nothing is remembered between passes: no previous name, no phase, no cursor. Anything
+// a Sentinel monitors that is not the desired name is stale by definition, which is also
+// why this repairs an instance a PREVIOUS botched rename (or a hand-issued MONITOR)
+// already broke (R4).
+func (r *LittleRedReconciler) reconcileStaleMasterNames(
+	ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState,
+	desired string, quorum int, password string, forsaken bool, now time.Time,
+) error {
+	plan := planStaleMasterNames(state, desired, quorum, forsaken)
+	audit := r.getLogger(ctx, lr, LogCategoryAudit)
+
+	skippedAtReconfirm := r.executeStaleMasterNamePrune(ctx, lr, plan, desired, password, audit)
+
+	msg := plan.Message
+	if len(skippedAtReconfirm) > 0 {
+		sort.Strings(skippedAtReconfirm)
+		msg += fmt.Sprintf("; skipped at the pre-REMOVE re-confirm (did not confirm %q when asked "+
+			"directly, Rule 0 registers it next pass): %s", desired, strings.Join(skippedAtReconfirm, ", "))
+	}
+	plan.Message = msg
+
+	return r.setStaleMasterNameCondition(ctx, lr,
+		planStaleMasterNameReport(plan, lr.Status.StaleMasterNameForeignSince, now))
+}
+
+// executeStaleMasterNamePrune issues the REMOVEs the plan asks for and returns the pods
+// it skipped at the re-confirm. A non-Pruning plan executes nothing at all.
+//
+// G6 is re-confirmed HERE, per Sentinel, immediately before acting, with a bounded
+// IsMonitoring — the planner's view is a gather that is already milliseconds old, and
+// REMOVE is destructive. This is LR-024's electMaster lesson (enforce the invariant, do
+// not assume it) applied to the last line of defence: a Sentinel that does not confirm
+// the desired name is SKIPPED, never pruned, because removing its only entry would leave
+// it bare on purpose. Rule 0 gives it the desired name on a later pass.
+func (r *LittleRedReconciler) executeStaleMasterNamePrune(
+	ctx context.Context, lr *littleredv1alpha1.LittleRed, plan StaleMasterNamePlan,
+	desired, password string, audit logr.Logger,
+) []string {
+	if plan.Reason != staleNamesPruning {
+		return nil
+	}
+	var skipped []string
+	for _, entry := range plan.Prune {
+		addr := fmt.Sprintf("%s:%d", entry.SentinelIP, littleredv1alpha1.SentinelPort)
+		sc := redisclient.NewSentinelClient([]string{addr}, password, lr.Spec.TLS.Enabled)
+
+		// Bounded twice, and both halves are required (LR-040): IsMonitoring's client
+		// carries ProbeTimeout on Dial/Read/Write, and this deadline is what bounds
+		// go-redis's dial-retry loop. Rule N runs during churn by design, which is the
+		// exact situation that stalled a reconcile ~117s.
+		confirmCtx, cancel := context.WithTimeout(ctx, redisclient.ProbeTimeout)
+		monitoring, err := sc.IsMonitoring(confirmCtx, addr, desired)
+		cancel()
+		if err != nil || !monitoring {
+			audit.Info("Skipping stale master-name prune: this Sentinel did not confirm the desired "+
+				"name when asked directly; Rule 0 registers it next pass",
+				"pod", entry.SentinelPod, "address", addr, "desired_name", desired,
+				"stale_names", entry.Names, "error", err)
+			skipped = append(skipped, entry.SentinelPod)
+			continue
+		}
+
+		for _, name := range entry.Names {
+			if err := sc.Remove(ctx, name); err != nil {
+				audit.Error(err, "Failed to remove stale Sentinel master name",
+					"pod", entry.SentinelPod, "address", addr,
+					"stale_name", name, "desired_name", desired)
+				continue
+			}
+			audit.Info("Removed stale Sentinel master name",
+				"pod", entry.SentinelPod, "address", addr,
+				"stale_name", name, "desired_name", desired)
+		}
+	}
+	return skipped
+}
+
+// setStaleMasterNameCondition persists Rule N's report, and is deliberately quiet when
+// nothing changed: this runs on every sentinel pass, and a status write every 2s for an
+// unchanged verdict is churn of exactly the kind LR-042 removed.
+//
+// One event per TRANSITION, never per reconcile — and only a settled Foreign is a
+// Warning (see planStaleMasterNameReport).
+func (r *LittleRedReconciler) setStaleMasterNameCondition(
+	ctx context.Context, lr *littleredv1alpha1.LittleRed, rep staleNameReport,
+) error {
+	prev := meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionStaleMasterName)
+	sinceUnchanged := timesEqual(lr.Status.StaleMasterNameForeignSince, rep.ForeignSince)
+	if prev != nil && prev.Status == rep.Status && prev.Reason == rep.Reason &&
+		prev.Message == rep.Message && sinceUnchanged {
+		return nil
+	}
+	changed := prev == nil || prev.Reason != rep.Reason
+
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
+		latest := &littleredv1alpha1.LittleRed{}
+		if err := r.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest); err != nil {
+			return err
+		}
+		latest.Status.StaleMasterNameForeignSince = rep.ForeignSince
+		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
+			Type: littleredv1alpha1.ConditionStaleMasterName, Status: rep.Status,
+			Reason: rep.Reason, Message: rep.Message,
+		})
+		if err := r.Status().Update(ctx, latest); err != nil {
+			return err
+		}
+		// Mirror what was just persisted onto the in-memory object. updateSentinelStatus
+		// runs later in the SAME pass and writes the whole status back from this object,
+		// so without the mirror it silently reverts what we just wrote — the LR-044
+		// defect, which must not be reintroduced.
+		lr.Status.Conditions = latest.Status.Conditions
+		lr.Status.StaleMasterNameForeignSince = latest.Status.StaleMasterNameForeignSince
+		return nil
+	}); err != nil {
+		return err
+	}
+
+	if changed && rep.Warn {
+		r.event(lr, corev1.EventTypeWarning, rep.Reason, rep.Message)
+	}
+	return nil
+}
+
+// timesEqual compares two optional timestamps by value, nil included.
+func timesEqual(a, b *metav1.Time) bool {
+	switch {
+	case a == nil && b == nil:
+		return true
+	case a == nil || b == nil:
+		return false
+	default:
+		return a.Equal(b)
+	}
 }
 
 func (r *LittleRedReconciler) setLeaderlessSince(ctx context.Context, lr *littleredv1alpha1.LittleRed, t metav1.Time) error {
