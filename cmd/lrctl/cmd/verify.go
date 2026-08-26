@@ -327,15 +327,32 @@ func verifySentinel(
 		fmt.Println("\n[OK] Cluster configuration is consistent.")
 	}
 
+	return sentinelVerifyFailure(cCtx.Namespace, cCtx.Name, masterNameOf(cCtx),
+		state.RealMasterIP, len(actions), staleNames)
+}
+
+// sentinelVerifyFailure turns the three sentinel-mode findings into the error verify
+// returns, or nil. A non-nil error becomes errCount, then the RunE error, then
+// main.go's os.Exit(1) — so this function IS the exit code.
+//
+// It is a separate, pure function for exactly one reason: the printed verdict and the
+// process's exit status must not be able to disagree. A script trusts the exit code,
+// so a `[FAIL]` line beside an exit 0 would be worse than no check at all — the check
+// would be actively misleading rather than merely absent. Keeping the decision here,
+// driven by the same booleans that drove the printing, makes that a unit-testable
+// property instead of a reviewer's promise.
+func sentinelVerifyFailure(namespace, name, masterName, realMasterIP string,
+	healActions int, staleNames bool,
+) error {
 	switch {
-	case state.RealMasterIP == "" || len(actions) > 0:
-		return fmt.Errorf("cluster %s/%s is not healthy or consistent", cCtx.Namespace, cCtx.Name)
+	case realMasterIP == "" || healActions > 0:
+		return fmt.Errorf("cluster %s/%s is not healthy or consistent", namespace, name)
 	case staleNames:
 		// Named separately: an instance that is otherwise healthy but carries a
 		// second master name is a specific, actionable defect, and "not healthy or
 		// consistent" would send the reader looking for the wrong thing.
 		return fmt.Errorf("cluster %s/%s does not monitor exactly one Sentinel master name (%q)",
-			cCtx.Namespace, cCtx.Name, masterNameOf(cCtx))
+			namespace, name, masterName)
 	}
 	return nil
 }

@@ -202,32 +202,57 @@ A reachable Sentinel whose master list could not be read is reported `[WARN]` an
 an unread list is no evidence either way, and rendering it as convergence would be exactly the
 plausible-looking lie this check exists to remove (LR-041).
 
-Fixture-derived example of the two-name state (the shape measured live on t3e, rendered here from
-the unit fixtures rather than captured from a cluster):
+Captured live on a real two-name instance (t3e), the state a half-finished rename leaves behind —
+this is the whole `verify` output, and the last line is `lrctl`'s own exit message:
 
 ```text
+Verifying Cluster: lr048-red/rn-full-1787768094 (Mode: sentinel)
+Gathering Cluster Ground Truth...
+
+Sentinel Status:
+  - Sentinel rn-full-1787768094-sentinel-2: monitoring 10.233.192.112
+  - Sentinel rn-full-1787768094-sentinel-1: monitoring 10.233.192.112
+  - Sentinel rn-full-1787768094-sentinel-0: monitoring 10.233.192.112
+
+Redis Status:
+  - Redis rn-full-1787768094-redis-2: role:slave, following:10.233.192.112, link:up, keys:500
+  - Redis rn-full-1787768094-redis-0: role:master, keys:500
+  - Redis rn-full-1787768094-redis-1: role:slave, following:10.233.192.112, link:up, keys:500
+
+Ground Truth Summary:
+  [OK] Authority Master: rn-full-1787768094-redis-0 (10.233.192.112)
+
 Sentinel Identity:
-  Master name: lr048.rn
+  Master name: lr048-red.rn-full-1787768094
   Monitored master names (every name each Sentinel carries):
-    - rn-sentinel-0: "lr048.rn" at 10.233.192.95, flags:master  (desired)
-    - rn-sentinel-0: "mymaster" at 10.233.192.95, flags:master  (stale — ours)
-    - rn-sentinel-1: "lr048.rn" at 10.233.192.95, flags:master  (desired)
-    - rn-sentinel-1: "mymaster" at 10.233.192.95, flags:master  (stale — ours)
-    - rn-sentinel-2: "lr048.rn" at 10.233.192.95, flags:master  (desired)
-    - rn-sentinel-2: "mymaster" at 10.233.192.95, flags:master  (stale — ours)
-  [FAIL] Stale master name(s) "mymaster" are still monitored alongside "lr048.rn".
+    - rn-full-1787768094-sentinel-0: "lr048-red.rn-full-1787768094" at 10.233.192.112, flags:master  (desired)
+    - rn-full-1787768094-sentinel-0: "mymaster" at 10.233.192.112, flags:master  (stale — ours)
+    - rn-full-1787768094-sentinel-1: "lr048-red.rn-full-1787768094" at 10.233.192.112, flags:master  (desired)
+    - rn-full-1787768094-sentinel-1: "mymaster" at 10.233.192.112, flags:master  (stale — ours)
+    - rn-full-1787768094-sentinel-2: "lr048-red.rn-full-1787768094" at 10.233.192.112, flags:master  (desired)
+    - rn-full-1787768094-sentinel-2: "mymaster" at 10.233.192.112, flags:master  (stale — ours)
+  [FAIL] Stale master name(s) "mymaster" are still monitored alongside "lr048-red.rn-full-1787768094".
          One instance under two names runs two independent failover state machines
          over the same pods, which can promote different replicas (LR-039, LR-048).
          The operator prunes them once its gates pass — read the StaleMasterName
          condition on the CR, whose message names the gate that refused.
-  [OK] No foreign Sentinel contact observed (3 sentinels, 2 replicas expected).
+1 of 1 resource(s) failed verification
 ```
 
-The `[OK] No foreign Sentinel contact observed` line is still printed beside the `[FAIL]`, and
-deliberately: the two answer different questions, and "the leftover name is **ours** and nothing
-foreign is in contact" is precisely what separates a botched rename from a capture.
+Everything above the `Sentinel Identity` block reads healthy — an authority master, three
+Sentinels agreeing on it, all three Redis pods holding the same 500 keys — which is exactly why
+this check had to be added: the instance *is* serving, and the defect is the second `sentinel
+monitor` line no single-name query can see.
 
-And the foreign case (same provenance — fixture-derived):
+Note what the capture does **not** show: this binary predates a late revision in which the
+`[OK] No foreign Sentinel contact observed` line was un-suppressed. Current builds print it beside
+the `[FAIL]`, and deliberately — the two answer different questions, and "the leftover name is
+**ours** and nothing foreign is in contact" is precisely what separates a botched rename from a
+capture.
+
+The foreign case is **fixture-derived**, not captured: no genuine foreign master existed on the
+validation cluster, and a foreign capture must not be manufactured by editing addresses in the one
+above. It is rendered by the shipped code from the unit fixtures:
 
 ```text
 Sentinel Identity:
@@ -258,7 +283,9 @@ single pointer to the recovery runbook.
 > **also** exits non-zero when any reachable Sentinel monitors a master name other than the CR's.
 > An instance that a script previously read as healthy while carrying a leftover name now reports
 > failure — which is the point, and the reason the rename runbook's verification step is only
-> implementable from this version on. The `--json` output changes the same way: `healthy` is false
+> implementable from this version on. The chain is `verify`'s error → `errCount` → the command's
+> error → `os.Exit(1)`; the `1 of 1 resource(s) failed verification` line in the capture above is
+> printed on that path, immediately before the non-zero exit. The `--json` output changes the same way: `healthy` is false
 > for such an instance, and the new `masterNameScope` object plus the per-Sentinel
 > `monitoredMasters` array carry the detail.
 

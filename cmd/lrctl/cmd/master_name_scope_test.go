@@ -50,6 +50,9 @@ const (
 	scopeRedisPod  = "inst-redis-0"
 	scopePod0      = "s-0"
 	tokenFail      = "[FAIL]"
+	// msgUnhealthy is verify's generic failure text, as distinct from the specific
+	// master-name one.
+	msgUnhealthy = "not healthy or consistent"
 )
 
 // scopeState builds a ReplicationState carrying the given Sentinel views, with the
@@ -329,5 +332,75 @@ func TestReportCrossInstanceSkipsTheCheckWithoutACR(t *testing.T) {
 	}
 	if !strings.Contains(out, "not known") {
 		t.Errorf("the skip is not explained:\n%s", out)
+	}
+}
+
+// TestSentinelVerifyFailureMatchesThePrintedVerdict pins that the exit code cannot
+// disagree with the printed verdict.
+//
+// `verify` prints `[FAIL]` for a stale master name; a script reads the exit code. If
+// those two could diverge the check would be worse than absent — it would be actively
+// misleading. The chain is: this function's error → errCount → the RunE error →
+// main.go's os.Exit(1), and the last link was confirmed by running the built binary
+// (`lrctl verify demo --kubeconfig /nonexistent` → exit 1).
+func TestSentinelVerifyFailureMatchesThePrintedVerdict(t *testing.T) {
+	cases := []struct {
+		name         string
+		realMasterIP string
+		healActions  int
+		staleNames   bool
+		wantErr      bool
+		wantMentions string
+	}{
+		{
+			name: "healthy and converged", realMasterIP: ipMaster,
+			wantErr: false,
+		},
+		{
+			name: "no authority master", realMasterIP: "",
+			wantErr: true, wantMentions: msgUnhealthy,
+		},
+		{
+			name: "healing actions recommended", realMasterIP: ipMaster, healActions: 2,
+			wantErr: true, wantMentions: msgUnhealthy,
+		},
+		{
+			// The WP5 case: everything else is fine, and it must still fail.
+			name:         "otherwise healthy but carrying a stale master name",
+			realMasterIP: ipMaster, staleNames: true,
+			wantErr: true, wantMentions: "exactly one Sentinel master name",
+		},
+		{
+			name: "stale name AND unhealthy still fails", realMasterIP: "", staleNames: true,
+			wantErr: true, wantMentions: msgUnhealthy,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := sentinelVerifyFailure("ns", "inst", nameDesired,
+				tc.realMasterIP, tc.healActions, tc.staleNames)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("sentinelVerifyFailure() = %v, want error: %v", err, tc.wantErr)
+			}
+			if tc.wantMentions != "" && !strings.Contains(err.Error(), tc.wantMentions) {
+				t.Errorf("error %q does not mention %q", err, tc.wantMentions)
+			}
+		})
+	}
+}
+
+// TestStaleNamesAlwaysFail is the invariant behind the table above, stated once and
+// independently of which other findings happen to be present: whenever the master-name
+// scope failed — i.e. whenever a `[FAIL]` was printed for it — verify must return an
+// error, whatever else is true.
+func TestStaleNamesAlwaysFail(t *testing.T) {
+	for _, ip := range []string{"", ipMaster} {
+		for _, actions := range []int{0, 1} {
+			if err := sentinelVerifyFailure("ns", "inst", nameDesired, ip, actions, true); err == nil {
+				t.Errorf("stale names with realMasterIP=%q healActions=%d returned nil; "+
+					"a printed [FAIL] would exit 0", ip, actions)
+			}
+		}
 	}
 }
