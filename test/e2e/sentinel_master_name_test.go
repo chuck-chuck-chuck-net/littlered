@@ -611,6 +611,32 @@ var _ = Describe("Sentinel Master Name Rename", Label("sentinel"), func() {
 		}
 	}
 
+	// expectNeverForsaken is the K9 regression guard the design makes MANDATORY, and
+	// which nothing else in this suite carries.
+	//
+	// §7.1b measured a healthy rename transiently presenting the whole capture
+	// signature — the quorum unanimous on a JUST-REPLACED pod's address, which is no
+	// longer in ValidIPs and not yet flagged down, with no pod of ours a master. All
+	// four planForsaken clauses hold in that window, and the design says plainly that
+	// "what saved it was the 30s forsakenCooldown, not the clauses". K9 rates a
+	// spurious quarantine of a healthy instance mid-rename as "strictly worse than the
+	// bug being fixed", because the quarantine DELETES THE PODS and storage is EmptyDir
+	// (pillar 3.1) — on an instance holding data, that is data loss on a supported
+	// operation.
+	//
+	// So the rename window must be asserted to produce no capture verdict, not merely
+	// to converge. Note what this does NOT assert: a transient False/CaptureSuspected
+	// is legitimate and expected (§7.1b measured exactly one such sample), so only the
+	// settled True verdict is a failure.
+	expectNeverForsaken := func(g Gomega, crName string) {
+		st, _ := getConditionField(crName, "Forsaken", "status")
+		reason, _ := getConditionField(crName, "Forsaken", "reason")
+		g.Expect(st).NotTo(Equal("True"),
+			"the operator declared this instance FORSAKEN (%s) during an ordinary rename — "+
+				"there is no other Sentinel deployment here, so this is the K9 false positive: "+
+				"a quarantine deletes the pods and EmptyDir means that is data loss", reason)
+	}
+
 	cleanup := func(names ...string) {
 		if debugOnFailure && suiteOrSpecFailed() {
 			By("skipping cleanup to allow debugging")
@@ -717,6 +743,7 @@ var _ = Describe("Sentinel Master Name Rename", Label("sentinel"), func() {
 			// WP0 measured redis-1 and redis-0 being replaced.
 			Consistently(func(g Gomega) {
 				expectExactlyOneName(g, crName, newName)
+				expectNeverForsaken(g, crName)
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("the instance settles back to Running / Ready=True under the new name")
@@ -863,6 +890,7 @@ var _ = Describe("Sentinel Master Name Rename", Label("sentinel"), func() {
 			By("and holding there while both rollouts finish")
 			Consistently(func(g Gomega) {
 				expectExactlyOneName(g, crName, nameB)
+				expectNeverForsaken(g, crName)
 			}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("the instance is healthy under the final name")
