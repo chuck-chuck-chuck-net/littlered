@@ -203,8 +203,11 @@ func (i *ImageSpec) FullImage() string {
 
 // ConfigSpec defines Redis configuration
 type ConfigSpec struct {
-	// Maxmemory sets Redis maxmemory (e.g., "1Gi")
+	// Maxmemory sets Redis maxmemory as a Kubernetes quantity (e.g., "1Gi", "375Mi", "375M").
+	// Note that "m" is the milli suffix in Kubernetes notation, so "375m" means 0.375 bytes,
+	// not 375 MB; use "375Mi" or "375M" instead. Values below 1Mi are rejected.
 	// +optional
+	// +kubebuilder:validation:XValidation:rule="!self.matches('^[0-9.]+[mun]$')",message="'m'/'u'/'n' are the Kubernetes milli/micro/nano suffixes, so this is less than one byte (375m = 0.375 bytes, rendered as maxmemory 1). Use mebibytes (375Mi) or megabytes (375M)."
 	Maxmemory string `json:"maxmemory,omitempty"`
 
 	// MaxmemoryPolicy sets the eviction policy
@@ -1236,6 +1239,12 @@ type LittleRed struct {
 func (r *LittleRed) Validate() error {
 	// Sentinel mode: validated for 3 sentinels and 3 redis (1+2).
 	// Since we don't expose sentinel count yet, we just check replicas.
+
+	// Guard the unit-suffix collision on maxmemory before any config is rendered:
+	// Kubernetes reads "375m" as 0.375 bytes where Redis would read 375 MB.
+	if err := ValidateMaxmemory(r.Spec.Config.Maxmemory); err != nil {
+		return err
+	}
 
 	if r.Spec.Mode == ModeCluster {
 		if r.Spec.Cluster != nil {

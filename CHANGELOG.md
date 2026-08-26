@@ -38,6 +38,17 @@ cut a release (`scripts/prepare-release.sh`).
 - Default `redis_exporter` sidecar image is now **v1.92.1** (from v1.89.0). Instances
   that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
 
+### Fixed
+
+- **`spec.config.maxmemory` is now validated.** The field is parsed as a Kubernetes
+  quantity, where `m` is the *milli* suffix — so `maxmemory: 375m` meant 0.375 bytes and
+  was rendered into `redis.conf` as `maxmemory 1`, silently capping the instance at one
+  byte while the user read it as 375 MB (Redis's own parser would have). The CRD now
+  rejects the `m`/`u`/`n` suffixes at admission with a message naming the likely intent
+  (`375Mi` / `375M`), and the operator refuses any value resolving below 1Mi, or one that
+  is neither a Kubernetes quantity nor a Redis memory value (`375mb`, `2gb`) — the latter
+  are passed to `redis.conf` verbatim and stay valid. `0` still means unlimited.
+
 ### Security
 
 - **The `Security scan` workflow on `main` failed with 27 reachable vulnerabilities, 26 of

@@ -124,7 +124,7 @@ spec:
 
 | Field | Type | Required | Default | Description |
 |-------|------|----------|---------|-------------|
-| `config.maxmemory` | `string` | No | (from resources) | Redis maxmemory (e.g., `1Gi`, `512Mi`) |
+| `config.maxmemory` | `string` | No | (from resources) | Redis maxmemory as a Kubernetes quantity (e.g., `1Gi`, `512Mi`, `375M`). **`m` means milli**, so `375m` is 0.375 bytes, not 375 MB — it is rejected at admission. Minimum `1Mi`; `0` means unlimited |
 | `config.maxmemoryPolicy` | `string` | No | `noeviction` | Eviction policy |
 | `config.timeout` | `int` | No | `0` | Client idle timeout (seconds, 0=disabled) |
 | `config.tcpKeepalive` | `int` | No | `300` | TCP keepalive (seconds) |
@@ -184,6 +184,8 @@ resources:
 **QoS convention**: LittleRed sets a memory limit equal to the memory request and deliberately omits the CPU limit, placing pods in the **Burstable** QoS class. Redis's CPU consumption is *bounded by its thread count* — one main thread for command execution, plus (if `io-threads` is enabled) a fixed number of I/O threads for socket reads/writes and protocol parsing, the count of which includes the main thread. Redis therefore never uses more CPU than its threads occupy. Size the CPU *request* to that thread budget so the scheduler reserves those cores. Do not set a CPU *limit*: Redis can't exceed its thread budget anyway, so a limit can only throttle it under load, turning into latency spikes, request pile-up, and downstream timeouts. Set an explicit CPU limit only if your platform mandates the Guaranteed QoS class.
 
 **Behavior**: If `config.maxmemory` is not set, the operator auto-calculates it as ~90% of `resources.limits.memory` to leave headroom for Redis overhead (buffers, connections, etc.). User can always override with explicit value.
+
+**Unit suffixes**: `config.maxmemory` is parsed as a Kubernetes quantity, not with Redis's own suffix rules. The two disagree on `m`: Redis reads `375m` as 375 MB, Kubernetes reads it as 375 *milli*bytes (0.375), which the operator would render into `redis.conf` as `maxmemory 1` — a working instance capped at one byte. Write `375Mi` (mebibytes) or `375M` (megabytes) instead. The CRD rejects the `m`/`u`/`n` suffixes at admission, and the operator refuses any value that resolves below 1Mi. Redis-native suffixes that are *not* Kubernetes quantities (`375mb`, `2gb`, `512kb`) are passed through to `redis.conf` verbatim and remain valid.
 
 ### 2.5 Authentication
 
@@ -1315,7 +1317,8 @@ func (i *ImageSpec) FullImage() string {
 }
 
 type ConfigSpec struct {
-    // Maxmemory sets Redis maxmemory (e.g., "1Gi")
+    // Maxmemory sets Redis maxmemory as a Kubernetes quantity (e.g., "1Gi", "375Mi", "375M").
+    // "m" is the milli suffix, so "375m" is 0.375 bytes, not 375 MB.
     Maxmemory string `json:"maxmemory,omitempty"`
 
     // MaxmemoryPolicy sets the eviction policy
@@ -1356,7 +1359,9 @@ type ConfigSpec struct {
 | `spec.placement.shardAntiAffinity` rejected unless `mode: cluster` (failover included) | Validation failure |
 | `cluster.shards` must be ≥ `3` | Enforced by the CRD schema (minimum 3, default 3) and mirrored in controller validation (`cluster mode requires at least 3 shards`) |
 | `cluster.replicasPerShard` must be `0` or `1` | Currently only 0 or 1 replica per shard supported |
-| `maxmemory` must parse as quantity | Invalid memory format |
+| `maxmemory` must parse as a Kubernetes quantity or a Redis memory value | Invalid memory format |
+| `maxmemory` must not use the `m`/`u`/`n` (milli/micro/nano) suffix | Rejected at admission by a CEL rule: `375m` is 0.375 bytes, not 375 MB |
+| `maxmemory` must be `0` (unlimited) or at least `1Mi` | A smaller cap is a unit mistake, not an intent |
 | At most one registered **CR-resident heavy field** may change per update (ADR-020) | Rejected at admission, on `kubectl apply`. A CEL **transition** rule on `spec`: it does not fire on create, so a CR that sets every field at once is unaffected. **Today the constraint is vacuously true** — the declared-operations registry has exactly one CR-resident member (`spec.sentinel.masterName`), so the count of changed heavy fields can never exceed one, and **no apply is refused by it**. It is shipped now so the second member (auth) adds a term rather than a rule, and a unit test fails if a member is registered without one. |
 
 ### 7.2 Schema-Level Validation (CEL, enforced by the API server)
