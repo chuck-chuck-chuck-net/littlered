@@ -55,9 +55,9 @@ type forsakenPlan struct {
 // is far worse than a false negative — that merely leaves today's behaviour in place.
 // So EVERY clause must hold:
 //
-//  1. At least one reachable, monitoring Sentinel — otherwise we know nothing. (Bare
-//     Sentinels are Rule L's business, not this one's.)
-//  2. Every reachable monitoring Sentinel agrees on ONE master address. Disagreement
+//  1. At least one reachable Sentinel that monitors SOMETHING — otherwise we know
+//     nothing. (Bare Sentinels are Rule L's business, not this one's.)
+//  2. Every master every reachable Sentinel monitors is at ONE address. Disagreement
 //     is a transition, and transitions are not verdicts.
 //  3. That address is not one of our pods, and is NOT flagged down. The down flag is
 //     the discriminator that keeps ordinary post-failover debris — a dead ex-master —
@@ -65,6 +65,28 @@ type forsakenPlan struct {
 //     is alive there. Same discriminator the lrctl diagnostic uses.
 //  4. No reachable Redis pod of ours is a master. While one of ours still is, the
 //     instance has something to be healed back toward and the existing rules own it.
+//
+// The clauses are NAME-AGNOSTIC: they range over every master a Sentinel monitors,
+// not only the one we currently want. Keying them on the desired name — which is
+// what sn.MasterIP/sn.MasterFlags are, the single-name probe's answer — made the
+// verdict evaporate the moment an owner renamed a captured instance, which is
+// precisely what the LR-039/LR-042 runbook tempts them into ("we were captured, so
+// let's give it a unique name"). The Sentinels keep serving the captor under the OLD
+// name, the new name reads bare, clause 1 fails, and with the verdict goes ADR-016's
+// quarantine — the thing that heals both sides. A capture under a stale name is a
+// capture. See the rename design §7.3.
+//
+// This is a widening of what the clauses observe, and NOTHING else: their intent,
+// order and conservatism are untouched, and every input that produced a verdict on
+// the desired name alone still produces the same one. Two consequences of the wider
+// observation set are worth stating, because both run toward the safe direction:
+//
+//   - A Sentinel monitoring only a stale name now counts for clause 1. That is the
+//     §7.3 case itself.
+//   - Two names naming two different addresses is now a clause-2 disagreement. An
+//     ordinary rename transiently does exactly that (WP0 measured 88.5s of it, 56.6s
+//     of which named two different LIVE pods), so the widening removes a suspicion
+//     the desired-name view raised on its own rather than adding one.
 func planForsaken(
 	state *redisclient.ReplicationState, since *metav1.Time, now time.Time,
 ) forsakenPlan {
@@ -72,21 +94,27 @@ func planForsaken(
 	monitoring := 0
 
 	for _, sn := range state.SentinelNodes {
-		if sn == nil || !sn.Reachable || !sn.Monitoring {
+		if sn == nil || !sn.Reachable {
+			continue
+		}
+		observed := monitoredAddresses(sn)
+		if len(observed) == 0 {
 			continue
 		}
 		monitoring++
-		if sn.MasterIP == "" {
-			return forsakenPlan{}
-		}
-		if foreign == "" {
-			foreign = sn.MasterIP
-		} else if foreign != sn.MasterIP {
-			return forsakenPlan{} // clause 2: no consensus, no verdict
-		}
-		// clause 3: alive, and not ours
-		if !state.IsGhost(sn.MasterIP) || flaggedDown(sn.MasterFlags) {
-			return forsakenPlan{}
+		for _, m := range observed {
+			if m.IP == "" {
+				return forsakenPlan{}
+			}
+			if foreign == "" {
+				foreign = m.IP
+			} else if foreign != m.IP {
+				return forsakenPlan{} // clause 2: no consensus, no verdict
+			}
+			// clause 3: alive, and not ours
+			if !state.IsGhost(m.IP) || flaggedDown(m.Flags) {
+				return forsakenPlan{}
+			}
 		}
 	}
 	if monitoring == 0 { // clause 1
@@ -112,4 +140,32 @@ func planForsaken(
 // local because it is one line and the redis-side one is not exported.
 func flaggedDown(flags string) bool {
 	return strings.Contains(flags, "s_down") || strings.Contains(flags, "o_down")
+}
+
+// monitoredAddresses is every (address, flags) this Sentinel currently monitors,
+// under any master name.
+//
+// Two sources, deliberately BOTH:
+//
+//   - The desired name's dedicated probe (sn.MasterIP / sn.MasterFlags, gated on
+//     sn.Monitoring). This is what planForsaken read before it went name-agnostic,
+//     and it stays the authority on the name we want, so behaviour on that name is
+//     unchanged in every case.
+//   - sn.MonitoredMasters — the full `SENTINEL MASTERS` list. The desired name
+//     appears in it too and is not filtered out: the same address twice agrees with
+//     itself, and if the two reads DISAGREE (they are separate round trips) that is
+//     a transition clause 2 should refuse anyway.
+//
+// An EMPTY MonitoredMasters list means "we could not read it", never "this Sentinel
+// monitors nothing" — the extra round trip degrades to empty rather than to
+// Reachable:false. So it contributes no observations and the verdict falls back to
+// the desired-name view alone, which is the correct reading of no evidence and is
+// LR-041's class of mistake avoided.
+func monitoredAddresses(sn *redisclient.SentinelNodeState) []redisclient.MonitoredMaster {
+	observed := make([]redisclient.MonitoredMaster, 0, len(sn.MonitoredMasters)+1)
+	if sn.Monitoring {
+		observed = append(observed, redisclient.MonitoredMaster{IP: sn.MasterIP, Flags: sn.MasterFlags})
+	}
+	observed = append(observed, sn.MonitoredMasters...)
+	return observed
 }
