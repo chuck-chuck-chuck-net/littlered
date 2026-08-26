@@ -471,8 +471,25 @@ func (c *SentinelClient) Remove(ctx context.Context, masterName string) error {
 	return nil
 }
 
-// IsMonitoring checks if a specific sentinel address is monitoring the given master
+// IsMonitoring checks if a specific sentinel address is monitoring the given master.
+//
+// Bounded twice, and the second half is why this deadline lives HERE rather than at
+// the call site: newBoundedClient caps each individual socket operation at
+// ProbeTimeout, but only a context deadline caps go-redis's dial-retry loop around
+// them — against an address that swallows SYNs the pool dials five times before
+// giving up (LR-040's ~117s field stall). Neither half is sufficient alone; LR-040
+// measured the converse case, where a ctx over a DefaultTimeout client is inert
+// (5.02s -> 5.00s).
+//
+// Putting the bound in the primitive rather than in each caller is LR-041's lesson
+// applied to a duration instead of to a string: a guarantee that every caller must
+// remember has no enforcement, and this method both reads as bounded (its client is)
+// and is one line from being so. Today's only caller wraps it as well, which is
+// belt and braces, not redundancy to remove.
 func (c *SentinelClient) IsMonitoring(ctx context.Context, sentinelAddr, masterName string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+	defer cancel()
+
 	client := c.newBoundedClient(sentinelAddr)
 	defer func() { _ = client.Close() }()
 

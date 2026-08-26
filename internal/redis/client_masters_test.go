@@ -223,3 +223,50 @@ func TestGetMonitoredMastersIsProbeTimeoutBounded(t *testing.T) {
 			"the call is not bounded by ProbeTimeout (LR-040/LR-046)", elapsed, budget)
 	}
 }
+
+// TestIsMonitoringIsProbeTimeoutBounded is the guard for a LATENT half-bound.
+//
+// IsMonitoring builds its client with newBoundedClient, so each socket operation
+// is capped at ProbeTimeout — but it carried no per-call context deadline, unlike
+// Remove, GetMonitoredMasters and every other LR-040/LR-046 site. Both halves are
+// required and neither is sufficient: the client timeouts bound each individual
+// attempt, the context bounds go-redis's dial-retry loop around them. That is the
+// inertness LR-040 measured at 5.02s -> 5.00s.
+//
+// There is no unprotected caller today — Rule N wraps the call in its own
+// ProbeTimeout context — so this is a trap for the next caller rather than a live
+// stall: the method name and the newBoundedClient line both read as "bounded".
+// Bounding it inside the method puts the guarantee on the primitive instead of on
+// each caller remembering.
+//
+// GREEN FROM BIRTH, and disclosed as such rather than dressed up. This harness
+// blackholes the READ, and on that path the client-timeout half ALONE already
+// delivers the bound, so it cannot isolate the missing ctx. Measured on this
+// listener, all three shapes of the same command:
+//
+//	unbounded client, no ctx    5.019s   (LR-040's original red)
+//	unbounded client, ctx only  5.001s   (LR-040's "a ctx alone is inert")
+//	bounded client, no ctx      3.018s   (IsMonitoring before the fix -> green)
+//
+// The ctx's job is the DIAL-retry loop — five dials against an address that
+// swallows SYNs — which needs a packet filter this suite does not have; LR-040 and
+// LR-046 both recorded the same limitation for the same reason. So what this test
+// guards is that the bound EXISTS at all, not which half provides it. Its teeth were
+// shown by a mutation: replacing the bounded client with a DefaultTimeout one fails
+// it at 5.026619249s against the 4s budget, and the budget discriminates 3s from
+// DefaultTimeout's 5s on purpose.
+func TestIsMonitoringIsProbeTimeoutBounded(t *testing.T) {
+	addr := blackholeListener(t)
+	const budget = ProbeTimeout + time.Second
+
+	c := NewSentinelClient([]string{addr}, "", false)
+
+	start := time.Now()
+	_, _ = c.IsMonitoring(context.Background(), addr, "ns.inst")
+	elapsed := time.Since(start)
+
+	if elapsed > budget {
+		t.Fatalf("SENTINEL GET-MASTER-ADDR-BY-NAME against a blackholing address took %v, "+
+			"want <= %v: IsMonitoring is not bounded by ProbeTimeout (LR-040/LR-046)", elapsed, budget)
+	}
+}
