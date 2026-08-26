@@ -1793,7 +1793,7 @@ func TestBuildClusterPreStopFencesLastCopy(t *testing.T) {
 	if masterCheckAt < 0 || lookupAt < 0 || branchAt < 0 || failoverAt < 0 {
 		t.Fatalf("cluster preStop no longer has the expected shape:\n%s", script)
 	}
-	if !(masterCheckAt < lookupAt && lookupAt < branchAt && branchAt < fenceAt && fenceAt < failoverAt) {
+	if masterCheckAt >= lookupAt || lookupAt >= branchAt || branchAt >= fenceAt || fenceAt >= failoverAt {
 		t.Errorf("fence must live inside the last-copy branch only "+
 			"(masterCheck=%d lookup=%d branch=%d fence=%d failover=%d)",
 			masterCheckAt, lookupAt, branchAt, fenceAt, failoverAt)

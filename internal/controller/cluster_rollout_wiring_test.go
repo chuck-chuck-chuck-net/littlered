@@ -101,9 +101,9 @@ func TestClusterShardPartitionIsOutsideThePodTemplateHash(t *testing.T) {
 
 // --- buildShardRolloutInput: live objects → the seam's facts ------------------------
 
-func rolloutSTS(name, appliedHash string, gen, observed int64, cur, upd string, partition *int32) *appsv1.StatefulSet {
+func rolloutSTS(appliedHash string, gen, observed int64, cur, upd string, partition *int32) *appsv1.StatefulSet {
 	sts := &appsv1.StatefulSet{}
-	sts.Name = name
+	sts.Name = "s"
 	sts.Generation = gen
 	sts.Spec.Template.Annotations = map[string]string{AnnotationPodSpecHash: appliedHash}
 	sts.Status.ObservedGeneration = observed
@@ -201,7 +201,7 @@ func TestBuildShardRolloutInputRedundancy(t *testing.T) {
 		pods[name] = rolloutPodObj(name, "rev2", true, now.Add(-time.Minute))
 	}
 
-	in := buildShardRolloutInput(lr, 0, 2, "want", rolloutSTS("s", "have", 3, 2, "rev1", "rev2", nil), pods, gt, now)
+	in := buildShardRolloutInput(lr, 0, 2, "want", rolloutSTS("have", 3, 2, "rev1", "rev2", nil), pods, gt, now)
 
 	if len(in.Pods) != 3 {
 		t.Fatalf("expected 3 pods, got %d", len(in.Pods))
@@ -241,7 +241,7 @@ func TestBuildShardRolloutInputStructuralFacts(t *testing.T) {
 	pod0.Status.Conditions[0].Status = corev1.ConditionTrue
 
 	in := buildShardRolloutInput(lr, 0, 1, "want",
-		rolloutSTS("s", "have", 5, 4, "rev1", "rev2", new(int32(1))),
+		rolloutSTS("have", 5, 4, "rev1", "rev2", new(int32(1))),
 		map[string]*corev1.Pod{pod0.Name: pod0}, nil, now)
 
 	if in.AppliedPartition == nil || *in.AppliedPartition != 1 {
@@ -285,25 +285,25 @@ func TestPreGatherPlanOnlyHoldsOrRaises(t *testing.T) {
 	}
 
 	// Template change: gate at the highest ordinal. The one legal raise.
-	if p := preGather(rolloutSTS("s", "have", 3, 3, "rev1", "rev1", nil)); p.Verdict != rolloutStart ||
+	if p := preGather(rolloutSTS("have", 3, 3, "rev1", "rev1", nil)); p.Verdict != rolloutStart ||
 		p.Partition == nil || *p.Partition != 2 {
 		t.Errorf("first sight of a template change: verdict=%v partition=%v, want Started/2", p.Verdict, p.Partition)
 	}
 	// Mid-rollout at the desired template: re-emit the cursor UNCHANGED.
 	for _, cursor := range []int32{2, 1} {
-		p := preGather(rolloutSTS("s", "want", 4, 4, "rev1", "rev2", &cursor))
+		p := preGather(rolloutSTS("want", 4, 4, "rev1", "rev2", &cursor))
 		if p.Verdict != rolloutHold || p.Partition == nil || *p.Partition != cursor {
 			t.Errorf("cursor %d: verdict=%v partition=%v, want Holding at %d", cursor, p.Verdict, p.Partition, cursor)
 		}
 	}
 	// Settled: nothing left to gate.
-	if p := preGather(rolloutSTS("s", "want", 4, 4, "rev2", "rev2", new(int32(2)))); p.Verdict != rolloutComplete ||
+	if p := preGather(rolloutSTS("want", 4, 4, "rev2", "rev2", new(int32(2)))); p.Verdict != rolloutComplete ||
 		p.Partition == nil || *p.Partition != 0 {
 		t.Errorf("settled: verdict=%v partition=%v, want Complete/0", p.Verdict, p.Partition)
 	}
 	// replicasPerShard 0: no partition field at all, and the caller's Warning verdict.
 	zero := planShardRolloutPartition(buildShardRolloutInput(clusterLRWithReplicas(0), 0, 0, "want",
-		rolloutSTS("s", "have", 1, 1, "rev1", "rev1", nil), nil, nil, time.Now()))
+		rolloutSTS("have", 1, 1, "rev1", "rev1", nil), nil, nil, time.Now()))
 	if zero.Verdict != rolloutUngated || zero.Partition != nil {
 		t.Errorf("replicasPerShard 0: verdict=%v partition=%v, want Ungated/nil", zero.Verdict, zero.Partition)
 	}
