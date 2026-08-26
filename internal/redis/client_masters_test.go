@@ -270,3 +270,54 @@ func TestIsMonitoringIsProbeTimeoutBounded(t *testing.T) {
 			"want <= %v: IsMonitoring is not bounded by ProbeTimeout (LR-040/LR-046)", elapsed, budget)
 	}
 }
+
+// TestSlaveOfIsProbeTimeoutBounded is the guard for the same half-bound one level
+// down, and this one had a LIVE unprotected caller.
+//
+// LR-040 bounded SlaveOf's client half and recorded that "bounding the shared
+// SlaveOf fixed the same latent defect in failover mode's slaveOfBounded". Only
+// the client half travelled. Failover mode kept its own ctx wrapper; sentinel mode
+// never had one, so Rule R (littlered_controller.go:1225) passed the raw reconcile
+// context and the dial-retry loop stayed unbounded — ~5 dials x ProbeTimeout per
+// straggler pod, per pass, against a dial-blackholing stale IP. That is the
+// LR-017/LR-040 reconcile-stall class, which has already cost this project measured
+// 146s and 117s stalls.
+//
+// GREEN FROM BIRTH, for the same reason as TestIsMonitoringIsProbeTimeoutBounded —
+// see that test's three-row table. This listener blackholes the READ, where the
+// client-timeout half alone already delivers the bound (measured 3.02s before the
+// fix, 3.00s after); the ctx's job is the DIAL-retry loop, which needs a packet
+// filter this suite does not have. So no honest red is available here and none was
+// manufactured. Teeth by mutation instead: replacing the bounded client with a
+// DefaultTimeout one fails both rows at 5.025815278s and 5.0310136s against the 4s
+// budget, which discriminates 3s from DefaultTimeout's 5s on purpose.
+func TestSlaveOfIsProbeTimeoutBounded(t *testing.T) {
+	addr := blackholeListener(t)
+	const budget = ProbeTimeout + time.Second
+
+	cases := []struct {
+		name string
+		call func(context.Context) error
+	}{
+		{"REPLICAOF <master>", func(ctx context.Context) error {
+			return SlaveOf(ctx, addr, "", masterIP, "6379", false)
+		}},
+		{"REPLICAOF NO ONE", func(ctx context.Context) error {
+			return SlaveOf(ctx, addr, "", "", "", false)
+		}},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			start := time.Now()
+			_ = tc.call(context.Background())
+			elapsed := time.Since(start)
+
+			if elapsed > budget {
+				t.Fatalf("%s against a blackholing address took %v, want <= %v: SlaveOf is "+
+					"not bounded by ProbeTimeout (LR-040/LR-046)", tc.name, elapsed, budget)
+			}
+		})
+	}
+}

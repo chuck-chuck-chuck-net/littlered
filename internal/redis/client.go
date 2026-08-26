@@ -511,8 +511,31 @@ func Ping(ctx context.Context, addr, password string, tlsEnabled bool) error {
 	return client.Ping(ctx).Err()
 }
 
-// SlaveOf reconfigures a redis instance to follow a new master
+// SlaveOf reconfigures a redis instance to follow a new master.
+//
+// Bounded twice, in the primitive. newBoundedRedisClient caps each socket
+// operation at ProbeTimeout (LR-040); the context deadline caps go-redis's
+// dial-retry loop around them, which the client timeouts cannot reach — against an
+// address that swallows SYNs the pool dials five times before giving up, and that
+// is the shape behind this project's measured 146s (LR-017) and 117s (LR-040)
+// reconcile stalls.
+//
+// The ctx half was missing here and it had a live caller. LR-040 bounded this
+// function's client and recorded that doing so "fixed the same latent defect in
+// failover mode's slaveOfBounded" — but only the client half travelled. Failover
+// mode kept its own ProbeTimeout wrapper, while sentinel mode's Rule R passed the
+// raw reconcile context, so a straggler repoint against a dial-blackholing stale
+// pod IP cost ~5 x ProbeTimeout per pod, per pass. Rule 11 (cross-mode parity)
+// applied to LR-040's own fix, one level down; see LR-049.
+//
+// The deadline lives here rather than at each call site for LR-041's reason,
+// applied to a duration instead of to a string: a guarantee every caller must
+// remember has no enforcement. failover_reconcile.go's slaveOfBounded wrapper is
+// now belt and braces, not redundancy to remove.
 func SlaveOf(ctx context.Context, addr, password, masterIP, masterPort string, tlsEnabled bool) error {
+	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+	defer cancel()
+
 	client := newBoundedRedisClient(addr, password, tlsEnabled)
 	defer func() { _ = client.Close() }()
 
