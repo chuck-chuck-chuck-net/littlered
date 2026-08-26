@@ -23,6 +23,7 @@ const (
 	infoSubcommand    = "info"
 	clusterSubcommand = "cluster"
 	statusUnreachable = "unreachable"
+	valueNone         = "<none>"
 )
 
 var (

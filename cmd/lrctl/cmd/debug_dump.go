@@ -35,7 +35,8 @@ Collected artifacts:
   - LittleRed CR (full YAML including status and conditions)
   - Operator logs (last 10 minutes, filtered to the instance)
   - Pod logs (all containers, current + previous for crash loops)
-  - Redis state (INFO replication, SENTINEL MASTER/REPLICAS, CLUSTER NODES/INFO)
+  - Redis state (INFO replication, SENTINEL MASTER/REPLICAS/MASTERS,
+    CLUSTER NODES/INFO)
   - Kubernetes resources (pods, statefulsets, services, PDBs, events)
   - Failover-mode assignment annotations (assigned-role / assigned-master-ip /
     assignment-epoch per data pod, failover mode only)
@@ -205,11 +206,18 @@ func collectRedisState(
 			// Sentinel pod.
 			// Per-instance master name: a hardcoded one would report "No such master"
 			// on any correctly-scoped instance.
+			//
+			// `SENTINEL masters` is dumped alongside them because the two
+			// single-name calls can only confirm or deny the name we passed: a
+			// Sentinel carrying a leftover name answers `master <mn>` perfectly
+			// well, and the leftover — two names over one instance, two failover
+			// state machines — is invisible in their output (LR-048).
 			mn := lr.SentinelMasterName()
 			out, _, _ := k8s.Exec(ctx, coreClient, config, lr.Namespace, pod.Name, "sentinel",
 				redisCliChainArgs(
 					[]string{"-p", "26379", modeSentinel, roleMaster, mn},
 					[]string{"-p", "26379", modeSentinel, "replicas", mn},
+					[]string{"-p", "26379", modeSentinel, "masters"},
 				))
 			writeFile(dir, fmt.Sprintf("sentinel-%s-state.txt", pod.Name), out)
 		}

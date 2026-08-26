@@ -99,7 +99,19 @@ lrctl inspect <name>
 ```
 
 **What it does:**
-- **Sentinel Mode**: Runs `SENTINEL master` on every sentinel pod and `INFO replication` on every redis pod.
+- **Sentinel Mode**: Runs `SENTINEL masters` and `SENTINEL master <name>` on every sentinel pod,
+  and `INFO replication` on every redis pod. The full monitored-master list is printed above the
+  raw single-name reply, because that reply can only ever confirm or deny the name it was given —
+  a Sentinel carrying a *leftover* name answers it perfectly well:
+  ```text
+  Sentinel Pod: rn-sentinel-0 (IP: 10.233.192.10)
+    Monitored master names:
+      - "lr048.rn" at 10.233.192.95, flags:master  (desired)
+      - "mymaster" at 10.233.192.95, flags:master  (stale — ours)
+    name
+    lr048.rn
+    ...
+  ```
 - **Cluster Mode**: Runs `CLUSTER NODES` and `CLUSTER INFO` on every node.
 - **Failover Mode**: Runs `INFO replication` on every redis pod and prints each pod's
   operator-stamped assignment (the ADR-011 intent record) above the raw output:
@@ -140,8 +152,115 @@ Redis Status:
 Ground Truth Summary:
   [OK] Authority Master: store-sentinel-redis-0 (10.233.66.107)
 
+Sentinel Identity:
+  Master name: default.store-sentinel
+  Monitored master names (every name each Sentinel carries):
+    - store-sentinel-sentinel-0: "default.store-sentinel" at 10.233.66.107, flags:master  (desired)
+    - store-sentinel-sentinel-1: "default.store-sentinel" at 10.233.66.107, flags:master  (desired)
+    - store-sentinel-sentinel-2: "default.store-sentinel" at 10.233.66.107, flags:master  (desired)
+  [OK] Every reachable Sentinel monitors only "default.store-sentinel".
+  [OK] No foreign Sentinel contact observed (3 sentinels, 2 replicas expected).
+
 [OK] Cluster configuration is consistent.
 ```
+
+#### Sentinel Identity — which master names are monitored
+
+The master name is the **only isolation boundary Sentinel's gossip protocol has** (LR-039), so
+`verify` reports not just *whether* each Sentinel monitors the name the CR asks for but **every**
+name it carries. That distinction is the whole point: a single-name query returns a healthy answer
+from a Sentinel that also carries a second, leftover entry, so before this check a two-name
+instance — two `sentinel monitor` lines, two config epochs, two independent failover state
+machines over the same three pods — reported as entirely healthy (LR-048).
+
+Each name is classified against the CR's `spec.sentinel.masterName`:
+
+| class | meaning | verdict |
+|---|---|---|
+| `desired` | the name the CR asks for | — |
+| `stale — ours` | a leftover entry of ours: its address is one of this instance's pods, **or** Sentinel flags it down (a dead ex-master is debris) | `[FAIL]` |
+| `FOREIGN` | its address is neither one of our pods nor flagged down, so **something else is alive there** — the signature of a cross-instance capture | `[FAIL]` |
+
+The discriminator is exactly the operator's own (Rule N gate G5, `planForsaken` clause 3), so the
+tool and the operator cannot disagree about what counts as debris. An entry whose address Sentinel
+did not report is treated as foreign: it cannot be attributed to us, and refusing to call it debris
+is the safe direction.
+
+**Both classes fail verification** — a name other than the CR's is a defect whatever else is true —
+but they call for different actions. A *stale* name is cleaned up by the operator (`Rule N`); read
+the `StaleMasterName` condition on the CR, whose message names the gate that refused. A *foreign*
+name means the instance may be captured: **do not rename to escape a capture**, because that
+converts a diagnosed, self-healing capture into an undiagnosed leaderless refusal — let the
+quarantine complete first (ADR-016), then rename the empty instance.
+
+With `--unmanaged` there is no CR to read the wanted name from, so the check is **skipped** with a
+`[WARN]` rather than judged against the fallback guess — classifying against a guess would accuse a
+correctly-named foreign instance of carrying a stale name. The `--json` output omits
+`masterNameScope` entirely in that case.
+
+A reachable Sentinel whose master list could not be read is reported `[WARN]` and does **not** fail:
+an unread list is no evidence either way, and rendering it as convergence would be exactly the
+plausible-looking lie this check exists to remove (LR-041).
+
+Fixture-derived example of the two-name state (the shape measured live on t3e, rendered here from
+the unit fixtures rather than captured from a cluster):
+
+```text
+Sentinel Identity:
+  Master name: lr048.rn
+  Monitored master names (every name each Sentinel carries):
+    - rn-sentinel-0: "lr048.rn" at 10.233.192.95, flags:master  (desired)
+    - rn-sentinel-0: "mymaster" at 10.233.192.95, flags:master  (stale — ours)
+    - rn-sentinel-1: "lr048.rn" at 10.233.192.95, flags:master  (desired)
+    - rn-sentinel-1: "mymaster" at 10.233.192.95, flags:master  (stale — ours)
+    - rn-sentinel-2: "lr048.rn" at 10.233.192.95, flags:master  (desired)
+    - rn-sentinel-2: "mymaster" at 10.233.192.95, flags:master  (stale — ours)
+  [FAIL] Stale master name(s) "mymaster" are still monitored alongside "lr048.rn".
+         One instance under two names runs two independent failover state machines
+         over the same pods, which can promote different replicas (LR-039, LR-048).
+         The operator prunes them once its gates pass — read the StaleMasterName
+         condition on the CR, whose message names the gate that refused.
+  [OK] No foreign Sentinel contact observed (3 sentinels, 2 replicas expected).
+```
+
+The `[OK] No foreign Sentinel contact observed` line is still printed beside the `[FAIL]`, and
+deliberately: the two answer different questions, and "the leftover name is **ours** and nothing
+foreign is in contact" is precisely what separates a botched rename from a capture.
+
+And the foreign case (same provenance — fixture-derived):
+
+```text
+Sentinel Identity:
+  Master name: lr048.rn
+  Monitored master names (every name each Sentinel carries):
+    - rn-sentinel-0: "mymaster" at 10.233.192.152, flags:master  (FOREIGN — not one of our pods, and alive)
+    - rn-sentinel-1: "mymaster" at 10.233.192.152, flags:master  (FOREIGN — not one of our pods, and alive)
+    - rn-sentinel-2: "mymaster" at 10.233.192.152, flags:master  (FOREIGN — not one of our pods, and alive)
+  [FAIL] Master name(s) "mymaster" point at an address that is not one of this instance's
+         pods and is not flagged down — someone else's live master. This instance
+         may be captured, and a rename does not escape a capture: it converts a
+         diagnosed, self-healing capture into an undiagnosed leaderless refusal.
+  [FAIL] Evidence of another Sentinel deployment sharing this master name:
+         - monitored master is not one of this instance's pods, and is alive: 10.233.192.152
+         - rn-sentinel-0 reports 5 other sentinels; 2 were deployed
+         ...
+         This instance's data may already have been overwritten. See the
+         "Recovering a sentinel instance captured by another Sentinel deployment"
+         runbook in docs/USAGE.md.
+```
+
+A capture is reported **once**, not in two voices: the foreign-name finding and the foreign-contact
+evidence are two observations of one state, printed in one block under one heading, sharing a
+single pointer to the recovery runbook.
+
+> **Exit code — a behaviour change.** `lrctl verify` on a sentinel instance previously exited
+> non-zero only when there was no authority master or when healing actions were recommended. It now
+> **also** exits non-zero when any reachable Sentinel monitors a master name other than the CR's.
+> An instance that a script previously read as healthy while carrying a leftover name now reports
+> failure — which is the point, and the reason the rename runbook's verification step is only
+> implementable from this version on. The `--json` output changes the same way: `healthy` is false
+> for such an instance, and the new `masterNameScope` object plus the per-Sentinel
+> `monitoredMasters` array carry the detail.
 
 **Example Output (Cluster Mode):**
 ```text
@@ -221,6 +340,8 @@ only), `[FAIL]` (any FAIL finding, non-zero exit).
 
 **Advanced Checks:**
 - **Consensus**: Do all Sentinels agree on the master?
+- **Master-name scope (Sentinel Mode)**: Does every Sentinel monitor *only* the name the CR asks for?
+  A leftover or foreign name fails verification (see **Sentinel Identity** above).
 - **Ghost Detection**: Is the master reported by Redis/Sentinel actually a living Kubernetes pod?
 - **Role Alignment**: Do the `redis.chuck-chuck-chuck.net/role` labels match the actual process role?
 - **Topology (Cluster Mode)**: Visualizes the tree of Master -> Replica relationships and slot coverage.

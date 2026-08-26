@@ -106,8 +106,12 @@ type sentinelPodJSON struct {
 	Pod        string            `json:"pod"`
 	IP         string            `json:"ip"`
 	MasterInfo map[string]string `json:"masterInfo,omitempty"`
-	Error      string            `json:"error,omitempty"`
-	raw        string
+	// MonitoredMasters is EVERY master name this Sentinel carries. MasterInfo above
+	// answers a single-name question and therefore cannot reveal a leftover name;
+	// this is the surface that can (LR-048).
+	MonitoredMasters []monitoredMasterJSON `json:"monitoredMasters,omitempty"`
+	Error            string                `json:"error,omitempty"`
+	raw              string
 }
 
 // clusterNodeInspectJSON is a JSON-tagged representation of a cluster node,
@@ -178,6 +182,29 @@ type sentinelNodeVerifyJSON struct {
 	MasterIP       string `json:"masterIP,omitempty"`
 	FailoverStatus string `json:"failoverStatus,omitempty"`
 	Reachable      bool   `json:"reachable"`
+	// MonitoredMasters is EVERY master name this Sentinel carries, not only the
+	// one we asked about. Empty means the list could not be read, never that the
+	// Sentinel monitors nothing (LR-041).
+	MonitoredMasters []monitoredMasterJSON `json:"monitoredMasters,omitempty"`
+}
+
+// monitoredMasterJSON is one monitored master name, with the class it falls into
+// against the CR's configured name: desired | stale | foreign.
+type monitoredMasterJSON struct {
+	Name  string `json:"name"`
+	IP    string `json:"ip,omitempty"`
+	Flags string `json:"flags,omitempty"`
+	Class string `json:"class"`
+}
+
+// masterNameScopeJSON answers "does every Sentinel monitor ONLY the configured
+// name" — the question a single-name probe structurally cannot ask (LR-048).
+type masterNameScopeJSON struct {
+	Desired    string   `json:"desired"`
+	Converged  bool     `json:"converged"`
+	Stale      []string `json:"stale,omitempty"`
+	Foreign    []string `json:"foreign,omitempty"`
+	Unreported []string `json:"unreported,omitempty"`
 }
 
 type redisNodeVerifyJSON struct {
@@ -207,6 +234,10 @@ type sentinelVerifyJSON struct {
 	// CrossInstance is evidence that another Sentinel deployment shares that name.
 	// Its absence means "nothing visible from this vantage", never "isolated".
 	CrossInstance *crossInstanceJSON `json:"crossInstance,omitempty"`
+	// MasterNameScope is what every reachable Sentinel actually monitors. It is
+	// absent for an --unmanaged target, where no CR names the wanted master name
+	// and classifying against a guess would accuse a correctly-named instance.
+	MasterNameScope *masterNameScopeJSON `json:"masterNameScope,omitempty"`
 }
 
 type sentinelCountJSON struct {
@@ -245,9 +276,13 @@ type clusterVerifyJSON struct {
 	Healthy      bool                    `json:"healthy"`
 }
 
+// buildSentinelVerifyJSON renders the sentinel verify result. wantedName is the
+// master name the CR asks for, or "" when there is no CR to read it from
+// (--unmanaged) — in which case the monitored-name scope is reported as unknown
+// rather than judged against sentinelMasterName's fallback guess.
 func buildSentinelVerifyJSON(
 	name, namespace string, redisMap map[string]string,
-	state *redisclient.ReplicationState, sentinelMasterName string,
+	state *redisclient.ReplicationState, sentinelMasterName, wantedName string,
 	expectedSentinels, expectedReplicas int,
 ) sentinelVerifyJSON {
 	actions := state.GetHealActions(sentinelMasterName)
@@ -287,15 +322,37 @@ func buildSentinelVerifyJSON(
 		result.RealMasterPodName = redisMap[state.RealMasterIP]
 	}
 
+	scope := state.SurveyMonitoredNames(wantedName)
+	if wantedName != "" {
+		result.MasterNameScope = &masterNameScopeJSON{
+			Desired:    wantedName,
+			Converged:  scope.Converged(),
+			Stale:      scope.Stale,
+			Foreign:    scope.Foreign,
+			Unreported: scope.Unreported,
+		}
+	}
+	classOf := make(map[string]string, len(scope.Findings))
+	for _, f := range scope.Findings {
+		classOf[f.SentinelPod+"\x00"+f.Name] = f.Class
+	}
+
 	for _, sn := range state.SentinelNodes {
-		result.Sentinels = append(result.Sentinels, sentinelNodeVerifyJSON{
+		entry := sentinelNodeVerifyJSON{
 			PodName:        sn.PodName,
 			IP:             sn.IP,
 			Monitoring:     sn.Monitoring,
 			MasterIP:       sn.MasterIP,
 			FailoverStatus: sn.FailoverStatus,
 			Reachable:      sn.Reachable,
-		})
+		}
+		for _, m := range sn.MonitoredMasters {
+			entry.MonitoredMasters = append(entry.MonitoredMasters, monitoredMasterJSON{
+				Name: m.Name, IP: m.IP, Flags: m.Flags,
+				Class: classOf[sn.PodName+"\x00"+m.Name],
+			})
+		}
+		result.Sentinels = append(result.Sentinels, entry)
 	}
 
 	for _, rn := range state.RedisNodes {
@@ -310,7 +367,11 @@ func buildSentinelVerifyJSON(
 		})
 	}
 
-	result.Healthy = state.RealMasterIP != "" && len(result.HealActions) == 0 && !state.FailoverActive
+	// A Sentinel monitoring a name other than the CR's is a defect whatever else is
+	// true, so it is part of the health verdict and not only of the text output —
+	// the JSON consumer must not be able to read "healthy" off a two-name instance.
+	result.Healthy = state.RealMasterIP != "" && len(result.HealActions) == 0 &&
+		!state.FailoverActive && scope.Converged()
 	return result
 }
 

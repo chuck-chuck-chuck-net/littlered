@@ -310,7 +310,12 @@ func verifySentinel(
 		fmt.Printf("  [!] Sentinel reports failover in progress!\n")
 	}
 
-	reportCrossInstance(state, cCtx)
+	// A Sentinel monitoring a name other than the CR's fails verification. This is
+	// the check the rename runbook's verification step needs: before it, `verify`
+	// asked only about the desired name, so a two-name instance — two `sentinel
+	// monitor` lines, two failover state machines over the same pods — reported as
+	// entirely healthy (LR-048).
+	staleNames := reportCrossInstance(state, cCtx)
 
 	actions := state.GetHealActions(masterNameOf(cCtx))
 	if len(actions) > 0 {
@@ -318,12 +323,19 @@ func verifySentinel(
 		for _, a := range actions {
 			fmt.Printf("  - %s\n", a)
 		}
-	} else if state.RealMasterIP != "" {
+	} else if state.RealMasterIP != "" && !staleNames {
 		fmt.Println("\n[OK] Cluster configuration is consistent.")
 	}
 
-	if state.RealMasterIP == "" || len(actions) > 0 {
+	switch {
+	case state.RealMasterIP == "" || len(actions) > 0:
 		return fmt.Errorf("cluster %s/%s is not healthy or consistent", cCtx.Namespace, cCtx.Name)
+	case staleNames:
+		// Named separately: an instance that is otherwise healthy but carries a
+		// second master name is a specific, actionable defect, and "not healthy or
+		// consistent" would send the reader looking for the wrong thing.
+		return fmt.Errorf("cluster %s/%s does not monitor exactly one Sentinel master name (%q)",
+			cCtx.Namespace, cCtx.Name, masterNameOf(cCtx))
 	}
 	return nil
 }
@@ -354,7 +366,7 @@ func verifySentinelJSON(
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
 	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx))
 	return buildSentinelVerifyJSON(name, namespace, redisMap, state, masterNameOf(cCtx),
-		len(cCtx.SentinelPods), max(len(cCtx.RedisPods)-1, 0))
+		cCtx.SentinelMasterName, len(cCtx.SentinelPods), max(len(cCtx.RedisPods)-1, 0))
 }
 
 // verifyClusterJSON gathers cluster ground truth and returns it as a

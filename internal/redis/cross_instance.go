@@ -129,3 +129,136 @@ func sortedKeys(m map[string]bool) []string {
 	sort.Strings(out)
 	return out
 }
+
+// =============================================================================
+// Monitored master-name scope
+// =============================================================================
+
+// The three classes a monitored master name can fall into, from the vantage of an
+// instance that wants exactly one name. They are the rendering half of Rule N's
+// per-entry discriminator (design §7.3 / §9 gate G5) and must stay identical to it:
+// an address in ValidIPs, or an address Sentinel flags down, is ordinary debris of
+// OURS; anything else is somebody else's live master.
+const (
+	// MasterNameDesired is the name the CR asks for.
+	MasterNameDesired = "desired"
+	// MasterNameStale is a leftover entry of ours — the address is one of our pods,
+	// or it is flagged down (a dead ex-master, LR-024's subject).
+	MasterNameStale = "stale"
+	// MasterNameForeign is a name pointing at an address that is neither one of our
+	// pods nor flagged down: something else is alive there. A different and more
+	// serious finding than a stale one — it is the signature of a capture (LR-039).
+	MasterNameForeign = "foreign"
+)
+
+// ClassifyMonitoredName places one monitored master name in its class, against the
+// name the CR asks for and the set of this instance's own pod addresses.
+//
+// It is the one definition of the distinction, shared by the survey below and by
+// `lrctl inspect`, which has pod addresses but no gathered ReplicationState. The
+// discriminator is Rule N's G5 / planForsaken clause 3, and must stay identical to
+// them: an address of ours, or an address Sentinel flags down, is debris of ours;
+// anything else — including an entry with no address at all, which cannot be
+// attributed to us — is somebody else's live master.
+func ClassifyMonitoredName(name, ip, flags, desired string, ourIPs map[string]bool) string {
+	switch {
+	case name == desired:
+		return MasterNameDesired
+	case ourIPs[ip] || flaggedDown(flags):
+		return MasterNameStale
+	default:
+		return MasterNameForeign
+	}
+}
+
+// MonitoredNameFinding is one (Sentinel, monitored master name) pair as that Sentinel
+// reports it, plus the class it falls into.
+type MonitoredNameFinding struct {
+	SentinelPod string
+	Name        string
+	IP          string
+	Flags       string
+	Class       string
+}
+
+// MasterNameScope is what every reachable Sentinel monitors, and how it classifies.
+//
+// It answers the question `lrctl verify` structurally could not ask before: not "is
+// this Sentinel monitoring the name we want" (which any Sentinel carrying a leftover
+// name alongside the desired one answers yes to) but "does it monitor ONLY that
+// name". A half-finished master-name change leaves two `sentinel monitor` lines and
+// two independent failover state machines over the same three pods (LR-048), and
+// nothing that asks about a single name can see the second one.
+type MasterNameScope struct {
+	// Findings is every monitored name of every reachable Sentinel, ordered by
+	// Sentinel pod then name so an unchanged topology renders identically twice.
+	Findings []MonitoredNameFinding
+	// Stale and Foreign are the distinct names of each class, sorted.
+	Stale   []string
+	Foreign []string
+	// Unreported names the reachable Sentinels whose master list could not be read.
+	// An empty list means "no evidence", never "monitors nothing" (LR-041), so it is
+	// reported rather than silently rendered as convergence.
+	Unreported []string
+}
+
+// Converged reports whether every reachable Sentinel monitors the desired name and
+// nothing else. It is deliberately not "healthy": a Sentinel whose list could not be
+// read is not evidence either way, and is surfaced separately.
+func (s MasterNameScope) Converged() bool {
+	return len(s.Stale) == 0 && len(s.Foreign) == 0
+}
+
+// SurveyMonitoredNames classifies every master name every reachable Sentinel
+// monitors, against the name this instance wants.
+//
+// Pure, and deliberately NOT gated on sn.Monitoring: mid-rename every Sentinel reads
+// `Monitoring: false` for the new name while still carrying the old entry (measured,
+// design §9.1 item 2), which is exactly the state this survey exists to see.
+func (s *ReplicationState) SurveyMonitoredNames(desired string) MasterNameScope {
+	var scope MasterNameScope
+	// With no name to compare against there is nothing to say. Classifying every
+	// entry as stale would be the "prune everything" failure mode read out loud.
+	if s == nil || desired == "" {
+		return scope
+	}
+
+	stale := map[string]bool{}
+	foreign := map[string]bool{}
+	for _, sn := range s.SentinelNodes {
+		if sn == nil || !sn.Reachable {
+			continue
+		}
+		if len(sn.MonitoredMasters) == 0 {
+			scope.Unreported = append(scope.Unreported, sn.PodName)
+			continue
+		}
+		for _, m := range sn.MonitoredMasters {
+			f := MonitoredNameFinding{
+				SentinelPod: sn.PodName, Name: m.Name, IP: m.IP, Flags: m.Flags,
+			}
+			f.Class = ClassifyMonitoredName(m.Name, m.IP, m.Flags, desired, s.ValidIPs)
+			switch f.Class {
+			case MasterNameStale:
+				stale[m.Name] = true
+			case MasterNameForeign:
+				foreign[m.Name] = true
+			}
+			scope.Findings = append(scope.Findings, f)
+		}
+	}
+
+	// The gather is a map, so without an explicit order an unchanged topology
+	// renders differently every run and a reader cannot tell a change from a
+	// re-render (design §9.1 item 5).
+	sort.Slice(scope.Findings, func(i, j int) bool {
+		if scope.Findings[i].SentinelPod != scope.Findings[j].SentinelPod {
+			return scope.Findings[i].SentinelPod < scope.Findings[j].SentinelPod
+		}
+		return scope.Findings[i].Name < scope.Findings[j].Name
+	})
+	sort.Strings(scope.Unreported)
+	scope.Stale = sortedKeys(stale)
+	scope.Foreign = sortedKeys(foreign)
+	return scope
+}

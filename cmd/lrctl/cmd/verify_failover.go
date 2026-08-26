@@ -98,7 +98,7 @@ func describeFailoverPod(v clifailover.PodView, state *redisclient.ReplicationSt
 	}
 	label := v.RoleLabel
 	if label == "" {
-		label = "<none>"
+		label = valueNone
 	}
 	status += ", label:" + label
 	if parked[v.Name] {
