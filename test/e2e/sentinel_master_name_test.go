@@ -490,3 +490,855 @@ spec:
 		}, 60*time.Second, 5*time.Second).Should(Succeed())
 	})
 })
+
+// =============================================================================
+// In-place Sentinel master-name RENAME (LR-048 / ADR-017, design §10 WP6)
+// =============================================================================
+//
+// The feature under test: editing `spec.sentinel.masterName` on a healthy sentinel
+// instance re-points its Sentinels at the new name, REMOVES the old one, rolls the
+// Redis pods so their baked scripts carry it, and preserves the dataset.
+//
+// The bug this is the regression guard for (design §4, measured live as WP0 on t3e):
+// before Rule N the rename "converged" and the data survived, but every Sentinel was
+// left monitoring BOTH names — permanently. Two `sentinel monitor` lines, two config
+// epochs, two independent failover state machines over the same three pods, which is
+// exactly the hazard LR-039 named. WP0 measured both names still present 12m39s after
+// the patch on a `Running`/`Ready=True` instance, and measured the master's baked
+// old-name preStop firing a REAL `SENTINEL failover <old>`, leaving the two names
+// naming two different LIVE pods as master for 56.6s.
+//
+// Tier 1's `SENTINEL masters` length-of-1 assertion is that defect's red, and it was
+// observed red against a pre-fix operator image before this file was believed.
+//
+// BUDGETS ARE MEASURED, NOT GUESSED (design §7.1a, WP0 on t3e, 1s sampling):
+//   both names present on all three Sentinels  t0+0.8s   (the prune lands in pass 1)
+//   redis-2 Ready under the new name           t0+12.9s
+//   redis-1 deleted / Ready                    t0+47.6s / t0+55.5s
+//   redis-0 (the master) deleted               t0+89.1s
+//   final sustained Running/Ready=True         t0+176.8s (2m57s)
+// Post-fix the `redis-0` edge costs ~30s MORE: with the stale entry gone, the master's
+// baked-old-name preStop `SENTINEL failover <old>` errors instead of handing over, so
+// the desired name's quorum waits out down-after-milliseconds before electing. Every
+// Eventually below is sized off those numbers plus honest margin.
+//
+// TWO THINGS THESE ASSERTIONS DELIBERATELY DO NOT DO:
+//
+//  1. They never assert on the TRANSIENT. Design §7.1b: a healthy rename transiently
+//     presents the capture signature (WP0 measured `Forsaken=False/CaptureSuspected` at
+//     t0+89.1s, cleared by the 30s cooldown), and the CR flaps
+//     Running → Initializing → Running several times during the roll. So every
+//     steady-state claim is an `Eventually` on the SETTLED value, and `Consistently` is
+//     used only where the design says a state must hold.
+//  2. The failover step is never allowed to become a data-loss test that passes by luck
+//     (LR-017's discipline). The key sweep is exact — every written key, by value — and
+//     it is asserted after the failover whatever shape the failover took.
+
+// sentinelMasterNames returns every master name one Sentinel monitors, in reply order.
+//
+// This is the assertion the whole feature turns on, so it reads the LIST rather than
+// asking about one name: `SENTINEL master <desired>` answering happily is exactly what
+// a two-name instance looks like, which is how the defect stayed invisible to
+// `lrctl verify` for as long as it did (design §10 WP5). redis-cli renders
+// `SENTINEL masters` as flat key/value lines, one master's fields after another's, so
+// each line equal to "name" opens a master entry and the line after it is its name.
+func sentinelMasterNames(out string) []string {
+	var names []string
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	for i, l := range lines {
+		if strings.TrimSpace(l) == "name" && i+1 < len(lines) {
+			names = append(names, strings.TrimSpace(lines[i+1]))
+		}
+	}
+	return names
+}
+
+// sentinelMasterIPs is sentinelMasterNames' sibling: the address each monitored name
+// points at, keyed by name. Used to prove a stale FOREIGN entry is still present
+// (tier 2) rather than merely that some entry is.
+func sentinelMasterIPs(out string) map[string]string {
+	byName := map[string]string{}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	cur := ""
+	for i, l := range lines {
+		switch strings.TrimSpace(l) {
+		case "name":
+			if i+1 < len(lines) {
+				cur = strings.TrimSpace(lines[i+1])
+			}
+		case "ip":
+			if cur != "" && i+1 < len(lines) {
+				byName[cur] = strings.TrimSpace(lines[i+1])
+			}
+		}
+	}
+	return byName
+}
+
+// renameMasterName performs the runbook's step 4 verbatim (design §12): a merge patch
+// of the one field. Nothing else is touched, which is the point — the operator has to
+// derive the whole operation from the spec edit alone.
+func renameMasterName(crName, newName string) {
+	patch := fmt.Sprintf(`{"spec":{"sentinel":{"masterName":%q}}}`, newName)
+	out, err := utils.Run(exec.Command("kubectl", "patch", "littlered", crName,
+		"-n", testNamespace, "--type=merge", "-p", patch))
+	Expect(err).NotTo(HaveOccurred(), "patch output: %s", out)
+}
+
+var _ = Describe("Sentinel Master Name Rename", Label("sentinel"), func() {
+
+	sentinelPods := func(crName string) []string {
+		return []string{crName + "-sentinel-0", crName + "-sentinel-1", crName + "-sentinel-2"}
+	}
+	// monitoredNames asks ONE Sentinel what it monitors. Errors are folded into the
+	// returned slice as a single sentinel value so an Eventually reports the exec
+	// failure rather than an unexplained empty list.
+	monitoredNames := func(pod string) []string {
+		out, err := sentinelPortExec(testNamespace, pod, "SENTINEL", "masters")
+		if err != nil {
+			return []string{"exec-error:" + strings.TrimSpace(out)}
+		}
+		return sentinelMasterNames(out)
+	}
+
+	// expectExactlyOneName is R3 ("every Sentinel monitors exactly one master name — the
+	// desired one — no leftover entry, EVER") as an assertion over the whole quorum.
+	expectExactlyOneName := func(g Gomega, crName, want string) {
+		for _, sp := range sentinelPods(crName) {
+			names := monitoredNames(sp)
+			g.Expect(names).To(Equal([]string{want}),
+				"%s monitors %v, want exactly [%s]", sp, names, want)
+		}
+	}
+
+	cleanup := func(names ...string) {
+		if debugOnFailure && suiteOrSpecFailed() {
+			By("skipping cleanup to allow debugging")
+			return
+		}
+		for _, n := range names {
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "littlered", n,
+				"-n", testNamespace, "--ignore-not-found"))
+		}
+	}
+
+	// --- Tier 1: the full rename, with the dataset preserved -----------------
+	//
+	// Auth-ON, like every other sentinel-mode fixture in this suite. It is not
+	// incidental here: Rule N's REMOVE, the pre-check IsMonitoring and Rule 0's
+	// re-registration all go through the authenticated path, so running the tier in
+	// the suite's default posture is what proves the rename works with a credential
+	// rather than only in the auth-free capture fixtures.
+	Context("Full rename with the dataset preserved", Ordered, func() {
+		var crName, newName string
+		// The legacy shared name, on purpose: the instances the runbook is written for
+		// are the ones that never chose a name, and `mymaster` is what they carry.
+		const oldName = "mymaster"
+		// Enough keys that a lost dataset is unmistakable and few enough that a full
+		// byte-for-byte sweep is one round trip.
+		const keyCount = 500
+
+		// verifyKeys sweeps EVERY written key by value and returns how many are missing
+		// or wrong. Not a DBSIZE check and not a sample: LR-038's lesson is that a
+		// sampled counter cannot carry a durability claim (one lost key read five times
+		// looks like five), and DBSIZE cannot tell a preserved dataset from a
+		// same-sized wrong one.
+		const sweep = `local bad=0 for i=1,tonumber(ARGV[1]) do ` +
+			`if redis.call('GET','rn:'..i) ~= 'v'..i then bad=bad+1 end end return bad`
+
+		BeforeAll(func() {
+			crName = fmt.Sprintf("rn-full-%d", time.Now().Unix())
+			newName = e2eMasterName(testNamespace, crName)
+			AddReportEntry("cr:" + crName)
+
+			By("deploying a healthy sentinel instance under the legacy name " + oldName)
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(sentinelRenameCR(crName, oldName))
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "apply output: %s", out)
+
+			Eventually(func(g Gomega) {
+				g.Expect(getPhase(crName)).To(Equal("Running"))
+			}, 5*time.Minute, 5*time.Second).Should(Succeed(), "%s never reached Running", crName)
+		})
+
+		AfterAll(func() { cleanup(crName) })
+
+		It("leaves exactly one monitored name, the data intact, and a working failover", func() {
+			By("the precondition the runbook demands: healthy, and monitoring exactly " + oldName)
+			Eventually(func(g Gomega) {
+				expectExactlyOneName(g, crName, oldName)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By(fmt.Sprintf("writing %d distinguishable keys to the master", keyCount))
+			master := getMasterPod(crName)
+			Expect(master).NotTo(BeEmpty())
+			_, err := redisExec(testNamespace, master, "EVAL",
+				`for i=1,tonumber(ARGV[1]) do redis.call('SET','rn:'..i,'v'..i) end return 1`,
+				"0", strconv.Itoa(keyCount))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("asserting the write actually REPLICATED before anything is disrupted")
+			// LR-016's precondition lesson: a tier that disrupts an instance without
+			// first establishing that the data reached the replicas can fail (or pass)
+			// for a reason that has nothing to do with what it claims to test.
+			replicas := otherRedisPods(crName, master)
+			Expect(replicas).To(HaveLen(2))
+			Eventually(func(g Gomega) {
+				for _, rp := range replicas {
+					size, err := redisExec(testNamespace, rp, "DBSIZE")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(size)).To(Equal(strconv.Itoa(keyCount)),
+						"%s has not received the dataset", rp)
+				}
+			}, 2*time.Minute, 3*time.Second).Should(Succeed())
+
+			By("renaming: kubectl patch spec.sentinel.masterName -> " + newName)
+			renameMasterName(crName, newName)
+
+			// ---- THE REGRESSION GUARD ----------------------------------------
+			//
+			// Both halves in one assertion, because the defect is precisely that the
+			// first half passes while the second does not: on pre-fix code every
+			// Sentinel monitors the new name within ~0.1s (Rule 0 registers it) and
+			// ALSO still monitors `mymaster`, forever. Asserting only "the new name is
+			// monitored" is the assertion `lrctl verify` was already making, and it
+			// reported a two-name instance as entirely healthy.
+			By("every Sentinel monitors the new name and NOTHING else — no `" + oldName + "` left")
+			Eventually(func(g Gomega) {
+				expectExactlyOneName(g, crName, newName)
+			}, 3*time.Minute, 3*time.Second).Should(Succeed())
+
+			By("and it STAYS at one name across the whole Redis rollout")
+			// The roll takes ~3 minutes and replaces all three Redis pods, each of
+			// which re-registers with Sentinel on the way back. A stale entry
+			// re-appearing later would be the same defect arriving by a different door,
+			// and only a sustained window can see it. Sampled across the window in which
+			// WP0 measured redis-1 and redis-0 being replaced.
+			Consistently(func(g Gomega) {
+				expectExactlyOneName(g, crName, newName)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("the instance settles back to Running / Ready=True under the new name")
+			// WP0 measured 2m57s to the final sustained Running, plus ~30s for the
+			// post-fix redis-0 edge (the baked old-name preStop can no longer hand over,
+			// so the quorum waits out down-after-milliseconds). The CR legitimately
+			// flaps Running → Initializing → Running several times on the way (§7.1b),
+			// so this is an Eventually on the settled value followed by a short
+			// Consistently, never a bare read.
+			Eventually(func(g Gomega) {
+				g.Expect(getPhase(crName)).To(Equal("Running"))
+				st, _ := getConditionField(crName, "Ready", "status")
+				g.Expect(st).To(Equal("True"))
+			}, 10*time.Minute, 5*time.Second).Should(Succeed())
+			Consistently(func(g Gomega) {
+				g.Expect(getPhase(crName)).To(Equal("Running"))
+			}, 30*time.Second, 5*time.Second).Should(Succeed())
+
+			By("StaleMasterName reports the quiet steady state, False/Converged")
+			Eventually(func(g Gomega) {
+				st, _ := getConditionField(crName, "StaleMasterName", "status")
+				reason, _ := getConditionField(crName, "StaleMasterName", "reason")
+				g.Expect([]string{st, reason}).To(Equal([]string{"False", "Converged"}))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("SentinelMasterNameUnscoped is not raised")
+			// Disclosed rather than dressed up: this condition can only ever be True for
+			// an instance whose masterName field is UNSET, and LR-039 made the field
+			// REQUIRED on create, so it is unreachable through the API for anything this
+			// suite can deploy. The assertion is therefore that the rename does not
+			// somehow raise it — a guard against a regression in the accessor, not a
+			// demonstration of clearing.
+			st, err := getConditionField(crName, "SentinelMasterNameUnscoped", "status")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(st).To(Equal("False"))
+
+			By("every written key survived the rename — swept exactly, on the master")
+			postMaster := getMasterPod(crName)
+			Expect(postMaster).NotTo(BeEmpty())
+			bad, err := redisExec(testNamespace, postMaster, "EVAL", sweep, "0", strconv.Itoa(keyCount))
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(bad)).To(Equal("0"),
+				"%s keys are missing or wrong on %s after the rename", strings.TrimSpace(bad), postMaster)
+
+			By("and they are readable through the {name} Service, which is what a client sees")
+			Eventually(func(g Gomega) {
+				bad, err := serviceExec(crName, "EVAL", sweep, "0", strconv.Itoa(keyCount))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(bad)).To(Equal("0"))
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			// ---- The proof that we left ONE healthy state machine behind ------
+			//
+			// One monitored name and intact data would both be true of an instance
+			// whose Sentinel quorum can no longer elect anything. Killing the master and
+			// requiring a real election under the NEW name is what separates "converged"
+			// from "quiesced".
+			By("a failover still works under the new name: deleting master " + postMaster)
+			_, err = utils.Run(exec.Command("kubectl", "delete", "pod", postMaster,
+				"-n", testNamespace, "--wait=false"))
+			Expect(err).NotTo(HaveOccurred())
+
+			By("a different pod is elected master")
+			Eventually(func(g Gomega) {
+				m := getMasterPod(crName)
+				g.Expect(m).NotTo(BeEmpty())
+				g.Expect(m).NotTo(Equal(postMaster), "no failover happened; still %s", m)
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("still exactly one monitored name afterwards")
+			Eventually(func(g Gomega) {
+				expectExactlyOneName(g, crName, newName)
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("and the dataset survived the failover too — the same exact sweep")
+			// Asserted unconditionally, whatever shape the failover took (LR-017: a
+			// tier that accepts more than one outcome must still ALWAYS assert no data
+			// loss, so a false negative can never become a false positive).
+			Eventually(func(g Gomega) {
+				m := getMasterPod(crName)
+				g.Expect(m).NotTo(BeEmpty())
+				bad, err := redisExec(testNamespace, m, "EVAL", sweep, "0", strconv.Itoa(keyCount))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(bad)).To(Equal("0"),
+					"%s keys are missing or wrong on the new master %s", strings.TrimSpace(bad), m)
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+		})
+	})
+
+	// --- Tier 3: idempotence -------------------------------------------------
+	//
+	// Two renames in quick succession, so the second lands while the first is still
+	// rolling. It exercises the design's "two stale names on one Sentinel" row for
+	// real: the quorum can transiently carry `mymaster`, the intermediate name AND the
+	// final one, and Rule N must converge on exactly the last-requested value without
+	// thrashing between them.
+	//
+	// Cheap by construction — it is the tier-1 fixture with no data and no failover —
+	// and it is the only place the "no remembered previous name" property (R4) is
+	// visible end to end: the operator never learns that name A existed, it simply
+	// removes everything that is not name B.
+	Context("Renamed twice in quick succession", Ordered, func() {
+		var crName, nameA, nameB string
+
+		BeforeAll(func() {
+			crName = fmt.Sprintf("rn-twice-%d", time.Now().Unix())
+			nameA = e2eMasterName(testNamespace, crName) + ".a"
+			nameB = e2eMasterName(testNamespace, crName) + ".b"
+			AddReportEntry("cr:" + crName)
+
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(sentinelRenameCR(crName, "mymaster"))
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "apply output: %s", out)
+			Eventually(func(g Gomega) {
+				g.Expect(getPhase(crName)).To(Equal("Running"))
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+		})
+
+		AfterAll(func() { cleanup(crName) })
+
+		It("converges on the last name with exactly one entry and no thrash", func() {
+			Eventually(func(g Gomega) {
+				expectExactlyOneName(g, crName, "mymaster")
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("renaming to " + nameA)
+			renameMasterName(crName, nameA)
+
+			By("waiting only long enough for the first rename to be in flight, then renaming to " + nameB)
+			// One pass, not one convergence: WP0 measured Rule 0 registering the new
+			// name at t0+0.1s and the prune landing in the same pass, so ~10s is several
+			// passes in and the Redis roll is definitely under way (redis-2 is deleted at
+			// t0+0.6s). Deliberately NOT waiting for nameA to converge — that would be
+			// two sequential renames, which tier 1 already covers.
+			time.Sleep(10 * time.Second)
+			renameMasterName(crName, nameB)
+
+			By("converging on exactly " + nameB)
+			Eventually(func(g Gomega) {
+				expectExactlyOneName(g, crName, nameB)
+			}, 5*time.Minute, 3*time.Second).Should(Succeed())
+
+			By("and holding there while both rollouts finish")
+			Consistently(func(g Gomega) {
+				expectExactlyOneName(g, crName, nameB)
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("the instance is healthy under the final name")
+			Eventually(func(g Gomega) {
+				g.Expect(getPhase(crName)).To(Equal("Running"))
+				st, _ := getConditionField(crName, "Ready", "status")
+				g.Expect(st).To(Equal("True"))
+			}, 10*time.Minute, 5*time.Second).Should(Succeed())
+		})
+	})
+})
+
+// sentinelRenameCR renders a healthy 3-pod sentinel instance under a given master name.
+//
+// Auth-ON (the suite default, auth_utils_test.go) and that is load-bearing rather than
+// inherited: the rename's whole execution path — Rule 0's MONITOR + auth-pass, Rule N's
+// bounded IsMonitoring pre-check and its REMOVE — runs through the authenticated client,
+// and the deliberately auth-free capture fixtures elsewhere in this file cannot exercise
+// it. downAfterMilliseconds is left at the product default rather than shortened to 5s:
+// the post-rename `redis-0` edge is DEFINED by that timer (the baked old-name preStop can
+// no longer hand over, so the quorum has to time the master out), and shrinking it would
+// hide the very cost the design documents.
+func sentinelRenameCR(crName, masterName string) string {
+	return e2eAuthPreamble(crName) + fmt.Sprintf(`
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: sentinel
+%s  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  sentinel:
+    masterName: %s
+    quorum: 2
+`, crName, testNamespace, e2eAuthSpecYAML(crName), masterName)
+}
+
+// serviceExec runs redis-cli against the label-routed `{name}` Service from inside one of
+// the instance's own pods — i.e. by the path a client actually takes.
+//
+// It matters that this is not another pod-local read: the Service selects on the
+// operator-managed `role: master` label, so it also proves the operator moved that label
+// to whichever pod the rename's failover left as master. The command is issued from
+// sentinel-0's sentinel container purely because that pod is never the Redis pod being
+// rolled; the target is the Service.
+func serviceExec(crName string, args ...string) (string, error) {
+	full := []string{"exec", crName + "-sentinel-0", "-n", testNamespace,
+		"-c", "sentinel", "--", "redis-cli", "-h", crName, "-p", "6379"}
+	full = append(full, redisCliAuthArgs(crName)...)
+	full = append(full, args...)
+	return utils.Run(exec.Command("kubectl", full...))
+}
+
+// =============================================================================
+// Tier 2 — renaming to escape a capture must NOT defeat the quarantine
+// =============================================================================
+//
+// The trap the design calls out (§7.3, N6, risk K2): an owner who reads the
+// LR-039 → LR-042 → LR-044 runbook chain will try exactly this — "we were captured, so
+// let's give the instance a unique name."
+//
+// Before WP4b that turned a diagnosed, self-healing capture into an undiagnosed
+// leaderless refusal. `planForsaken` evaluated only the DESIRED name, so the moment the
+// rename landed the victim's Sentinels were monitoring the foreign master under a name
+// the verdict no longer looked at: clause 1 failed, the capture verdict EVAPORATED, and
+// with it ADR-016's quarantine — the thing that heals the captor in ~4 minutes. Making
+// the verdict name-agnostic is the actual repair; Rule N refusing to prune is the
+// diagnostic that sits on top of it.
+//
+// So the load-bearing assertion here is the FIRST one: `Forsaken` still holds after the
+// rename. The rest — no REMOVE, the foreign entry still present, and finally the
+// quarantine firing and both sides healing — is what makes "the verdict survived" mean
+// something operationally.
+//
+// STAGING, and why it is shaped this way. A plain capture arms the quarantine within
+// ~60s and takes the victim's pods away, which makes "the foreign entry is still there"
+// unobservable for any useful window. So this tier PRE-ARMS the HoldDataPresent data
+// clause (LR-044) exactly as the quarantine tier does — a bogus `masterauth` on one
+// victim pod, set BEFORE the injection — which holds the quarantine open indefinitely
+// while leaving the capture verdict fully in force. That buys a deterministic window in
+// which to rename and assert. Releasing the clause afterwards (restoring `masterauth`)
+// lets the pod resync from the foreign master, `atRisk` clears, and the quarantine runs
+// for real — so both halves of the tier are exercised on one instance, in order.
+//
+// The pinned pod is deliberately NOT the highest ordinal. The rename rewrites the Redis
+// pod template, so the StatefulSet immediately deletes `redis-2`; its replacement parks
+// in the startup wait-loop (nothing monitors the new name, because a forsaken instance
+// returns before Rule 0), which stalls the roll there and leaves the lower ordinals —
+// including the pinned pod and its staged state — untouched for the whole window.
+//
+// ============================ DELIBERATELY AUTH-FREE ==========================
+//
+// Same reason as the two capture-staging Describes it borrows from: the capture is
+// staged by PUBLISHing a hello at the victim's sentinel port, and with `requirepass`
+// set that connection answers NOAUTH before the payload ever reaches
+// sentinelProcessHelloMessage() — so the capture would never land and every assertion
+// below would silently degrade into asserting a non-event. The shared name here is a
+// SCOPED one rather than `mymaster` on purpose: `mymaster` + auth-off is
+// quarantineConfigDangerous, which drops the attempt budget to 1 and LATCHES on the
+// first quarantine, making the release-and-heal half of this tier unobservable.
+// ==============================================================================
+var _ = Describe("Sentinel Master Name Rename Under Capture", Label("sentinel"), Ordered, func() {
+	var captor, victim, sharedName, newName, foreign, pinned string
+
+	sentinelCmd := func(pod string, args ...string) (string, error) {
+		full := append([]string{"exec", pod, "-n", testNamespace,
+			"-c", "sentinel", "--", "redis-cli", "-p", "26379"}, args...)
+		return utils.Run(exec.Command("kubectl", full...))
+	}
+	sentinelField := func(out, key string) string {
+		lines := strings.Split(strings.TrimSpace(out), "\n")
+		for i, l := range lines {
+			if strings.TrimSpace(l) == key && i+1 < len(lines) {
+				return strings.TrimSpace(lines[i+1])
+			}
+		}
+		return ""
+	}
+	nextEpoch := func(mastersOut string) uint64 {
+		cur, _ := strconv.ParseUint(sentinelField(mastersOut, "config-epoch"), 10, 64)
+		return cur + 1000
+	}
+	sentinelPodsOf := func(crName string) []string {
+		return []string{crName + "-sentinel-0", crName + "-sentinel-1", crName + "-sentinel-2"}
+	}
+	redisPodsOf := func(crName string) []string {
+		return []string{crName + "-redis-0", crName + "-redis-1", crName + "-redis-2"}
+	}
+	stsSpecReplicas := func(sts string) string {
+		out, err := utils.Run(exec.Command("kubectl", "get", "statefulset", sts,
+			"-n", testNamespace, "-o", "jsonpath={.spec.replicas}"))
+		if err != nil {
+			return "err:" + strings.TrimSpace(out)
+		}
+		return strings.TrimSpace(out)
+	}
+	quarantinedSince := func(crName string) string {
+		out, _ := utils.Run(exec.Command("kubectl", "get", "littlered", crName,
+			"-n", testNamespace, "-o", "jsonpath={.status.quarantinedSince}"))
+		return strings.TrimSpace(out)
+	}
+	sentinelCounts := func(pod, masterName string) (slaves, peers string) {
+		out, err := sentinelCmd(pod, "SENTINEL", "master", masterName)
+		if err != nil {
+			return "err", "err"
+		}
+		return sentinelField(out, "num-slaves"), sentinelField(out, "num-other-sentinels")
+	}
+
+	// The capture-staging machinery is DUPLICATED from sentinel_quarantine_test.go
+	// rather than hoisted, following the precedent that file set (and documents) when
+	// it duplicated from the isolation Describe above: those fixtures carry
+	// load-bearing warning comments about the operator being paused and about avoiding
+	// status assertions, and a mechanical refactor of two freshly-fixed Describes does
+	// not belong in the change that adds a third. What is reused is the KNOWLEDGE, not
+	// the closures — including both of LR-044's staging findings: the precondition is
+	// asserted over all three Sentinels BEFORE any injection, and the PUBLISH reply is
+	// asserted to be `1` so the payload's positive control stays load-bearing.
+	capture := func() string {
+		By("reading the captor's live master address")
+		captorMasters, err := sentinelCmd(captor+"-sentinel-0", "SENTINEL", "masters")
+		Expect(err).NotTo(HaveOccurred())
+		Expect(sentinelField(captorMasters, "name")).To(Equal(sharedName))
+		f := sentinelField(captorMasters, "ip")
+		Expect(f).NotTo(BeEmpty())
+		AddReportEntry("foreign master (captor's)", f)
+
+		By("asserting the precondition over ALL THREE of the victim's Sentinels first")
+		for _, sp := range sentinelPodsOf(victim) {
+			out, err := sentinelCmd(sp, "SENTINEL", "masters")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sentinelField(out, "ip")).NotTo(Equal(f),
+				"%s already monitors the foreign master before any injection", sp)
+		}
+
+		By("injecting a hello for the captor's master into all three")
+		injected := 0
+		for _, sp := range sentinelPodsOf(victim) {
+			before, err := sentinelCmd(sp, "SENTINEL", "masters")
+			Expect(err).NotTo(HaveOccurred())
+			if sentinelField(before, "ip") == f {
+				// Sentinel propagates a higher-epoch config to its peers in its own
+				// hellos, so a peer may already have converged (LR-044 observed exactly
+				// this). Skipping it is correct; asserting about it is a race.
+				AddReportEntry("converged before injection", sp)
+				continue
+			}
+			epoch := nextEpoch(before)
+			hello := fmt.Sprintf("%s,26379,%s,%d,%s,%s,6379,%d",
+				podIP(captor+"-sentinel-0"),
+				"ca7e0000000000000000000000000000deadbee2",
+				epoch, sharedName, f, epoch)
+			out, err := sentinelCmd(sp, "PUBLISH", "__sentinel__:hello", hello)
+			Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
+			Expect(strings.TrimSpace(out)).To(Equal("1"), "%s refused the injected hello", sp)
+			injected++
+		}
+		Expect(injected).To(BeNumerically(">=", 1),
+			"no hello was injected at all, so nothing below is attributable to the payload")
+
+		By("the victim's whole Sentinel quorum now serves the foreign master")
+		Eventually(func(g Gomega) {
+			for _, sp := range sentinelPodsOf(victim) {
+				out, err := sentinelCmd(sp, "SENTINEL", "masters")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(sentinelField(out, "ip")).To(Equal(f),
+					"%s still monitors %s", sp, sentinelField(out, "ip"))
+			}
+		}, 90*time.Second, 3*time.Second).Should(Succeed())
+
+		By("and no Redis pod of the victim is a master any more (planForsaken clause 4)")
+		Eventually(func(g Gomega) {
+			for _, rp := range redisPodsOf(victim) {
+				out, err := redisExec(testNamespace, rp, "INFO", "replication")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(ContainSubstring("role:slave"), "%s is not a replica", rp)
+			}
+		}, 2*time.Minute, 3*time.Second).Should(Succeed())
+
+		return f
+	}
+
+	quarantineCR := func(crName string) string {
+		return fmt.Sprintf(`
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  mode: sentinel
+  resources:
+    requests:
+      cpu: "100m"
+      memory: "128Mi"
+    limits:
+      cpu: "100m"
+      memory: "128Mi"
+  sentinel:
+    masterName: %s
+    quorum: 2
+    downAfterMilliseconds: 5000
+    failoverTimeout: 10000
+`, crName, testNamespace, sharedName)
+	}
+
+	BeforeAll(func() {
+		stamp := time.Now().Unix()
+		captor = fmt.Sprintf("rn-cap-captor-%d", stamp)
+		victim = fmt.Sprintf("rn-cap-victim-%d", stamp)
+		sharedName = fmt.Sprintf("rn.shared.%d", stamp)
+		newName = e2eMasterName(testNamespace, victim)
+		AddReportEntry("cr:" + victim)
+
+		for _, n := range []string{captor, victim} {
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(quarantineCR(n))
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "apply output: %s", out)
+		}
+		for _, n := range []string{captor, victim} {
+			Eventually(func(g Gomega) {
+				g.Expect(getPhase(n)).To(Equal("Running"))
+			}, 5*time.Minute, 5*time.Second).Should(Succeed(), "%s never reached Running", n)
+		}
+	})
+
+	AfterAll(func() {
+		if debugOnFailure && suiteOrSpecFailed() {
+			By("skipping cleanup to allow debugging")
+			return
+		}
+		for _, n := range []string{captor, victim} {
+			_, _ = utils.Run(exec.Command("kubectl", "delete", "littlered", n,
+				"-n", testNamespace, "--ignore-not-found"))
+		}
+	})
+
+	It("keeps the capture verdict, prunes nothing, and still quarantines and heals", func() {
+		By("writing data to the captor's master")
+		captorMaster := getMasterPod(captor)
+		Expect(captorMaster).NotTo(BeEmpty())
+		_, err := redisExec(testNamespace, captorMaster, "MSET", "cap-1", "cv1", "cap-2", "cv2")
+		Expect(err).NotTo(HaveOccurred())
+
+		By("baseline: the captor's Sentinels know exactly what the captor deployed")
+		// The positive control for the healing assertion at the end: without it,
+		// "the captor reports 2/2" would be indistinguishable from a capture that never
+		// touched the captor at all.
+		Eventually(func(g Gomega) {
+			for _, sp := range sentinelPodsOf(captor) {
+				s, p := sentinelCounts(sp, sharedName)
+				g.Expect([]string{s, p}).To(Equal([]string{"2", "2"}),
+					"%s reports %s/%s", sp, s, p)
+			}
+		}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("writing data to the victim's own master and letting it replicate")
+		victimMaster := getMasterPod(victim)
+		Expect(victimMaster).NotTo(BeEmpty())
+		_, err = redisExec(testNamespace, victimMaster, "MSET", "vic-1", "vv1", "vic-2", "vv2")
+		Expect(err).NotTo(HaveOccurred())
+
+		// A replica of the victim's own master, and never the highest ordinal: the
+		// rename deletes redis-2 first and its replacement parks, which is what keeps
+		// the roll away from this pod for the whole assertion window.
+		for _, rp := range []string{victim + "-redis-0", victim + "-redis-1"} {
+			if rp != victimMaster {
+				pinned = rp
+				break
+			}
+		}
+		Expect(pinned).NotTo(BeEmpty())
+		AddReportEntry("pinned victim pod", pinned)
+		Eventually(func(g Gomega) {
+			out, err := redisExec(testNamespace, pinned, "GET", "vic-1")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(out)).To(Equal("vv1"))
+		}, 90*time.Second, 2*time.Second).Should(Succeed())
+
+		By("pre-arming " + pinned + " so its sync from the foreign master can never succeed")
+		// A wrong masterauth against a password-less master fails the handshake forever
+		// ("Client sent AUTH, but no password is set") while master_host still points at
+		// the foreign master, so Sentinel sees nothing to fix (+fix-slave-config never
+		// fires) and the dataset is retained — a flush only happens on a SUCCESSFUL
+		// resync. The pod therefore keeps the VICTIM's own keys, genuinely the only copy
+		// in existence, which is exactly what LR-044's atRisk clause exists to protect.
+		_, err = redisExec(testNamespace, pinned, "CONFIG", "SET", "masterauth", "wrong-on-purpose")
+		Expect(err).NotTo(HaveOccurred())
+
+		foreign = capture()
+
+		By("the operator declares the capture and REFUSES to quarantine (data at risk)")
+		Eventually(func(g Gomega) {
+			st, _ := getConditionField(victim, "Forsaken", "status")
+			reason, _ := getConditionField(victim, "Forsaken", "reason")
+			g.Expect(st).To(Equal("True"))
+			g.Expect(reason).To(Equal("QuarantineRefusedDataPresent"))
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		// ---- THE PANICKED RENAME -----------------------------------------
+		By("the owner panics and renames the captured instance to " + newName)
+		renameMasterName(victim, newName)
+
+		By("the capture verdict SURVIVES the rename — this is WP4b, and it is the repair")
+		// Before planForsaken was made name-agnostic this is where the verdict
+		// evaporated: the Sentinels went on monitoring the foreign master under the now
+		// STALE name, clause 1 stopped finding a monitoring Sentinel for the DESIRED
+		// name, and ADR-016's quarantine — the only thing that heals the captor — was
+		// never armed. The reason may legitimately move between the two data refusals
+		// during the roll (redis-2 is replaced and parks, so it can read as unverifiable
+		// rather than as holding data), so the assertion is on the verdict itself plus
+		// the family of refusals, not on one reason string.
+		Consistently(func(g Gomega) {
+			st, _ := getConditionField(victim, "Forsaken", "status")
+			reason, _ := getConditionField(victim, "Forsaken", "reason")
+			g.Expect(st).To(Equal("True"), "the capture verdict was lost after the rename")
+			g.Expect(reason).To(BeElementOf(
+				"QuarantineRefusedDataPresent", "QuarantineRefusedDataUnknown"),
+				"unexpected Forsaken reason %q", reason)
+
+			// No REMOVE was issued: the stale, foreign entry is still on every Sentinel.
+			for _, sp := range sentinelPodsOf(victim) {
+				out, err := sentinelCmd(sp, "SENTINEL", "masters")
+				g.Expect(err).NotTo(HaveOccurred())
+				byName := sentinelMasterIPs(out)
+				g.Expect(byName).To(HaveKeyWithValue(sharedName, foreign),
+					"%s no longer carries the stale entry %s -> %s; Rule N pruned a capture: %v",
+					sp, sharedName, foreign, byName)
+			}
+
+			// No quarantine was armed, so the pods are still there.
+			g.Expect(quarantinedSince(victim)).To(BeEmpty())
+			g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("3"))
+			g.Expect(stsSpecReplicas(victim + "-sentinel")).To(Equal("3"))
+
+			// Re-assert the staged precondition, so this refusal cannot pass by decay.
+			info, err := redisExec(testNamespace, pinned, "INFO", "replication")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(info).NotTo(ContainSubstring("master_link_status:up"),
+				"the staged precondition decayed; this refusal proves nothing")
+			own, err := redisExec(testNamespace, pinned, "GET", "vic-1")
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(own)).To(Equal("vv1"))
+		}, 60*time.Second, 5*time.Second).Should(Succeed())
+
+		By("StaleMasterName reports the Foreign family — Rule N stood down, it did not converge")
+		// Read once rather than in the window above, and deliberately not
+		// over-claimed: G0 is fed the capture verdict, so Rule N stands down on ANY
+		// capture in evidence — the condition can therefore have been armed by the
+		// suspicion window BEFORE the rename. What it must never say here is
+		// False/Converged, which is what "the operator thinks this instance is fine"
+		// looks like.
+		st, err := getConditionField(victim, "StaleMasterName", "status")
+		Expect(err).NotTo(HaveOccurred())
+		reason, _ := getConditionField(victim, "StaleMasterName", "reason")
+		AddReportEntry("StaleMasterName after the rename", st+"/"+reason)
+		Expect(st).To(Equal("True"))
+		Expect(reason).To(BeElementOf("Foreign", "ForeignSuspected"))
+
+		// ---- and ADR-016 still works -------------------------------------
+		By("releasing the staged data risk, so the quarantine may proceed")
+		// Restoring masterauth lets the pinned pod's handshake succeed; it resyncs from
+		// the foreign master, which flushes the victim's own keys and replaces them with
+		// the captor's — at which point atRisk is false for the right reason (the keys
+		// are the captor's copy and the original still exists on the captor).
+		_, err = redisExec(testNamespace, pinned, "CONFIG", "SET", "masterauth", "")
+		Expect(err).NotTo(HaveOccurred())
+
+		By("the quarantine fires despite the rename — a panicked rename no longer defeats ADR-016")
+		Eventually(func(g Gomega) {
+			reason, _ := getConditionField(victim, "Forsaken", "reason")
+			g.Expect(reason).To(Equal("Quarantined"))
+			g.Expect(quarantinedSince(victim)).NotTo(BeEmpty())
+		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("both StatefulSets reach 0 desired replicas and the victim's pods go away")
+		Eventually(func(g Gomega) {
+			g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("0"))
+			g.Expect(stsSpecReplicas(victim + "-sentinel")).To(Equal("0"))
+		}, 3*time.Minute, 2*time.Second).Should(Succeed())
+		Eventually(func(g Gomega) {
+			out, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+				"-l", "app.kubernetes.io/instance="+victim,
+				"-o", "jsonpath={.items[*].metadata.name}"))
+			g.Expect(err).NotTo(HaveOccurred())
+			g.Expect(strings.TrimSpace(out)).To(BeEmpty(), "victim pods still present: %s", out)
+		}, 3*time.Minute, 3*time.Second).Should(Succeed())
+
+		By("the captor heals itself through Rule D, exactly as it would have without the rename")
+		Eventually(func(g Gomega) {
+			for _, sp := range sentinelPodsOf(captor) {
+				s, p := sentinelCounts(sp, sharedName)
+				g.Expect([]string{s, p}).To(Equal([]string{"2", "2"}),
+					"%s reports %s/%s", sp, s, p)
+			}
+		}, 4*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("the captor's own data was never touched")
+		for _, rp := range redisPodsOf(captor) {
+			out, err := redisExec(testNamespace, rp, "GET", "cap-1")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(out)).To(Equal("cv1"), "%s lost the captor's data", rp)
+		}
+
+		By("the victim is released and Rule L re-bootstraps it empty — under the NEW name")
+		// The silver lining the design records (§7.2): Rule L's electMaster issues
+		// REMOVE + MONITOR with the name the operator currently WANTS, so the rename
+		// completes out of the wreckage. The victim comes back with exactly one
+		// monitored name and it is the one the owner asked for.
+		Eventually(func(g Gomega) {
+			g.Expect(getPhase(victim)).To(Equal("Running"))
+			g.Expect(getMasterPod(victim)).NotTo(BeEmpty())
+		}, 8*time.Minute, 5*time.Second).Should(Succeed())
+
+		Eventually(func(g Gomega) {
+			for _, sp := range sentinelPodsOf(victim) {
+				out, err := sentinelCmd(sp, "SENTINEL", "masters")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(sentinelMasterNames(out)).To(Equal([]string{newName}),
+					"%s monitors %v, want exactly [%s]", sp, sentinelMasterNames(out), newName)
+			}
+		}, 4*time.Minute, 5*time.Second).Should(Succeed())
+
+		By("and it came back empty")
+		for _, rp := range redisPodsOf(victim) {
+			out, err := redisExec(testNamespace, rp, "DBSIZE")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(out)).To(Equal("0"), "%s came back with data", rp)
+		}
+	})
+})
