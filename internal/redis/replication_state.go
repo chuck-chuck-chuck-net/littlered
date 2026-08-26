@@ -96,7 +96,7 @@ func (s *ReplicationState) DetermineRealMaster() {
 	// 1. Check for active failover
 	for _, sn := range s.SentinelNodes {
 		if sn.Reachable && sn.Monitoring && sn.FailoverStatus != "" &&
-			sn.FailoverStatus != "none" && sn.FailoverStatus != "no-failover" {
+			sn.FailoverStatus != failoverStateNone && sn.FailoverStatus != "no-failover" {
 			s.FailoverActive = true
 			break
 		}

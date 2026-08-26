@@ -73,6 +73,10 @@ const (
 	// added for cluster mode (LR-012); sentinel mode lacked it and hit the identical
 	// stall — see the cross-mode-parity rule in CLAUDE.md.
 	ProbeTimeout = 3 * time.Second
+
+	// failoverStateNone is Sentinel's own name for "no failover in progress"
+	// (sentinelFailoverStateStr, SENTINEL_FAILOVER_STATE_NONE).
+	failoverStateNone = "none"
 )
 
 // newBoundedClient builds a go-redis Sentinel client for ONE single-shot command
@@ -219,7 +223,7 @@ func (c *SentinelClient) IsFailoverInProgress(ctx context.Context, name string) 
 		reachable = true
 		status := result["failover-status"]
 		// Valid statuses when NO failover is happening are typically empty or "none" (depending on version)
-		if status != "" && status != "none" && status != "no-failover" {
+		if status != "" && status != failoverStateNone && status != "no-failover" {
 			return true, nil
 		}
 	}
@@ -611,4 +615,163 @@ func atoiOrZero(s string) int {
 		return 0
 	}
 	return n
+}
+
+// MonitoredMaster is one entry of a Sentinel's `SENTINEL MASTERS` reply — i.e. one
+// master name this particular Sentinel currently monitors.
+//
+// It exists because every other read path in this file asks a Sentinel about ONE
+// name we already know. That can only ever confirm or deny the name we asked for;
+// it can never reveal a name we did not ask about, which is precisely the state a
+// half-finished master-name change leaves behind (a Sentinel carrying both the old
+// and the new name, answering `Monitoring: true` for either).
+type MonitoredMaster struct {
+	// Name is the `name` field — the monitored master's name, i.e. the only
+	// isolation boundary Sentinel's gossip protocol has (LR-039).
+	Name string
+	// IP is the `ip` field, the address this Sentinel believes that master is at.
+	IP string
+	// Flags is the `flags` field, e.g. "master", "s_down,master",
+	// "master,failover_in_progress".
+	Flags string
+	// FailoverState is the `failover-state` field.
+	//
+	// The field name is source-confirmed, not guessed, and it is NOT
+	// "failover-status": `addReplySentinelRedisInstance` emits the key
+	// "failover-state" in redis/redis 8.0 (src/sentinel.c:3435) and in
+	// valkey-io/valkey 8.1 (src/sentinel.c:3317) alike, with the values produced
+	// by sentinelFailoverStateStr (sentinel.c:3366 / :3249 respectively):
+	// "none", "wait_start", "select_slave", "send_slaveof_noone",
+	// "wait_promotion", "reconf_slaves", "update_config", "unknown". The two
+	// projects agree exactly, including the underscores.
+	//
+	// It is emitted ONLY while the instance carries SRI_FAILOVER_IN_PROGRESS, so
+	// its ordinary steady-state value is *absent*, not "none". Read it through
+	// FailoverInProgress rather than comparing it here.
+	FailoverState string
+}
+
+// idleFailoverStates are the only values that count as "no failover in progress".
+//
+// The test is deliberately inverted — recognise idle, treat everything else as
+// in-flight — so an unrecognised or future value fails safe (design §9 G3). The
+// empty string is idle because Sentinel omits the field entirely unless a failover
+// is running; "none" is listed for completeness (sentinelFailoverStateStr can
+// return it, even though the emitting branch is unreachable while the state is
+// NONE) and so that a caller synthesising a MonitoredMaster is not surprised.
+var idleFailoverStates = map[string]bool{"": true, failoverStateNone: true}
+
+// FailoverInProgress reports whether this Sentinel says a failover is running for
+// this master.
+//
+// Two independent signals from the same reply, at no extra cost: the presence of a
+// non-idle `failover-state`, and the `failover_in_progress` flag that gates that
+// field's emission in the first place. Either alone is sufficient — a reply that
+// somehow carried the flag without the field, or a version that emits the field
+// unconditionally, is still read correctly.
+func (m MonitoredMaster) FailoverInProgress() bool {
+	if strings.Contains(m.Flags, "failover_in_progress") {
+		return true
+	}
+	return !idleFailoverStates[strings.TrimSpace(m.FailoverState)]
+}
+
+// GetMonitoredMasters asks ONE Sentinel which masters it monitors.
+//
+// Single address on purpose — it is not the loop-over-c.addresses shape the other
+// read paths use, because the whole value of this call is that different Sentinels
+// can disagree about which names they carry, and a first-reachable-wins loop would
+// destroy exactly that information.
+//
+// Bounded twice, and both halves are required (LR-040, re-confirmed by LR-046):
+// newBoundedClient caps each individual attempt via Dial/Read/WriteTimeout, and the
+// per-call context deadline caps go-redis's dial-retry loop. A context deadline
+// ALONE is inert here — go-redis reports `context deadline exceeded` at the
+// deadline and then spends roughly another DefaultTimeout unwinding. This call is
+// issued during pod churn by design (before Rule A), which is the exact situation
+// that stalled a reconcile ~117s in LR-040.
+//
+// A failure is returned as an error; the gatherers degrade it to an empty list
+// rather than to Reachable:false — a Sentinel that cannot answer this one extra
+// question is not a dead Sentinel (LR-041's class of mistake).
+func (c *SentinelClient) GetMonitoredMasters(ctx context.Context, sentinelAddr string) ([]MonitoredMaster, error) {
+	ctx, cancel := context.WithTimeout(ctx, ProbeTimeout)
+	defer cancel()
+
+	client := c.newBoundedClient(sentinelAddr)
+	defer func() { _ = client.Close() }()
+
+	raw, err := client.Masters(ctx).Result()
+	if err != nil {
+		return nil, fmt.Errorf("failed to list monitored masters: %w", err)
+	}
+	return parseMonitoredMasters(raw), nil
+}
+
+// parseMonitoredMasters turns go-redis's generic `SENTINEL MASTERS` reply into
+// records, defensively: unknown and extra fields are ignored, an entry that is not
+// a readable record is skipped rather than fatal, and nothing here can panic on a
+// short or odd reply.
+//
+// Two wire shapes have to be handled and neither is hypothetical. Sentinel builds
+// each record with addReplyDeferredLen + setDeferredMapLen, which is a true map on
+// a RESP3 connection and a flat 2N array on RESP2. go-redis negotiates RESP3 by
+// default and HELLO carries the SENTINEL command flag, so the map shape is what the
+// operator sees today — but the parser must not silently depend on a protocol
+// choice made in Options.
+func parseMonitoredMasters(reply []any) []MonitoredMaster {
+	var out []MonitoredMaster
+	for _, entry := range reply {
+		fields := recordFields(entry)
+		if fields == nil {
+			continue
+		}
+		// A record with no name is unusable: the name is the whole point of the
+		// call, and Sentinel always emits it first.
+		name, ok := fields["name"]
+		if !ok || name == "" {
+			continue
+		}
+		out = append(out, MonitoredMaster{
+			Name:          name,
+			IP:            fields["ip"],
+			Flags:         fields["flags"],
+			FailoverState: fields["failover-state"],
+		})
+	}
+	return out
+}
+
+// recordFields flattens one reply element into string fields, or nil if it is not a
+// record at all. Non-string keys and values are dropped rather than coerced —
+// every field this parser reads is a bulk string in both projects, so a non-string
+// there means the reply is not what we think it is, and guessing would be worse
+// than ignoring.
+func recordFields(entry any) map[string]string {
+	switch e := entry.(type) {
+	case map[any]any:
+		fields := make(map[string]string, len(e))
+		for k, v := range e {
+			ks, kok := k.(string)
+			vs, vok := v.(string)
+			if kok && vok {
+				fields[ks] = vs
+			}
+		}
+		return fields
+	case []any:
+		fields := make(map[string]string, len(e)/2)
+		for i := 0; i+1 < len(e); i += 2 {
+			ks, kok := e[i].(string)
+			vs, vok := e[i+1].(string)
+			if kok && vok {
+				fields[ks] = vs
+			}
+		}
+		// A trailing key with no value (an odd-length array) is simply dropped by
+		// the loop bound above, which is why it does not need its own branch.
+		return fields
+	default:
+		return nil
+	}
 }
