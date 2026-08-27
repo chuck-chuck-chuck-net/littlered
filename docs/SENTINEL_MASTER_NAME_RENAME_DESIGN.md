@@ -1151,11 +1151,20 @@ LR-021's `clusterShardRolloutSettled`, renamed `statefulSetRolloutSettled` and p
 pure planners in-signature (LR-041). Config-independent, no new state, and it covers strictly more
 than a rename — a deleted, crash-looping or not-yet-Ready pod fails the same replica clauses.
 
-**The subtlety that decides the implementation:** the gate suppresses **arming**, in both
-directions. It must not make `planForsaken` return "not captured", because the call site's
-`default` branch calls `clearForsaken` — so a naive "no verdict while rolling" would *retract* a
-capture diagnosed before the rename, reopening §7.3 and turning tier 2 red. **A rollout cannot
-START a capture verdict, and cannot CLEAR one either.**
+**The subtlety that decides the implementation:** the gate suppresses **arming**. It must not make
+`planForsaken` return "not captured", because the call site's `default` branch calls
+`clearForsaken` — so a naive "no verdict while rolling" would *retract* a capture diagnosed before
+the rename, reopening §7.3 and turning tier 2 red. **A rollout cannot START a capture verdict, and
+it never CLEARS one either — only the ordinary clauses do, on the ordinary evidence.**
+
+The *stronger* reading (hold an armed verdict up against an **absent** signature while rolling) is
+wrong, and only the cluster said so. The quarantine **release** scales the instance `0 → 3`, which
+reads as unsettled, and the pods return with bare Sentinels and no signature at all — so the
+verdict was carried over a state with zero evidence, the call site returned before `clearForsaken`,
+and the victim never left quarantine (measured: `phase: Initializing` for the full 480s of the
+tier-2 assertion; LR-044 is explicit that the lifecycle rests on the verdict self-clearing once the
+pods are gone). The gate is therefore a **one-way suppression of arming**, and that costs §7.3
+nothing: a captured instance keeps presenting the signature under the **stale** name (WP4b).
 
 **Net removal of surface.** §9.2's settle is gone with the defect it softened: the
 `ForeignSuspected` reason, `staleMasterNameForeignCooldown`, and `status.

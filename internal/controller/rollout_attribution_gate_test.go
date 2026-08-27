@@ -133,12 +133,24 @@ func TestPlanForsakenRolloutGate(t *testing.T) {
 			wantCaptured: true, wantForsaken: true,
 		},
 		{
-			// And it survives even when the signature itself has momentarily gone: the
-			// gate withholds attribution in BOTH directions, so a roll can neither
-			// start a verdict nor end one. Retracting here would reach clearForsaken.
-			name:  "INVARIANT: an already-armed verdict survives a roll (signature absent)",
+			// The COUNTER-invariant, and it is not a softening — it is what the live run
+			// forced. The first implementation held an armed verdict up against an
+			// ABSENT signature while rolling ("a roll cannot clear a verdict either"),
+			// and the capture e2e wedged within minutes: the quarantine RELEASE scales
+			// this instance 0 -> 3, which reads as unsettled, and the pods come back
+			// with bare Sentinels and no signature at all. Returning Captured there made
+			// the call site return before clearForsaken, and the victim never left
+			// quarantine — measured, `phase: Initializing` for the full 480s. LR-044 is
+			// explicit that the whole lifecycle rests on the verdict self-clearing once
+			// the pods are gone: absence of evidence must not become evidence.
+			//
+			// So the gate is a ONE-WAY suppression of arming. It costs the §7.3 trap
+			// nothing, because a captured instance keeps presenting the signature under
+			// the STALE name (WP4b's name-agnostic clauses) — which is the row above,
+			// and which the live capture tier exercises.
+			name:  "a roll does not manufacture a verdict from an absent signature (the quarantine release)",
 			state: bareShape(), since: ago(time.Hour), rolling: true,
-			wantCaptured: true, wantForsaken: true,
+			wantCaptured: false, wantForsaken: false,
 		},
 		{
 			// Nothing armed, nothing observed: the gate must not manufacture a verdict

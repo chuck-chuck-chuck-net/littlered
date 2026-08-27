@@ -90,14 +90,19 @@ type forsakenPlan struct {
 //   - While rolling, a signature observed for the first time is NOT a verdict. There is
 //     no evidence here that distinguishes it from our own churn, so the honest answer is
 //     to hold, not to accuse.
-//   - While rolling, an ALREADY-ARMED verdict is not retracted either — not even if the
-//     signature has momentarily gone. The caller's switch treats "not captured" as
-//     "clear it" (`clearForsaken`), so a naive "return no verdict while rolling" would
-//     make a panicked rename of a genuinely captured instance dissolve the verdict, which
-//     is exactly the §7.3 trap the name-agnostic clauses exist to close, and with it
-//     ADR-016's quarantine — the only thing that heals the CAPTOR.
+//   - While rolling, an ALREADY-ARMED verdict is evaluated exactly as before: the gate
+//     does not touch it. The caller's switch treats "not captured" as "clear it"
+//     (`clearForsaken`), so a naive "return no verdict while rolling" would make a
+//     panicked rename of a genuinely captured instance dissolve the verdict — which is
+//     exactly the §7.3 trap the name-agnostic clauses exist to close, and with it
+//     ADR-016's quarantine, the only thing that heals the CAPTOR. That mutant is what
+//     the invariant row in the table guards against.
 //
-// So: a rollout cannot START a capture verdict, and cannot CLEAR one either.
+// So: a rollout cannot START a capture verdict, and it never CLEARS one either — only
+// the ordinary clauses do, on the ordinary evidence, exactly as before. The stronger
+// reading (hold an armed verdict up against an ABSENT signature while rolling) was
+// implemented first and wedged the quarantine release live; see the note at the
+// `!captured` return below.
 //
 // It is deliberately not a timer. The alternatives considered were all margins against
 // `spec.sentinel.downAfterMilliseconds`, which is user-settable and unbounded, so no
@@ -129,16 +134,29 @@ func planForsaken(
 	captured, foreign := forsakenSignature(state)
 
 	armed := since != nil && !since.IsZero()
-	if rolling {
-		// Cannot arm: mid-roll the operator does not attribute addresses. Cannot clear
-		// either: an armed verdict is carried through the roll it triggered, even if
-		// the signature has momentarily gone — ForeignMaster is then empty, which
-		// degrades to the safe direction downstream, where quarantineDataRisk can no
-		// longer explain any pod's keys as the captor's copy and therefore refuses.
-		if !armed {
-			return forsakenPlan{}
-		}
-	} else if !captured {
+	if rolling && !armed {
+		// Cannot ARM: mid-roll the operator does not attribute addresses, so a
+		// signature seen here is not a verdict.
+		return forsakenPlan{}
+	}
+	if !captured {
+		// The gate is a ONE-WAY suppression of arming, and never asserts a verdict the
+		// evidence does not support. It deliberately does NOT hold an armed verdict up
+		// against an absent signature while rolling, and the first implementation that
+		// did was wedged by a live run within minutes: the quarantine RELEASE scales
+		// this instance's StatefulSets 0 -> 3, which reads as unsettled, while the pods
+		// come back with bare Sentinels and no signature at all. Carrying the verdict
+		// through that returned Captured for a state with zero evidence, the call site
+		// returned before clearForsaken, and the instance never left quarantine (LR-044
+		// is explicit that the whole lifecycle rests on the verdict self-clearing once
+		// the pods are gone). Absence of evidence must not become evidence.
+		//
+		// What that costs is nothing the §7.3 trap needs: a captured instance being
+		// renamed goes on presenting the signature under the STALE name, because the
+		// clauses are name-agnostic (WP4b) — verified live, the verdict survives the
+		// panicked rename and the quarantine still fires. So "a roll cannot clear a
+		// verdict" holds in the only sense that is true: the gate never clears one; the
+		// ordinary clauses do, exactly as they did before this change.
 		return forsakenPlan{}
 	}
 

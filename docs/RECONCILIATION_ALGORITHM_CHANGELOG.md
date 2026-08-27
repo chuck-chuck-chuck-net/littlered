@@ -1792,3 +1792,42 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   an attributable stale entry still prunes while rolling. The **entire pre-existing `planForsaken`
   table passes unedited**; only the two call lines gained a `false` argument, so no row's inputs or
   expectations changed (K2b's stop condition is respected).
+- **Live verification (t3e, 2026-08-27, operator `4150704`) — the unit rows prove the logic, only the
+  cluster proves the fix.** Both of M7's recipes were re-run against the gated build: e2e tier-1
+  fixture shape (auth-on, three Redis + three Sentinels), rename off the legacy `mymaster` onto a
+  scoped name, **product-default `downAfterMilliseconds: 30000`**, once **with** 500 replicated keys and
+  once **without** — the no-data case being the one that destroyed the pods.
+
+  **The defect's precondition reproduced at full strength in both runs**, which is what makes the
+  negative result evidence rather than an absence:
+
+      run A (500 keys)   planForsaken SIGNATURE WINDOWS: from  92.4s to 134.4s  duration = 42.0s
+      run B (no data)    planForsaken SIGNATURE WINDOWS: from  86.8s to 127.8s  duration = 41.0s
+
+  i.e. the whole name-agnostic capture signature — quorum unanimous, address not in the pod list, not
+  flagged down, no master of ours — present for **41-42s against a 30s cooldown**, matching M7's 42.5s.
+  The operator even logged the same precursor line as §16's excerpt, on the same address:
+
+      18:43:22Z  Sentinel reported a ghost master. Ensuring no pod is labeled as master.  ghost_ip=10.233.192.161
+
+  **and this time nothing follows it.** Across both runs, at 0.5s sampling: **no `Forsaken` condition at
+  any sample, no `forsakenSince`, no `quarantinedSince`, `quarantineAttempts: 0`, and no pod deleted**
+  (`.spec.replicas` 3/3 on both StatefulSets throughout). `StaleMasterName` never reached `Foreign`.
+  Convergence: exactly one monitored name on all three Sentinels (`m8diag.m8a` / `m8diag.m8b`),
+  `Running`/`Ready=True`, and the exact sweep on the new master returned **`present=500 missing=0`**.
+- **The invariant was exercised live, and not by design — the capture e2e tier depends on it.** In
+  `Sentinel Master Name Rename Under Capture` the victim's `pinned` pod is pre-armed with a bogus
+  `masterauth`, so once the capture lands that pod can never resync, its readiness (`link:up`) fails and
+  the victim's Redis StatefulSet drops to `1/3` ready — i.e. **unsettled**. The verdict nevertheless
+  stands, because it was armed on the pass *before* the pods lost readiness (`forsakenSince
+  18:57:05Z`, `Forsaken=True/QuarantineRefusedDataPresent` at `18:57:35Z`) and the gate then **carried
+  it through** unchanged. A naive "no verdict while rolling" would have retracted it there.
+- **Residual, and it is broader than the stuck-rollout hole above — stated rather than discovered
+  later.** The settledness predicate includes `ReadyReplicas == Replicas`, so **a capture that renders a
+  victim pod not-Ready *before* the operator's first post-capture gather cannot arm the verdict at all**
+  (once armed, it survives). This is not the common shape: a real capture makes the victim's pods
+  link-`up` replicas of the **captor's** master, hence Ready, hence settled — which is why M4a, the
+  quarantine tiers and the run above all arm normally. Keeping the readiness clause is deliberate: it is
+  what extends the gate from "a template rollout" to "any pod of ours that has just left", which is the
+  state the false signature actually lives in, and the failure direction is a withheld accusation rather
+  than a wrongly-deleted instance.
