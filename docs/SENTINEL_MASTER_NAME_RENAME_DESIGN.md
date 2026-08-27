@@ -576,8 +576,7 @@ verdict.
 | `Converged` | `False` | Every reachable Sentinel monitors exactly the desired name. The steady state; nothing to report. |
 | `Pruning` | `True` | Stale names observed and being removed this pass. Message names the stale names, and any Sentinel **skipped** by G6. |
 | `Deferred` | `True` | Stale names observed but a gate refuses. Message names **which** gate. |
-| `ForeignSuspected` | `True` | The `Foreign` signature is present but has not yet held past the settle (§9.2). Deliberately **neutral — it accuses nobody**, and emits **no event**. Added by M3; the planner is pure and has no clock, so this reason is caller-side only. |
-| `Foreign` | `True` | §7.3 — the stale name points at someone else's master, **and has for longer than the settle**. `Warning` event; do not rename to escape a capture. |
+| `Foreign` | `True` | §7.3 — the stale name points at someone else's master, **on a settled instance** (LR-050: mid-rollout the same reading is `Deferred`, because a pod we have just replaced looks identical). `Warning` event; do not rename to escape a capture. |
 
 ---
 
@@ -703,8 +702,8 @@ implemented as if `!state.FailoverActive` were not there — which it effectivel
    than years later. `Captured` is the reachable and strictly more conservative reading: while a
    capture is merely *in evidence*, Rule N stands down and ADR-016 owns the instance.
    **Accepted, and better than what §9 specified.**
-7. **A fifth condition reason, `ForeignSuspected`** (M3), for §9.2's settle — see §8.
-8. **The settle covers the G0 path as well as G5's** (M3). It has to: `planForsaken`'s own
+7. ~~**A fifth condition reason, `ForeignSuspected`** (M3), for §9.2's settle~~ — **reverted by M8/LR-050** together with `staleMasterNameForeignCooldown` and `status.staleMasterNameForeignSince`. The rollout gate closes §9.2's window at its source, so the settle had nothing left to settle. See §16.1.
+8. ~~**The settle covers the G0 path as well as G5's**~~ (M3, reverted with item 7). It has to: `planForsaken`'s own
    `CaptureSuspected` window is reachable mid-rename (§7.1b), so an unsettled G0 would emit the
    same wrong Warning through a second door.
 9. **The condition write is suppressed when nothing changed** (M3) — otherwise every healthy
@@ -1075,8 +1074,8 @@ Recorded so the next session starts ahead, not to be resolved here.
 | K6 | The master's stale-name preStop is a no-op, so the handover is not proactive. | Low (with N1) | Documented as expected. Closed for good only by §6.4 (name-agnostic pods) — deferred. |
 | K7 | Renaming to a name another instance on the pod network already uses causes a *new* capture. | Low, user error | `lrctl verify`'s cross-instance diagnostic; the runbook recommends `<namespace>.<name>`. Validation cannot see the network. |
 | K8 | An owner does rename + auth in one window and cannot tell which change broke what. | Low | N7 + §13. |
-| K9 | ⛔ **REALISED — see §16. No longer a risk; a measured defect that blocks the feature.** The rename transiently presents the capture signature (§7.1b, measured: `CaptureSuspected` at t0+89s, all four `planForsaken` clauses held). Only the 30s `forsakenCooldown` prevented it latching, and WP4b widens what the verdict reads. | **High if WP4b regresses it** | Mandatory WP4b regression row built from WP0's measured shape; the cooldown stays as the backstop. A spurious quarantine of a healthy instance mid-rename would be strictly worse than the bug being fixed. |
-| K9b | G5's `Foreign` verdict fires spuriously during a normal rename (§9.2), emitting a "you may be captured" `Warning` on the documented happy path. | Medium (observability) | Caller-side settling period in WP4, mirroring `forsakenSince`/`forsakenCooldown`. Prunes nothing meanwhile, so no data risk. |
+| K9 | ✅ **CLOSED by M8/LR-050 — see §16.1.** Was: ⛔ **REALISED — see §16. No longer a risk; a measured defect that blocks the feature.** The rename transiently presents the capture signature (§7.1b, measured: `CaptureSuspected` at t0+89s, all four `planForsaken` clauses held). Only the 30s `forsakenCooldown` prevented it latching, and WP4b widens what the verdict reads. | **High if WP4b regresses it** | Mandatory WP4b regression row built from WP0's measured shape; the cooldown stays as the backstop. A spurious quarantine of a healthy instance mid-rename would be strictly worse than the bug being fixed. |
+| K9b | G5's `Foreign` verdict fires spuriously during a normal rename (§9.2), emitting a "you may be captured" `Warning` on the documented happy path. | ✅ **CLOSED by M8/LR-050**, with K9 and by the same gate | Was: a caller-side settling period (M3). That settle is **deleted**; mid-rollout the reading is now `Deferred` naming the gate — no accusation, no event, and (unchanged) no prune. |
 | K10 | Rule D's ghost-replica `SENTINEL RESET` fires against the **desired** name during the roll (observed twice in WP0, triggered by departed pod IPs going `s_down`). | Low here, known class | LR-024's self-inflicted-deadlock ingredient, live on this path; it did not deadlock in WP0. Not made worse by this change — Rule N never issues RESET (§7.6). Prevention remains ADR-010's deferred subject. |
 
 ---
@@ -1132,11 +1131,53 @@ intermittency is not luck about *whether* but about *which* rename lands on the 
 Candidate amplifier: Rule D's `SENTINEL RESET`, observed firing twice mid-roll in both WP0's and
 M5b's runs (K10 / LR-024's ingredient).
 
-**Status:** the committed e2e tiers are **legitimately red against HEAD** on the K9 guard. The
-guard was not weakened. **The feature cannot ship until this is resolved** — R2 ("the dataset
-survives") is violated on the happy path. Fix options are (a) gate the verdict on settled
-topology, (b) remember recently-departed own pods, (c) lengthen the cooldown, (d) whatever the
-diagnosis indicates; the owner deferred the choice to the measurement.
+### 16.1 ✅ RESOLVED (M8, LR-050) — the operator does not attribute addresses while its own StatefulSet rolls
+
+**The measurement (M7)** settled the cause and eliminated three of the four fix options in one
+stroke. The signature window is **42.5s** — `preStop stall ~21s + downAfterMilliseconds 30s +
+election ~1.5s` — against a 30s `forsakenCooldown`, so the verdict fires at **T+30**, **12.5s
+before the instance heals itself**. Run C's dose-response control (`downAfterMilliseconds: 5000`)
+produced **no verdict**. That makes it a *timer* defect, not a clause defect: `downAfterMilliseconds`
+is user-settable and unbounded, so **no value of `forsakenCooldown` can be correct for every
+instance**, and options (b) lengthen-the-cooldown and any `anyTerminating`-style margin are ruled
+out on principle rather than on taste. Remembering departed pod IPs would work but needs cross-pass
+state.
+
+**The decision (owner):** *while the operator's own Redis StatefulSet is mid-rollout, the operator
+does not attribute addresses.* Not to a captor (`planForsaken`), and not as foreign (Rule N's G5).
+A rollout of our own making is precisely the window in which "is this address one of ours?" cannot
+be answered from the gather, so the honest answer is **hold**, not accuse. The predicate is
+LR-021's `clusterShardRolloutSettled`, renamed `statefulSetRolloutSettled` and passed into both
+pure planners in-signature (LR-041). Config-independent, no new state, and it covers strictly more
+than a rename — a deleted, crash-looping or not-yet-Ready pod fails the same replica clauses.
+
+**The subtlety that decides the implementation:** the gate suppresses **arming**, in both
+directions. It must not make `planForsaken` return "not captured", because the call site's
+`default` branch calls `clearForsaken` — so a naive "no verdict while rolling" would *retract* a
+capture diagnosed before the rename, reopening §7.3 and turning tier 2 red. **A rollout cannot
+START a capture verdict, and cannot CLEAR one either.**
+
+**Net removal of surface.** §9.2's settle is gone with the defect it softened: the
+`ForeignSuspected` reason, `staleMasterNameForeignCooldown`, and `status.
+staleMasterNameForeignSince` are **deleted** (owner: no status-field inflation for a
+once-in-an-instance-lifetime operation). Mid-roll, G5's reading is `Deferred` naming the gate —
+no accusation, no `Warning`, and, unchanged, no prune. K9b is closed with K9.
+
+**Accepted hole:** a *stuck* rollout means the gate never lifts, so a genuine capture there goes
+undetected. Accepted by the owner — *"we don't fix on operator level if something's broken below"*;
+such an instance is already `Ready=False` and visibly broken, and the quarantine exists to heal the
+**captor**, which it cannot do for an instance that cannot roll. LR-023 is the precedent if it is
+ever closed: its own rule, not a timer.
+
+**Verified live (t3e, 2026-08-27, operator `3014676`).** Both M7 recipes, e2e tier-1 fixture shape,
+product-default `downAfterMilliseconds: 30000`. The capture signature reproduced at full strength —
+`planForsaken SIGNATURE WINDOWS: from 92.4s to 134.4s duration=42.0s` — and the operator logged
+`Sentinel reported a ghost master` in it, exactly as in the §16 excerpt above. **No `Forsaken`
+condition at any 0.5s sample, no `forsakenSince`, no `quarantinedSince`, no pod deleted;
+`StaleMasterName` never reached `Foreign`.** With data: **500 of 500 keys present** on the new
+master, exactly one monitored name on all three Sentinels. See changelog LR-050.
+
+**Status:** the design's §16 blocker is cleared; the K9 e2e guard is the regression guard.
 
 ---
 
