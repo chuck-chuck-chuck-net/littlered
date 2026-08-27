@@ -85,7 +85,7 @@ type forsakenPlan struct {
 // during an ordinary supported rename, at T+30 of a 42.5s window, 12.5s before the
 // instance healed itself.
 //
-// It gates ARMING, in both directions, and the distinction is load-bearing:
+// It gates ARMING — and only arming. The two halves of that are both load-bearing:
 //
 //   - While rolling, a signature observed for the first time is NOT a verdict. There is
 //     no evidence here that distinguishes it from our own churn, so the honest answer is
