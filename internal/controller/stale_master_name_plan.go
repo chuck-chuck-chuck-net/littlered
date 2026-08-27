@@ -91,14 +91,33 @@ type StaleMasterNamePlan struct {
 //   - G3 no monitored master, under ANY name, reports an in-flight failover.
 //   - G4 a Sentinel quorum is reachable — do not operate on a minority.
 //   - G5 every stale entry's address is one of our pods or is flagged down. Otherwise
-//     something else is alive there and the entry is evidence of a capture, not debris.
+//     something else is alive there and the entry is evidence of a capture, not debris —
+//     UNLESS `rolling`, in which case it is unattributable rather than foreign (below).
 //   - G6 per Sentinel, the desired name is already present on THAT Sentinel.
 func planStaleMasterNames(
 	state *redisclient.ReplicationState,
 	desired string,
 	quorum int,
 	forsaken bool,
+	rolling bool,
 ) StaleMasterNamePlan {
+	// `rolling` — our own Redis StatefulSet is not settled (LR-050). G5's discriminator
+	// is byte-identical to planForsaken clause 3, and it goes true during an ORDINARY
+	// rename: a pod we have just replaced leaves ValidIPs at once and is not flagged
+	// down for a whole down-after-milliseconds. Reported as `Foreign` that emits a
+	// Warning reading "this instance may be captured — do not rename to escape a
+	// capture" at the exact moment the owner is performing the rename the runbook asked
+	// for.
+	//
+	// So while rolling such an address is UNATTRIBUTABLE, not foreign: `Deferred`,
+	// naming the gate. What does NOT change is the refusal itself — an entry we cannot
+	// attribute is never pruned, in either reading. Only the sentence differs, and
+	// whether the operator raises its voice.
+	//
+	// Note the asymmetry, which is deliberate: Rule N still RUNS during churn (§7.5 —
+	// that is the whole point of it sitting before Rule A, so the two-name window stays
+	// intra-pass), it just stops ATTRIBUTING. An entry whose address IS one of our pods
+	// is attributable whatever the StatefulSet is doing, and is pruned as usual.
 	// G0 — first, and unconditionally. It is checked ahead of everything (including
 	// "is there anything to do at all") because it is a stand-down, not a gate on an
 	// action: while the instance is captured, ADR-016's quarantine owns it and Rule N
@@ -129,11 +148,12 @@ func planStaleMasterNames(
 	// the desired name, is anything failing over, and does any stale entry point
 	// somewhere that is not ours.
 	var (
-		entries       []staleEntry
-		skipped       []string
-		allStale      = map[string]bool{}
-		failoverUnder []string
-		foreign       []string
+		entries        []staleEntry
+		skipped        []string
+		allStale       = map[string]bool{}
+		failoverUnder  []string
+		foreign        []string
+		unattributable []string
 	)
 	for _, sn := range state.SentinelNodes {
 		if sn == nil || !sn.Reachable {
@@ -165,7 +185,12 @@ func planStaleMasterNames(
 			// cannot be attributed to one of our pods, and refusing to prune is the
 			// safe direction for an entry we cannot read.
 			if !state.ValidIPs[m.IP] && !flaggedDown(m.Flags) {
-				foreign = append(foreign, fmt.Sprintf("%q (at %s)", m.Name, addrOrUnknown(m.IP)))
+				entry := fmt.Sprintf("%q (at %s)", m.Name, addrOrUnknown(m.IP))
+				if rolling {
+					unattributable = append(unattributable, entry)
+				} else {
+					foreign = append(foreign, entry)
+				}
 			}
 		}
 		if len(names) == 0 {
@@ -197,6 +222,15 @@ func planStaleMasterNames(
 	// RealMasterIP is empty), and reporting that as a generic "Deferred: no living
 	// master" would hand the owner the least useful of the two true statements. Both
 	// outcomes prune nothing, so this changes only which sentence the operator reads.
+	if len(unattributable) > 0 {
+		return deferStaleNames("G5", fmt.Sprintf(
+			"stale master name(s) %s point at an address that is not one of our pods and is not "+
+				"flagged down, but this instance's own Redis StatefulSet is mid-rollout — a pod we "+
+				"have just replaced looks exactly like this until down-after-milliseconds elapses, "+
+				"so the address is unattributable rather than foreign. Nothing was removed",
+			strings.Join(dedupSorted(unattributable), ", ")), staleList)
+	}
+
 	if len(foreign) > 0 {
 		return StaleMasterNamePlan{
 			Reason: staleNamesForeign,

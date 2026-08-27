@@ -2437,22 +2437,6 @@ spec:
                 - ready
                 - total
                 type: object
-              staleMasterNameForeignSince:
-                description: |-
-                  StaleMasterNameForeignSince records when the operator first observed a stale
-                  Sentinel master-name entry pointing at an address that is neither one of this
-                  instance's pods nor flagged down (see ConditionStaleMasterName).
-
-                  It exists only to hold that reading below a settling period, and the reason is
-                  measured rather than theoretical: during an ORDINARY rename a just-replaced pod's
-                  address is already out of the pod list while Sentinel has not yet flagged it down
-                  (down-after-milliseconds, 30s by default), which is byte-identical to a captor's
-                  live master. Without the settle the operator would warn "this instance may be
-                  captured" at the exact moment the owner is performing the rename the runbook asked
-                  for. Nothing is ever pruned in that state either way — this is an observability
-                  timer, like ForsakenSince.
-                format: date-time
-                type: string
               status:
                 description: Status is a human-readable summary of the current state
                 type: string

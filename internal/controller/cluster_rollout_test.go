@@ -54,13 +54,13 @@ func TestClusterShardRolloutSettled(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			if got := clusterShardRolloutSettled(tt.sts); got != tt.want {
-				t.Errorf("clusterShardRolloutSettled(%s) = %v, want %v", tt.name, got, tt.want)
+			if got := statefulSetRolloutSettled(tt.sts); got != tt.want {
+				t.Errorf("statefulSetRolloutSettled(%s) = %v, want %v", tt.name, got, tt.want)
 			}
 		})
 	}
 
-	if clusterShardRolloutSettled(&appsv1.StatefulSet{}) {
+	if statefulSetRolloutSettled(&appsv1.StatefulSet{}) {
 		t.Error("STS with nil Replicas must not be settled")
 	}
 }

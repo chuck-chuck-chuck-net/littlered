@@ -350,7 +350,7 @@ func TestPlanStaleMasterNames(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planStaleMasterNames(tc.state, tc.desired, tc.quorum, tc.forsaken)
+			got := planStaleMasterNames(tc.state, tc.desired, tc.quorum, tc.forsaken, false)
 
 			if got.Reason != tc.wantReason {
 				t.Errorf("Reason = %q, want %q (message: %q)", got.Reason, tc.wantReason, got.Message)
@@ -405,9 +405,9 @@ func TestPlanStaleMasterNamesIsDeterministic(t *testing.T) {
 		mon(staleName, ipMaster, "master", ""),
 	)
 
-	first := planStaleMasterNames(s, desiredName, 2, false)
+	first := planStaleMasterNames(s, desiredName, 2, false, false)
 	for range 20 {
-		got := planStaleMasterNames(s, desiredName, 2, false)
+		got := planStaleMasterNames(s, desiredName, 2, false, false)
 		if !reflect.DeepEqual(got, first) {
 			t.Fatalf("a repeated call differs:\n got %+v\nwant %+v", got, first)
 		}

@@ -1111,7 +1111,7 @@ func (r *LittleRedReconciler) reconcileClusterHeadlessService(ctx context.Contex
 // Missing shard StatefulSets are created immediately and in parallel — a fresh bootstrap has
 // no data to protect and no reason to stage pod creation. For an existing shard whose applied
 // pod-template hash differs from desired, the operator rolls that one shard and returns,
-// deferring every later shard until this one has fully settled (clusterShardRolloutSettled).
+// deferring every later shard until this one has fully settled (statefulSetRolloutSettled).
 // This restores the global one-pod-at-a-time serialization that the single pre-0.3.0
 // StatefulSet gave for free; without it, applying a new template to all N shards at once rolls
 // them in parallel and takes every shard's master down in one wave (the availability dip
@@ -1186,7 +1186,7 @@ func (r *LittleRedReconciler) reconcileClusterStatefulSet(ctx context.Context, l
 		// next shard so at most one shard rolls at a time. Deliberately NO apply here: the
 		// partition is stepped down only by advanceClusterRollout, after the gather has
 		// shown the shard to be redundant.
-		if !clusterShardRolloutSettled(existing) {
+		if !statefulSetRolloutSettled(existing) {
 			log.Info("Serialized cluster rollout: waiting for shard to settle before rolling the next",
 				"shard", k, "sts", existing.Name, "partition", partitionValue(plan.Partition))
 			return nil
@@ -1214,7 +1214,7 @@ func desiredClusterShardTemplateHash(lr *littleredv1alpha1.LittleRed, shardIdx i
 // from desired, or the shard has not settled. See the call site for why.
 //
 // Note that the in-flight test is itself taken from the possibly-stale cached object, and
-// that this is sound rather than circular: clusterShardRolloutSettled requires
+// that this is sound rather than circular: statefulSetRolloutSettled requires
 // ObservedGeneration == Generation, and every write that starts or steps a rollout bumps
 // Generation. A cached object that is behind therefore either still carries the OLD
 // template hash (caught by the first clause) or carries the new spec with a status that has
@@ -1225,7 +1225,7 @@ func (r *LittleRedReconciler) refreshShardSTSForRollout(
 	cached *appsv1.StatefulSet, desiredHash string,
 ) (*appsv1.StatefulSet, error) {
 	appliedHash := cached.Spec.Template.Annotations[AnnotationPodSpecHash]
-	if appliedHash == desiredHash && clusterShardRolloutSettled(cached) {
+	if appliedHash == desiredHash && statefulSetRolloutSettled(cached) {
 		return cached, nil
 	}
 	fresh := &appsv1.StatefulSet{}
@@ -1302,7 +1302,7 @@ func (r *LittleRedReconciler) advanceClusterRollout(
 			}
 			return err
 		}
-		if sts.Spec.Template.Annotations[AnnotationPodSpecHash] == desiredHash && clusterShardRolloutSettled(sts) {
+		if sts.Spec.Template.Annotations[AnnotationPodSpecHash] == desiredHash && statefulSetRolloutSettled(sts) {
 			continue // this shard is at rest; look at the next one
 		}
 

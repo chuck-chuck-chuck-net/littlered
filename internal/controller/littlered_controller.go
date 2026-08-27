@@ -887,6 +887,46 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		}
 	}
 
+	// Is our OWN Redis StatefulSet settled? (LR-050)
+	//
+	// This is the one input that separates "an address that is not one of our pods" from
+	// "an address that is not one of our pods ANY MORE". While the StatefulSet is mid-roll
+	// — or simply short of its Ready count — a pod of ours has just left and its address is
+	// still in the air: absent from ValidIPs the instant the pod object goes, and not yet
+	// flagged down by Sentinel for a whole down-after-milliseconds. That reading is
+	// byte-identical to a captor's live master, which is how an ORDINARY rename settled a
+	// false capture verdict and quarantined a healthy instance (design §16: the verdict
+	// fired at T+30 of a 42.5s window, 12.5s before the instance healed itself).
+	//
+	// So while this is false the operator does not ATTRIBUTE addresses: it will not arm a
+	// new capture verdict (planForsaken) and it will not call a stale entry foreign
+	// (Rule N's G5). It is deliberately not a licence to stop working — Rule N still runs,
+	// and an already-armed verdict is neither advanced nor retracted by a roll of our own
+	// making.
+	//
+	// Read UNCACHED, on LR-047's precedent: the dangerous direction is a stale read that
+	// says "settled" while a roll is in flight, and the informer necessarily lags BEHIND —
+	// at t0 of a rename it still holds the previous, settled generation. One GET per
+	// sentinel pass. A StatefulSet we cannot read at all is treated as not settled, which
+	// is the conservative direction for a gate whose only effect is to withhold an
+	// accusation.
+	rollingSts := &appsv1.StatefulSet{}
+	rolling := true
+	switch err := r.apiReader().Get(ctx, types.NamespacedName{
+		Name: statefulSetName(littleRed), Namespace: littleRed.Namespace,
+	}, rollingSts); {
+	case err == nil:
+		rolling = !statefulSetRolloutSettled(rollingSts)
+	case apierrors.IsNotFound(err):
+		// A definitive answer, not an unknown: with no StatefulSet there is no rollout
+		// of ours in flight and nothing to withhold attribution for. (Unreachable on
+		// the normal path — reconcileSentinel applies it well before this function.)
+		rolling = false
+	default:
+		log.V(1).Info("Could not read the Redis StatefulSet uncached; holding address attribution",
+			"error", err.Error())
+	}
+
 	// 2. Gather Cluster State (Ground Truth)
 	g := &operatorGatherer{password: password, tlsEnabled: littleRed.Spec.TLS.Enabled}
 	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, sentinelMasterName)
@@ -905,7 +945,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// rejected. Silence here asserts nothing.
 	forsakenLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
 	now := time.Now()
-	forsakenPlan := planForsaken(state, littleRed.Status.ForsakenSince, now)
+	forsakenPlan := planForsaken(state, littleRed.Status.ForsakenSince, now, rolling)
 
 	// 2c. Quarantine lifecycle (LR-044). A forsaken instance is not merely beyond help,
 	// it is actively harmful: its pods keep replicating from the CAPTOR's master, so the
@@ -1039,7 +1079,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// conservative — reading of "a capture is in evidence": while one is, Rule N stands
 	// down entirely and ADR-016 owns the instance.
 	if err := r.reconcileStaleMasterNames(ctx, littleRed, state, sentinelMasterName,
-		sentinelQuorum(littleRed), password, forsakenPlan.Captured, now); err != nil {
+		sentinelQuorum(littleRed), password, forsakenPlan.Captured, rolling); err != nil {
 		auditLog.Error(err, "failed to reconcile stale Sentinel master names")
 	}
 
@@ -2312,81 +2352,41 @@ func sentinelQuorum(lr *littleredv1alpha1.LittleRed) int {
 	return 2
 }
 
-// staleNamesForeignSuspected is the caller-side fifth reason for the StaleMasterName
-// condition. It is not one of the planner's four (design §8) on purpose: the planner is
-// pure and has no clock, and this reason exists ONLY to hold the Foreign reading below a
-// settling period. It is deliberately neutral — it reports that the operator is waiting,
-// and accuses nobody.
-const staleNamesForeignSuspected = "ForeignSuspected"
-
-// staleMasterNameForeignCooldown is how long the Foreign reading must persist before it
-// is reported as a possible capture. It mirrors forsakenCooldown, and the value is not
-// arbitrary: WP0 measured a just-replaced pod's address reading as "not ours and not
-// flagged down" for up to a full down-after-milliseconds (30s by default), so anything
-// shorter would not close the false-positive window it exists for.
-const staleMasterNameForeignCooldown = forsakenCooldown
-
 // staleNameReport is the caller's half of Rule N's verdict: what to put on the
 // condition, and whether the operator is entitled to raise its voice yet.
 type staleNameReport struct {
 	Status  metav1.ConditionStatus
 	Reason  string
 	Message string
-	// Warn: emit a Warning event on transition. Only ever true for a settled Foreign.
+	// Warn: emit a Warning event on transition. Only ever true for Foreign.
 	Warn bool
-	// ForeignSince is what status.staleMasterNameForeignSince must hold after this
-	// pass: the arming instant while the Foreign reading persists, nil otherwise.
-	ForeignSince *metav1.Time
 }
 
 // planStaleMasterNameReport turns the pure plan into the condition the operator
-// publishes, and owns the ONE thing the planner cannot: the clock.
+// publishes. It is a rendering, not a decision — and it deliberately has no clock.
 //
-// The planner's G5 discriminator — an address that is neither one of our pods nor
+// It USED to (M3): G5's discriminator — an address that is neither one of our pods nor
 // flagged down — is byte-identical to planForsaken clause 3, and WP0 measured that
-// predicate going true during an ORDINARY rename: at t0+89.1s the just-replaced
-// redis-0's address had already left the pod list while Sentinel had not yet flagged
-// it down (down-after-milliseconds, 30s). A just-replaced pod of ours and a captor's
-// master are structurally indistinguishable from Sentinel's vantage.
+// predicate going true during an ORDINARY rename, so `Foreign` was held below a
+// settling period (`ForeignSuspected`, `status.staleMasterNameForeignSince`) to stop the
+// operator warning "this instance may be captured" at the exact moment the owner is
+// performing the rename the runbook asked for.
 //
-// Reported naively, that would fire a Warning reading "this instance may be captured —
-// do not rename to escape a capture" at the exact moment the owner is performing the
-// rename the runbook asked for. Nothing is pruned in that state either way, so this is
-// an observability defect rather than a safety one — but an alarming, wrong warning on
-// the documented happy path is not shippable.
-//
-// So Foreign is held as a SUSPICION until it has persisted, mirroring
-// forsakenSince/forsakenCooldown: below the cooldown the condition says it is waiting
-// and names nothing as a captor, and no event is emitted at all.
-func planStaleMasterNameReport(
-	plan StaleMasterNamePlan, foreignSince *metav1.Time, now time.Time,
-) staleNameReport {
-	switch plan.Reason {
-	case staleNamesConverged:
+// LR-050 removed all three surfaces, because the settle was a MARGIN against a
+// user-settable timer (`spec.sentinel.downAfterMilliseconds`, unbounded) and the gate
+// that replaced it closes the same window at its source: while our own Redis
+// StatefulSet is not settled the planner does not call anything foreign at all, it
+// defers naming the rollout gate. There is nothing left to settle, so an extra status
+// field and a fifth condition reason for a once-in-an-instance-lifetime operation are
+// surface with no job — and the gate covers strictly more, since a departed address of
+// ours only exists in states where the StatefulSet is short of its Ready count.
+func planStaleMasterNameReport(plan StaleMasterNamePlan) staleNameReport {
+	if plan.Reason == staleNamesConverged {
 		return staleNameReport{Status: metav1.ConditionFalse, Reason: plan.Reason, Message: plan.Message}
-	case staleNamesForeign:
-		since := foreignSince
-		if since == nil || since.IsZero() {
-			armed := metav1.NewTime(now)
-			since = &armed
-		}
-		if now.Sub(since.Time) >= staleMasterNameForeignCooldown {
-			return staleNameReport{
-				Status: metav1.ConditionTrue, Reason: staleNamesForeign, Message: plan.Message,
-				Warn: true, ForeignSince: since,
-			}
-		}
-		return staleNameReport{
-			Status: metav1.ConditionTrue, Reason: staleNamesForeignSuspected, ForeignSince: since,
-			Message: fmt.Sprintf("A stale Sentinel master name points at an address that is not "+
-				"currently one of this instance's pods and that Sentinel has not flagged down. A pod "+
-				"the rename has just replaced looks exactly like this until down-after-milliseconds "+
-				"elapses, so the operator waits %s before reading it as anything else. Nothing is "+
-				"pruned in this state either way; the operator log names the entry.",
-				staleMasterNameForeignCooldown),
-		}
-	default:
-		return staleNameReport{Status: metav1.ConditionTrue, Reason: plan.Reason, Message: plan.Message}
+	}
+	return staleNameReport{
+		Status: metav1.ConditionTrue, Reason: plan.Reason, Message: plan.Message,
+		Warn: plan.Reason == staleNamesForeign,
 	}
 }
 
@@ -2404,9 +2404,9 @@ func planStaleMasterNameReport(
 // already broke (R4).
 func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState,
-	desired string, quorum int, password string, forsaken bool, now time.Time,
+	desired string, quorum int, password string, forsaken, rolling bool,
 ) error {
-	plan := planStaleMasterNames(state, desired, quorum, forsaken)
+	plan := planStaleMasterNames(state, desired, quorum, forsaken, rolling)
 	audit := r.getLogger(ctx, lr, LogCategoryAudit)
 
 	skippedAtReconfirm := r.executeStaleMasterNamePrune(ctx, lr, plan, desired, password, audit)
@@ -2419,8 +2419,7 @@ func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	}
 	plan.Message = msg
 
-	return r.setStaleMasterNameCondition(ctx, lr,
-		planStaleMasterNameReport(plan, lr.Status.StaleMasterNameForeignSince, now))
+	return r.setStaleMasterNameCondition(ctx, lr, planStaleMasterNameReport(plan))
 }
 
 // executeStaleMasterNamePrune issues the REMOVEs the plan asks for and returns the pods
@@ -2485,9 +2484,8 @@ func (r *LittleRedReconciler) setStaleMasterNameCondition(
 	ctx context.Context, lr *littleredv1alpha1.LittleRed, rep staleNameReport,
 ) error {
 	prev := meta.FindStatusCondition(lr.Status.Conditions, littleredv1alpha1.ConditionStaleMasterName)
-	sinceUnchanged := timesEqual(lr.Status.StaleMasterNameForeignSince, rep.ForeignSince)
 	if prev != nil && prev.Status == rep.Status && prev.Reason == rep.Reason &&
-		prev.Message == rep.Message && sinceUnchanged {
+		prev.Message == rep.Message {
 		return nil
 	}
 	changed := prev == nil || prev.Reason != rep.Reason
@@ -2497,7 +2495,6 @@ func (r *LittleRedReconciler) setStaleMasterNameCondition(
 		if err := r.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest); err != nil {
 			return err
 		}
-		latest.Status.StaleMasterNameForeignSince = rep.ForeignSince
 		meta.SetStatusCondition(&latest.Status.Conditions, metav1.Condition{
 			Type: littleredv1alpha1.ConditionStaleMasterName, Status: rep.Status,
 			Reason: rep.Reason, Message: rep.Message,
@@ -2510,7 +2507,6 @@ func (r *LittleRedReconciler) setStaleMasterNameCondition(
 		// so without the mirror it silently reverts what we just wrote — the LR-044
 		// defect, which must not be reintroduced.
 		lr.Status.Conditions = latest.Status.Conditions
-		lr.Status.StaleMasterNameForeignSince = latest.Status.StaleMasterNameForeignSince
 		return nil
 	}); err != nil {
 		return err
@@ -2520,18 +2516,6 @@ func (r *LittleRedReconciler) setStaleMasterNameCondition(
 		r.event(lr, corev1.EventTypeWarning, rep.Reason, rep.Message)
 	}
 	return nil
-}
-
-// timesEqual compares two optional timestamps by value, nil included.
-func timesEqual(a, b *metav1.Time) bool {
-	switch {
-	case a == nil && b == nil:
-		return true
-	case a == nil || b == nil:
-		return false
-	default:
-		return a.Equal(b)
-	}
 }
 
 func (r *LittleRedReconciler) setLeaderlessSince(ctx context.Context, lr *littleredv1alpha1.LittleRed, t metav1.Time) error {

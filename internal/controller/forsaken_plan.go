@@ -76,6 +76,42 @@ type forsakenPlan struct {
 // quarantine — the thing that heals both sides. A capture under a stale name is a
 // capture. See the rename design §7.3.
 //
+// The `rolling` parameter is the ONE thing the four clauses cannot see, and without it
+// they are structurally unable to tell "an address that is not one of our pods" from "an
+// address that is not one of our pods ANY MORE" (LR-050). A pod of ours that has just
+// been replaced leaves `ValidIPs` the instant its object goes and is not flagged down for
+// a whole `down-after-milliseconds`, so for that window it is byte-identical to a
+// captor's live master. That is not hypothetical: it quarantined a healthy instance
+// during an ordinary supported rename, at T+30 of a 42.5s window, 12.5s before the
+// instance healed itself.
+//
+// It gates ARMING, in both directions, and the distinction is load-bearing:
+//
+//   - While rolling, a signature observed for the first time is NOT a verdict. There is
+//     no evidence here that distinguishes it from our own churn, so the honest answer is
+//     to hold, not to accuse.
+//   - While rolling, an ALREADY-ARMED verdict is not retracted either — not even if the
+//     signature has momentarily gone. The caller's switch treats "not captured" as
+//     "clear it" (`clearForsaken`), so a naive "return no verdict while rolling" would
+//     make a panicked rename of a genuinely captured instance dissolve the verdict, which
+//     is exactly the §7.3 trap the name-agnostic clauses exist to close, and with it
+//     ADR-016's quarantine — the only thing that heals the CAPTOR.
+//
+// So: a rollout cannot START a capture verdict, and cannot CLEAR one either.
+//
+// It is deliberately not a timer. The alternatives considered were all margins against
+// `spec.sentinel.downAfterMilliseconds`, which is user-settable and unbounded, so no
+// value of `forsakenCooldown` can be correct for every instance. The StatefulSet's own
+// settledness is config-independent and needs no new state — and it covers strictly more
+// than a rename, since a departed address of ours exists only in states where the
+// StatefulSet is short of its Ready count.
+//
+// Accepted hole, stated rather than hidden: a permanently STUCK rollout means the gate
+// never lifts, so a genuine capture arriving in that window goes undetected. The owner
+// accepted it — "we don't fix on operator level if something's broken below". An instance
+// whose roll is stuck is already `Ready=False` and visibly broken, and the quarantine
+// exists to heal the CAPTOR, which it cannot do for an instance that cannot roll.
+//
 // This is a widening of what the clauses observe, and NOTHING else: their intent,
 // order and conservatism are untouched, and every input that produced a verdict on
 // the desired name alone still produces the same one. Two consequences of the wider
@@ -88,8 +124,34 @@ type forsakenPlan struct {
 //     of which named two different LIVE pods), so the widening removes a suspicion
 //     the desired-name view raised on its own rather than adding one.
 func planForsaken(
-	state *redisclient.ReplicationState, since *metav1.Time, now time.Time,
+	state *redisclient.ReplicationState, since *metav1.Time, now time.Time, rolling bool,
 ) forsakenPlan {
+	captured, foreign := forsakenSignature(state)
+
+	armed := since != nil && !since.IsZero()
+	if rolling {
+		// Cannot arm: mid-roll the operator does not attribute addresses. Cannot clear
+		// either: an armed verdict is carried through the roll it triggered, even if
+		// the signature has momentarily gone — ForeignMaster is then empty, which
+		// degrades to the safe direction downstream, where quarantineDataRisk can no
+		// longer explain any pod's keys as the captor's copy and therefore refuses.
+		if !armed {
+			return forsakenPlan{}
+		}
+	} else if !captured {
+		return forsakenPlan{}
+	}
+
+	p := forsakenPlan{Captured: true, ForeignMaster: foreign}
+	if armed && now.Sub(since.Time) >= forsakenCooldown {
+		p.Forsaken = true
+	}
+	return p
+}
+
+// forsakenSignature is the four clauses, unchanged: is the capture signature present in
+// THIS gather, and at which address.
+func forsakenSignature(state *redisclient.ReplicationState) (bool, string) {
 	var foreign string
 	monitoring := 0
 
@@ -104,35 +166,30 @@ func planForsaken(
 		monitoring++
 		for _, m := range observed {
 			if m.IP == "" {
-				return forsakenPlan{}
+				return false, ""
 			}
 			if foreign == "" {
 				foreign = m.IP
 			} else if foreign != m.IP {
-				return forsakenPlan{} // clause 2: no consensus, no verdict
+				return false, "" // clause 2: no consensus, no verdict
 			}
 			// clause 3: alive, and not ours
 			if !state.IsGhost(m.IP) || flaggedDown(m.Flags) {
-				return forsakenPlan{}
+				return false, ""
 			}
 		}
 	}
 	if monitoring == 0 { // clause 1
-		return forsakenPlan{}
+		return false, ""
 	}
 
 	// clause 4
 	for _, rn := range state.RedisNodes {
 		if rn != nil && rn.Reachable && rn.Role == RoleMaster {
-			return forsakenPlan{}
+			return false, ""
 		}
 	}
-
-	p := forsakenPlan{Captured: true, ForeignMaster: foreign}
-	if since != nil && !since.IsZero() && now.Sub(since.Time) >= forsakenCooldown {
-		p.Forsaken = true
-	}
-	return p
+	return true, foreign
 }
 
 // flaggedDown reports whether a Sentinel flags string marks the instance down. Mirrors

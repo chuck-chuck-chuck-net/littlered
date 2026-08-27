@@ -152,7 +152,7 @@ func TestPlanForsaken(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planForsaken(tc.state, tc.since, now)
+			got := planForsaken(tc.state, tc.since, now, false)
 			if got.Captured != tc.wantCaptured {
 				t.Errorf("Captured = %v, want %v", got.Captured, tc.wantCaptured)
 			}
@@ -422,7 +422,7 @@ func TestPlanForsakenIsNameAgnostic(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planForsaken(tc.state, tc.since, now)
+			got := planForsaken(tc.state, tc.since, now, false)
 			if got.Captured != tc.wantCaptured {
 				t.Errorf("Captured = %v, want %v", got.Captured, tc.wantCaptured)
 			}

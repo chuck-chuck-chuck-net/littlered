@@ -26,6 +26,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -342,12 +343,50 @@ var _ = Describe("Rule N: stale Sentinel master names", func() {
 		Expect(inMemory.Reason).To(Equal(staleNamesPruning))
 	})
 
-	It("holds a stale entry pointing elsewhere as a SUSPICION, prunes nothing, and does not accuse", func() {
-		// §9.2, the measured shape: the stale name points at an address that is not one
-		// of our pods and that Sentinel has not flagged down — which is what a pod the
-		// rename has just replaced looks like for a whole down-after-milliseconds. The
-		// operator must not tell the owner their supported field edit looks like a
-		// capture.
+	// setRedisStatefulSet gives the instance a Redis StatefulSet in a chosen state.
+	// LR-050's gate reads exactly this object: while it is not settled the operator
+	// withholds ATTRIBUTION, because a pod it has just replaced is indistinguishable
+	// from a captor's master from Sentinel's vantage.
+	setRedisStatefulSet := func(settled bool) {
+		replicas := int32(3)
+		sts := &appsv1.StatefulSet{
+			ObjectMeta: metav1.ObjectMeta{Name: lr.Name + "-redis", Namespace: lr.Namespace},
+			Spec: appsv1.StatefulSetSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: redisSelectorLabels(lr)},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: redisSelectorLabels(lr)},
+					Spec: corev1.PodSpec{Containers: []corev1.Container{
+						{Name: ComponentRedis, Image: "redis:8"},
+					}},
+				},
+				ServiceName: lr.Name + "-redis",
+			},
+		}
+		Expect(k8sClient.Create(ctx, sts)).To(Succeed())
+		sts.Status = appsv1.StatefulSetStatus{
+			ObservedGeneration: sts.Generation,
+			Replicas:           3,
+			ReadyReplicas:      3,
+			UpdatedReplicas:    3,
+			CurrentRevision:    "rev-1",
+			UpdateRevision:     "rev-1",
+		}
+		if !settled {
+			// Mid-roll: the highest ordinal has been taken down and its replacement is
+			// not Ready yet. This is the state a rename patch produces at t0+0.6s.
+			sts.Status.ReadyReplicas = 2
+			sts.Status.UpdatedReplicas = 1
+			sts.Status.UpdateRevision = "rev-2"
+		}
+		Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+	}
+
+	It("reports a stale entry pointing elsewhere as Foreign on a SETTLED instance, and prunes nothing", func() {
+		// §7.3: the stale name points at an address that is not one of our pods and
+		// that Sentinel has not flagged down. On a settled instance something else is
+		// alive there, so this is the trap the warning exists for.
+		setRedisStatefulSet(true)
 		startSentinels("10.9.9.9")
 
 		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
@@ -361,10 +400,35 @@ var _ = Describe("Rule N: stale Sentinel master names", func() {
 		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
 		c := meta.FindStatusCondition(latest.Status.Conditions, littleredv1alpha1.ConditionStaleMasterName)
 		Expect(c).NotTo(BeNil())
-		Expect(c.Reason).To(Equal(staleNamesForeignSuspected),
-			"below the settle this is a suspicion, not a verdict")
+		Expect(c.Reason).To(Equal(staleNamesForeign))
+		Expect(c.Message).To(ContainSubstring("may be captured"))
+		Expect(drainMasterNameEvents(recorder)).NotTo(BeEmpty(),
+			"a settled Foreign reading must be reported once, loudly")
+	})
+
+	It("holds the SAME reading as unattributable while our own StatefulSet is rolling, and does not accuse", func() {
+		// LR-050 / §9.2, the measured shape: mid-rename the just-replaced pod's address
+		// has already left the pod list while Sentinel has not yet flagged it down. The
+		// operator must not tell the owner their supported field edit looks like a
+		// capture — and it must not raise its voice at all.
+		setRedisStatefulSet(false)
+		startSentinels("10.9.9.9")
+
+		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
+
+		for i, s := range sentinels {
+			Expect(s.removals()).To(BeEmpty(), "sentinel-%d: an unattributable entry is never pruned", i)
+			Expect(s.monitored()).To(ConsistOf(desired, stale), "sentinel-%d", i)
+		}
+
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		c := meta.FindStatusCondition(latest.Status.Conditions, littleredv1alpha1.ConditionStaleMasterName)
+		Expect(c).NotTo(BeNil())
+		Expect(c.Reason).To(Equal(staleNamesDeferred),
+			"mid-rollout an address of ours in the air is unattributable, not foreign")
+		Expect(c.Message).To(ContainSubstring("mid-rollout"))
 		Expect(c.Message).NotTo(ContainSubstring("may be captured"))
-		Expect(latest.Status.StaleMasterNameForeignSince).NotTo(BeNil(), "the settle must be armed")
 
 		// No event at all, let alone a Warning — on either pass.
 		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())

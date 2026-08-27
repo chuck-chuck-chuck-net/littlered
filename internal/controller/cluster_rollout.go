@@ -42,15 +42,25 @@ func gtNode(gt *redisclient.ClusterGroundTruth, podName string) *redisclient.Clu
 	return gt.Nodes[podName]
 }
 
-// clusterShardRolloutSettled reports whether a shard StatefulSet has fully converged on its
-// desired pod template: the controller has observed the latest spec (ObservedGeneration ==
+// statefulSetRolloutSettled reports whether a StatefulSet has fully converged on its desired
+// pod template: the controller has observed the latest spec (ObservedGeneration ==
 // Generation), no rollout is in progress (UpdateRevision == CurrentRevision), and every
-// replica is updated and ready. The operator uses this to serialize rollouts across shards
-// (LR-021): it only rolls the next shard once the current one is settled, so an
-// operator-driven template change never restarts more than one shard's pods at a time —
-// restoring the global one-pod-at-a-time serialization the single pre-0.3.0 StatefulSet gave
-// for free.
-func clusterShardRolloutSettled(sts *appsv1.StatefulSet) bool {
+// replica is updated and ready.
+//
+// Cluster mode uses it to serialize rollouts across shards (LR-021): it only rolls the next
+// shard once the current one is settled, so an operator-driven template change never restarts
+// more than one shard's pods at a time — restoring the global one-pod-at-a-time serialization
+// the single pre-0.3.0 StatefulSet gave for free.
+//
+// Sentinel mode uses the same predicate for a different question (LR-050): while our own
+// Redis StatefulSet is not settled, the operator does not ATTRIBUTE addresses, because that
+// is precisely the window in which an address that is no longer one of our pods may be a pod
+// of ours that has just left. Note that it is deliberately broader than "a template rollout
+// is in flight": a deleted, crash-looping or merely not-yet-Ready pod also fails the replica
+// clauses, and those are the same states in which a departed address of ours is in the air.
+// It is NOT mode-specific — hence the mode-neutral name; it was `statefulSetRolloutSettled`
+// until sentinel mode needed it, and a second copy would have been the LR-045 mistake.
+func statefulSetRolloutSettled(sts *appsv1.StatefulSet) bool {
 	if sts == nil || sts.Spec.Replicas == nil {
 		return false
 	}
@@ -245,7 +255,7 @@ func (in shardRolloutInput) currentPartition() int {
 //     and the data is intact; a stalled rollout is availability-safe where a time-released one
 //     is the lossy path this seam removes. There is deliberately no timer fallback — one would
 //     be the current defect with a longer timer.
-//   - **Complete** when the shard has settled (`clusterShardRolloutSettled`'s proposition,
+//   - **Complete** when the shard has settled (`statefulSetRolloutSettled`'s proposition,
 //     computed here from the same facts): partition 0, nothing left to gate. Checked BEFORE the
 //     clauses, because a settled shard's own master owns the slots and so is nobody's replica —
 //     evaluating clause (c) against it would report a healthy shard as stuck.

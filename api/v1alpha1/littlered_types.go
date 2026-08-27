@@ -711,11 +711,12 @@ const (
 	// actually wrong. The reason says what the operator is doing about it: `Pruning`
 	// (stale names observed and being removed, message names them and any Sentinel
 	// skipped because it does not carry the desired name yet), `Deferred` (observed, but
-	// a gate refuses — the message names WHICH gate), `ForeignSuspected` (a stale entry
-	// points at an address that is not one of our pods and is not flagged down, which a
-	// just-replaced pod also looks like mid-rename; held as a suspicion while it
-	// settles), and `Foreign` (that state has persisted, so it is reported as a possible
-	// capture — do NOT rename to escape a capture; let the quarantine complete first).
+	// a gate refuses — the message names WHICH gate, including the LR-050 rollout gate
+	// that withholds attribution while our own Redis StatefulSet is not settled), and
+	// `Foreign` (a stale entry points at an address that is neither one of our pods nor
+	// flagged down, on a SETTLED instance — so something else is alive there and this
+	// instance may be captured; do NOT rename to escape a capture, let the quarantine
+	// complete first).
 	ConditionStaleMasterName = "StaleMasterName"
 
 	// ConditionFailoverRecovery reflects a failover-mode no-master state and the
@@ -820,21 +821,6 @@ type LittleRedStatus struct {
 	// merely because the capture signature stopped being observable.
 	// +optional
 	QuarantineAttempts int32 `json:"quarantineAttempts,omitempty"`
-
-	// StaleMasterNameForeignSince records when the operator first observed a stale
-	// Sentinel master-name entry pointing at an address that is neither one of this
-	// instance's pods nor flagged down (see ConditionStaleMasterName).
-	//
-	// It exists only to hold that reading below a settling period, and the reason is
-	// measured rather than theoretical: during an ORDINARY rename a just-replaced pod's
-	// address is already out of the pod list while Sentinel has not yet flagged it down
-	// (down-after-milliseconds, 30s by default), which is byte-identical to a captor's
-	// live master. Without the settle the operator would warn "this instance may be
-	// captured" at the exact moment the owner is performing the rename the runbook asked
-	// for. Nothing is ever pruned in that state either way — this is an observability
-	// timer, like ForsakenSince.
-	// +optional
-	StaleMasterNameForeignSince *metav1.Time `json:"staleMasterNameForeignSince,omitempty"`
 
 	// ObservedGeneration is the last observed generation
 	// +optional
