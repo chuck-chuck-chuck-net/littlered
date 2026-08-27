@@ -1186,7 +1186,15 @@ condition at any 0.5s sample, no `forsakenSince`, no `quarantinedSince`, no pod 
 `StaleMasterName` never reached `Foreign`.** With data: **500 of 500 keys present** on the new
 master, exactly one monitored name on all three Sentinels. See changelog LR-050.
 
-**Status:** the design's §16 blocker is cleared; the K9 e2e guard is the regression guard.
+**The three M5b tiers are green on t3e** (`Sentinel Master Name Rename`, operator `6f20511`):
+`SUCCESS! -- 3 Passed | 0 Failed`, 871s — including tier 2, whose whole point is that the capture
+verdict **survives** a panicked rename and the quarantine still fires. `expectNeverForsaken` was
+not weakened; it is now green with the assertion doing work. One earlier run's tier 1 failed on its
+post-rollout `Consistently(30s, phase == Running)` reading `Initializing` 5.2s in — the §7.1b CR
+flap the tier's own comment anticipates, racing its `Eventually`/`Consistently` boundary; not the
+K9 assertion, and unrelated to the gate (tier 1 never arms a verdict).
+
+**Status:** the §16 blocker is cleared; the K9 e2e guard is the regression guard.
 
 ---
 

@@ -1815,6 +1815,21 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   (`.spec.replicas` 3/3 on both StatefulSets throughout). `StaleMasterName` never reached `Foreign`.
   Convergence: exactly one monitored name on all three Sentinels (`m8diag.m8a` / `m8diag.m8b`),
   `Running`/`Ready=True`, and the exact sweep on the new master returned **`present=500 missing=0`**.
+- **e2e (`Sentinel Master Name Rename`, t3e, operator `6f20511`), the three tiers M5b added — and the
+  K9 guard they carry is the deliverable.** `expectNeverForsaken` sits in tiers 1 and 3, was
+  legitimately **red against the pre-fix HEAD**, and was not weakened: both tiers now pass with it
+  asserting. Tier 2 (`Under Capture`) is the invariant's own guard — it requires the verdict to
+  **survive** a panicked rename and the quarantine to fire anyway — and it is what caught the
+  over-strong first reading above. Across the runs: **tier 2 green** (334.5s, after the correction),
+  **tier 3 green** twice, **tier 1 green** on its first run. Tier 1 failed once on its post-rollout
+  `Consistently(30s, phase == Running)` — 5.2s in, reading `Initializing`. That is the CR flap §7.1b
+  documents and the tier's own comment anticipates (*"the CR legitimately flaps Running →
+  Initializing → Running several times on the way"*), racing the boundary between the tier's
+  `Eventually` and its `Consistently`; it is **not** the K9 assertion and is unrelated to this change
+  (tier 1 never arms a verdict, so the gate's only branch it reaches is byte-identical to the old
+  behaviour), and a clean re-run of all three on the same build was **`SUCCESS! -- 3 Passed | 0
+  Failed`** in 871s. Reported as a test-tightness flake rather than fixed here — `test/e2e` was out of
+  this change's ownership.
 - **The invariant was exercised live, and not by design — the capture e2e tier depends on it.** In
   `Sentinel Master Name Rename Under Capture` the victim's `pinned` pod is pre-armed with a bogus
   `masterauth`, so once the capture lands that pod can never resync, its readiness (`link:up`) fails and
