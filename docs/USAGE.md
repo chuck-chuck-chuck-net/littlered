@@ -382,11 +382,116 @@ kubectl get littlered store -o jsonpath='{.status.conditions[?(@.type=="Sentinel
 
 Setting the field is a **client-visible change** — Sentinel-aware clients must be reconfigured
 in the same maintenance window; clients using the label-routed `{name}` Service are unaffected.
-There is no rolling cutover: monitoring one master under two names runs two independent failover
-state machines that can promote different replicas. Since a coordinated client reconfiguration
-is required anyway, enable authentication in the same window rather than paying for two
-outages. Setting `masterName: mymaster` explicitly is accepted (a legacy client may hardcode it)
-and silences the warning without changing behaviour or requiring any client change.
+There is **no dual-name overlap for clients**, and there never will be: monitoring one master under
+two names runs two independent failover state machines that can promote different replicas. The
+cutover is therefore a maintenance window, not a rolling change. Setting `masterName: mymaster`
+explicitly is accepted (a legacy client may hardcode it) and silences the warning without changing
+behaviour or requiring any client change.
+
+**The edit itself is supported and the operator drives it** — see the runbook below. Do **not**
+combine it with enabling or rotating authentication: one variable per window. (Earlier guidance
+suggested pairing them, because the auth change happens to roll the Sentinel StatefulSet and so
+wiped the leftover master name as a side effect. The operator now removes it properly, so that
+coincidence is no longer load-bearing.)
+
+### Renaming the Sentinel master name in place
+
+Editing `spec.sentinel.masterName` on a healthy sentinel instance is a supported operation. The
+operator re-points its Sentinels at the new name, **removes the old one**, and rolls the Redis pods
+so their startup scripts and preStop hooks carry the new name. **The dataset is preserved.**
+
+**Preconditions.** `Phase: Running`, `Ready=True`, all Redis and Sentinel pods ready; no failover in
+flight; the instance is **not** `Forsaken`; a maintenance window with **clients stopped**; and a
+stable platform (no drains, no node maintenance). Renaming under concurrent disruption is not
+supported — the ordinary healing rules still apply, but the rename makes no guarantee there.
+
+1. Note the current name.
+
+   ```bash
+   kubectl get littlered store -o jsonpath='{.spec.sentinel.masterName}'
+   ```
+
+2. Confirm health. `lrctl verify` must report exactly one monitored name and no foreign contact.
+
+   ```bash
+   lrctl status store -n apps
+   lrctl verify store -n apps
+   ```
+
+3. **Stop the Sentinel-aware clients.** (Clients that use the label-routed `{name}` Service do not
+   carry the name, but the window includes a master failover, so they will see a gap either way.)
+
+4. Patch the field.
+
+   ```bash
+   kubectl patch littlered store --type=merge \
+     -p '{"spec":{"sentinel":{"masterName":"apps.store"}}}'
+   ```
+
+5. **Within seconds**, check that every Sentinel monitors **only** the new name:
+
+   ```bash
+   lrctl verify store -n apps
+   # Sentinel Identity:
+   #   Master name: apps.store
+   #   Monitored master names (every name each Sentinel carries):
+   #     - store-sentinel-0: "apps.store" at 10.233.66.107, flags:master  (desired)
+   #     ...
+   #   [OK] Every reachable Sentinel monitors only "apps.store".
+   ```
+
+   `verify` reports **every** name each Sentinel carries and fails on any name other than the CR's —
+   see the `Sentinel Identity` section of [LRCTL.md](LRCTL.md). Before that check existed, a
+   single-name query answered "healthy" for an instance quietly carrying two names, so this step was
+   not implementable. If the old name is still listed, read the `StaleMasterName` condition: its
+   message names the gate that refused, and any Sentinel it skipped.
+
+   ```bash
+   kubectl get littlered store -o jsonpath='{range .status.conditions[?(@.type=="StaleMasterName")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+   ```
+
+6. Wait for the Redis rollout. Measured end to end: the old name is removed **~1.4s** after the
+   patch, and the instance settles at `Running`/`Ready=True` about **3 minutes** later, plus roughly
+   **30s** at the master's own replacement (see below). The CR legitimately flaps
+   `Running → Initializing → Running` on the way.
+
+   ```bash
+   kubectl get pods -w
+   kubectl get littlered store -w
+   ```
+
+7. Verify the data — your own key check, plus `lrctl verify store -n apps`.
+
+8. Reconfigure the Sentinel-aware clients with the new master name and start them.
+
+**What you will see, and it is expected.** The master pod's preStop hook is baked into its container
+spec with the *old* name, so while it is being replaced it cannot hand over proactively: its
+`SENTINEL failover <old>` fails with `ERR No such master with that name`, and Sentinel elects a
+successor only after `down-after-milliseconds` (30s by default). With writes quiesced this costs
+availability, not data. Removing this entirely means taking the name out of the pod spec altogether,
+which is deferred (ADR-018, Alternative D).
+
+**If the instance is not healthy when you rename it**, the operator refuses rather than acting: with
+no master of its own it cannot register the new name, Rule N defers naming its gate, and the Redis
+pods roll into a wait-loop. The instance then presents the leaderless signature, and the leaderless
+recovery is the safety net — with **two or more pods holding data it refuses** and waits for a human
+(`sentinel.allowUnsafeRebootstrapOnDeadlock`). Meet the preconditions.
+
+**If the instance is captured (`Forsaken`), do NOT rename it to escape the capture.** The remedy
+order is **capture → let the quarantine finish → then rename.** A quarantined instance has no
+Sentinel pods, so there is nothing to prune; after release it re-bootstraps empty with every Sentinel
+bare, and the rename is then trivial. Renaming a captured instance is refused with
+`StaleMasterName=True/Foreign` and a `Warning` event — and the capture verdict deliberately survives
+the rename, so the quarantine still heals both sides. See *"Recovering a sentinel instance captured
+by another Sentinel deployment"* below.
+
+**Escape hatch** if a stale entry somehow survives (for example the operator was down for the whole
+window): `kubectl rollout restart statefulset/store-sentinel`. Sentinel's `/data` is an EmptyDir, so
+the pods come back carrying nothing and the operator registers only the desired name. Expect a short
+window with no monitoring at all.
+
+**Do not:** rename a degraded instance; rename to escape an active capture; rename and change the
+password in the same window.
 
 ### Verify
 
@@ -464,7 +569,8 @@ kubectl get littlered store -o jsonpath='{.spec.sentinel.masterName}'
 ```
 
 Changing `masterName` later requires reconfiguring these clients in the same window; there is
-no overlap period during which both names resolve.
+no overlap period during which both names resolve. The operator supports the edit in place and
+preserves the dataset — see *"Renaming the Sentinel master name in place"* above.
 
 For simple clients (connects to current master):
 
@@ -1627,7 +1733,11 @@ kubectl scale -n littlered-system deployment/littlered-operator --replicas=1
 ```
 
 **Then fix the cause**, or it recurs on the next pod-IP recycle: give the instance a unique
-`masterName` and enable authentication with a password not shared with the neighbouring instance.
+`masterName` and enable authentication with a password not shared with the neighbouring instance —
+in **separate** windows, and with the rename following the runbook in *"Renaming the Sentinel master
+name in place"* above. Do not rename *to escape* an active capture: the operator refuses the prune
+(`StaleMasterName=True/Foreign`), and the safe order is **let the quarantine finish, then rename the
+empty instance**.
 
 ### When a cluster rollout is held (`ClusterRolloutBlocked`)
 

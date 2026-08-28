@@ -60,7 +60,10 @@ graph TD
         DetermineRM --> Rule0
 
         Rule0["Rule 0: Re-register bare sentinels<br/><i>Sentinel reachable but not monitoring</i><br/><i>→ SENTINEL MONITOR + SET</i>"]
-        Rule0 --> RuleA
+        Rule0 --> RuleN
+
+        RuleN["Rule N: Prune stale master names<br/><i>Any name monitored that is not the desired one</i><br/><i>→ SENTINEL REMOVE (gated)</i>"]
+        RuleN --> RuleA
 
         RuleA{"Rule A: Guardrails<br/>Any terminating pods?<br/>Failover active?"}
         RuleA -- Yes --> SkipAll["Skip all healing<br/><i>Let Sentinel/K8s finish</i>"]
@@ -101,7 +104,13 @@ for ~146 s on a managed cloud, starving the recovery rules of the loop iteration
 | Source | Data Collected |
 |--------|---------------|
 | Each Redis pod (`INFO replication`) | Role, MasterHost, LinkStatus, Offset, Reachable |
-| Each Sentinel pod (`SENTINEL MASTER`, `SENTINEL REPLICAS`) | MasterIP, FailoverStatus, Monitoring, Reachable, Replica list |
+| Each Sentinel pod (`SENTINEL MASTER`, `SENTINEL REPLICAS`, `SENTINEL MASTERS`) | MasterIP, FailoverStatus, Monitoring, Reachable, Replica list, **MonitoredMasters** (every name that Sentinel carries, with its address and flags — LR-048) |
+
+`SENTINEL MASTERS` is one extra bounded round trip per Sentinel per pass, paid **unconditionally**
+rather than only when a Sentinel reads bare: a Sentinel carrying *both* a leftover name and the
+desired one answers `Monitoring: true`, so a bareness-triggered probe would never see the two-name
+state — which is exactly the state a half-finished rename leaves behind. A failed read degrades to
+an **empty list**, never to `Reachable: false` (LR-041), so emptiness is not evidence of absence.
 
 ### DetermineRealMaster Algorithm
 
@@ -142,6 +151,72 @@ The **ghost-majority guard** (LR-004) is critical: if most sentinels still point
 **Action**: `SENTINEL MONITOR <masterName> <RealMasterIP>` + apply all settings (auth-pass, down-after, failover-timeout, parallel-syncs) directly to that pod's IP.
 
 **Safety**: Always safe — adding a monitor to an unconfigured sentinel is non-disruptive.
+
+### Rule N: Stale Master-Name Pruning (LR-048, ADR-018)
+
+**Trigger**: a reachable Sentinel monitors any master name other than `spec.sentinel.masterName`.
+
+**Cause**: Sentinel persists every `sentinel monitor <name> …` it is given, and nothing used to take
+one away. Editing `masterName` registered the new name (via Rule 0, which sees the quorum read bare
+for a name it does not know) and left the old one in place **forever** — one master under two names,
+two config epochs, two independent failover state machines over the same three pods. The master's
+baked stale-name preStop then fired a real `SENTINEL failover <old>` into it. This is LR-039's named
+hazard, reached from a supported field edit on a healthy instance.
+
+**Action**: `SENTINEL REMOVE <staleName>` per Sentinel, per stale name, decided by the pure
+`planStaleMasterNames`. Nothing is remembered — no previous name, no phase, no cursor: anything
+monitored that is not the desired name is stale by definition, which is also why this repairs an
+instance a *previous* botched rename (or a hand-issued `MONITOR`) already broke.
+
+**Position: after Rule 0, and deliberately BEFORE Rule A.**
+
+- *After Rule 0*, so the desired name is already registered on a bare Sentinel **in the same pass**.
+  That is what makes the two-name window intra-pass rather than multi-pass, and what makes the
+  prune's own precondition (G6) pass on the first attempt. A Sentinel is never left bare on purpose.
+- *Before Rule A*, i.e. it runs while `anyTerminating` is true. This is the opposite of the LR-040
+  defect and is chosen, not inherited: a rename rewrites the Redis pod template, so a pod is
+  terminating from the moment of the edit, and **the churn Rule A sits out is exactly when a rename
+  is in flight**. Gating on `!anyTerminating` would hold the two-name window open for the whole
+  multi-minute roll — the one window in which `redis-0`'s stale-name preStop fires a real failover
+  under the old name (measured: 56.6s of two names naming two different live pods as master).
+- *LR-040's actual lesson therefore applies in full*: an action that runs during churn **must be
+  bounded**. Every call Rule N makes (`Masters`, `IsMonitoring`, `Remove`) goes through
+  `newBoundedClient` — all three of `Dial`/`Read`/`WriteTimeout` at `ProbeTimeout` — **and** carries
+  a per-call context deadline. A context alone is inert against go-redis (LR-040's 5.02s → 5.00s).
+
+**Gates** — `REMOVE` is destructive and this predicate is the only thing aiming it, so nearly all of
+the value is in the refusals. Every one must hold:
+
+| # | Gate | Which incident |
+|---|---|---|
+| G0 | A capture is **in evidence** (`planForsaken`'s `Captured`, computed once per pass and passed in) stands the whole rule down: reason `Foreign`, prune nothing | fed `Captured` and not `Forsaken`, because a *settled* `Forsaken` returns from the switch long before this line — `Forsaken` would be a structurally dead gate |
+| G1 | `desired != ""` | LR-041: with an empty desired name **every** name reads as stale, so the failure mode is "prune everything" |
+| G2 | a living, reachable master of **ours** — `RealMasterIP` set, in `ValidIPs`, and its own Redis view reporting a reachable master | LR-008's gate reused; pruning without it manufactures LR-015's leaderless deadlock. All three clauses: `RealMasterIP != ""` alone is not the gate |
+| G3 | no monitored master, **under any name**, reports an in-flight failover | a failover under the stale name is still a real state machine reconfiguring our pods |
+| G4 | reachable Sentinels ≥ quorum | do not operate on a minority |
+| G5 | every stale entry's address is one of our pods **or** is flagged down; else `Foreign` — **unless our own Redis StatefulSet is mid-rollout, in which case `Deferred`** | the capture trap. Byte-identical to `planForsaken` clause 3 (and to `lrctl`'s copy, pinned by a parity test). The rollout clause is LR-050 |
+| G6 | per Sentinel, the desired name is present on **that** Sentinel; else skip it and **name it in the condition message** | LR-024's `electMaster` shape. The caller re-confirms with a bounded `IsMonitoring` immediately before each `REMOVE`, because the plan's view is a gather already milliseconds old |
+
+Deliberately **not** gates: `!anyTerminating` (above) and `Phase == Running` (the phase is written at
+the tail of the pass and lags by one — LR-044's M4b finding; gate on the state, not on the phase).
+G5 is evaluated *before* G2/G3/G4 although it is numbered after them: the capture trap fails G2 too,
+so numeric order would report the generic *"no living master of ours"* and never the `Foreign`
+diagnosis, in precisely the case the diagnosis exists for. Both prune nothing; only the sentence
+changes.
+
+**What Rule N must NOT do** (LR-007/LR-008/LR-013/LR-024): no `SENTINEL RESET` — it does not remove a
+master entry and wiping the replica list is the known hazard; and no `REMOVE` of the **desired**
+name — re-pointing that at a different address is LR-005/LR-008's job and stays there.
+
+**Reported** on the `StaleMasterName` condition (`Converged` / `Pruning` / `Deferred` / `Foreign`;
+`True` is bad), written only when something changed, one event per transition, a `Warning` only for
+`Foreign`. The condition is mirrored onto the in-memory object after a successful update, because
+`updateSentinelStatus` runs later in the same pass and would otherwise revert it (LR-044's bug).
+
+**Not gated on `sn.Monitoring`, and that is load-bearing**: at pass 1 of a rename every Sentinel
+reads `Monitoring:false, Reachable:true` — the single-name probe asks about the *new* name — while
+still carrying the old entry. Gating on `Monitoring` would make Rule N inert on exactly the pass it
+must act.
 
 ### Rule A: Guardrails
 
@@ -251,7 +326,10 @@ rather than adding to it. It applies to an instance **captured** by another Sent
 sharing its master name (ADR-015, LR-039), which is unrecoverable by design.
 
 **Verdict** (`planForsaken`, pure). All four clauses must hold, plus a 30s `forsakenCooldown`
-tracked in `status.forsakenSince`:
+tracked in `status.forsakenSince`. They range over **every** `(address, flags)` a reachable Sentinel
+monitors under **any** name, not only the desired one (LR-048): a capture under a *stale* name is
+still a capture, and scoping the verdict to the desired name made it evaporate the moment an owner
+renamed a captured instance — taking the quarantine with it:
 1. At least one reachable, **monitoring** Sentinel (bare Sentinels are Rule L's business).
 2. Every reachable monitoring Sentinel agrees on ONE master address (disagreement is a
    transition, and transitions are not verdicts).
@@ -261,6 +339,16 @@ tracked in `status.forsakenSince`:
 
 Conservative in one direction on purpose: a false positive parks a live instance, a false negative
 merely leaves the previous behaviour.
+
+**Plus one input that is not a clause (LR-050): while our own Redis StatefulSet is not settled, the
+operator does not ATTRIBUTE addresses at all** — neither here nor at Rule N's G5. A pod of ours that
+has just been replaced has left `ValidIPs` and has not yet reached `s_down`, which is byte-identical
+to a captor's live master; an ordinary rename presented the whole signature for a measured 42.5s
+against the 30s cooldown and quarantined a healthy instance. The predicate is LR-021's
+`statefulSetRolloutSettled`, read **uncached**, passed into both planners in-signature. **The gate
+suppresses ARMING and nothing else**: a rollout cannot *start* a verdict, and it never *clears* one
+either — the ordinary clauses still clear on ordinary evidence, which is what the quarantine's
+self-clearing lifecycle depends on.
 
 **Effect of the verdict**: the operator returns **before Rule 0**, so no rule fights a battle
 ADR-015 §9.2 proved unwinnable; it logs once per transition; and it requeues at the **steady**
@@ -342,6 +430,14 @@ The sentinel-mode Redis pre-stop hook ensures graceful shutdown:
    d. Waits (up to 10s) for Sentinel to confirm a different master
 3. If replica: simply shuts down (Sentinel will detect and update its replica list)
 
+**The name in the hook is baked into the container spec**, so during a master-name rename the pod
+being replaced still carries the *old* one. Once Rule N has pruned that entry, its
+`SENTINEL FAILOVER <old>` fails with `ERR No such master with that name` and there is no proactive
+handover: the new name's quorum waits out `down-after-milliseconds` (30s by default) before
+electing. Expected, documented, and harmless with writes quiesced — a rename is a maintenance
+window. Closing it for good means taking the name out of the pod spec altogether (a mounted file
+re-read at start and stop), which is deferred: ADR-018 Alternative D.
+
 ---
 
 ## Status Determination
@@ -363,5 +459,6 @@ This prevents premature "Running" status before Sentinel has fully discovered th
 - [ADR-005: Leaderless Bootstrap-Deadlock Recovery](adr/005-leaderless-bootstrap-recovery.md)
 - [ADR-015: Per-Instance Sentinel Master Name](adr/015-per-instance-sentinel-master-name.md)
 - [ADR-016: Forsaken-Gated Quarantine](adr/016-forsaken-gated-quarantine.md)
+- [ADR-018: In-Place Sentinel Master-Name Rename](adr/018-sentinel-master-name-rename.md) — Rule N
 - [Reconciliation Algorithm Changelog](RECONCILIATION_ALGORITHM_CHANGELOG.md)
 - [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md) — high-level view

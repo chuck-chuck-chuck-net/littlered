@@ -1,10 +1,15 @@
 # In-Place Sentinel Master-Name Rename — Design & Implementation Brief
 
-**Status:** design, not implemented. Written to be driven by an orchestrating agent that
-fans the work out to sub-agents.
-**Prospective ADR:** ADR-017 (next free; `docs/adr/` ends at 016).
-**Prospective changelog ID:** **LR-048** (LR-047 is taken on `fix/cluster-rollout-state-gate`
-— re-check with the LR-039 loop before writing the entry).
+**Status: IMPLEMENTED and e2e-verified** (branch `feat/sentinel-master-name-rename`). This document
+is now a **history, not a spec**: it was amended roughly ten times as milestones landed, so it
+records the design *and* how measurement corrected it. **Where sections contradict each other across
+amendments, the LATER section wins** — the two known cases are flagged in place (§9.2, superseded by
+§16.1; §12, superseded by the shipped runbook in `docs/USAGE.md`). The permanent record is **ADR-018**
+and changelog **LR-048**; read those first and this one only for the reasoning behind them.
+**ADR:** **ADR-018**, not 017. 017 was reserved here when `docs/adr/` ended at 016 and was taken in
+the meantime by *State-Gated Intra-Shard Rolling Updates* (LR-047), already merged into `e2e-0821`.
+**Changelog ID:** **LR-048** — allocated, written. LR-049 (bounded primitives) and **LR-050 (the
+rollout attribution gate, a PREREQUISITE — see §16.1)** landed on the same branch.
 **Naming note:** this operation is a **rename**, never a "migration" — in this project a
 migration moves data (ADR-013), and this moves none. The word is avoided throughout, including
 in the condition name (§8).
@@ -709,7 +714,15 @@ implemented as if `!state.FailoverActive` were not there — which it effectivel
 9. **The condition write is suppressed when nothing changed** (M3) — otherwise every healthy
    sentinel instance takes a status write every 2s.
 
-### 9.2 ⚠ G5 fires a FALSE `Foreign` during a normal rename — the caller must settle it
+### 9.2 ⚠ SUPERSEDED BY §16.1 — G5 fires a FALSE `Foreign` during a normal rename
+
+> **This section is kept for its diagnosis, which is correct and load-bearing, and its REMEDY is
+> obsolete.** M3 implemented the settling period below (`ForeignSuspected`,
+> `staleMasterNameForeignCooldown`, `status.staleMasterNameForeignSince`); **LR-050 deleted all
+> three** and closed the window at its source with the rollout attribution gate. Mid-rollout the
+> reading is now `Deferred` naming that gate — no accusation, no `Warning`, and, unchanged, no
+> prune. See §16.1 and §9.1 items 7/8. Read the rest of this section as the analysis that led there.
+
 
 Found in review by reading M2's G5 against WP0's measurements. **The planner is correct as a
 pure function; the defect is that §8 makes `Foreign` emit a `Warning`, and §9 gave the caller no
@@ -979,7 +992,15 @@ real numbers (LR-044's M4a precedent).
 
 ---
 
-## 12. Runbook (goes into `docs/USAGE.md`)
+## 12. Runbook (SHIPPED — the authoritative copy is now `docs/USAGE.md`)
+
+> **Superseded in two places by what was measured.** (a) Step 6's *"~4-6 min"* is wrong: §7.1a
+> measured the settled `Running`/`Ready=True` at **+176.8s (2m57s)**, plus **~30s** at the `redis-0`
+> edge post-fix. (b) Step 5's *"requires WP5"* caveat is discharged — `lrctl verify` reports every
+> monitored name and fails on a stale one as of `f6cae73`; see `docs/LRCTL.md`. The shipped runbook
+> in `docs/USAGE.md` (*"Renaming the Sentinel master name in place"*) carries the corrected numbers
+> and is the copy to maintain. This one is left as the draft it was.
+
 
 **Preconditions.** `Phase: Running`, `Ready=True`, all pods ready; no failover in flight; the
 instance is **not** `Forsaken` (if it is, let the quarantine complete first — it returns the

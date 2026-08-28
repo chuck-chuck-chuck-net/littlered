@@ -409,9 +409,21 @@ condition. They are only forced to state a name on their next change to `spec.se
 Setting `masterName: mymaster` explicitly is accepted — a legacy client may hardcode it — and
 silences the warning without changing behaviour. **Changing the value is client-visible:**
 Sentinel-aware clients must be reconfigured in the same maintenance window (clients using the
-label-routed `{name}` Service are unaffected), and there is no rolling cutover — monitoring one
-master under two names runs two independent failover state machines that can promote different
-replicas.
+label-routed `{name}` Service are unaffected), and there is no dual-name overlap for clients —
+monitoring one master under two names runs two independent failover state machines that can promote
+different replicas.
+
+**The field is mutable, and an edit is a supported in-place rename** (ADR-018, LR-048). It triggers,
+in one pass: the Redis StatefulSet is re-applied (the name is baked into the pods' startup script
+and preStop hook, so they roll in reverse-ordinal order, master last); the operator registers the
+new name on every Sentinel; and **Rule N removes every other name those Sentinels carry**, reporting
+what it did — or which gate refused — on the `StaleMasterName` condition (§3.1). The dataset is
+preserved. Measured convergence: the old name is gone ~1.4s after the patch, the instance settles
+about 3 minutes later, plus ~30s at the master's own replacement. Preconditions and the full
+procedure are in the `USAGE.md` runbook *"Renaming the Sentinel master name in place"*; the two that
+matter most are that the instance must be **healthy** (a degraded rename can wedge on the leaderless
+recovery's ≥2-holder refusal) and must **not** be `Forsaken` (let the quarantine finish first, then
+rename the empty instance).
 
 ### 2.12 Failover-Specific Configuration (Experimental)
 
