@@ -21,6 +21,7 @@ package e2e
 
 import (
 	"fmt"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -1300,19 +1301,36 @@ spec:
 			g.Expect(strings.TrimSpace(own)).To(Equal("vv1"))
 		}, 60*time.Second, 5*time.Second).Should(Succeed())
 
-		By("StaleMasterName reports the Foreign family — Rule N stood down, it did not converge")
-		// Read once rather than in the window above, and deliberately not
-		// over-claimed: G0 is fed the capture verdict, so Rule N stands down on ANY
-		// capture in evidence — the condition can therefore have been armed by the
-		// suspicion window BEFORE the rename. What it must never say here is
-		// False/Converged, which is what "the operator thinks this instance is fine"
-		// looks like.
+		By("StaleMasterName reports True/Foreign — Rule N stood down, it did not converge")
+		// Read once rather than in the window above. The reason is EXACT, not a family:
+		// G0 (`forsaken`) is checked FIRST and UNCONDITIONALLY in `planStaleMasterNames`
+		// — ahead of the ground-truth check, ahead of G1, and ahead of the per-entry
+		// survey — so while the capture verdict holds Rule N returns `Foreign` and
+		// nothing else. The `Consistently` above has just asserted `Forsaken=True` over
+		// this very window, so that precondition is established rather than assumed.
+		//
+		// In particular LR-050's rollout gate cannot make this `Deferred` here, even
+		// though the rename genuinely is rolling the Redis StatefulSet: the gate acts on
+		// G5's per-entry attribution, which G0 returns before ever reaching.
+		//
+		// This assertion USED to read BeElementOf("Foreign", "ForeignSuspected"). That
+		// second reason was DELETED by LR-050 — the rollout gate closed §9.2's window at
+		// its source, so the settle, its cooldown and `status.staleMasterNameForeignSince`
+		// all came out with it. Accepting a reason the product can no longer emit is a
+		// guard that would silently pass a regression reintroducing exactly the surface
+		// that was removed, which is the one thing an assertion in this position must not
+		// do. `TestStaleMasterNameHasNoSuspicionReason` fails if it ever comes back.
+		//
+		// What this must never say is False/Converged — "the operator thinks this
+		// instance is fine" — but asserting only that would be weaker than the code
+		// warrants.
 		st, err := getConditionField(victim, "StaleMasterName", "status")
 		Expect(err).NotTo(HaveOccurred())
 		reason, _ := getConditionField(victim, "StaleMasterName", "reason")
 		AddReportEntry("StaleMasterName after the rename", st+"/"+reason)
 		Expect(st).To(Equal("True"))
-		Expect(reason).To(BeElementOf("Foreign", "ForeignSuspected"))
+		Expect(reason).To(Equal("Foreign"),
+			"Rule N must stand down as Foreign while the capture verdict holds (G0), not %q", reason)
 
 		// ---- and ADR-016 still works -------------------------------------
 		By("releasing the staged data risk, so the quarantine may proceed")
@@ -1592,5 +1610,43 @@ func TestRenameFixtureDoesNotOverrideMinReadySeconds(t *testing.T) {
 	if crSettleWindow <= crSettleMinReady {
 		t.Errorf("crSettleWindow = %s, which does not exceed minReadySeconds = %s — "+
 			"a mid-roll Running interlude can satisfy the settle", crSettleWindow, crSettleMinReady)
+	}
+}
+
+// TestStaleMasterNameHasNoSuspicionReason is the local half of the tier-2 assertion above.
+//
+// That assertion reads `Equal("Foreign")` and its teeth are CLUSTER-ONLY: it can only
+// fail against a running operator emitting a different reason, so there is no honest red
+// for it here. What IS checkable without a cluster is the half that made the old
+// `BeElementOf("Foreign", "ForeignSuspected")` dangerous — that the second reason still
+// does not exist. LR-050 deleted it (the rollout gate closed §9.2's window at its source,
+// taking the settle, its cooldown and `status.staleMasterNameForeignSince` with it), and
+// an e2e that accepts a reason the product cannot emit would pass a regression
+// reintroducing precisely the surface that was removed.
+//
+// It keys on a constant DECLARATION rather than the bare string, because
+// `stale_master_name_plan.go` and `littlered_controller.go` both mention the name in
+// historical comments explaining the removal — those must not trip the guard, and
+// deleting them to satisfy it would erase the record of why the reason is gone.
+func TestStaleMasterNameHasNoSuspicionReason(t *testing.T) {
+	const dir = "../../internal/controller"
+	files, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("cannot read %s: %v", dir, err)
+	}
+	for _, f := range files {
+		if f.IsDir() || !strings.HasSuffix(f.Name(), ".go") || strings.HasSuffix(f.Name(), "_test.go") {
+			continue
+		}
+		src, err := os.ReadFile(dir + "/" + f.Name())
+		if err != nil {
+			t.Fatalf("cannot read %s: %v", f.Name(), err)
+		}
+		if strings.Contains(string(src), `= "ForeignSuspected"`) {
+			t.Errorf("%s declares a ForeignSuspected reason again. LR-050 deleted it along with "+
+				"staleMasterNameForeignCooldown and status.staleMasterNameForeignSince. If it is "+
+				"genuinely coming back, revisit the tier-2 assertion on StaleMasterName's reason "+
+				"(it now requires exactly \"Foreign\") before landing this.", f.Name())
+		}
 	}
 }
