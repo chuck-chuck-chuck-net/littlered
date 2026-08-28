@@ -1429,9 +1429,31 @@ type crSettleTracker struct {
 }
 
 // crSettleWindow is the derived number above: it must exceed the Redis StatefulSet's
-// minReadySeconds (35s), which is the structural upper bound on a mid-roll `Running`
-// interlude, with margin for the operator's own observation lag.
+// minReadySeconds, which is the structural upper bound on a mid-roll `Running` interlude,
+// with margin for the operator's own observation lag.
+//
+// ⚠ IT IS KEYED TO THE DEFAULT 35s, NOT TO WHAT THE CR CARRIES. `minReadySeconds` is
+// user-settable — `resources.go` reads `lr.Spec.UpdateStrategy.MinReadySeconds` and only
+// falls back to `int32(35)` — so this constant is a margin against a value the fixture
+// happens not to set. That is the shape that has bitten this branch twice: LR-049 (a
+// constant timeout against a real one) and LR-050, whose whole reason for rejecting a
+// longer `forsakenCooldown` was that it would be a margin against the user-settable,
+// unbounded `spec.sentinel.downAfterMilliseconds`. Setting
+// `updateStrategy.minReadySeconds` in `sentinelRenameCR` without revisiting this number
+// silently restores the flake — so `TestRenameFixtureDoesNotOverrideMinReadySeconds`
+// fails the moment the fixture grows that field, rather than leaving the next reader a
+// fresh mystery.
+//
+// The 25s of margin over 35s covers the operator's own observation lag between a pod
+// going Ready and the CR reading `Running`, which is REASONED, NOT MEASURED. If this ever
+// settles falsely inside a 60s interlude, that lag is the number to go and measure — not
+// this constant to bump.
 const crSettleWindow = 60 * time.Second
+
+// crSettleMinReady is the `resources.go` default for the StatefulSet's
+// `minReadySeconds` field, as a Duration — named so the drift guard below and the
+// derivation above cannot disagree about the number they are both keyed to.
+const crSettleMinReady = 35 * time.Second
 
 // observe folds one poll in and reports whether the settled state has now held for the
 // whole window. Any non-settled sample resets the streak — a flap is an interleaving, not
@@ -1545,5 +1567,30 @@ func TestCRSettleTrackerRequiresReadyTrue(t *testing.T) {
 		if tr.observe("Running", "False", base.Add(d)) {
 			t.Fatalf("reported settled at %v on Ready=False", d)
 		}
+	}
+}
+
+// TestRenameFixtureDoesNotOverrideMinReadySeconds is the drift guard for crSettleWindow.
+//
+// The settle window is a margin over the Redis StatefulSet's `minReadySeconds`, and that
+// value is USER-SETTABLE (`resources.go` reads `lr.Spec.UpdateStrategy.MinReadySeconds`
+// and only falls back to 35s). The window is therefore derived from what the fixture
+// happens NOT to set, which is exactly the trap LR-049 and LR-050 record: a margin
+// against a configurable timer is correct only for the configuration it was measured on.
+// Deriving the window from the live StatefulSet instead would mean a cluster read on a
+// path that must stay pure, so the cheap enforcement is here: raise
+// `updateStrategy.minReadySeconds` in the fixture and this fails, naming the constant to
+// revisit, rather than silently restoring the flake for the next reader to rediscover.
+func TestRenameFixtureDoesNotOverrideMinReadySeconds(t *testing.T) {
+	if got := sentinelRenameCR("drift-guard", "mymaster"); strings.Contains(got, "minReadySeconds") {
+		t.Errorf("sentinelRenameCR now sets updateStrategy.minReadySeconds, but crSettleWindow (%s) "+
+			"is derived from the resources.go DEFAULT of %s. Re-derive the window from the new value "+
+			"before landing this — the settle must exceed minReadySeconds or tier 1's consistency "+
+			"window can open during a mid-roll Running interlude again (LR-050).",
+			crSettleWindow, crSettleMinReady)
+	}
+	if crSettleWindow <= crSettleMinReady {
+		t.Errorf("crSettleWindow = %s, which does not exceed minReadySeconds = %s — "+
+			"a mid-roll Running interlude can satisfy the settle", crSettleWindow, crSettleMinReady)
 	}
 }
