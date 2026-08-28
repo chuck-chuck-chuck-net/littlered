@@ -49,6 +49,21 @@ commands are in §2.
    **every** pod at **every** instant, in both features. **No "try both" is needed and the six
    call sites do not change.** See §5, Q4.
 
+4. **A correction to an earlier draft of *this* document, kept visible rather than quietly
+   edited.** §3.5 first attributed the Rule L reseed to "a rotation", which contradicts finding
+   #1 of §3.6 (a rotation changes no pod template and **rolls nothing**, so the rolled/un-rolled
+   interleaving cannot arise from the rotation itself). **§3.5a now works the reachability out
+   per path**, and the answer is neither of the obvious ones: a single-step **enablement** does
+   not reach Rule L at all, a **rotation alone** does not either but silently unmanages the
+   instance forever, and only a **rotation followed by an unrelated Sentinel-only restart**
+   reaches the reseed — days later, with the edit, the trigger and the loss separated by three
+   unrelated causes.
+
+**All of §3.5/§3.5a describes the CURRENT build, not the design proposed here.** They are
+defects an owner can reach today with a supported `spec.auth` or Secret edit; §4 exists to make
+them unreachable. They want their own LR entry, and the smallest of the fixes (WP1) is worth
+shipping **ahead** of the feature — see K1a.
+
 Nothing else in §13 is wrong. Its two named pitfalls are both confirmed; its "overlap on the
 client edge, atomic switch on the internal edges" instinct is **half right** — the internal
 edges turn out to have an overlap too, just a different one.
@@ -174,7 +189,9 @@ the facts** — they have drifted before.
 - The Secret key is **hardcoded**: `internal/controller/resources.go:155`
   `secretKeyPassword = "password"`. There is no `passwordKey` field.
 - **`ConditionAuthReady = "AuthReady"` is declared at `api/v1alpha1/littlered_types.go:654-655`
-  and never used anywhere.** It is free for this feature (§5.6).
+  and is set, cleared and read **nowhere** — `grep -rn ConditionAuthReady` returns only the
+  declaration.** Recorded explicitly because an implementer will otherwise assume it is wired and
+  extend it; there is nothing to extend. It is free, and this feature claims it (§8, §11).
 - The only validation is imperative, in `validateSpec`
   (`internal/controller/littlered_controller.go:296-316`): enabled ⇒ `existingSecret` non-empty,
   the Secret must exist and must carry a `password` key. It re-runs every pass, so it does react
@@ -321,16 +338,16 @@ pod still enforces P) that yields `NOAUTH`.
 
 **Which rules then misfire, precisely** (this is the case for the whole design):
 
-- **Rule L (LR-015) — the data-destroying one.** `DataHolders()` and `BestDataHolder()`
-  (`replication_state.go:184`, `:212`) filter on `Reachable`, so every pod reads as **0 keys and
-  not a data holder**. During a *rotation* the sentinel StatefulSet rolls fast (its probes are a
-  bare PING) while the Redis StatefulSet rolls slowly behind `minReadySeconds: 35`. The
-  intermediate state is: rolled Sentinels reachable (operator holds the new password) and
-  **bare** (EmptyDir wiped their config), a reachable Sentinel quorum, **no reachable Redis
-  master** (still on the old password), and **zero data holders**. That is precisely
-  `planLeaderlessRecovery`'s no-data-reseed signature, it outlives the 30s cooldown by minutes,
-  and the verdict is *"Reseeded"* — **the operator elects an empty master over a live, intact
-  dataset.** No test at any tier covers this.
+- **Rule L (LR-015) — its data-safety gate is VOIDED.** `DataHolders()` and `BestDataHolder()`
+  (`replication_state.go:184-190`, `:212`) filter on `Reachable`, so under a credential mismatch
+  every pod reads as **0 keys and not a data holder**. Rule L's ≥2-holder REFUSE — the gate that
+  exists *specifically* to stop the operator discarding data, and the only one requiring
+  `allowUnsafeRebootstrapOnDeadlock` — can therefore **never fire**, and Rule L always takes its
+  **no-opt-in** `recoverySeedNoData` branch, electing a master on the belief that the instance
+  holds nothing while it holds everything. That much is a property of the code and needs no
+  experiment. **Its reachability is narrower than the other bullets here and is worked out
+  separately in §3.5a — it is NOT reached by an enablement, and NOT by a rotation on its own.**
+  No test at any tier covers it.
 - **`planForsaken` / the quarantine (LR-042/LR-044).** `HasHealthyKnownReplica()` goes false;
   clause 1 needs a reachable *monitoring* Sentinel and clause 4 needs no reachable master of
   ours — an unreachable master satisfies clause 4 the wrong way. The quarantine's own
@@ -351,6 +368,94 @@ pod still enforces P) that yields `NOAUTH`.
 - **`SENTINEL SET auth-pass` failures are discarded** (§3.4). If the operator's password is
   stale, the Sentinels keep the old `auth-pass` and silently lose the ability to read their
   master, with no signal anywhere.
+
+### 3.5a Precise reachability of the Rule L reseed, on a shipped build today
+
+§3.5's misfire catalogue is a property of the *inputs*. Rule L specifically also needs a
+particular **shape**, and working it out changes which user action is dangerous. All five of its
+preconditions must hold at one instant (`littlered_controller.go:1086-1095` and `:1193-1201`;
+`leaderless_recovery.go:73-112`):
+
+| | precondition | source |
+|---|---|---|
+| 1 | `RealMasterIP == ""` | the `if` at `:1193` — Rule L is inside it |
+| 2 | **≥1 reachable Sentinel and *zero* reachable Sentinels monitoring** — `AllSentinelsBare` is `reachable > 0 && monitoring == 0`, so **all-unreachable returns `false`** | `replication_state.go:169-181` |
+| 3 | `reachable >= quorum` | `:83` |
+| 4 | Rule A passed — **no pod terminating**, no failover active (Rule A `return`s at `:1095`, *before* the leaderless branch) | `:1090-1095` |
+| 5 | `leaderlessSince` older than 30s | `:86-91` |
+
+So the dangerous shape is specifically **"the operator can talk to the Sentinels but not to the
+Redis pods, and the Sentinels are bare"** — a *credential split between the two StatefulSets*,
+not a mismatch as such. Three candidate paths, each traced to its verdict:
+
+**Path A — enablement (`auth.enabled: false → true`) in one step. DOES NOT reach Rule L.**
+Precondition 2 fails, and so does 1. The operator holds `P`; a not-yet-rolled pod is `nopass` and
+go-redis's `HELLO … AUTH default P` is **accepted** (§0, F1b/F1d, measured); a rolled pod requires
+`P` and is likewise reachable. **Every pod is reachable to the operator for the whole enablement**,
+so some pod still reports `role:master`, the LR-004 Redis-only fallback sets `RealMasterIP`, and
+the leaderless branch is never entered. The transient moments when the master itself is being
+replaced are covered by precondition 4: a pod is terminating, so Rule A returns before the
+leaderless branch is even reached, and by the time the `minReadySeconds` gap arrives with nothing
+terminating the replacement is Ready and answering.
+*What an enablement DOES break today is the peer edges, not the operator's view:* an un-rolled
+Sentinel presenting no credential to a rolled, enforcing master gets `NOAUTH`, reaches `s_down`,
+and a quorum of un-rolled Sentinels reaches `o_down` and **fails over a healthy master**; and
+replication breaks in **both** directions for the duration of the Redis roll (an un-rolled replica
+sends no `AUTH` to an enforcing master; a rolled replica sends the *two-argument* `AUTH` to a
+`nopass` master and is refused — measured, F4b). If that Sentinel-driven failover promotes a
+replica whose link has been down, the unreplicated tail is lost: the LR-038 class, not a wipe.
+**Severity: availability event plus an unnecessary failover onto a possibly-stale replica, during
+an operation the owner is actively watching.**
+
+**Path B — rotation alone (edit the password inside the Secret). DOES NOT reach Rule L either,
+and is worse than it looks.** Nothing rolls (§3.6), so the *fleet stays perfectly coherent on the
+old password* — Sentinel↔Sentinel, Sentinel↔master and replication are all unaffected and
+**clients keep working**. Only the **operator** moves to the new password, and it therefore
+becomes blind to every pod, Sentinels included. Precondition 2 fails (`reachable == 0`), so Rule L
+returns `recoveryClearMarker`. Two consequences instead:
+  1. `getMasterPodName` classifies a `WRONGPASS` as `SentinelUnreachable` (only `"redis: nil"` is
+     mapped to `SentinelNoMaster`, `littlered_controller.go:1345-1358`), and `updateMasterLabel`
+     **skips entirely** on that code (`:1411-1413`). So the `role: master` label is *preserved* —
+     writer routing survives, which is the right conservative behaviour and is worth knowing.
+  2. **But every healing rule is now silently dead**, indefinitely, with nothing rolling to end it:
+     Rule 0, Rule D, Rule R, LR-005/LR-008 correction, LR-024 recovery, and the per-pass
+     `SENTINEL SET auth-pass` pushes whose errors are discarded (§3.4). The instance reports
+     `Ready=False` and looks broken while being perfectly healthy — and **on the next real master
+     failure, Sentinel fails over correctly but the operator cannot move the label**, so the
+     `{name}` Service keeps selecting the dead pod and writes stop.
+  **Severity: a supported Secret edit silently unmanages the instance forever and plants an
+  outage that detonates on the next master failure — with nothing connecting the two events.**
+  This is the coordinator's candidate (2), and it is the shape that should drive urgency.
+
+**Path C — rotation, then an unrelated partial restart. THIS is what reaches Rule L.** After a
+Path-B rotation the Secret and the pods disagree indefinitely. Any later event that restarts the
+**Sentinel** pods but not the **Redis** pods — a node drain, an eviction, an OOM, an operator
+upgrade, a `kubectl rollout restart statefulset/<n>-sentinel` (which is `docs/USAGE.md`'s own
+documented escape hatch), or any unrelated spec edit that touches only the Sentinel template —
+produces exactly the shape: Sentinels back on the **new** password and **bare** (EmptyDir, pillar
+3.1) ⇒ preconditions 2 and 3 hold; Redis pods still on the **old** password ⇒ unreachable ⇒
+preconditions 1 and `DataHolders() == 0`; the restart has finished ⇒ precondition 4; 30s ⇒
+precondition 5. **`recoverySeedNoData` fires** and `seedSentinelsWithMaster` points the whole
+quorum at `redis-0` (`pickBootstrapMasterIP` reads the pod map, so an unreachable `redis-0` is
+still chosen; `needsPromotion` is false for an unreachable pod, so no `REPLICAOF NO ONE` is
+issued — the operator cannot even execute its own decision).
+  The *decision* is already wrong at that point. The **damage** is delivered later, by ordinary
+  mechanisms acting on it: when the Redis pods do restart onto the new password, `redis-0` returns
+  **empty** (EmptyDir) as the Sentinel-blessed master, and any pod that restarts after it is told
+  to replicate from it and **full-syncs from empty**. A partial Redis restart is therefore the
+  loss case; a total one loses the data to EmptyDir anyway and Rule L's verdict is retroactively
+  correct.
+  **Severity: delayed, silent, and multi-step — the edit, the trigger and the loss are separated
+  by days and by three unrelated causes.**
+
+**Framing, and it decides what to do next.** Paths A, B and C are all **defects of the current
+build**, reachable today by a supported spec or Secret edit; none of them is a hazard of the
+design in §4, which exists precisely to make all three unreachable. Path B is arguably the most
+serious *product* problem here — it is silent, permanent, and needs no second event to unmanage
+the instance — while Path C is the one that ends in lost data. **Recommendation: they get their
+own LR entry and Path B's fix (WP1, plus surfacing "the operator cannot authenticate to its own
+pods" as a loud condition) ships AHEAD of the feature**, because it is small, independently
+valuable, and an owner can hit it today without ever attempting a staged rotation.
 
 ### 3.6 Rollout and change-detection machinery
 
@@ -385,6 +490,17 @@ pod still enforces P) that yields `NOAUTH`.
   `if rolling && !armed`) and Rule N's G5 `Foreign` verdict, downgraded to `Deferred`
   (`stale_master_name_plan.go:189`). It stops nothing else from running.
 
+### 3.6a Docs debt found while grounding this design (not fixed here)
+
+Neither is this feature's to fix, and both would mislead its implementer, so they are recorded
+rather than silently corrected:
+
+- **`CLAUDE.md` pillar 3.12 still calls the settledness predicate `clusterShardRolloutSettled`.**
+  LR-050 renamed it `statefulSetRolloutSettled` (`cluster_rollout.go:45-75`) precisely because it
+  was never mode-specific — it is now the sentinel-mode attribution gate's predicate too. An
+  implementer grepping CLAUDE.md's name finds nothing.
+- **`ConditionAuthReady` is declared-but-unused** (§3.1). Not wired to anything, in any mode.
+
 ### 3.7 Existing tests
 
 **Two unit tests, both shape checks:** `TestBuildStatefulSetWithAuth`
@@ -403,7 +519,7 @@ in `sentinel_quarantine_test.go:622-626` and `sentinel_master_name_test.go:1239-
 
 **There is no test, at any tier, of enabling auth on an existing instance, of disabling it, or
 of rotating a password.** `grep -rn "Spec.Auth" test/e2e/*.go` returns zero hits outside
-creation-time literals. **The transition is entirely unexercised and, per §3.5, entirely
+creation-time literals. **The transition is entirely unexercised and, per §3.5/§3.5a, entirely
 silent.** That is the red this feature is entitled to (§8).
 
 ---
@@ -515,8 +631,8 @@ choice of AUTH form.
 | **Rotation** | Buys nothing at all. | Three stages (two user edits), clients migrate individually. | **No window, ever.** A window here would be a confession that the overlap does not work. |
 
 **Do not offer a "quick" single-rollout variant of either.** It is the variant that reaches
-§3.5's misfire catalogue, and one of those misfires (Rule L reseeding over a live dataset) is
-data loss on a supported operation — the LR-050 shape exactly. The rename design could make a
+§3.5/§3.5a's misfire catalogue, whose worst members are data loss and a permanently unmanaged
+instance on supported operations — the LR-050 shape exactly. The rename design could make a
 window a *precondition* and get a simpler design for it; here a window buys no simplification,
 so there is nothing to trade.
 
@@ -613,7 +729,7 @@ The brief proposes **standalone → failover → cluster → sentinel**. I agree
 |---|---|---|
 | **1. standalone** | none | Exactly right, and for the reason given: it isolates the substrate. One pod, one restart, no peer to be out of step with. Everything in Q4(ii) is exercised with none of the topology risk. |
 | **2. failover** | `masterauth` only; the operator owns every decision; the startup start-gate needs no credential at all (§3.2) | Right. It is the smallest instance of the internal-edge problem, so `masteruser default` and the two-stage renderer are proven before `sentinel-pass`/`auth-pass`/quorum arrive. It also has the strongest existing e2e (a rolling-update tier with data intact, LR-038 addenda). |
-| **3. sentinel** ⬅ moved up | `masterauth` + `sentinel-pass` (peer membership) + `auth-pass` (operator-pushed), a **quorum split** while the peers disagree, **and the roll wipes Sentinel's EmptyDir into Rule L** | **This is the mode where the hazard is real** (§3.5: the Rule L reseed, and Sentinel failing over a healthy master on its own). It is also the mode whose runbooks *already tell owners to enable auth* (`docs/USAGE.md`, ADR-015 Decision 6, pillar 3.7). Shipping "auth changes are supported" for three modes while the one mode users will actually do it on is unbuilt is the worse failure. Hard, but it is the point of the feature. |
+| **3. sentinel** ⬅ moved up | `masterauth` + `sentinel-pass` (peer membership) + `auth-pass` (operator-pushed), a **quorum split** while the peers disagree, **and the roll wipes Sentinel's EmptyDir into Rule L** | **This is the mode where the hazard is real** (§3.5a: Path B's permanent unmanagement, Path C's Rule L reseed, and Sentinel failing over a healthy master on its own). It is also the mode whose runbooks *already tell owners to enable auth* (`docs/USAGE.md`, ADR-015 Decision 6, pillar 3.7). Shipping "auth changes are supported" for three modes while the one mode users will actually do it on is unbuilt is the worse failure. Hard, but it is the point of the feature. |
 | **4. cluster** ⬅ moved down | `masterauth`; **the bus is unauthenticated regardless** (F7); 2N pods; LR-021 cross-shard serialization **plus** ADR-017's intra-shard partition gate; `MIGRATE … AUTH` needs `AUTH2` (F7c) | Lowest value and highest cost. `docs/USAGE.md` already says a password *does not* protect the cluster mesh, so auth here is a client-edge nicety. And the cost is the largest: **two or three fully serialized rollouts, each shard gated on a full sync** — for a large dataset that is measured in tens of minutes and the user must be warned (LR-047's own "Regresses" note makes the same point about rollout duration). It also carries the only genuine code fix outside the substrate (WP6, `AUTH2`). |
 
 Two per-mode edges worth naming that the brief did not:
@@ -630,11 +746,15 @@ Two per-mode edges worth naming that the brief did not:
 ### Q6 — Interactions with what was just built
 
 **(a) Enabling auth changes the Sentinel pod template, so the Sentinel roll wipes EmptyDir into
-Rule L.** Confirmed and it is worse than "lands in Rule L": with the naive single-stage change
-it lands in Rule L's **no-data-reseed** branch, which needs no opt-in and elects an empty
-`redis-0` over a live dataset (§3.5). With the staged design the Redis pods are always reachable
-to the operator, so `RealMasterIP != ""` and Rule L's precondition never holds; the returning
-bare Sentinels are picked up by **Rule 0**, which is the designed path and the one M4a observed.
+Rule L.** Confirmed as far as the wipe goes, and then **the conclusion is the opposite of the
+obvious one**: a single-step *enablement* does **not** reach Rule L, because go-redis's implicit
+`AUTH default <pw>` keeps every not-yet-rolled pod reachable, so `RealMasterIP != ""` and the
+leaderless branch is never entered (§3.5a, Path A). The returning bare Sentinels are picked up by
+**Rule 0**, which is the designed path and the one M4a observed. What an enablement *does* cost
+today is on the peer edges — a quorum of un-rolled Sentinels can `o_down` a healthy enforcing
+master and fail it over, and replication breaks in both directions for the Redis roll. The staged
+design removes both. Rule L is reached only by §3.5a's **Path C** (a rotation followed by a
+Sentinel-only restart), which the staged design also removes, by making a rotation roll at all.
 **Residual, accepted:** the sentinel StatefulSet rolls fast (its probes are a bare `PING`,
 `resources.go:1596`/`:1610`), so all three Sentinels can be bare simultaneously for a few
 seconds — a window with no monitoring, hence no failover. That is exactly §6.2's rejected
@@ -648,10 +768,11 @@ The staged design removes the input rather than guarding the consumers. For the 
 would have happened otherwise: `planForsaken` clause 4 is satisfied the wrong way by an
 unreachable master; the quarantine's `unverified` is **not** fooled (LR-044 rekeyed it onto
 kubelet readiness, LR-023); failover's death detection **HOLDs** (the LR-017 corroboration
-clause); and Rule L is the one that actually destroys something. **A botched auth change looks
-exactly like a leaderless deadlock, not like a capture** — worth stating precisely, because the
-brief's guess was "or like a capture" and the capture reading is blocked by clause 3 (the foreign
-address must not be one of our pods, and here every address *is* one of ours).
+clause); and Rule L is the one that actually destroys something, on Path C only. **A botched
+auth change looks like a leaderless deadlock, never like a capture** — worth stating precisely,
+because the brief's guess was "or like a capture" and the capture reading is blocked by
+`planForsaken` clause 3 (the foreign address must not be one of our pods, and here every address
+*is* one of ours) and, independently, by LR-050's rollout gate whenever pods are actually moving.
 
 **(c) Does LR-050's rollout attribution gate cover an auth rollout? — MOSTLY YES, and the gap is
 named.**
@@ -684,9 +805,12 @@ named.**
 ### 6.1 Single-stage change (flip the template once and let it roll) — REJECTED
 
 The obvious design, and the one a reader arrives with. Rejected because every intermediate state
-is a mixed-credential fleet, which §3.5 shows reaches **Rule L's no-data reseed over a live
-dataset** in sentinel mode and makes Sentinel fail over a healthy master on its own. Its only
-advantage is one fewer rollout per mode (~3 minutes).
+is a mixed-credential fleet, and §3.5a traces where each variant of that ends: a single-step
+**enablement** makes Sentinel `o_down` and fail over a healthy master while replication is broken
+in both directions (Path A), and a single-step **rotation** — which today rolls nothing at all —
+leaves the instance permanently unmanaged (Path B) and one unrelated Sentinel restart away from
+Rule L's no-opt-in reseed over a live dataset (Path C). Its only advantage is one fewer rollout
+per mode (~3 minutes).
 **Trigger to reopen:** none. If the staged renderer proves too complex, the correct fallback is
 6.2 (refuse the transition), never this.
 
@@ -699,7 +823,8 @@ owner to destroy a working dataset to obtain the isolation the project *recommen
 trade than the staging we can build. It is also the exact shape of the rename's §6.1, and the
 same answer applies.
 **Trigger to reopen: if the staged renderer cannot be made safe, ship immutability rather than
-shipping today's silent mixed-credential transition** — because §3.5 is a defect either way.
+shipping today's silent mixed-credential transition** — because §3.5a is a defect either way,
+and immutability closes Paths A, B and C as surely as the staged renderer does.
 
 ### 6.3 Live multi-password via `ACL SETUSER` — REJECTED
 
@@ -910,7 +1035,7 @@ Ordered by dependency. Disjoint file ownership is noted so siblings can run in p
 
 | WP | What | Owns | Depends on |
 |---|---|---|---|
-| **WP0** | **Observation, build nothing.** Reproduce §3.5's Rule L reseed on a throwaway sentinel instance: enable auth in one step, sample `status`, the operator log and `DBSIZE` at 1s. Exit criterion: either the `Reseeded` verdict is observed (the design's red is banked) **or** it is not, in which case §3.5's chain must be re-derived before anything is built. This is the equivalent of the rename's WP0 and it must be done **first**. | nothing | — |
+| **WP0** | **Observation, build nothing.** Two throwaway sentinel instances, 1s sampling of `status`, the operator log and `DBSIZE`. **(a) Path B, the cheap one:** rotate the password inside the Secret and change nothing else; assert that no pod restarts, that clients keep working, that the CR goes `Ready=False`, and that **no healing rule fires again** — then kill the master and observe whether the `role: master` label follows it. **(b) Path C:** after (a), `kubectl rollout restart statefulset/<n>-sentinel` and watch for `LeaderlessRecovery=…/Reseeded`. Exit criterion: each path's verdict observed, **or** its absence with an explanation — §3.5a's chain must be re-derived before anything is built on it. The equivalent of the rename's WP0; **do this first**. | nothing | — |
 | **WP1** | `getRedisPassword` returns `(string, error)`; a Secret read failure becomes a `Warning` + condition instead of `""`. Un-discard the four `SENTINEL SET auth-pass` errors. Log the auth-vs-timeout distinction in the failover monitor. | `littlered_controller.go`, `failover_monitor.go` | — (independently valuable; ship it even if the feature slips) |
 | **WP2** | The pure seam: `planAuthStage` + `authArgs`, red-first, both mutants. | `internal/controller/auth_stage_plan.go` + tests | — |
 | **WP2b** | Extend LR-050's `rolling` to the OR over both sentinel StatefulSets (§Q6(c)). Red-first with a fixture where the Redis STS is settled and the Sentinel STS is not. | `littlered_controller.go` | — |
@@ -990,7 +1115,9 @@ value your clients currently use. The operator narrows back to one password on t
 
 | # | Risk | Severity | Mitigation / decision |
 |---|---|---|---|
-| **K1** | A single-stage auth change reaches Rule L's no-data reseed and elects an empty master over a live dataset (§3.5). | **Critical** — data loss on a supported operation | The staged design removes the input. WP0 banks the red first, and the e2e tier asserts data intact. Note this is a *present* defect, reachable today by any user who edits `spec.auth`. |
+| **K1a** | **PRESENT DEFECT, not a risk of this design.** A rotation inside the Secret (§3.5a Path B) silently and permanently unmanages the instance — every healing rule dead, no pod restarts to end it — and plants an outage that detonates on the next master failure, when the operator can no longer move the `role: master` label. | **High**, and it is *silent and delayed* | Wants its own LR entry and **WP1 shipped ahead of the feature**: `getRedisPassword` must distinguish "auth is off" from "I cannot read/use this credential", and the operator must say so loudly. The staged design then makes the state unreachable by rolling on a Secret change at all. |
+| **K1b** | **PRESENT DEFECT.** A rotation followed by a Sentinel-only restart (§3.5a Path C) voids Rule L's ≥2-holder REFUSE — the gate is keyed on `Reachable` — so it takes the no-opt-in reseed branch and blesses an empty `redis-0`, with the loss delivered later by ordinary resyncs. | **Critical** — data loss, delayed and multi-causal | Same LR entry. The staged design removes it. WP0(b) banks the red; the e2e tier asserts data intact. |
+| **K1c** | A single-step **enablement** (§3.5a Path A) drives a Sentinel-led failover of a healthy master and breaks replication in both directions for the duration of the Redis roll. | High, but **visible** — during an operation the owner is watching | The staged design's `Prepare` stage is inert by construction, so no peer is ever unable to authenticate to another. |
 | **K2** | Sentinel fails over a healthy master while the quorum disagrees about credentials. | High | Same mitigation; E1 is inert and E2's demand is always already satisfiable. |
 | **K3** | An owner performs an auth change and a `masterName` rename in the same window and cannot attribute a failure. | Medium | N9, the runbook, and `docs/USAGE.md:392-395`'s existing sentence generalized. |
 | **K4** | A password literal leaks into a StatefulSet, ConfigMap or Event. | High | R8 + the pure `authArgs` guard test asserting no rendered string contains a value; `AnnotationAuthHash` is an HMAC keyed on the instance UID, never a bare digest. |
@@ -1012,7 +1139,7 @@ assumed in an implementation.**
 
 | # | Question | The experiment that settles it |
 |---|---|---|
-| **O1** | **Does §3.5's Rule L reseed actually fire?** The chain is traced from four independently-verified facts (gather maps a credential error to `Reachable:false`; `DataHolders` filters on `Reachable`; the Sentinel STS rolls faster than the Redis STS; the 30s cooldown is far shorter than a roll) but has **never been observed**. It has exactly the shape ADR-016's "the captor heals via Rule D" had — an inference from independently-documented mechanisms that turned out correct but was only *known* after M4a. | **WP0.** A throwaway sentinel instance holding data; enable auth in one step; sample `status.conditions`, the operator log and `DBSIZE` at 1s across the whole window. Exit criterion: the `LeaderlessRecovery=…/Reseeded` line, or its absence with an explanation. |
+| **O1** | **Do §3.5a's Path B and Path C actually behave as traced?** Both chains are derived from code that was read line by line (the `Reachable` filters, `AllSentinelsBare`'s `reachable > 0` clause, the `SentinelUnreachable` classification of `WRONGPASS`, Rule A's early return ahead of the leaderless branch, `pickBootstrapMasterIP` reading the pod map) but **neither has been observed**. They have exactly the shape ADR-016's "the captor heals via Rule D" had — an inference from independently-documented mechanisms, correct as it turned out, but only *known* after M4a, which falsified a companion claim in the same run. **Path B is the cheaper and more urgent observation of the two.** | **WP0(a) and WP0(b)** above. Exit criteria: for B, "no rule fires again" plus the label's behaviour on a subsequent master kill; for C, the `LeaderlessRecovery=…/Reseeded` line — or, in either case, its absence with an explanation. |
 | **O2** | **How long does each stage actually take, per mode?** Every duration in this document is derived from `minReadySeconds: 35` and the existing rollout measurements (the rename measured 176.8s for three sentinel Redis pods), not measured for this feature. Cluster mode's number is genuinely unknown because ADR-017's gate makes it dataset-dependent. | Time each stage on t3e for all four modes, with and without a non-trivial dataset. Replace §7's estimates (LR-044 M4a precedent). |
 | **O3** | **Which key holds which value at stage `Switch`?** §4's table has the user swapping `password` and `additionalPassword` at R2, while §7.2 has the operator auto-advancing to `Switch` without a user edit. Those two cannot both be right. The clean resolution is that `Switch` renders `additionalPassword` as the *presented* value and both as accepted — but that makes the key names lie for one stage. Decide before WP2; it is a naming/semantics question, not a mechanism question. | No experiment needed — an owner decision. Listed here because it is a genuine gap in this design, not a detail. |
 | **O4** | **Does an un-rolled Sentinel presenting no credential to an enforcing peer merely lose the link, or does it also lose its `+switch-master` hello propagation?** F5 establishes the command link fails; the hello channel is published *to* peers, so it should fail with it, but Sentinel also learns peers via the master's hello channel, which may still work. This only matters for the rejected single-stage design, so it is low priority. | A three-Sentinel lab with one enforcing and two not, watching `num-other-sentinels` and `SENTINEL is-master-down-by-addr` responses. |
@@ -1037,9 +1164,13 @@ assumed in an implementation.**
 5. No rendered string, in any mode or stage, contains a password literal — pinned by a test.
 6. WP0's and O2's measurements are in ADR-019, and §7's estimates have been **replaced** by them
    rather than left standing beside them.
-7. ADR-019 and the LR-nnn entry are written; `docs/USAGE.md` carries both runbooks;
+7. The **present** defects of §3.5a have their own LR entry — Path B (permanent silent
+   unmanagement) and Path C (Rule L's voided REFUSE) named, with WP0's observations attached —
+   and **WP1 has shipped ahead of the feature**, so an owner who rotates a Secret on a build
+   without the staged renderer is told loudly instead of silently unmanaged.
+8. ADR-019 and the LR-nnn entry are written; `docs/USAGE.md` carries both runbooks;
    `docs/API_SPEC.md` and `CLAUDE.md` (pillar 3.7, §4) are updated; `make lint && make test` are
    clean.
-8. The deferred items are recorded **as decisions with triggers**, not as loose ends:
+9. The deferred items are recorded **as decisions with triggers**, not as loose ends:
    immutability as the fallback (§6.2), the `aclfile` reopening trigger (§6.3), dual-Secret
    rotation (§6.4), disabling auth (N6).
