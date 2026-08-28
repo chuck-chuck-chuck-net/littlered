@@ -24,6 +24,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"testing"
 	"time"
 
 	. "github.com/onsi/ginkgo/v2"
@@ -753,10 +754,25 @@ var _ = Describe("Sentinel Master Name Rename", Label("sentinel"), func() {
 			// flaps Running → Initializing → Running several times on the way (§7.1b),
 			// so this is an Eventually on the settled value followed by a short
 			// Consistently, never a bare read.
+			//
+			// AND THE SETTLE IS EXPLICIT, because an `Eventually` alone does not wait for
+			// a flap to FINISH — it is satisfied by the first `Running` sample it sees,
+			// including one taken during a mid-roll interlude, and then hands a
+			// still-flapping instance to the `Consistently` below. Measured (LR-050,
+			// t3e): exactly that, `Initializing` 5.2s into the window, ~1 run in 5. So
+			// the window only opens once `Running`/`Ready=True` has held CONTINUOUSLY for
+			// crSettleWindow — see crSettleTracker for why that number is 60s and not a
+			// guess. The `Consistently` that follows is unchanged: the claim "and it
+			// STAYS there" is still asserted, on top of the settle rather than instead
+			// of it.
+			settle := &crSettleTracker{settleFor: crSettleWindow}
+			var lastPhase, lastReady string
 			Eventually(func(g Gomega) {
-				g.Expect(getPhase(crName)).To(Equal("Running"))
-				st, _ := getConditionField(crName, "Ready", "status")
-				g.Expect(st).To(Equal("True"))
+				lastPhase = getPhase(crName)
+				lastReady, _ = getConditionField(crName, "Ready", "status")
+				g.Expect(settle.observe(lastPhase, lastReady, time.Now())).To(BeTrue(),
+					"instance has not held Running/Ready=True for %s yet (currently %s/Ready=%s)",
+					crSettleWindow, lastPhase, lastReady)
 			}, 10*time.Minute, 5*time.Second).Should(Succeed())
 			Consistently(func(g Gomega) {
 				g.Expect(getPhase(crName)).To(Equal("Running"))
@@ -1370,3 +1386,164 @@ spec:
 		}
 	})
 })
+
+// =============================================================================
+// The settle tracker — and why the tier needs one
+// =============================================================================
+//
+// Plain table tests, not Ginkgo specs, needing no cluster. They live here only because
+// the code they guard carries the e2e build tag (the `auth_utils_unit_test.go`
+// precedent). Run them on their own — an unfiltered `go test -tags e2e ./test/e2e/...`
+// starts the whole suite:
+//
+//	go test -tags e2e ./test/e2e/ -run 'TestCRSettle'
+
+// crSettleTracker folds a sequence of CR polls into one question: has this instance held
+// `Running`/`Ready=True` CONTINUOUSLY for `settleFor`?
+//
+// It exists because "the CR reads Running" and "the CR has finished flapping" are
+// different claims, and tier 1 was making the first while asserting the second. Design
+// §7.1a: a rename replaces all three Redis pods, and the CR legitimately flaps
+// `Running → Initializing → Running` twice more on the way. An `Eventually` is satisfied
+// by the FIRST `Running` sample it sees, so on an unlucky poll alignment it returns
+// during a mid-roll interlude and hands a still-flapping instance to the `Consistently`
+// that follows — which then reads `Initializing` and fails. Measured live (LR-050, t3e):
+// exactly that, 5.2s into the window, roughly 1 run in 5.
+//
+// THE SETTLE BUDGET IS DERIVED, NOT TUNED. The mid-roll `Running` interludes are not
+// arbitrary: the Redis StatefulSet carries `minReadySeconds: 35` (`resources.go`), so
+// after a replaced pod goes Ready the StatefulSet waits exactly that long before deleting
+// the next one — and the CR reads `Running` for that whole wait. WP0's measured trace is
+// this arithmetic to the second: `redis-2` Ready at t0+12.9s, `redis-1` deleted at
+// t0+47.6s. So `minReadySeconds` IS the structural upper bound on a false settle, and the
+// tracker's window must exceed it. 60s = 35s + margin for the operator's own observation
+// lag, and it is well inside the tier's existing 10-minute budget: WP0 measured the final
+// sustained `Running` at t0+176.8s, plus ~30s for the post-fix `redis-0` edge.
+//
+// Note what this deliberately does NOT do: it does not shorten or replace the tier's
+// `Consistently`. The claim "and it STAYS Running" is still asserted, on top of the
+// settle, exactly as before.
+type crSettleTracker struct {
+	settleFor time.Duration
+	since     time.Time // zero when the last sample was NOT the settled state
+}
+
+// crSettleWindow is the derived number above: it must exceed the Redis StatefulSet's
+// minReadySeconds (35s), which is the structural upper bound on a mid-roll `Running`
+// interlude, with margin for the operator's own observation lag.
+const crSettleWindow = 60 * time.Second
+
+// observe folds one poll in and reports whether the settled state has now held for the
+// whole window. Any non-settled sample resets the streak — a flap is an interleaving, not
+// a state, so it can only be seen by keeping the sequence.
+func (t *crSettleTracker) observe(phase, ready string, now time.Time) bool {
+	if phase != "Running" || ready != "True" {
+		t.since = time.Time{}
+		return false
+	}
+	if t.since.IsZero() {
+		t.since = now
+	}
+	return now.Sub(t.since) >= t.settleFor
+}
+
+// TestCRSettleTrackerRejectsAWindowOpenedMidFlap replays the rename's MEASURED phase
+// trace (§7.1a, WP0 on t3e) at the tier's own 5s poll cadence and asserts the two
+// properties the tier needs, in the order that matters:
+//
+//  1. the tracker must NOT report settled during either mid-roll `Running` interlude —
+//     this is the flake, and it is the row the pre-fix logic fails;
+//  2. it must report settled once the instance has genuinely finished — otherwise the fix
+//     is an unconditional-fail, which is no better than an unconditional-pass.
+//
+// The trace: `redis-2` rolls (Ready t0+12.9s), `minReadySeconds: 35` elapses, `redis-1`
+// rolls (Ready t0+55.5s), 35s more, then the master `redis-0` goes at t0+89.1s and the
+// post-fix edge costs down-after-milliseconds on top, settling at ~t0+207s.
+func TestCRSettleTrackerRejectsAWindowOpenedMidFlap(t *testing.T) {
+	const settleFor = 60 * time.Second
+	const finalSettleAt = 210 * time.Second // first sample of the terminal Running run
+
+	// running reports the CR's phase at time d, from the measured trace.
+	running := func(d time.Duration) bool {
+		switch {
+		case d < 15*time.Second: // redis-2 replaced
+			return false
+		case d < 50*time.Second: // INTERLUDE 1 — 35s of Running (minReadySeconds)
+			return true
+		case d < 60*time.Second: // redis-1 replaced
+			return false
+		case d < 90*time.Second: // INTERLUDE 2 — 30s of Running
+			return true
+		case d < finalSettleAt: // redis-0 (the master) + the post-fix down-after edge
+			return false
+		default:
+			return true
+		}
+	}
+
+	tr := &crSettleTracker{settleFor: settleFor}
+	base := time.Unix(0, 0)
+
+	var firstSettledAt time.Duration = -1
+	for d := time.Duration(0); d <= 6*time.Minute; d += 5 * time.Second {
+		phase, ready := "Initializing", "False"
+		if running(d) {
+			phase, ready = "Running", "True"
+		}
+		if tr.observe(phase, ready, base.Add(d)) && firstSettledAt < 0 {
+			firstSettledAt = d
+		}
+	}
+
+	if firstSettledAt < 0 {
+		t.Fatalf("the tracker never reported settled; the instance was Running from %v onwards", finalSettleAt)
+	}
+	// The window may only open once the terminal Running run has itself lasted settleFor.
+	// Anything earlier is a mid-flap window — the flake this guards.
+	if want := finalSettleAt + settleFor; firstSettledAt < want {
+		t.Errorf("tracker reported settled at %v, want no earlier than %v — "+
+			"it opened the consistency window during a mid-roll Running interlude, "+
+			"which is exactly the flake (LR-050: read Initializing 5.2s into the window)",
+			firstSettledAt, want)
+	}
+}
+
+// TestCRSettleTrackerResetsOnASingleBadSample pins the other half: one non-settled poll
+// must discard the whole streak. Without it the tracker degrades into "Running for
+// settleFor in total", which a flapping instance satisfies just as easily.
+func TestCRSettleTrackerResetsOnASingleBadSample(t *testing.T) {
+	tr := &crSettleTracker{settleFor: 30 * time.Second}
+	base := time.Unix(0, 0)
+
+	for d := time.Duration(0); d < 25*time.Second; d += 5 * time.Second {
+		if tr.observe("Running", "True", base.Add(d)) {
+			t.Fatalf("reported settled at %v, before settleFor elapsed", d)
+		}
+	}
+	// One blip at t=25s, then Running again: the clock must restart from t=30s, so t=50s
+	// is only 20s into the new streak.
+	if tr.observe("Initializing", "False", base.Add(25*time.Second)) {
+		t.Fatal("reported settled on an Initializing sample")
+	}
+	for _, d := range []time.Duration{30, 40, 50} {
+		if tr.observe("Running", "True", base.Add(d*time.Second)) {
+			t.Errorf("reported settled at t=%vs — the streak was not reset by the blip", d)
+		}
+	}
+	if !tr.observe("Running", "True", base.Add(60*time.Second)) {
+		t.Error("never reported settled at t=60s, 30s into an unbroken streak")
+	}
+}
+
+// TestCRSettleTrackerRequiresReadyTrue pins that the settle asserts BOTH halves of the
+// tier's claim. `Running` with `Ready=False` is not the settled state, and accepting it
+// would silently weaken what tier 1 proves.
+func TestCRSettleTrackerRequiresReadyTrue(t *testing.T) {
+	tr := &crSettleTracker{settleFor: 10 * time.Second}
+	base := time.Unix(0, 0)
+	for d := time.Duration(0); d <= 60*time.Second; d += 5 * time.Second {
+		if tr.observe("Running", "False", base.Add(d)) {
+			t.Fatalf("reported settled at %v on Ready=False", d)
+		}
+	}
+}
