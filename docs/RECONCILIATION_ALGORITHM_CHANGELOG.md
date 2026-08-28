@@ -2094,6 +2094,23 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   behaviour), and a clean re-run of all three on the same build was **`SUCCESS! -- 3 Passed | 0
   Failed`** in 871s. Reported as a test-tightness flake rather than fixed here — `test/e2e` was out of
   this change's ownership.
+
+  **Closed since, in `4b6b709` + `3fc55fa`, and the fix is more interesting than the flake.** The
+  tier opened its 30s `Consistently` off a bare `Eventually`, i.e. on the **first** `Running` sample
+  it saw — including one taken during a mid-roll interlude — so it could start mid-flap. It now waits
+  for `Running`/`Ready=True` to have been held **continuously** for 60s, and nothing asserted was
+  weakened (the `Consistently` is unchanged, not shortened to dodge the flap). **The 60s is derived,
+  not guessed:** those interludes *are* `minReadySeconds` (`resources.go:1063`, default 35s) — the
+  StatefulSet waits exactly that long after a replaced pod goes Ready before deleting the next, which
+  is §7.1a's measured trace to the second (`redis-2` Ready t0+12.9s, `redis-1` deleted t0+47.6s) — so
+  `minReadySeconds` is the structural upper bound on a false settle and the window must exceed it.
+  The reproduction is a **deterministic unit table replaying that trace at the tier's own cadence**,
+  not a live re-run: the old logic settles at 15s, the first sample of interlude 1, where the new one
+  cannot settle before 4m30s. And `minReadySeconds` is **user-settable**, so a constant keyed to the
+  default is the same shape this branch has now been bitten by twice — LR-049's, and LR-050's own
+  rejected fix, which was rejected precisely for being a margin against a user-settable
+  `downAfterMilliseconds`. Hence a guard rather than a comment:
+  `TestRenameFixtureDoesNotOverrideMinReadySeconds` fails the moment the fixture grows the field.
 - **The invariant was exercised live, and not by design — the capture e2e tier depends on it.** In
   `Sentinel Master Name Rename Under Capture` the victim's `pinned` pod is pre-armed with a bogus
   `masterauth`, so once the capture lands that pod can never resync, its readiness (`link:up`) fails and

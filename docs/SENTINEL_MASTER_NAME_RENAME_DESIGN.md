@@ -1213,7 +1213,11 @@ verdict **survives** a panicked rename and the quarantine still fires. `expectNe
 not weakened; it is now green with the assertion doing work. One earlier run's tier 1 failed on its
 post-rollout `Consistently(30s, phase == Running)` reading `Initializing` 5.2s in — the §7.1b CR
 flap the tier's own comment anticipates, racing its `Eventually`/`Consistently` boundary; not the
-K9 assertion, and unrelated to the gate (tier 1 never arms a verdict).
+K9 assertion, and unrelated to the gate (tier 1 never arms a verdict). **Since closed** (`4b6b709` +
+`3fc55fa`): the tier now waits for `Running`/`Ready=True` to be held **continuously** for 60s rather
+than opening its window on the first `Running` sample, with the 60s derived from `minReadySeconds`
+(which those interludes *are*) and pinned by a guard, because that field is user-settable. See
+LR-050.
 
 **Status:** the §16 blocker is cleared; the K9 e2e guard is the regression guard.
 
