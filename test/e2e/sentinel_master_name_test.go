@@ -1352,7 +1352,13 @@ spec:
 		// all came out with it. Accepting a reason the product can no longer emit is a
 		// guard that would silently pass a regression reintroducing exactly the surface
 		// that was removed, which is the one thing an assertion in this position must not
-		// do. `TestStaleMasterNameHasNoSuspicionReason` fails if it ever comes back.
+		// do. Two guards hold it, and they pin different things: the invariant this
+		// assertion rests on — G0 wins, and wins even while our own StatefulSet is
+		// rolling — is pinned next to the code by `TestPlanStaleMasterNames`'s two G0
+		// rows in `internal/controller`, while `TestStaleMasterNameHasNoSuspicionReason`
+		// below pins that the reason CONSTANT stays deleted. Behaviour and surface are
+		// not the same property: a reintroduced `ForeignSuspected` on some other state
+		// would satisfy every row in that table.
 		//
 		// What this must never say is False/Converged — "the operator thinks this
 		// instance is fine" — but asserting only that would be weaker than the code

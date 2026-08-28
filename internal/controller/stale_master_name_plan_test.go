@@ -105,11 +105,14 @@ func allThreePrune(names ...string) map[string][]string {
 
 func TestPlanStaleMasterNames(t *testing.T) {
 	cases := []struct {
-		name        string
-		state       *redisclient.ReplicationState
-		desired     string
-		quorum      int
-		forsaken    bool
+		name     string
+		state    *redisclient.ReplicationState
+		desired  string
+		quorum   int
+		forsaken bool
+		// rolling: our own Redis StatefulSet is unsettled (LR-050). Defaults to false,
+		// so every pre-existing row keeps the exact inputs it was written with.
+		rolling     bool
 		wantReason  string
 		wantPrune   map[string][]string
 		wantSkipped []string
@@ -348,11 +351,33 @@ func TestPlanStaleMasterNames(t *testing.T) {
 			forsaken:   true,
 			wantReason: staleNamesForeign,
 		},
+		{
+			name: "G0: forsaken beats the LR-050 rollout gate too, not just the per-entry tests",
+			// The row the e2e depends on. `Sentinel Master Name Rename Under Capture`
+			// renames a CAPTURED instance, which rewrites the Redis pod template — so
+			// the StatefulSet is rolling for the whole window in which that tier asserts
+			// StaleMasterName reads exactly True/Foreign.
+			//
+			// Both of LR-050's readings are live at once here, and they disagree: the
+			// rollout gate says a departed address of ours is unattributable (Deferred),
+			// while G0 says a captured instance is stood down (Foreign). G0 wins because
+			// it is checked FIRST and UNCONDITIONALLY — ahead of the nil-state check,
+			// ahead of G1, ahead of the survey the gate acts inside. Nothing else in the
+			// suite pins that ordering: the table ran every other row at rolling=false,
+			// so a regression putting the gate ahead of G0 would turn the e2e red on a
+			// cluster and nothing red here.
+			state:      midRename(),
+			desired:    desiredName,
+			quorum:     2,
+			forsaken:   true,
+			rolling:    true,
+			wantReason: staleNamesForeign,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := planStaleMasterNames(tc.state, tc.desired, tc.quorum, tc.forsaken, false)
+			got := planStaleMasterNames(tc.state, tc.desired, tc.quorum, tc.forsaken, tc.rolling)
 
 			if got.Reason != tc.wantReason {
 				t.Errorf("Reason = %q, want %q (message: %q)", got.Reason, tc.wantReason, got.Message)
