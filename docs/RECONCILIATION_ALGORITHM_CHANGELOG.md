@@ -2394,8 +2394,8 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   | `status.master` empty (i.e. `RealMasterIP == ""`), pre-fix operator | **2.14 s** (16:10:08.06 → 16:10:10.20) |
 
 - **Live evidence, part 2 — the fixed code, A/B against the pre-fix binary, on the same cluster
-  across the same failovers.** No operator image could be published this session (no registry
-  credentials — see "Not verified live" below), so the fixed code was exercised through **`lrctl`**,
+  across the same failovers.** No operator image was published in that session (the cause was
+  misdiagnosed at the time — see "Not verified live" below), so the fixed code was exercised through **`lrctl`**,
   which reaches Redis and Sentinel exclusively by `kubectl exec` (LR-046's parity table), runs
   locally, and shares the *identical* gather, parser and `DetermineRealMaster` this change touches.
   Two binaries — `lrctl` built at the pre-fix commit `7f57600` and at the fixed HEAD — were sampled
@@ -2520,11 +2520,22 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
 
 - **NOT verified live: the operator itself, and the sentinel e2e suite. Stated plainly because the
   plan's §9 risk row asks for exactly that.** `OPERATOR_IMAGE` derives from the git hash, so a code
-  change can only be deployed by publishing an image, and this session had **no registry
-  credentials** (`podman login --get-login ghcr.io` → *not logged into ghcr.io*, and no
-  `auth.json`/`config.json` anywhere; the nodes are Talos with no `talosctl` available, so
-  side-loading was not an option either). This is the same class of blocker LR-044's M4b recorded
-  when its honest red was *"blocked by the environment's permission policy"*. So:
+  change can only be deployed by publishing an image, and the implementing session could not
+  publish one.
+
+  **⚠ Correction, same day: the recorded cause was wrong, and the correction is the useful part.**
+  It was reported as *"no registry credentials"* on the strength of
+  `podman login --get-login ghcr.io` → *not logged into ghcr.io*. But `ghcr.io/littlered-operator`
+  is only the Makefile's **default**; the registry actually in use is
+  `registry.tanne3.de/littlered-operator`, which is **local, anonymous and validly certified — it
+  needs no login at all.** `LITTLERED_REGISTRY` carries that value and lives in the interactive
+  shell environment, which a subagent does not inherit, so the build silently targeted a registry
+  nobody uses and the failure to push was read as a permissions problem. The generalizable point:
+  **an unset environment variable and a denied permission present identically at the failing
+  command, and only one of them is a real blocker** — which is this very entry's own subject
+  (`Reachable:false` conflating three facts, LR-051) arriving in the toolchain rather than in the
+  gather. It is NOT the class of blocker LR-044's M4b recorded; that one was a genuine environment
+  policy. So:
     - **What WAS verified on a real cluster:** the wire (both keys, healthy and mid-failover, on the
       shipped Redis 8.4.2), the window durations, and the fixed *code path* end to end through
       `lrctl` against the pre-fix binary — which covers the gather, the parser, `MasterInfo`,
