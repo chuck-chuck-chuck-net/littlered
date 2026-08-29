@@ -89,7 +89,9 @@ Three independent reasons, each of which alone is sufficient:
    question, so N+M. An invariant never refers to the operation set at all, so M — and, more
    importantly, **adding a fifth operation leaves every invariant guard unchanged and provably
    still correct**, because it never enumerated the operations. That is precisely the
-   re-verification burden we are trying to escape.
+   re-verification burden we are trying to escape. **This holds only if heavy operations do not
+   overlap** — an invariant proven against one operation says nothing about that operation running
+   during another. Serialization (D4) is what makes the claim sound.
 
 ### 3.2 The invariants already in the tree
 
@@ -144,72 +146,133 @@ unsplit.
 
 ---
 
-## 5. Design decisions already taken
+## 5. Design decisions
 
-**D1 — The runlevel is DERIVED, and therefore stored nowhere.** Not spec, not status, not
-annotations.
+### 5.0 How this converged (the rejected positions are the valuable part)
 
-*Revised 2026-08-28 after review. The first draft said "spec, not status", on the grounds of
-ADR-006, surviving operator restarts, and who clears it if the operator dies. That was wrong on
-usability and, more importantly, against the grain of the codebase.*
+Two earlier positions were held and abandoned; both are recorded because their reasons constrain
+the final shape.
 
-The usability objection, and it is decisive: **the human has no intent for "maintenance mode".**
-Their intent is "the master name should be X" or "auth should be enabled". Requiring a second,
-separate declaration is making them drive the train when they only wanted to write the timetable.
+**Rejected — a human-declared `spec.maintenanceMode`.** Two objections, the second decisive.
+*Usability:* the human has no intent for "maintenance mode"; their intent is "the master name
+should be X" or "auth should be enabled". A second declaration makes them drive the train when
+they only wanted to write the timetable. *Consistency:* five consecutive ADRs say derive from live
+state and never invent persistence — ADR-006 (*"Nothing is persisted — not a status field… a
+status field is a monitoring surface"*, and it rejected persisting a capability as **either**
+status **or** annotation), ADR-011 (*"derived from live state when bumped… never read back from
+status"*), ADR-013 (phase *"re-derived from live cluster state every pass"*), ADR-017 (*"the
+StatefulSet's own partition field is the cursor, so nothing new is persisted"*), ADR-018 (*"no
+'from' name, no phase, no cursor"*).
 
-The consistency objection is stronger still — five consecutive ADRs say the same thing:
+**Rejected — pure derivation from drift.** The successor position, and it fails on a sharper
+point: **`spec` disagreeing with observed is *drift*, and drift has many causes.** Someone changed
+the spec; or the world broke; or a capture occurred. Deriving intent from drift is the same
+conflation that produced K9 — `planForsaken` could not tell our own churn from a captor because
+both present as drift. It also cannot express serialization (§5.4), and for rotation-as-shipped
+there is nothing to derive from at all (no template changes).
 
-| ADR | |
+### 5.1 D1 — Intent is a change EVENT, not a state comparison
+
+The change is observable **exactly once**. After it passes, all that remains is a discrepancy, and
+a discrepancy is ambiguous by construction.
+
+**The bar for telling intent from drift is 100% — no false positive, no false negative.** This is
+*not* a safety bar and must not be confused with one. It is the bar that keeps the two mechanisms
+separate: if intent detection is fuzzy, invariants must compensate for a bad intent reading, and
+we are back to one mechanism doing two jobs — the thing this whole concept exists to escape.
+
+Worked example of the separation, because it is easy to slip: on a **capture-then-rename**, the
+intent question has a definite answer (*yes, the human asked for a rename*) and the safety
+question has a different one (*and the instance is captured*). Both are true. The intent
+mechanism is not ambiguous there; the situation is simply both asked-for and unsafe, which is
+precisely why both mechanisms are needed and neither can cover for the other.
+
+### 5.2 D2 — Per-field acknowledgment over a declared heavy set
+
+Three candidate mechanisms; only one clears the bar.
+
+| Mechanism | Verdict |
 |---|---|
-| 006 | *"Nothing is persisted — not a status field (a status field is a monitoring surface…)"*; the executor *"resumes from the cluster's own IMPORTING/MIGRATING markers — no persisted operator cursor"*. It explicitly rejected persisting a capability as **either** status **or** annotation. |
-| 011 | Annotations carry intent, but the epoch is *"derived from live state when bumped… never read back from status"*; every step is *"resumable from live state (ADR-006 discipline)"*. |
-| 013 | Even the migration, which genuinely has phases, *"re-derives phase from live cluster state every pass"*. |
-| 017 | *"the StatefulSet's own partition field is the cursor, so nothing new is persisted"*. |
-| 018 | Rule N: *"Nothing is remembered; no 'from' name, no phase, no cursor."* |
+| `generation != observedGeneration` (coarse) | 100% for *"some spec change is unreconciled"*. **Free — the field already exists on the CR (`littlered_types.go:827`) and is entirely unwired.** Cannot distinguish a `masterName` change from a `replicas` change, and cannot serialize. |
+| generation **+** drift ("unacknowledged generation AND name drift ⇒ rename intent") | **FAILS the bar.** Edit `spec.replicas` while a capture causes name drift and it reads as rename intent. A narrow false positive is still a false positive. |
+| **Per-field acknowledgment over a bounded heavy set** | **Chosen.** 100% at the granularity needed; survives restarts; expresses serialization. |
 
-**Derive the runlevel from (spec, observed state) each pass.** It works for every candidate:
+**Acknowledge on COMPLETION, not on observation.** This is what makes it 100% rather than 99%:
+"unacknowledged" then means *unfinished work from a spec change*, which survives operator death
+and is idempotent across restarts. Acknowledging on sight loses the intent silently if the
+operator dies between the write and the action — a false negative of exactly the kind the bar
+forbids.
 
-- **rename** — `spec.sentinel.masterName` ≠ what the Sentinels monitor. Already Rule N's input;
-  self-clears on convergence.
-- **auth enablement** — the desired pod template carries auth and the StatefulSet is unsettled.
-  `statefulSetRolloutSettled` already answers it.
-- **auth rotation, staged/args-driven** — template changes, same derivation.
-- **rotation as it works today** — *not* derivable, because the password is a `secretKeyRef`
-  changing no template. But that is precisely defect A1, and the auth design's fix (drive it from
-  args) makes it derivable. **The defect and the underivability are the same problem** — a good
-  sign the design cuts along the grain.
+**The heavy set is a load-bearing API concept**, not an implementation detail: adding a field to
+it changes behaviour. It must be explicit, documented and versioned.
 
-*Operator restart mid-operation* is descoped by owner decision: a heavy reconfiguration
-interrupted by an operator death may leave the instance broken, and rollback is undeploy and
-redeploy. "Do not switch off your device during a firmware upgrade."
+Precedent for the storage: status already carries five load-bearing **event observations** —
+`LeaderlessSince`, `GhostMasterStuckSince`, `ForsakenSince`, `QuarantinedSince`,
+`QuarantineAttempts`. ADR-006 forbids persisting *recomputable* state; an observation of an event
+at a point in time is by definition not recomputable, which is why those five are consistent with
+it and a capability flag was not.
 
-**D2 — No global gate on operations; a narrow per-operation opt-in where a waiver is genuinely
-unavoidable.**
+### 5.3 D3 — The acknowledgment is NOT an operational input
 
-*Also revised.* The first draft had operations rejected outside the runlevel. With D1 derived
-there is no mode to be outside of, so that catch is gone — and a typo or GitOps drift can start a
-heavy reconfiguration with no confirmation.
+ADR-018 refused remembering the previous master name. That refusal stands and is untouched: Rule N
+derives what to prune from **evidence** (anything that is not the desired name is stale), which is
+what lets it repair an instance a *previous* botched rename broke.
 
-Accepted, on this principle: **if an operation is safe enough not to need a window, it does not
-need a waiver either; if it is not safe enough, the fix is to make it safe, not to make the human
-sign for it.** ADR-018 shipped exactly this way — preconditions in the runbook, N4 documenting
-non-robustness under concurrent disruption as an explicit non-requirement — and the auth design
-concludes no window is needed for either of its features.
+An acknowledgment record is a different object with a different purpose. It never tells any rule
+what to do. It answers one question — *was this asked for?* — and nothing else reads it.
 
-Where a waiver *is* unavoidable, the project already has the right shape:
-`sentinel.allowUnsafeRebootstrapOnDeadlock` — a **narrow, per-operation opt-in in spec** for one
+### 5.4 D4 — Heavy operations serialize
+
+With K heavy operations there are K(K−1)/2 pairs, and **not one has ever been analysed**. Rename ×
+auth exists today and has never been reasoned about. Serializing collapses that surface to zero:
+a pair never occurs, so a pair never needs analysis.
+
+It is also what makes §3.1's arithmetic sound. "This invariant holds" is proven against one
+operation at a time; if two heavy operations overlap, the proof does not carry. **Serialization is
+the precondition for reasoning about invariants one operation at a time.**
+
+The project already wants this in prose and cannot enforce it: the auth design's N7 (*"one
+variable per window"*) and §13 (*the rename and the auth change "should be separated rather than
+combined"* — today's advice to combine them works only by coincidence, because enabling auth rolls
+the Sentinel StatefulSet and wipes the EmptyDir the rename otherwise needs cleared). Per-field
+intent turns an unenforceable instruction into a mechanism.
+
+**Serialize, do not refuse.** Two pending intents run one after the other. Refusing and telling
+the human to un-declare one is train-driving again — they wrote a timetable with two entries, and
+honouring both in a safe order is the operator's job.
+
+**The order is a static precedence list**, deterministic and justified — not arrival order. Order
+demonstrably matters: §7.3's remedy order is *capture → let the quarantine finish → then rename*,
+and the auth/rename EmptyDir interaction above.
+
+### 5.5 D5 — An early branch, not a second loop
+
+Two loops means two places that must know the same things, and they drift. The existing
+quarantine/`Forsaken` shape is the model: read the runlevel early, take a different branch. The
+maintenance path is a small purpose-built driver, not a parallel universe.
+
+### 5.6 D6 — Exclusivity in both directions
+
+Regular healing does not run during a heavy operation; heavy actions do not run outside one.
+
+### 5.7 D7 — No global gate; a narrow per-operation opt-in where a waiver is unavoidable
+
+**If an operation is safe enough not to need a window, it does not need a waiver either; if it is
+not safe enough, the fix is to make it safe, not to make the human sign for it.** ADR-018 shipped
+exactly this way — preconditions in the runbook, N4 documenting non-robustness under concurrent
+disruption as an explicit non-requirement — and the auth design concludes no window is needed for
+either of its features.
+
+Where a waiver genuinely is unavoidable, the shape already exists:
+`sentinel.allowUnsafeRebootstrapOnDeadlock` — a narrow, per-operation opt-in in spec for one
 specific unsafe path, not a global mode. One line in the timetable saying "yes, I accept *this*
 risk".
 
-**D3 — An early branch, not a second loop.** Two loops means two places that must know the same
-things, and they drift. The existing quarantine/`Forsaken` shape is the model: read the runlevel
-early, take a different branch. The maintenance path is a small purpose-built driver, not a
-parallel universe.
+### 5.8 D8 — The runlevel does not replace invariant guards
 
-**D4 — Exclusivity in both directions.** Regular healing does not run in maintenance; maintenance
-actions do not run outside it.
-
-**D5 — The runlevel does not replace invariant guards.** §3.1. Both, with different jobs.
+§3.1. Both, with different jobs. The auth defects in `BUGS_AUTH_PREEXISTING.md` are the worked
+proof: **not one of them is fixed by any runlevel**, because the credential lives in a Secret the
+operator does not own, so no CR-level mechanism ever sees the change.
 
 ---
 
@@ -274,12 +337,17 @@ For anyone planning this, these are the cases that motivate each part:
 7. **~~Refusal mechanism for D2~~** — settled by the D2 revision: no global gate. What remains is
    per-operation: does any auth path genuinely need an `allowUnsafe…`-style opt-in? The auth
    design says no; revisit if WP0 says otherwise.
-8. **Derivation's own failure mode (new, from D1).** A derived runlevel is only as good as the
-   comparison that derives it. "`spec` disagrees with observed" is also what a *half-failed*
-   operation looks like, and what a *stuck* one looks like — so the derivation must not confuse
-   "in progress" with "wedged". This is the same shape as the accepted stuck-rollout hole in
-   LR-050 and probably wants the same answer (name it, do not paper over it).
-9. **Narrow-first or general?** Recommendation: **narrow**. Auth is the first operation that
+8. **Head-of-line blocking (from D4).** A serialized queue means a wedged operation A stops B
+   from ever running, leaving an intent unreconciled indefinitely. Same shape as LR-050's accepted
+   stuck-rollout hole, and it wants the same treatment: a loud condition, and **no auto-skip
+   timer** (ADR-017's lesson — a timer would be the defect with a delay).
+9. **Defining the heavy set.** Which fields, and what makes one heavy? It is an API surface (D2),
+   so the answer needs to be a documented list with a stated admission test, not a judgement made
+   per field as they arrive.
+10. **The static precedence order (from D4).** What order, and justified how? Two interactions are
+    already known (§7.3's capture-before-rename; the auth/rename EmptyDir coincidence). Whether a
+    total order is derivable or must be asserted per pair is open.
+11. **Narrow-first or general?** Recommendation: **narrow**. Auth is the first operation that
    genuinely needs the risk-acceptance signal; the rename shipped without one, which is evidence
    that the general case is harder to justify than the auth case. Build it for auth, generalise
    when a second customer appears.
