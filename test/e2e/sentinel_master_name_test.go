@@ -23,6 +23,8 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -1629,7 +1631,19 @@ func TestRenameFixtureDoesNotOverrideMinReadySeconds(t *testing.T) {
 // historical comments explaining the removal — those must not trip the guard, and
 // deleting them to satisfy it would erase the record of why the reason is gone.
 func TestStaleMasterNameHasNoSuspicionReason(t *testing.T) {
-	const dir = "../../internal/controller"
+	// Anchored to THIS source file, never to the process working directory.
+	// test/utils.Run() calls os.Chdir(GetProjectDir()) and never restores it, so by
+	// the time the plain Go tests run, any Ginkgo spec that shelled out has already
+	// moved the process to the repo root — and a "../../" path then resolves one
+	// level above the repo. The guard failed with a bare "no such file or directory"
+	// in every full `make test-e2e` run and passed when run alone, which reads as a
+	// flake and trains the reader to dismiss a guard that is supposed to be load-
+	// bearing. A source-anchored path cannot be moved out from under it.
+	_, thisFile, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("runtime.Caller(0) failed; cannot locate the source tree")
+	}
+	dir := filepath.Join(filepath.Dir(thisFile), "..", "..", "internal", "controller")
 	files, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatalf("cannot read %s: %v", dir, err)
