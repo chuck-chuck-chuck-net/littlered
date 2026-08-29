@@ -290,6 +290,12 @@ A sweep worth doing independently of the runlevel work, because each finding is 
    right thing; the field reads `failover-status`, a key Sentinel has never emitted (the real key
    is `failover-state`), so it is permanently false and Rule A's second half has never fired.
    Concept is fine; the plumbing is not. Tracked in `BACKLOG.md`.
+   **FIXED — LR-052 (M0.2).** The plumbing now reads `failover-state` through the one predicate
+   that was already correct. Measured on scm-s2: the window is 1.84 s and sits *inside* the window
+   in which `RealMasterIP` was already `""`, so the blast radius on the ordinary failover path is
+   nil — but the guard is now genuinely live in the sub-window where a majority already names the
+   new master while the leader is still reconfiguring replicas, which is precisely where Rule D's
+   RESET used to fire into a running failover (LR-011/LR-013).
 3. **`ValidIPs` serves two concepts** — R5 above. The deepest of the three, and the one whose fix
    is a conceptual split rather than a patch.
 

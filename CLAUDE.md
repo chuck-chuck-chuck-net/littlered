@@ -63,6 +63,7 @@ Welcome! This document provides a high-level, condensed overview of the LittleRe
     2. **Deadlocks**: When a specific failure sequence prevents auto-recovery (e.g., a master failing before a replica has fully synced).
     3. **External Knowledge**: When the operator knows something Redis doesn't (e.g., "The Pod for this NodeID is deleted from K8s, it's never coming back").
 - **Key Goal**: Support the internal workings of Sentinel and Gossip, only "helping" when a permanent stall or cluster-wide failure is detected.
+- **The deference to an in-flight Sentinel failover was NOMINAL until 2026-08-29 (LR-052).** Rule A's second half — `state.FailoverActive`, the clause that expresses "Sentinel is already working, stay out of its way" — read a Sentinel reply key (`failover-status`) that neither Redis nor Valkey has ever emitted, so it was permanently false and **had never fired in the product's history**. The pillar's claim was true of `anyTerminating` and of cluster-mode gossip; for a Sentinel *election* the operator was never actually standing back. Fixed by reading `failover-state`, routed through the one predicate that was already correct. Measured blast radius is nil on the ordinary path (the window sits inside one where no master was resolvable anyway) but the guard is genuinely live in the sub-window where a master is already resolvable while replicas are still being reconfigured — which is exactly where Rule D's `SENTINEL RESET` used to fire into a running failover (LR-011/LR-013). Read as a caution about this pillar generally: **a deference clause that never fires looks identical, in every log and every test, to one that never needs to.**
 - **SCOPE — this pillar governs `cluster` and `sentinel` mode, NOT `failover` mode** (added 2026-08-18, LR-038). It is a rule about *deference*, and deference needs something to defer **to**: cluster mode has gossip with quorum-propagated FAIL verdicts, sentinel mode has a Sentinel quorum with its own elections. Both are real distributed algorithms that fight an interfering operator. **Plain Redis replication is a mechanism, not an algorithm** — it has no failure detector, no election, and no opinion about who should be master, and a lone master will happily serve forever with every replica gone. In `failover` mode the operator *is* the algorithm (pillar 3.14), so there is nothing to defer to and restraint is not conservatism, it is abdication. Withholding an action there because it looks like "interference" is a category error.
 - **How to reason about pre-`failover` ADRs generally**: an ADR is written for one problem in one context. When it is cited in a *different* context, its assumptions must be re-checked rather than inherited. Worked examples from LR-038, where four inherited principles were each mis-applied to failover mode: **ADR-001 strict IP identity** was a constraint imposed by *Sentinel's address-keyed tables* — with no Sentinel there is no such table, so an IP is just a routing address and identity should come from Redis itself (`run_id`, replid lineage) or the pod UID. **LR-017 "the operator's dial is never sufficient evidence"** governs *verdicts*, not *actions*: never derive a verdict from a dial, but always feel free to act through one — a failed dial is an unknown, not a finding. **ADR-006 "nothing load-bearing in status"** forbids persisting *derived* state; failover mode deliberately persists load-bearing *intent* in annotations. **LR-016 "no topology decisions in the pod"** forbids a pod inferring the state of *other* nodes — a pod acting on "I am being terminated" is acting on local knowledge that cannot be wrong, which is why the terminating master self-fences (LR-038).
 
@@ -386,3 +387,45 @@ kubectl apply -f config/samples/ # Try out sample CRs
 **And the fix removed an accidental protection — read LR-048 and LR-050 as one story.** The stale entry was what let the outgoing master hand over *instantly*. With it gone the instance has no master of its own for `preStop stall ~21s + downAfterMilliseconds 30s + election ~1.5s ≈ 42.5s`, and in that window a just-replaced pod of ours is byte-identical to a captor's live master. The `Forsaken` verdict settled at T+30 and **quarantined a healthy instance 12.5s before it would have healed itself** — six pods deleted on EmptyDir. LR-050 closes it by withholding address attribution while our own StatefulSet is unsettled, **deleting three surfaces rather than adding any**. **The generalizable lesson: a fix that removes a broken mechanism also removes whatever that mechanism was accidentally providing** — the sibling of LR-038's *"a guard written against the ground truth is only as good as what the ground truth is allowed to contain"*.
 
 **Verified:** the rollout interlock the design rests on measured **34.76s / 33.63s** (both on `minReadySeconds: 35`) *before* anything was built on it; the prune lands **1.4s** after the patch and the instance settles at **+176.8s**, plus ~30s at the master edge; e2e tier 1 banked its pre-fix RED (`monitors [mymaster lr048-red…], want exactly […]`) and the three tiers are `3 Passed | 0 Failed`; **full suite `123 Passed | 0 Failed` on t3e (2026-08-28)**. **Not covered:** renaming a degraded instance (Rule L's ≥2-holder refusal is the safety net and the wedge), concurrent disruption, and the K2d residual — a captor whose master is transiently `s_down` at the instant of the rename is seen by neither gate, narrowed rather than closed.
+
+### The Guard That Had Never Fired — `FailoverActive` Read a Key Sentinel Does Not Emit (2026-08-29, LR-052)
+
+**Symptom:** none, ever — which is the point. `ReplicationState.FailoverActive` was populated from
+`result["failover-status"]`, and the key Sentinel actually emits is **`failover-state`**
+(`redis/redis` 8.0 `src/sentinel.c:3435`, `valkey-io/valkey` 8.1 `src/sentinel.c:3317`, both
+re-read first-hand; `failover-status` is a zero hit in either file). Sentinel answers a field it
+does not have by simply not sending it, so the gather got a plausible empty string rather than an
+error. The field was therefore permanently `false`, and with it: **Rule A's second half** (never
+fired, so a real Sentinel failover with no terminating pod did not suspend healing),
+`DetermineRealMaster`'s LR-004 fallback suppression, and `lrctl verify`'s in-flight-failover
+report. **This is LR-041's exact shape** — a gather that asks the wrong question gets a
+plausible answer, not an error, and every rule downstream goes quietly inert.
+
+**Fix:** read `failover-state`, and route *every* reader through the one predicate that was
+already correct — `MonitoredMaster.FailoverInProgress()`, written for Rule N — rather than adding
+a third copy (LR-045's lesson, the `IsLinkUpReplicaOf` precedent). Both signals are read (the
+`failover_in_progress` flag and a non-idle state) and the idle test stays inverted, so an
+unrecognised value fails safe. **Absence is idle**: Sentinel emits the key only while the master
+carries `SRI_FAILOVER_IN_PROGRESS`, and reading absence as in-flight would make Rule A skip all
+healing forever — strictly worse than the bug, and the mutation the tests are pinned against.
+
+**Measured on scm-s2** (Redis 8.4.2, three Sentinels, 0.2-0.3 s sampling across graceful master
+deletes): the window is **1.84 s**, only the **election leader** reports it (1 of 3 Sentinels — so
+`FailoverActive` must stay an OR, never a majority test), and it sits *inside* the **2.14 s** window
+in which `RealMasterIP` was already `""` via LR-004's ghost-majority clause — so the blast radius on
+the ordinary failover path is nil, and `updateMasterLabel` runs upstream of Rule A so the label flip
+cannot be delayed. The fixed code was A/B'd against the pre-fix binary through `lrctl` (exec-based,
+shares the whole path) across three failovers, sampled alternately: **`failoverActive=true` on 9 of
+the fixed binary's 365 samples, 0 of the pre-fix binary's**, never outside a window the in-pod
+sampler confirms.
+
+**New residual, recorded rather than closed:** `sentinelAbortFailover` cannot be reached from
+`RECONF_SLAVES`, and that state's only exit — `sentinelFailoverDetectEnd` — returns *before* its
+own timeout check when the promoted replica is `S_DOWN`. So a Sentinel whose promoted replica dies
+inside the ~2 s reconfiguration window can latch the flag indefinitely, and Rule A would honour it
+for as long. No timer is added (LR-050's ground: a margin against a user-settable
+`failoverTimeout` is the same mistake in a new place); the failure direction is a loud stall on an
+already-`Ready=False` instance, and Rule A's *first* half has the same property for a stuck
+`Terminating` pod. LR-024's no-good-slave abort is immediate, so the ghost-master recovery is
+**not** blocked. **Owed:** the sentinel e2e suite against a deployed build — no registry
+credentials were available to publish an operator image.

@@ -2313,3 +2313,250 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   Builds on LR-017 (the operator's own dial is never sufficient evidence for a verdict) and
   LR-023 (kubelet readiness is the blackhole-proof signal) — and adds the case neither covered:
   **a pod that answered, to say no.**
+
+## [LR-052] `FailoverActive` Was a Sound Invariant Reading a Key That Does Not Exist — Rule A's Second Half Had Never Fired
+- **Date:** 2026-08-29
+- **Commit:** (pending)
+- **ID note:** LR-047 is taken on `fix/cluster-rollout-state-gate`; LR-048/049/050 are the
+  master-name-rename branch's; LR-051 is this branch's commit directly beneath. Allocated with
+  the LR-039 cross-branch loop over **every** branch, not by reading the tip of one line — the
+  highest ID visible anywhere was LR-051.
+- **Scope:** Phase 0 milestone M0.2 of `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`,
+  the §6 invariant sweep of `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` item 2 — *the concept is
+  fine; the plumbing is not.* Closes the `BACKLOG.md` item ADR-018 deferred (LR-048 design §15b).
+
+- **Problem — the guard was right, its evidence was fictional.** `MasterInfo.FailoverStatus` was
+  populated from `result["failover-status"]` and `IsFailoverInProgress` compared the same key.
+  **Neither Redis nor Valkey has ever emitted it.** `addReplySentinelRedisInstance` emits
+  `failover-state`, at `redis/redis` 8.0 `src/sentinel.c:3435` and `valkey-io/valkey` 8.1
+  `src/sentinel.c:3317` — both re-read first-hand for this entry, both a single hit, and
+  `failover-status` a **zero** hit in either file. So the key parsed as a miss, the field was
+  permanently `""`, `SentinelNodeState.FailoverStatus` was permanently `""`, and
+  `ReplicationState.FailoverActive` was permanently **false**.
+
+  Three consumers were therefore dead:
+
+  | Consumer | Effect of the permanent `false` |
+  |---|---|
+  | `littlered_controller.go` — **Rule A** | `if anyTerminating \|\| state.FailoverActive` — the second half **has never fired in the product's history**. Rule A guarded on `anyTerminating` alone, so a real Sentinel failover with no terminating pod did not suspend healing |
+  | `replication_state.go` — `DetermineRealMaster` step 4 | `!s.FailoverActive` always true, so LR-004's suppression of the Redis-only fallback rested on the ghost-majority clause alone |
+  | `lrctl verify` / `--json` | the ground-truth tool could never report an in-flight failover, and `Healthy` was never reduced by one |
+
+  **This is LR-041's exact shape and it is worth naming as a class**: a gather value that reads
+  *plausible* rather than erroneous. Sentinel answers an unknown field the same way it answers an
+  absent one — by not sending it — so the operator was not told it had asked a nonsense question.
+  LR-041 was the same defect on the master *name*; this one is on a master *field*.
+
+- **Fix — one predicate, reused, never a third copy.** The correct predicate already existed:
+  `MonitoredMaster.FailoverInProgress()`, written for Rule N's G3, source-confirmed and
+  unit-tested. Its body is extracted to the package-level `failoverInProgress(flags, state)` and
+  **every** reader now routes through it — `MonitoredMaster`, the new `MasterInfo.FailoverInProgress`,
+  the new `SentinelNodeState.MasterFailoverInProgress` (which `DetermineRealMaster` step 1 calls),
+  and `IsFailoverInProgress`. This is the `IsLinkUpReplicaOf` precedent and LR-045's lesson: a
+  duplicated predicate is literally how that defect happened, and this is the same class one level
+  down — the `SENTINEL master` path re-derived the test against a key that does not exist while the
+  `SENTINEL MASTERS` path, twenty lines away, was correct all along.
+
+  Two signals, as before: the `failover_in_progress` token in the master's `flags`, and a non-idle
+  `failover-state`. The idle test stays **inverted** — recognise idle, treat everything else as
+  in-flight — so an unrecognised or future value fails safe.
+
+- **The idle/absent distinction is the row that keeps this from being strictly worse than the bug.**
+  Sentinel emits `failover-state` **only** while the instance carries `SRI_FAILOVER_IN_PROGRESS`
+  (the `if` at both cited lines), so the steady-state reply omits the key entirely rather than
+  sending `"none"`. Confirmed on the wire, not merely from the source: a healthy `SENTINEL master`
+  on the shipped Redis 8.4.2 returns 28 fields and **neither** key appears. Had absence read as
+  in-flight, Rule A would skip **all** healing on every pass, forever.
+
+- **Fields renamed rather than repointed** (`FailoverStatus` → `FailoverState` /
+  `MasterFailoverState`; the `lrctl` JSON key `failoverStatus` → `failoverState`). The old name is
+  what made the wrong wire key look plausible. The JSON rename breaks no consumer *because of the
+  bug*: the field is `omitempty` and its value was always `""`, so it has never appeared in any
+  output.
+
+- **Live evidence, part 1 — the wire (scm-s2, 2026-08-29, throwaway sentinel instance, Redis
+  8.4.2, three Sentinels, `downAfterMilliseconds: 5000`), 0.3 s in-pod sampling of
+  `SENTINEL master` on all three Sentinels across a graceful master delete.** The mid-transition
+  reply, verbatim and trimmed:
+
+      16:10:08.33 flags master,failover_in_progress,force_failover ... failover-state wait_promotion
+      16:10:09.25 flags master,failover_in_progress,force_failover ... failover-state reconf_slaves
+      16:10:10.17 flags master,disconnected,failover_in_progress,force_failover ... failover-state reconf_slaves
+
+  The **healthy** reply from the same Sentinel is 28 fields and contains **neither** key — which
+  is the absence the idle row depends on, observed rather than inferred.
+
+  | quantity | measured |
+  |---|---|
+  | `failover_in_progress` / `failover-state` present | **1.84 s** (16:10:08.33 → 16:10:10.17) |
+  | occurrences of `failover-status`, 553 samples × 3 Sentinels | **0** |
+  | Sentinels that ever reported it | **1 of 3** — only the election leader |
+  | `status.master` empty (i.e. `RealMasterIP == ""`), pre-fix operator | **2.14 s** (16:10:08.06 → 16:10:10.20) |
+
+- **Live evidence, part 2 — the fixed code, A/B against the pre-fix binary, on the same cluster
+  across the same failovers.** No operator image could be published this session (no registry
+  credentials — see "Not verified live" below), so the fixed code was exercised through **`lrctl`**,
+  which reaches Redis and Sentinel exclusively by `kubectl exec` (LR-046's parity table), runs
+  locally, and shares the *identical* gather, parser and `DetermineRealMaster` this change touches.
+  Two binaries — `lrctl` built at the pre-fix commit `7f57600` and at the fixed HEAD — were sampled
+  **alternately, ~0.3 s apart**, across three consecutive graceful master deletes, with the in-pod
+  Sentinel sampler running as independent ground truth. Verbatim, failover 1 of 3:
+
+      16:15:05.85 fixed  failoverActive=False healthy=True  master=10.233.66.210
+      16:15:06.24 prefix failoverActive=False healthy=False master=10.233.66.210   <- Sentinel: in failover
+      16:15:06.70 fixed  failoverActive=True  healthy=False master=10.233.66.210
+      16:15:07.00 prefix failoverActive=False healthy=False master=10.233.66.210
+      16:15:07.31 fixed  failoverActive=True  healthy=False master=10.233.64.178
+      16:15:07.63 prefix failoverActive=False healthy=False master=10.233.64.178
+      16:15:07.93 fixed  failoverActive=True  healthy=False master=10.233.64.178
+      16:15:08.23 prefix failoverActive=False healthy=True  master=10.233.64.178   <- Sentinel: window closed 08.11
+
+  **Totals over the run: 365 samples each; `failoverActive=true` on 9 of the fixed binary's, on 0
+  of the pre-fix binary's** — three per failover, in all three failovers, and never once outside a
+  window the in-pod sampler independently confirms. The alternation is what makes it an A/B rather
+  than two runs: the two binaries observe the same seconds of the same failover. Failover 3 was led
+  by `sentinel-1` rather than `sentinel-0`, so the "only the leader reports it" property is not an
+  artefact of one pod.
+
+- **Where it is NOT redundant, and this is the point of the change — measured, and larger than
+  first estimated.** There is a real sub-window in which a master is already resolvable (so
+  `RealMasterIP != ""`) while the leader is still reconfiguring replicas. The A/B shows it
+  directly: **every one of the nine `failoverActive=true` samples also carries a non-empty
+  `master=`**, and in each failover the guard is live across the whole ~1.5-1.9 s window rather
+  than the 0.03 s a first reading of the operator-status trace suggested. That is exactly where
+  Rule D's `SENTINEL RESET` and Rule R would previously have fired *into a running failover* — the
+  hazard LR-011 and LR-013 are entirely about (RESET wipes Sentinel's replica list, which can only
+  be rebuilt from the master's `INFO`). Turning the guard on makes that hazard **strictly less
+  reachable**. So this is not merely the restoration of an intended behaviour; it removes an
+  ordering that has bitten this project twice.
+  **Corollary for the "did the empty window grow?" question, answered on the same data:**
+  `RealMasterIP` was resolvable throughout, so `DetermineRealMaster` returned at its majority
+  clause and the newly-live fallback suppression was never even reached — **`master=NONE` appeared
+  in 0 of 365 samples for BOTH binaries.** The empty window did not grow in any observed failover;
+  the case where it *could* (Sentinels split with no valid majority *and* a failover in flight) did
+  not occur naturally and is covered by `TestFailoverActiveSuppressesTheRedisOnlyFallback`.
+
+- **`FailoverActive` is an OR over Sentinels, and the capture says that is required, not merely
+  conservative.** Only the **leader** runs the failover state machine and therefore only the leader
+  ever carries `SRI_FAILOVER_IN_PROGRESS` on its own master entry — 1 of 3 in the measurement. A
+  majority or unanimity test (the shape `planForsaken` clause 2 correctly uses for a *verdict*)
+  would make the field permanently false again. The asymmetry is principled: this is a reason to
+  **stand back**, not a verdict, and the conservative direction for "should the operator keep its
+  hands off" is to believe the first Sentinel that says yes.
+
+- **⚠ NEW RESIDUAL, found by this work and not closed here: a Sentinel can latch
+  `SRI_FAILOVER_IN_PROGRESS` indefinitely, and Rule A would then suspend sentinel healing for as
+  long.** Read first-hand at both versions. `sentinelAbortFailover` (redis 8.0 `:5340`, valkey 8.1
+  `:5127`) clears the flag *and* resets `failover_state`, and it is reachable from four call sites —
+  but it `serverAssert`s `failover_state <= WAIT_PROMOTION`, so it **cannot** be reached from
+  `RECONF_SLAVES`. The only exit from `RECONF_SLAVES` is `sentinelFailoverDetectEnd` (`:5177`),
+  whose **first statement returns early when the promoted replica is `NULL` or `SRI_S_DOWN`** —
+  *before* its `elapsed > failover_timeout` force-end at `:5201`. So a promoted replica that dies
+  inside the reconfiguration window leaves that Sentinel in `RECONF_SLAVES` with no timer to end
+  it. Four points bound the concern, and none of them closes it:
+    1. The window is the measured 1.84 s, and the replica must die *inside* it.
+    2. The no-good-slave abort — **LR-024's exact state** — is at `:5128`, in `SELECT_SLAVE`, with
+       **no timeout at all**: it aborts on the same state-machine tick. So the LR-024 ghost-master
+       deadlock and its recovery rule cannot be blocked by this guard, which was the specific
+       interaction the BACKLOG item asked to re-check.
+    3. Any peer that completes a failover at a higher config epoch resets the stuck Sentinel
+       through `sentinelResetMasterAndChangeAddress` on the next hello. This does **not** help when
+       the stuck Sentinel is the leader, which it is by construction.
+    4. Rule A's *first* half already has this property — a pod stuck `Terminating` suspends healing
+       for as long — so the shape is pre-existing, not introduced.
+  **No timer is added**, on LR-050's ground: a margin against a user-settable, unbounded
+  `spec.sentinel.failoverTimeout` is the same mistake in a new place, and the chosen failure
+  direction here is a loud stall on an instance that is already `Ready=False` rather than a
+  destructive action (LR-047's asymmetry, not LR-043's). The manual escape is the documented one, a
+  `SENTINEL RESET`. Recorded as a decision so it is not rediscovered as a surprise.
+
+- **Cross-mode parity audit (CLAUDE.md §7 rule 11) — two sweeps: the consumers, and every other
+  Sentinel reply key the tree reads.**
+
+  | site | verdict | why |
+  |---|---|---|
+  | sentinel — `GetMasterState` → `SentinelNodeState` → `DetermineRealMaster` → Rule A | **FIXED** | the reported defect |
+  | sentinel — `SentinelClient.IsFailoverInProgress` | **FIXED** | second instance of the same dead key, same file; now the same predicate |
+  | sentinel — Rule N G3 (`planStaleMasterNames`) | **already correct, untouched** | it reads `MonitoredMaster.FailoverInProgress()` over `SENTINEL MASTERS`, which was right all along. See the G3 note below |
+  | **`lrctl`** | **FIXED** | `cmd/lrctl/cmd/gatherer.go` parsed the same dead key from `redis-cli` output. `lrctl` is the project's ground-truth tool (rule §7.8) and must not report a failover state it read from a key that does not exist. `cmd/lrctl/cmd/sentinel_parse.go` — the `SENTINEL MASTERS` parser added by LR-048 — was already correct, so the CLI disagreed with itself between two of its own parsers |
+  | failover mode | **N/A, and it is not an oversight** | there are no Sentinels, so `GatherReplicationState` is called with no sentinel pods, `SentinelNodes` is empty and `FailoverActive` is correctly false. The mode's own failure detection is `planMasterDeath` (kubelet readiness + corroborated probes), which shares no key with this path |
+  | cluster mode | **N/A** | no Sentinel and no `SENTINEL master` reply. Its in-flight-topology signals are `CLUSTER INFO`/`CLUSTER NODES`, whose field names are exercised by every cluster e2e |
+  | standalone | **N/A** | no Sentinel |
+  | every other `SENTINEL master` / `SENTINEL replicas` field the tree reads — `name`, `ip`, `port`, `flags`, `num-other-sentinels`, `num-slaves` | **audited, all live** | each carries a real value in the field captures this project has banked (LR-044's M4a records `num-slaves 2 → 5` and `num-other-sentinels 2 → 5`; the healthy capture above shows all six populated). `failover-status` was the only dead key, and it is now the only one with no reader |
+
+- **Rule N's G3 comment is now stale — reported, not edited** (`stale_master_name_plan.go` is
+  M0.3's file). It reads *"`state.FailoverActive` is OR-ed in for form only; it is permanently
+  false in sentinel mode today … so nothing may rest on it."* That is no longer true. It is also
+  no longer *only* form: `failoverUnder` is collected from `MonitoredMasters`, which **degrades to
+  an empty list on a read failure** (LR-041's deliberate choice), whereas `FailoverActive` comes
+  from the desired name's own successful probe — so the OR now genuinely fires in the narrow case
+  where `SENTINEL MASTERS` failed and `SENTINEL master <desired>` did not. That is a strengthening
+  in the refusal direction, which is G3's safe direction. One cosmetic consequence is newly
+  reachable and is also reported rather than fixed: in that case `failoverUnder` is empty, so the
+  message renders `a failover is in flight under master name(s) []`.
+
+- **Tests, red-first.** `internal/controller/failover_active_test.go`. The rows go through the
+  **real gather** against a scripted Sentinel, because the defect was never in the guard — a
+  hand-built `SentinelNodeState` cannot see a wire-key bug (LR-051's precedent, which built its
+  fleet through the real gather for the same reason). `TestDetermineRealMasterFailoverActive`
+  (5 rows) + `TestFailoverActiveSuppressesTheRedisOnlyFallback` (2 rows) were observed **RED on 4
+  of 7**, and the red names the defect exactly — the gathered state prints `FailoverStatus:` empty
+  right beside `MonitoredMasters:[{… FailoverState:select_slave}]`, i.e. the correct value already
+  parsed and simply never read:
+
+      FailoverActive = false, want true
+        gathered sentinel state: &{… FailoverStatus: … MasterFlags:master,failover_in_progress
+          MonitoredMasters:[{Name:ns.inst IP:10.0.0.1 Flags:master,failover_in_progress
+          FailoverState:select_slave}] …}
+
+  The three rows that were **green from birth are disclosed as such** — the two idle rows (absent
+  key, explicit `"none"`) and the fallback positive control. Their teeth were shown with the mutant
+  a reasonable implementer writes first, *absence reads as in-flight*, which fails **exactly those
+  three and nothing else**: `FailoverActive = true, want false` twice plus the control's
+  precondition. That mutant is the strictly-worse-than-the-bug outcome (Rule A skipping all healing
+  forever), so it is the one that had to be pinned. The fallback test's own positive control pins
+  the other direction: an ordinary Sentinel split with no failover must **still** resolve through
+  LR-004's fallback, so a blanket suppression cannot pass.
+
+- **NOT verified live: the operator itself, and the sentinel e2e suite. Stated plainly because the
+  plan's §9 risk row asks for exactly that.** `OPERATOR_IMAGE` derives from the git hash, so a code
+  change can only be deployed by publishing an image, and this session had **no registry
+  credentials** (`podman login --get-login ghcr.io` → *not logged into ghcr.io*, and no
+  `auth.json`/`config.json` anywhere; the nodes are Talos with no `talosctl` available, so
+  side-loading was not an option either). This is the same class of blocker LR-044's M4b recorded
+  when its honest red was *"blocked by the environment's permission policy"*. So:
+    - **What WAS verified on a real cluster:** the wire (both keys, healthy and mid-failover, on the
+      shipped Redis 8.4.2), the window durations, and the fixed *code path* end to end through
+      `lrctl` against the pre-fix binary — which covers the gather, the parser, `MasterInfo`,
+      `SentinelNodeState` and `DetermineRealMaster`, i.e. every line this change touches except
+      Rule A's own `if`.
+    - **What is OWED:** `make test-e2e LABEL_FILTER=sentinel` on scm-s2 against a deployed build —
+      in particular the `Sentinel Failover` `Ordered` graceful-then-crash pair, which is the tier
+      that produced LR-024's ghost-master deadlock on a real multi-node cluster and did **not**
+      reproduce on Kind, plus `Sentinel Rolling Update`, `Sentinel Resilience` and the
+      leaderless-deadlock tiers. The failure mode of this change is **over-suppression** — Rule A
+      declining to heal when it should — and unit tests cannot prove its absence; that is what the
+      e2e is for. Read the source analysis of the `RECONF_SLAVES` latch above as the specific thing
+      that run should be watched for.
+    - **A correction to the plan's own framing, worth carrying:** its §9 row says to *"re-run the
+      failover e2e tiers and compare against ADR-011's committed numbers"*. `FailoverActive` is a
+      **sentinel-mode** field; failover mode has no Sentinels and never populates it. The baseline
+      is the sentinel suite, not ADR-011's numbers.
+
+- **Regresses:** None on any steady-state path — Sentinel omits the field unless a failover is
+  running, so a healthy gather produces `FailoverActive == false` exactly as before, and every rule
+  takes the branch it took yesterday. No gate, cadence, requeue interval or decision table changed;
+  the only behaviour change is the intended one, and it is confined to the seconds a Sentinel says
+  a failover is running. `updateMasterLabel` is upstream of Rule A and is untouched. Cluster,
+  failover and standalone paths are not reached. The `lrctl` JSON key rename cannot break a
+  consumer, for the reason given above.
+
+- **Impacts:** `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` §6 item 2 (the invariant is now stated in
+  code); `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md` §7 Phase 0 (M0.2 done; M0.3
+  unaffected — this change touches neither `ValidIPs` nor `forsaken_plan.go`) and its §9 risk row;
+  `docs/SENTINEL_MASTER_NAME_RENAME_DESIGN.md` §15b (the deferral it records is discharged);
+  `BACKLOG.md` (item struck). Completes for the `SENTINEL master` reply what **LR-041** completed
+  for the master *name*: **a gather that asks the wrong question gets a plausible answer, not an
+  error, and every rule downstream goes quietly inert.** Makes LR-011/LR-013's RESET-into-a-running-
+  failover hazard less reachable, and — verified against the source — leaves LR-024's ghost-master
+  recovery unblocked.

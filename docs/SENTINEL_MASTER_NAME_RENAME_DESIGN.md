@@ -1225,6 +1225,14 @@ LR-050.
 
 ## 15b. Discovered en route — the dead `failover-status` key (NOT this feature)
 
+> **STATUS: RESOLVED by LR-052 (2026-08-29), on branch `feat/declared-operations` as Phase 0
+> milestone M0.2 — not in this change, exactly as this section asks.** The trigger below was
+> honoured: it landed as its own change with its own LR entry and its own live measurement, ahead
+> of any new rule gating on `FailoverActive`. The section is kept as written because it is the
+> design record of the deferral; read it with changelog LR-052, which also records a NEW residual
+> this section could not have known about (a Sentinel can latch `SRI_FAILOVER_IN_PROGRESS` with no
+> timeout if its promoted replica dies inside `RECONF_SLAVES`).
+
 Found by M1 while source-confirming G3; recorded here so it is not lost, and deliberately **not
 fixed in this change**.
 

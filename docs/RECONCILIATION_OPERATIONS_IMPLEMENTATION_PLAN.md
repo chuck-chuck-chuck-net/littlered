@@ -319,13 +319,25 @@ shippable and does not depend on anything else in this plan.**
 | M | What | Owns | LR |
 |---|---|---|---|
 | **M0.1** | **Unreachability must carry why.** `RedisNodeState`/`SentinelNodeState` gain a classified probe failure (`None \| Unroutable \| Timeout \| AuthFailed \| ProtocolError`); `gather.go:78-81`, `:93-96`, `:175-179` stop discarding the error. Classify `NOAUTH`, `WRONGPASS`, `ERR Client sent AUTH, but no password is set`, `ERR invalid password` as `AuthFailed`; deadline/net errors as `Timeout`/`Unroutable`. **The fix that matters:** a node that is `AuthFailed` is *not* provably empty, so it must veto — reuse LR-044's existing `unverified` concept rather than inventing one — in `planLeaderlessRecovery`, `planGhostMasterRecovery` and `quarantineDataRisk`. New condition `OperatorCannotAuthenticate` (True is bad), one event per transition. | `internal/redis/replication_state.go`, `internal/redis/gather.go`, `internal/controller/gatherer.go`, `internal/controller/leaderless_recovery.go`, `ghost_master_recovery.go`, `quarantine_plan.go`, `api/v1alpha1` (condition const) | **LR-051** |
-| **M0.2** | **`FailoverActive`'s evidence pipeline.** `client.go:198` and `:224` read `failover-status`, a key neither Redis nor Valkey has ever emitted, so Rule A's second half has never fired. The correct predicate **already exists** — `MonitoredMaster.FailoverInProgress()` (`client.go:708`), source-confirmed for both projects and written for Rule N. Make `MasterInfo` carry `Flags` + `FailoverState` and route both call sites and `DetermineRealMaster`'s clause 1 through that one predicate. **One definition, cf. `IsLinkUpReplicaOf`.** | `internal/redis/client.go`, `internal/redis/replication_state.go`, `internal/controller/gatherer.go` | **LR-052** |
+| **M0.2** ✅ **DONE (LR-052)** | **`FailoverActive`'s evidence pipeline.** `client.go:198` and `:224` read `failover-status`, a key neither Redis nor Valkey has ever emitted, so Rule A's second half has never fired. The correct predicate **already exists** — `MonitoredMaster.FailoverInProgress()` (`client.go:708`), source-confirmed for both projects and written for Rule N. Make `MasterInfo` carry `Flags` + `FailoverState` and route both call sites and `DetermineRealMaster`'s clause 1 through that one predicate. **One definition, cf. `IsLinkUpReplicaOf`.** | `internal/redis/client.go`, `internal/redis/replication_state.go`, `internal/controller/gatherer.go` | **LR-052** |
 | **M0.3** | **Split `ValidIPs` (R5).** Two concepts, two fields: `LiveTopologyIPs` — pods that count as live topology, the LR-038 terminating-pod filter intact — consumed by `DetermineRealMaster` clause 3 and `IsGhost`; and `OwnedIPs` — every pod of ours, *terminating included* — consumed by every "is this address ours?" question: `planForsaken` clause 3, Rule N's G5, `cross_instance.go`'s `ClassifyMonitoredName`. No alias is kept; nine call sites. | `internal/redis/replication_state.go`, `internal/redis/gather.go`, `internal/redis/cross_instance.go`, `internal/controller/forsaken_plan.go`, `internal/controller/stale_master_name_plan.go`, `internal/controller/littlered_controller.go` | **LR-053** |
 
 **M0.2 is the one with live blast radius.** Turning `FailoverActive` on for the first time means
 Rule A genuinely starts skipping healing during Sentinel failovers — the intended behaviour, never
 before exercised. The failover e2e tiers must be re-run and their timings compared against the
 committed ADR-011 numbers; a regression there is a real finding, not noise.
+
+> **M0.2 landed (LR-052). The blast radius was measured on scm-s2 and is nil on the ordinary
+> failover path**: the `failover-state` window is 1.84 s and sits *inside* the 2.14 s window in
+> which `RealMasterIP` was already `""` via LR-004's ghost-majority clause, and `updateMasterLabel`
+> runs upstream of Rule A so the label flip cannot be delayed. **The e2e re-run this row asks for
+> is still OWED and was not done**: publishing an operator image needs registry credentials this
+> session did not have, so no build could be deployed. What was verified live instead is the code
+> path itself, through `lrctl` — which is exec-based, runs locally and shares the fixed gather and
+> `DetermineRealMaster` — sampled against the pre-fix binary across the same real failovers. Note
+> also that the comparison baseline for this milestone is the **sentinel** suite, not ADR-011's
+> failover-mode numbers: `FailoverActive` is a sentinel-mode field and failover mode never
+> populates it.
 
 **M0.3 does NOT make LR-050's gate redundant, and the implementer must not conclude it does.**
 `OwnedIPs` fixes the case where a terminating pod of ours is still in the pod list. LR-050's window
