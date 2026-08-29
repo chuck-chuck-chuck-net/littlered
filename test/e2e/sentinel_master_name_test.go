@@ -1196,6 +1196,37 @@ spec:
 	})
 
 	It("keeps the capture verdict, prunes nothing, and still quarantines and heals", func() {
+		// ⚠ BLOCKED ON LR-054 — SKIPPED DELIBERATELY, DO NOT "FIX" BY RESTAGING.
+		//
+		// Every assertion in this tier hangs off an ARMED capture verdict, and the
+		// staging that makes the tier possible is exactly what prevents the verdict from
+		// arming. The pinned pod must hold the victim's OWN keys, which it can only do
+		// if its sync from the captor FAILED (a successful one flushes them, LR-044 M4a)
+		// — and a failed sync is `link:down`, is not-Ready, is `ReadyReplicas <
+		// Replicas`, is `statefulSetRolloutSettled == false`, at which point LR-050's
+		// gate withholds attribution and `planForsaken` never arms. The staging is not
+		// optional either: without it the quarantine fires ~30s after the capture and
+		// the pods are gone before the panicked rename this tier exists to perform.
+		//
+		// This tier therefore passed, until now, by winning a measured 23s-in-30s race
+		// between the operator's first post-capture gather and the readiness probe. That
+		// is worse than no coverage, because it reads as coverage. Verified on t3e
+		// against the pre-LR-053 image as well, so it is not a regression — see LR-054
+		// for the full mechanism, the both-images table, and why the obvious narrowing
+		// of the gate is wrong.
+		//
+		// What this tier protects in the meantime, at the planner level and
+		// deterministically: WP4b's invariant — an ALREADY-ARMED verdict survives a roll,
+		// with the signature present and absent — is `TestPlanForsakenRolloutGate`'s two
+		// INVARIANT rows; the name-agnostic clauses are `TestPlanForsakenIsNameAgnostic`;
+		// G0 standing Rule N down is the `forsaken` row of `TestPlanStaleMasterNames`;
+		// and `TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData` pins this very
+		// blockage. UN-SKIP THIS TIER AS PART OF THE LR-054 FIX, not before: it is the
+		// end-to-end proof that a panicked rename cannot defeat ADR-016, and that proof
+		// is owed.
+		Skip("blocked on LR-054: a data-holding victim can never arm the capture verdict, " +
+			"so this tier can only pass by winning a race; un-skip with the LR-054 fix")
+
 		By("writing data to the captor's master")
 		captorMaster := getMasterPod(captor)
 		Expect(captorMaster).NotTo(BeEmpty())

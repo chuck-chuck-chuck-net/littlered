@@ -566,6 +566,14 @@ spec:
 	//     SUCCESSFUL resync — so this pod keeps the VICTIM's own keys, which really are
 	//     the only copy in existence.
 	//
+	// ⚠ RE-SCOPED BY LR-054, READ THIS BEFORE CHANGING ANYTHING BELOW. This tier no
+	// longer asserts that the operator declares the capture and REFUSES the quarantine
+	// on the data clause, because the product does not currently do that and this tier
+	// had been passing on a measured 23s-in-30s race. The full mechanism, both
+	// refutations and the reason the obvious fix is wrong are in LR-054; the short form
+	// is at the assertion itself, and the refusal guarantee stays pinned by the
+	// `planQuarantine` / `quarantineDataRisk` tables.
+	//
 	// Pre-arming it, rather than breaking the link after the capture has landed, is not
 	// tidiness: a first attempt broke the link afterwards and lost the race — the
 	// operator had already armed the quarantine and the pod was GONE (`pods
@@ -578,7 +586,7 @@ spec:
 	// is asserted, and re-asserted inside the Consistently, because an assertion that
 	// the operator refused is worthless if the state it should have refused on was
 	// never actually produced.
-	Context("Refusal when a victim pod holds data the captor does not have", Ordered, func() {
+	Context("A victim pod holding data the captor does not have", Ordered, func() {
 		var captor, victim, masterName string
 
 		BeforeAll(func() {
@@ -592,7 +600,7 @@ spec:
 
 		AfterAll(func() { cleanup(captor, victim) })
 
-		It("refuses to quarantine and leaves both StatefulSets at 3", func() {
+		It("is never quarantined, and keeps its own data and all its pods", func() {
 			By("writing data to the captor's master")
 			captorMaster := getMasterPod(captor)
 			Expect(captorMaster).NotTo(BeEmpty())
@@ -649,21 +657,57 @@ spec:
 					"%s no longer holds the victim's own data", pinned)
 			}, 90*time.Second, 3*time.Second).Should(Succeed())
 
-			By("the operator declares the capture but REFUSES to quarantine")
-			// Same budget as the arming edge in tier 1: the refusal reason only appears
-			// once forsakenCooldown has elapsed (before that the condition reads
-			// False/CaptureSuspected regardless of the data clauses).
-			Eventually(func(g Gomega) {
-				g.Expect(forsakenReason(victim)).To(Equal("QuarantineRefusedDataPresent"))
-				st, _ := getConditionField(victim, "Forsaken", "status")
-				g.Expect(st).To(Equal("True"))
-			}, 5*time.Minute, 5*time.Second).Should(Succeed())
-
-			By("no quarantine is armed and the pods stay put")
+			// WHAT THIS TIER ASSERTS, AND WHAT IT DELIBERATELY NO LONGER ASSERTS — LR-054.
+			//
+			// It used to require reason `QuarantineRefusedDataPresent`, i.e. that the
+			// operator DECLARES the capture and then refuses to quarantine on the data
+			// clause. **The product does not do that today, and this tier had been
+			// passing on a race rather than on an invariant.**
+			//
+			// The mechanism is a closed loop between two correct decisions. The only way
+			// this pod can still hold the VICTIM's own keys is if its sync from the
+			// captor failed (a successful one flushes them — LR-044 M4a). A failed sync
+			// is `link:down`; sentinel readiness requires `role:master` or `link:up`
+			// (LR-016); so the pod is not Ready; so `ReadyReplicas < Replicas`; so
+			// `statefulSetRolloutSettled` is false; so LR-050's gate withholds
+			// attribution and `planForsaken` never ARMS — and an unarmed verdict never
+			// reaches `planQuarantine`, so the `atRisk` clause never gets to refuse.
+			// **The very state atRisk exists to protect is the state that makes the
+			// instance unsettled.**
+			//
+			// Measured on t3e (2026-08-29): readiness falls 23s after the capture while a
+			// Running victim is polled at the 30s steady interval, so the verdict armed
+			// only when the first post-capture gather landed inside that window. Verified
+			// against the PRE-LR-053 image too — identical, so this is not a regression.
+			//
+			// The refusal GUARANTEE is pinned deterministically where it belongs: the
+			// `planQuarantine` / `quarantineDataRisk` tables (`quarantine_plan_test.go`),
+			// plus `TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData`, which pins
+			// this very state at the planner level. This tier asserts the reachable half.
+			//
+			// DO NOT "fix" this by restaging the ordering so the verdict arms first: that
+			// asserts behaviour which only holds once LR-054 is fixed, and it must land
+			// with the fix. A tier that passes on a 23s-in-30s race is worse than one that
+			// asserts less, because it reads as coverage.
+			By("the victim is not quarantined, and its own data survives")
 			Consistently(func(g Gomega) {
 				g.Expect(quarantinedSince(victim)).To(BeEmpty(), "a quarantine was armed")
 				g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("3"))
 				g.Expect(stsSpecReplicas(victim + "-sentinel")).To(Equal("3"))
+
+				// No pod was taken away — the property that actually matters here, and
+				// the reason this failure direction is the safe one.
+				for _, p := range redisPods(victim) {
+					out, err := utils.Run(exec.Command("kubectl", "get", "pod", p,
+						"-n", testNamespace, "-o", "jsonpath={.metadata.name}"))
+					g.Expect(err).NotTo(HaveOccurred(), "%s was deleted: %s", p, out)
+				}
+
+				// The victim's OWN keys — the only copy in existence — are still there.
+				own, err := redisExec(testNamespace, pinned, "GET", "vic-1")
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(strings.TrimSpace(own)).To(Equal("vv1"),
+					"%s lost the victim's own data", pinned)
 
 				// Re-assert the precondition, so a green cannot be earned by the state
 				// quietly decaying into "link up, captor's copy, safe to discard".

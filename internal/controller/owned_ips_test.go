@@ -222,3 +222,83 @@ func TestOwnedIPsFailSafeWhenTheCallerSuppliesNothing(t *testing.T) {
 		t.Errorf("IsOurs(%s) = true, want false: nothing told the gather about it", ownedTerminatingMaster)
 	}
 }
+
+// TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData is the e2e failure of
+// 2026-08-29 reproduced at the planner level, and it is NOT a defect of the
+// LR-053 split — it is LR-050's accepted residual, reached from a direction that
+// entry did not anticipate. Read it as a characterisation test: it pins what the
+// operator does today, which is nothing.
+//
+// The state is the `HoldDataPresent` fixture of `Sentinel Forsaken-Gated Quarantine`
+// and of `Sentinel Master Name Rename Under Capture`: a victim pod pre-armed with a
+// bogus `masterauth` so its sync from the captor's master can never succeed, and
+// which therefore still holds the victim's OWN keys — genuinely the only copy in
+// existence, which is exactly what LR-044's `atRisk` clause exists to protect.
+//
+// THE TENSION, which is the finding: a pod that could not sync from the captor has
+// `master_link_status:down`, and sentinel-mode readiness requires `role:master` or
+// `link:up`. So the pod is not Ready, so `ReadyReplicas < Replicas`, so
+// `statefulSetRolloutSettled` is false, so LR-050's gate withholds attribution and
+// `planForsaken` cannot ARM. **The very state `atRisk` exists to protect is a state
+// that makes the instance unsettled.** The verdict can only ever be armed by winning
+// a race between the operator's first post-capture gather and the readiness probe —
+// which is what both e2e tiers had been doing, undeclared.
+//
+// Measured on t3e (2026-08-29, this milestone's investigation), same recipe both
+// times, capture signature verified unanimous on all three Sentinels:
+//
+//	race WON  — injected while Ready 3/3: forsakenSince at +10s, readiness fell to
+//	            2/3 at +23s, True/QuarantineRefusedDataPresent at +44s.
+//	race LOST — pinned pod made not-Ready BEFORE the injection: no condition at all,
+//	            80s+, on BOTH the split build (8898ff0) and the PRE-split build
+//	            (6340724). Identical. The split is not implicated.
+//
+// The failure direction is the safe one — no verdict means no quarantine, so no pod
+// is deleted and the data survives — but the capture goes undiagnosed and the CAPTOR
+// stays poisoned, which is the whole point of ADR-016. Recorded here rather than
+// fixed: narrowing the gate to "a pod object of ours is missing" and dropping the
+// readiness clause was considered and is WRONG, because a pod replaced at the same
+// ordinal returns with a new IP while `status.replicas` is already back to full — the
+// old address is still in the air and only the readiness clause still says so. That
+// is LR-050's own reason for the clause, and it holds.
+func TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData(t *testing.T) {
+	const foreignMaster = "10.9.9.9"
+
+	// The full capture signature: every Sentinel of ours unanimously serving the
+	// captor's live master, and no pod of ours a master any more.
+	captured := func() *redisclient.ReplicationState {
+		s := redisclient.NewReplicationState()
+		for _, ip := range []string{ownedTerminatingMaster, ownedLiveReplica1, ownedLiveReplica2,
+			ownedSentinel1, ownedSentinel2, ownedSentinel3} {
+			s.AddLiveTopologyIP(ip)
+		}
+		for _, sip := range []string{ownedSentinel1, ownedSentinel2, ownedSentinel3} {
+			s.SentinelNodes[sip] = &redisclient.SentinelNodeState{
+				PodName: "sentinel-" + sip, IP: sip, Reachable: true, Monitoring: true,
+				MasterIP: foreignMaster, MasterFlags: RoleMaster,
+			}
+		}
+		for _, rip := range []string{ownedTerminatingMaster, ownedLiveReplica1, ownedLiveReplica2} {
+			s.RedisNodes[rip] = &redisclient.RedisNodeState{
+				PodName: "redis-" + rip, IP: rip, Reachable: true, Role: roleSlave,
+				MasterHost: foreignMaster, LinkStatus: "down",
+			}
+		}
+		return s
+	}
+
+	// Precondition: settled, this state IS a capture. Without this row the assertion
+	// below could pass because the fixture is simply not a capture at all.
+	if got := planForsaken(captured(), nil, time.Now(), false); !got.Captured {
+		t.Fatalf("precondition: a settled instance must read this as captured, got %+v", got)
+	}
+
+	// The reported state: the pinned pod's broken link makes the StatefulSet unsettled,
+	// so nothing arms — and with nothing armed the gate keeps withholding, forever.
+	got := planForsaken(captured(), nil, time.Now(), true)
+	if got.Captured || got.Forsaken {
+		t.Errorf("planForsaken = %+v, want the empty verdict: LR-050's gate withholds "+
+			"attribution while our own StatefulSet is unsettled, and a victim pod that "+
+			"cannot sync from the captor is exactly what makes it unsettled", got)
+	}
+}

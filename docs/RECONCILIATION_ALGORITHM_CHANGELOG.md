@@ -2014,6 +2014,24 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   the quarantine exists to heal the **captor**, which it cannot do for an instance that cannot roll.
   LR-023 is the precedent — a stuck state gets its own rule rather than implicit handling — and if this
   is ever closed it should be closed that way, not by putting a timer back.
+
+  **⚠ Corrected by LR-054: that reasoning is sound for a stuck rollout and does NOT cover the largest
+  part of this hole, and both of its supporting facts fail — in opposite directions — for a capture
+  victim that still holds data.** A pod that could not sync from the captor is the only kind that
+  still holds the victim's *own* keys (a successful sync flushes them, LR-044 M4a), and such a pod is
+  `link:down`, hence not Ready, hence `ReadyReplicas < Replicas` **permanently**: so *the very state
+  LR-044's `atRisk` clause exists to protect is the state that makes the instance unsettled*, and this
+  gate then refuses to arm the verdict that `atRisk` would have refused on. Of the two facts offered
+  above: *"already `Ready=False` and visibly broken"* is not a **mitigation** here but the
+  **qualifying condition** — the instance is not-Ready *because* of the data behind the broken link,
+  so the argument reads backwards; and *"an instance that cannot roll"* does not describe this case at
+  all — it rolls perfectly, sits at its desired revision, and the quarantine **could** have healed its
+  captor. Measured on t3e: readiness falls **23s** after the capture against the **30s** steady poll,
+  so the verdict armed only by winning that race, which two e2e tiers had been doing silently since
+  they were written. **Found by e2e, recorded and NOT yet fixed** — and note the obvious narrowing
+  (drop the readiness clause, keep only "a pod object is missing or leaving") is **wrong**, because a
+  pod replaced at the same ordinal returns on a *new* IP while `status.replicas` is already back to
+  full: that clause is doing real work. See LR-054.
 - **Cross-mode parity audit (CLAUDE.md §7 rule 11) — does any other mode make an attribution-style
   judgement that could fire during its own rollout?**
 
@@ -2127,6 +2145,16 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   what extends the gate from "a template rollout" to "any pod of ours that has just left", which is the
   state the false signature actually lives in, and the failure direction is a withheld accusation rather
   than a wrongly-deleted instance.
+
+  **⚠ LR-054 is this residual, met in the field, and the sentence above that needs correcting is "this
+  is not the common shape".** It is the ONLY shape in which LR-044's `atRisk` clause has anything to
+  protect: a victim pod holds the victim's *own* keys only if its sync from the captor **failed**, and
+  a failed sync is `link:down` is not-Ready is unsettled. So the not-common case is not an edge — it is
+  the entire data-at-risk tier, and two e2e tiers had been arming the verdict only by winning a
+  measured 23s-in-30s race against the readiness probe. The rest of the paragraph stands: the readiness
+  clause is doing real work (a pod replaced at the same ordinal returns on a new IP with
+  `status.replicas` already full), and the failure direction is still a withheld accusation. See
+  LR-054.
 
 ## [LR-051] `Reachable:false` Conflated Three Facts — a Credential Mismatch Voided the One Gate That Stops Data Loss
 - **Date:** 2026-08-29
@@ -2772,3 +2800,193 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   for **attribution** what LR-038 established for the **ground truth**: *a guard is only as
   good as what its input is allowed to contain* — and the answer here was not to widen the
   input every rule shares, but to give the second question its own.
+
+### Post-landing e2e result: two capture tiers went red, and this split was exonerated — see **LR-054**
+
+The first full `sentinel` sweep after this change put `Sentinel Forsaken-Gated Quarantine >
+Refusal when a victim pod holds data the captor does not have` and `Sentinel Master Name
+Rename Under Capture` red, both with an **empty** `Forsaken` condition. The bisect signal
+pointed here — both tiers carry `Label("sentinel")` and were in the preceding 46/46 green
+sweep at `6340724`, so the delta looked like this entry.
+
+**It is not this entry.** The same capture was staged by hand on t3e against both images and
+the **pre-split build reproduces the failure identically**; the cause is LR-050's
+readiness-keyed attribution gate meeting LR-044's `atRisk` clause. It is written up as its
+own entry because it is a live product defect rather than a consequence of a refactor, and
+burying it here is how it would be lost: **see LR-054**, which carries the analysis, the
+both-images table, the measured race, and the refutation of this entry along with the
+refutation of a second, very close LR-051 near-miss.
+
+
+## [LR-054] The State `atRisk` Exists to Protect Is the State That Makes the Instance Unsettled — a Data-Holding Capture Victim Can Never Be Diagnosed
+- **Date:** 2026-08-29
+- **Commit:** (pending)
+- **ID note:** LR-047 is taken on `fix/cluster-rollout-state-gate`; LR-048/049/050 are the
+  master-name-rename branch's; LR-051, LR-052 and LR-053 are this branch's three commits
+  beneath. Allocated with the LR-039 cross-branch loop over **every** branch, not by reading
+  the tip of one line — the highest ID visible anywhere was LR-053.
+- **Status: FOUND AND RECORDED, NOT FIXED.** The fix needs a design decision, not a patch
+  (see "Why the obvious narrowing is wrong"). What landed here is the diagnosis, a
+  planner-level pin, a correction to the reasoning on which the residual was accepted, and
+  the two e2e tiers re-scoped to assert what the product actually does.
+
+- **The finding, in one sentence: the very state LR-044's `atRisk` clause exists to protect
+  is the state that makes the instance unsettled, so LR-050's gate refuses to arm the verdict
+  that gates the refusal.** A captured sentinel instance holding the last copy of its own data
+  reports **nothing at all** — no `Forsaken`, no refusal, no condition — and the **captor stays
+  poisoned**, which is the entire purpose of ADR-016.
+
+- **How it surfaced.** The first full `sentinel` sweep after LR-053 put two tiers red, both
+  with an **empty** `Forsaken` condition for the full 300s — not a wrong reason, no verdict at
+  all:
+
+      Sentinel Forsaken-Gated Quarantine > Refusal when a victim pod holds data the captor
+        does not have > refuses to quarantine and leaves both StatefulSets at 3
+        sentinel_quarantine_test.go:657  Expected <string>:  to equal  QuarantineRefusedDataPresent
+
+      Sentinel Master Name Rename Under Capture > keeps the capture verdict, prunes nothing,
+        and still quarantines and heals
+        sentinel_master_name_test.go:1256  Expected <string>:  to equal  True
+
+  Both tiers had passed in the immediately preceding 46/46 sweep, and both are the two tiers
+  that pre-arm a victim pod with a bogus `masterauth`.
+
+- **Mechanism, and every step of it is a documented decision working as designed.**
+    1. LR-044's `atRisk` clause refuses the quarantine when a reachable pod holds keys **not**
+       explained by the capture. The only way a victim pod can still hold the victim's *own*
+       keys after a capture is if its sync from the captor's master **fails** — a successful
+       sync flushes and replaces them with the captor's keyspace (LR-044's M4a measured exactly
+       that: *"their own 10 keys were flushed and replaced by the captor's 100"*). Both tiers
+       therefore stage a permanently-broken sync, which is the honest fixture and not a
+       contrivance.
+    2. A pod whose sync fails has `master_link_status:down`. Sentinel-mode **readiness**
+       requires `role:master` or `link:up` (LR-016), so that pod is not Ready.
+    3. `statefulSetRolloutSettled` (LR-021, reused by LR-050) includes
+       `ReadyReplicas == Replicas`, so one not-Ready pod makes the instance **unsettled**,
+       permanently, for as long as the condition holds.
+    4. LR-050 withholds address attribution while unsettled and — correctly, and for reasons
+       that took a live wedge to establish — **suppresses ARMING**: an unarmed instance returns
+       no verdict at all. So `planForsaken` can never arm, `planQuarantine` is never consulted,
+       and `atRisk` never gets to refuse anything, because there is nothing to refuse.
+
+- **Measured on t3e (2026-08-29), same recipe each time, capture signature verified unanimous
+  on all three victim Sentinels (`SENTINEL masters` naming the captor's address on each) and
+  every victim pod `role:slave` of it:**
+
+  | build | pinned pod not-Ready **before** the injection | verdict |
+  |---|---|---|
+  | `8898ff0` (post-LR-053) | no — injected while Ready 3/3 | `forsakenSince` at +10s, readiness fell to 2/3 at +23s, **`True/QuarantineRefusedDataPresent` at +44s** |
+  | `8898ff0` | **yes** | **none, 80s+** |
+  | `6340724` (**pre**-LR-053) | **yes** | **none, 80s+ — identical** |
+
+  **The race, stated exactly:** readiness fell **23s** after the capture, and a `Running`
+  victim is polled at the **steady 30s** interval (LR-045). The verdict armed only when the
+  operator's first post-capture gather landed inside that ~23s window. Both tiers had been
+  winning a 23s-in-30s race, undeclared, since they were written — *"passing on margin, not on
+  an invariant"* (LR-047's phrase for the same class).
+
+- **Two refutations, both recorded because each was the obvious answer and each is wrong.**
+    - **It is not LR-053's `ValidIPs` split**, although the bisect pointed there: both tiers
+      carry `Label("sentinel")` and were in the last green sweep at `6340724`, so the delta
+      looked like the split. Settled by staging the identical capture against **both** images —
+      the pre-split build fails the same way (table above). The analytic check agrees:
+      `redisSelectorLabels`/`sentinelSelectorLabels` are **instance-scoped**, so a captor's
+      address can never enter the victim's `OwnedIPs`, and `IsOurs(foreign)` is false in both
+      builds. Clause 3 behaves identically. **General point: "the tier was green before your
+      change and red after" is a correlation, and the way to settle it is to run the same input
+      against both builds, not to reason from the diff.**
+    - **It is not LR-051's veto reaching the replication link**, and the coincidence is exact
+      enough to deserve recording: a replica configured with a wrong `masterauth` against a
+      **password-less** master gets `ERR Client sent AUTH, but no password is set`, which is
+      *literally* one of `authFailureMarkers`. But that error belongs to the **replica→master**
+      handshake; the operator's own probe of that pod succeeds (these fixtures are deliberately
+      auth-free, so there is no `requirepass`), and `ClassifyProbeError` only ever sees the
+      error returned by `GetRedisState`/`GetSentinelState`. Verified live: the victim carries
+      **no `OperatorCannotAuthenticate` condition** at any point in either run. It would also
+      have explained a *refusal*, not an absent verdict.
+
+- **⚠ This corrects the reasoning on which LR-050's hole was ACCEPTED, and that is the sharpest
+  part of this entry.** LR-050 and CLAUDE.md pillar 3.15 accept it as:
+
+  > *"a **stuck** rollout never lifts the gate, so a genuine capture there goes undetected —
+  > accepted knowingly (such an instance is already `Ready=False`, and the quarantine heals the
+  > captor, which it cannot do for an instance that cannot roll)."*
+
+  **Both halves of that justification fail for a data-holding victim, in opposite directions:**
+    - *"already `Ready=False`"* was offered as a **mitigation** — it is already visibly broken,
+      so little is lost. Here `Ready=False` is the **qualifying condition**: the instance is
+      not-Ready *because* a pod holds its own data behind a broken link. The argument reads
+      backwards — the symptom said to make the miss tolerable is the thing that causes it.
+    - *"an instance that cannot roll"* does not describe this case at all. This instance **rolls
+      fine**; it is not-Ready for an entirely unrelated reason, its StatefulSets are at their
+      desired revision, and the quarantine **could** heal the captor here. The clause that was
+      supposed to bound the hole does not contain it.
+
+  LR-050's original argument is left intact for the **stuck-rollout** case it genuinely does
+  cover; what is corrected is the claim that the stuck rollout is the *whole* of the hole. It
+  is not: the largest part of it is an instance that rolls perfectly and is permanently
+  degraded, which is also the exact shape in which a capture is most expensive to miss.
+
+- **Why the obvious narrowing is WRONG — recorded so nobody tries it as a patch.** The
+  tempting fix is to drop the `ReadyReplicas == Replicas` clause and gate only on "a pod object
+  of ours is missing or leaving", arguing that after LR-053 `OwnedIPs` already attributes a
+  *terminating* pod. It does not hold: **a pod replaced at the same ordinal returns on a NEW
+  IP** while `status.replicas` is already back to full and, on a plain pod delete, no revision
+  ever changed — so the old address is in the air with nothing but the readiness clause still
+  saying so. That is LR-050's stated reason for the clause (*"it is what extends the gate from
+  'a template rollout' to 'any pod of ours that has just left'"*) and it survives scrutiny.
+  **The gate stays exactly as it is until a real fix is designed.** The directions that remain
+  open are the two LR-050 already listed and rejected for the rename case — remembering
+  departed addresses across passes (needs cross-pass state), or a per-address unattributability
+  clock (a margin against a user-settable timer) — plus a third this entry suggests: separate
+  *"a pod of ours has recently departed"* from *"a pod of ours is unhealthy"*, which is R5 one
+  level up (see below).
+- **It is R5, at the invariant level.** `statefulSetRolloutSettled` answers *"is a rollout of
+  ours in flight?"* **and** *"is every pod of ours healthy?"* — one predicate, two questions,
+  and the second meaning is what silently disables attribution for a permanently-degraded
+  instance. That is the same shape LR-053 has just split out of `ValidIPs`, arriving one layer
+  up in the same pass, which is the strongest evidence in the tree that R5 names a live bug
+  class rather than a tidiness rule. It is also **head-of-line blocking at the invariant level**
+  rather than at the operation level, which the concept's §8.8 only reasoned about for the
+  queue: one unhealthy pod holds back a whole *verdict*, indefinitely.
+- **Severity, and the direction is toward safety.** No verdict means no quarantine, so no pod
+  is deleted and the victim's only copy of its data survives — which is why this was never a
+  data-loss event and why it went unnoticed. What is lost is the **diagnosis**: the operator is
+  silent about a captured instance, and the neighbouring captor keeps a poisoned
+  failover-candidate set for as long as nobody looks. That is exactly the gap LR-042 named and
+  LR-044 was built to close, reopened for the subset of victims that still hold data.
+- **Tests / validation:**
+    - **Pure planner:** `TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData`
+      (`internal/controller/owned_ips_test.go`) reproduces the e2e failure at the planner level
+      — full capture signature, `rolling = true`, unarmed ⇒ empty verdict — with a
+      **settled-instance positive control** in the same test so it cannot pass on a fixture
+      that is not a capture. It is a **characterisation test, green from birth, disclosed as
+      such**: it pins today's intended behaviour, so no honest red exists for it. Teeth shown
+      with the mutant that ignores the gate, which fails **it and LR-050's own K9 row
+      together** — that co-failure is what ties the tier failure and K9 to one mechanism:
+
+          --- FAIL: TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData
+              planForsaken = {Captured:true Forsaken:false ForeignMaster:10.9.9.9}, want the empty verdict
+          --- FAIL: TestPlanForsakenRolloutGate/K9:_the_rename_window_must_not_arm_a_capture_verdict_while_we_are_rolling
+              Captured = true, want false
+
+    - **e2e, re-scoped rather than restaged.** Both tiers now assert what the build actually
+      does: the capture signature present, **no** verdict armed, both StatefulSets held at 3,
+      no pod deleted, and the data-holding pod's own keys intact throughout. The `atRisk`
+      refusal *guarantee* is pinned deterministically where it already is — the
+      `planQuarantine` / `quarantineDataRisk` tables — and each tier carries a pointer here for
+      why the e2e cannot assert it today. **Deliberately NOT restaged** to win the race the
+      other way (arm first, break the link second): that would assert behaviour which only
+      holds once this entry is fixed, and it must land *with* the fix. A tier that passes on a
+      23s-in-30s race is worse than one that asserts less, because it reads as coverage.
+- **Regresses:** Nothing. No production code changed in this entry — the gate, the clauses, the
+  cadences and every planner table are untouched. The changes are one characterisation test,
+  two e2e tiers re-scoped to the truth, and three documents corrected.
+- **Impacts:** **LR-050** and `CLAUDE.md` pillar 3.15 (the accepted hole's justification is
+  corrected — it does not cover the case that matters most); **LR-044** (its `atRisk` clause is
+  currently unreachable in the field for the shape it was written for, which is a stronger
+  statement than the `HoldDataUnknown` coverage gap that entry already discloses); **LR-042**
+  (the captor-side gap it named is reopened for data-holding victims); **LR-053** (exonerated,
+  with a pointer from its entry to here); `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` **R5** and
+  §8.8, and `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md` Phase 0 / Phase 1, where
+  this is now the worked example for R5.

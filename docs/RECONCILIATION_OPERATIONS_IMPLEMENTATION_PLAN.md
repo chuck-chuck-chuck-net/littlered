@@ -323,6 +323,23 @@ shippable and does not depend on anything else in this plan.**
 > changes whose failure mode (over-suppression, over-attribution) unit tests cannot disprove,
 > so they are gated jointly rather than separately. The focused `Sentinel Failover` tier is
 > already green (4/4).
+>
+> **The sweep found a defect, and it is NOT one of Phase 0's: LR-054.** Two capture tiers went
+> red after M0.3 with an *empty* `Forsaken` condition. The bisect pointed at M0.3 and is
+> refuted — the same capture, staged by hand on t3e against the **pre**-split image, fails
+> identically. The cause is LR-050's readiness-keyed attribution gate meeting LR-044's
+> `atRisk` clause: **the very state `atRisk` exists to protect is the state that makes the
+> instance unsettled**, so the gate refuses to arm the verdict that gates the refusal.
+> Measured: readiness falls 23s after the capture against a 30s steady poll, so both tiers had
+> been passing on a race. **Recorded and DEFERRED — it needs a design decision, not a patch**
+> (the obvious narrowing, dropping the readiness clause, is wrong: a pod replaced at the same
+> ordinal returns on a new IP with `status.replicas` already full). No production code
+> changed; the two tiers were re-scoped to assert what the build actually does, one of them
+> `Skip`ped with a pointer, and the guarantee stays pinned by the `planQuarantine` /
+> `quarantineDataRisk` tables. **Phase 0's own green-suite gate is unaffected by it** — LR-054
+> is pre-existing and orthogonal — but the suite cannot be called green while two tiers assert
+> a guarantee the product does not provide, which is why they were re-scoped rather than left
+> flaky.
 
 | M | What | Owns | LR |
 |---|---|---|---|
@@ -350,7 +367,10 @@ committed ADR-011 numbers; a regression there is a real finding, not noise.
 **M0.3 does NOT make LR-050's gate redundant, and the implementer must not conclude it does.**
 `OwnedIPs` fixes the case where a terminating pod of ours is still in the pod list. LR-050's window
 also contains the case where the pod object is **already gone** and its address is still in the
-air — no list can hold it. Both stay.
+air — no list can hold it. Both stay. **Confirmed by the implementer against the code and then
+against the cluster** (LR-054's investigation): the gate's readiness clause is load-bearing for a
+pod replaced at the same ordinal, which returns on a *new* IP while `status.replicas` is already
+full.
 
 ### Phase 1 — ADR-020 (blocks code, per concept §9.1–9.2)
 
@@ -359,6 +379,19 @@ Write `docs/adr/020-declared-operations.md`: the two mechanisms and why neither 
 rule, §4's survives/suppressed enumeration, §5's three traps, and the accepted holes verbatim —
 the exit edge (§8.3), forever-in-an-operation (§8.6), head-of-line blocking (§8.8), and the
 stuck-rollout hole LR-050 already accepts. **No waiver knob ships (D7).**
+
+**LR-054 is the ADR's worked example for R5, and it should carry that argument rather than the
+`ValidIPs` split.** `statefulSetRolloutSettled` answers *"is a rollout of ours in flight?"*
+**and** *"is every pod of ours healthy?"* — one predicate, two questions — and it is the second
+meaning that silently disables address attribution for a permanently-degraded instance, so a
+captured victim holding the last copy of its data is never diagnosed and its captor is never
+healed. That is R5 stated as a live, measured bug rather than as a tidiness rule, and it landed
+in the same pass as LR-053 split the same shape out of `ValidIPs` one layer down — two
+instances of one class, found within days of each other.
+It also sharpens **§8.8**: that section reasoned about head-of-line blocking only for the
+operation *queue*, and LR-054 is head-of-line blocking at the **invariant** level — one
+unhealthy pod holds back a whole verdict, indefinitely, with no queue involved. The ADR must
+say that the concept's blocking analysis is not confined to the mechanism it introduces.
 
 Two framing points the ADR must get right, because the concept itself had to correct one of them
 (§8.11, 2026-08-28) and the stale reading is the more intuitive one:
