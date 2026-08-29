@@ -141,8 +141,29 @@ collapses to *"whenever the StatefulSet is unsettled"*.
 class is born. `ValidIPs` means "pods that count as live topology" (correct — LR-038 requires the
 terminating-pod filter) and is *also* used to mean "pods that are ours" — and for that question a
 terminating pod of ours is still ours. One structure, two concepts; the collision produced the
-LR-050 defect. LR-050 fixed the symptom by adding a second input; the conflated concept is still
-unsplit.
+LR-050 defect. LR-050 fixed the symptom by adding a second input; **the conflated concept was
+split in LR-053** (`LiveTopologyIPs` / `OwnedIPs`), which also established that the split could not
+be a rename — the gather was fed maps the caller had already filtered, so the ownership concept was
+not representable at all.
+
+*Updated 2026-08-29, and this is the item's strongest evidence.* R5 was written from `ValidIPs`,
+which was **latent** — constructible, argued reachable, never observed. Building the split turned up
+a second instance of the identical class in the same pass, and that one is **live, measured and
+data-relevant**: `statefulSetRolloutSettled` answers *"is a rollout of ours in flight?"* **and**
+*"is every pod of ours healthy?"*. LR-050 consumed it for the first question; the second is what
+silently breaks address attribution for an instance that is **permanently** degraded rather than
+transiently rolling. The consequence (LR-054) is that a capture victim can never be diagnosed in
+precisely the case worth diagnosing: a pod only still holds the victim's *own* keys if it could not
+sync from the captor, which means `link:down`, which means not-Ready, which means permanently
+unsettled — **the very state `atRisk` exists to protect is the state that makes the instance
+unsettled**, so the gate withholds the verdict that gates the refusal. Measured: readiness falls 23s
+after the capture against a 30s steady poll, so the e2e tiers covering it had been passing by
+winning that race rather than by checking anything.
+
+Two lessons for the detailed design. **The ADR should carry R5's argument on LR-054, not on
+`ValidIPs`** — one is a measured defect, the other was only ever a tidiness argument. And R5 is not
+a code-hygiene rule but a *bug-class predictor*: it was stated from one latent instance and
+immediately paid out a live one, which is the whole case for §6's sweep being O(1) leverage.
 
 ---
 
@@ -347,6 +368,15 @@ For anyone planning this, these are the cases that motivate each part:
    from ever running, leaving an intent unreconciled indefinitely. Same shape as LR-050's accepted
    stuck-rollout hole, and it wants the same treatment: a loud condition, and **no auto-skip
    timer** (ADR-017's lesson — a timer would be the defect with a delay).
+
+   *Sharpened 2026-08-29 by LR-054: the same shape occurs at the **invariant** level, with no
+   queue involved at all.* One unhealthy pod holds back a whole verdict indefinitely, because the
+   invariant it must satisfy ("our own pod set is stable") can be falsified permanently by a single
+   pod rather than transiently by a rollout. So the design must answer head-of-line blocking
+   **twice** — once for the operation queue, and once for any invariant whose input a permanent
+   condition can pin false. The second is the harder one: an operation queue has an obvious place
+   to hang a condition, whereas a withheld invariant is silent by construction, and LR-054 was
+   found only because an e2e stopped winning a race.
 9. **Defining the heavy set.** Which fields, and what makes one heavy? It is an API surface (D2),
    so the answer needs to be a documented list with a stated admission test, not a judgement made
    per field as they arrive.
