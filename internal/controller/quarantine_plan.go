@@ -257,6 +257,21 @@ func quarantineDataRisk(
 			continue
 		}
 		if !rn.Reachable {
+			// A pod that REFUSED our credential is unverified whatever the kubelet
+			// says (LR-051). The readiness clause below rests on LR-023's premise —
+			// a not-Ready redis is DOWN, so it holds nothing — and an AuthFailed
+			// probe falsifies that premise directly: something answered us, in the
+			// protocol, so a live server is running there and its keyspace is
+			// unknown. A negative inference must not overrule a positive observation.
+			//
+			// Not a hypothetical combination: sentinel-mode readiness requires
+			// role:master or master_link_status:up, and a credential mismatch is
+			// exactly what breaks replication — so the characteristic shape is a live
+			// pod, full of data, reading not-Ready while refusing our probes.
+			if rn.UnprovablyEmpty() {
+				unverified = true
+				continue
+			}
 			// Not-Ready per the kubelet ⇒ redis is down ⇒ no data (LR-023). Only a pod
 			// the kubelet still calls Ready — or one it has no view of — is unverified.
 			if ready, known := redisReady[rn.PodName]; !known || ready {

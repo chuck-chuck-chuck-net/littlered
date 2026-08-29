@@ -129,6 +129,16 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 	// 4. All pods are ready. Gather Ground Truth.
 	gt := r.gatherGroundTruth(ctx, littleRed)
 
+	// 4-0. Can we still talk to our own pods? (LR-051, rule §7.11.) Reporting only —
+	// no cluster-mode decision keys on it, because the one cluster decision that
+	// deletes pods (planClusterWipeRecovery) already takes its evidence from the
+	// kubelet's readiness probe rather than from the operator's dial (LR-023). It is
+	// wired here so a rotated Secret is NAMED in cluster mode too, instead of
+	// presenting as an instance that has silently stopped converging.
+	if err := r.reportOperatorAuth(ctx, littleRed, clusterAuthFailures(gt)); err != nil {
+		log.Error(err, "failed to report the operator's authentication state")
+	}
+
 	// 4a. State-gated rolling update (ADR-017, LR-047). This is the ONLY place the
 	// intra-shard rollout partition comes down, and it has to be here rather than at the
 	// step-1 apply because the clause it turns on — "the replacement is a link-`up` replica

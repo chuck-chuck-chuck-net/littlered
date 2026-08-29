@@ -340,6 +340,14 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 	// probe is issued.
 	state := redisclient.GatherReplicationState(ctx, g, redisMap, map[string]string{}, "")
 
+	// 2a. Can we still talk to our own pods? (LR-051, rule §7.11.) Failover mode has
+	// the same defect as sentinel mode and reaches it the same way — planFailover's
+	// 0-holder seed branch keys on DataHolders(), which filters on Reachable — so it
+	// gets the same veto (in planFailover) and the same named condition.
+	if err := r.reportOperatorAuth(ctx, lr, replicationAuthFailures(state)); err != nil {
+		log.Error(err, "failed to report the operator's authentication state")
+	}
+
 	// 3. Re-derive the intent and the live master from live state.
 	views := buildFailoverPodViews(podList, state)
 	intent := resolveFailoverIntent(views)
@@ -635,6 +643,21 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 		log.Info(msg)
 		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataPresent, msg)
 		return r.setFailoverRecoveryCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataPresent, msg)
+
+	case failoverRefuseUnverified:
+		// LR-051, the failover-mode twin of Rule L's branch. The SEED branch above is
+		// the dangerous one here: it would elect a FRESH pod — reachable precisely
+		// because it restarted onto the current credential, and therefore empty —
+		// while the pods holding the only copy are invisible to us.
+		msg := fmt.Sprintf("No live master, and %s. Refusing to elect — a pod that refuses the "+
+			"operator's credential is a live server whose keyspace cannot be read, so it cannot "+
+			"be shown to be empty and electing around it may discard the entire dataset. Fix the "+
+			"credential (see the OperatorCannotAuthenticate condition); "+
+			"failover.allowUnsafeRebootstrapOnDeadlock deliberately does NOT override this.",
+			unverifiedPodSummary(plan.unverified))
+		log.Info(msg)
+		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataUnverified, msg)
+		return r.setFailoverRecoveryCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataUnverified, msg)
 	}
 	return nil
 }

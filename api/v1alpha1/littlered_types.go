@@ -752,6 +752,34 @@ const (
 	// unbounded, and real progress — and reporting it would make the one alarm that
 	// must not cry wolf cry wolf on exactly the topology large deployments have.
 	ConditionClusterRolloutBlocked = "ClusterRolloutBlocked"
+
+	// ConditionOperatorCannotAuthenticate reports that at least one of this
+	// instance's own pods REFUSED the operator's credential — NOAUTH, WRONGPASS,
+	// "Client sent AUTH, but no password is set", or "invalid password".
+	//
+	// This is the loudest thing the operator can say about a state that was
+	// previously invisible (LR-051). Such a pod is not unreachable in any useful
+	// sense: something answered on that address and spoke the protocol well enough
+	// to turn us away. But every field the gather would have filled stays at its
+	// zero value, so before this condition existed a credential mismatch was
+	// byte-identical to a dial timeout — and because DataHolders() filters on
+	// Reachable, a fleet holding its entire dataset read as holding nothing.
+	//
+	// Polarity: True is bad, matching Forsaken, StaleMasterName and
+	// LegacyClusterTopology. The condition is absent while every pod answers, so it
+	// is quiet until something is actually wrong. The message names the pods and
+	// what each server said, because the reply IS the diagnosis: WRONGPASS means the
+	// Secret was rotated under a running fleet (a Secret edit rolls nothing, so the
+	// pods keep the old password indefinitely), while NOAUTH means the operator lost
+	// a password the pods still enforce. See the auth design §3.5a.
+	//
+	// While it is True the operator REFUSES every action that would discard data —
+	// Rule L's reseed, the ghost-master election, and the ADR-016 quarantine — since
+	// a pod whose keyspace cannot be read cannot be shown to be empty. That refusal
+	// is deliberately NOT overridable by
+	// sentinel.allowUnsafeRebootstrapOnDeadlock: the remedy is to fix the
+	// credential, which is trivial and destroys nothing.
+	ConditionOperatorCannotAuthenticate = "OperatorCannotAuthenticate"
 )
 
 // LittleRedStatus defines the observed state of LittleRed

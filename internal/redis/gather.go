@@ -77,7 +77,14 @@ func GatherReplicationState(
 			defer wg.Done()
 			rs, err := g.GetRedisState(ctx, name, ip)
 			if err != nil {
-				rs = &RedisNodeState{PodName: name, IP: ip, Reachable: false}
+				// The error is CLASSIFIED, not discarded (LR-051). Dropping it made a
+				// credential mismatch byte-identical to a dial timeout, and because
+				// DataHolders() filters on Reachable, an AuthFailed pod then read as
+				// "holds no data" while it could be holding the only copy.
+				rs = &RedisNodeState{
+					PodName: name, IP: ip, Reachable: false,
+					ProbeFailure: ClassifyProbeError(err), ProbeError: DescribeProbeError(err),
+				}
 			}
 			mu.Lock()
 			redisResults = append(redisResults, redisResult{ip: ip, rs: rs})
@@ -92,7 +99,10 @@ func GatherReplicationState(
 			defer wg.Done()
 			ss, err := g.GetSentinelState(ctx, name, ip, masterName)
 			if err != nil {
-				ss = &SentinelNodeState{PodName: name, IP: ip, Reachable: false}
+				ss = &SentinelNodeState{
+					PodName: name, IP: ip, Reachable: false,
+					ProbeFailure: ClassifyProbeError(err), ProbeError: DescribeProbeError(err),
+				}
 			}
 			mu.Lock()
 			sentinelResults = append(sentinelResults, sentinelResult{ip: ip, ss: ss})
@@ -174,7 +184,16 @@ func gatherNodeIdentities(ctx context.Context, g Gatherer, clusterPods map[strin
 			p := probes[i]
 			id, err := g.GetClusterID(ctx, p.name, p.ip)
 			if err != nil {
-				states[i] = &ClusterNodeState{PodName: p.name, PodIP: p.ip, Reachable: false}
+				// Classified, not discarded — the cross-mode half of LR-051 (rule §7.11).
+				// No cluster-mode decision keys on it today: the wipe recovery already
+				// takes its data-safety signal from the kubelet (LR-023), not from this
+				// dial. It is carried so the "operator cannot authenticate" report is
+				// mode-complete, and so the next rule that reaches for this state finds
+				// the reason already on it rather than having to rediscover the defect.
+				states[i] = &ClusterNodeState{
+					PodName: p.name, PodIP: p.ip, Reachable: false,
+					ProbeFailure: ClassifyProbeError(err), ProbeError: DescribeProbeError(err),
+				}
 				return
 			}
 			ns := &ClusterNodeState{PodName: p.name, PodIP: p.ip, NodeID: id, Reachable: true}

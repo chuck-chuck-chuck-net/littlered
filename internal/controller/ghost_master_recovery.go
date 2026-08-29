@@ -88,7 +88,15 @@ func planGhostMasterRecovery(
 		return leaderlessPlan{action: recoveryWait}
 	}
 
-	// 4. Act by data-holder set.
+	// 4. LR-051: the same veto as Rule L's, for the same reason — everything below
+	// this line elects a master, and a pod that refused our credential is a live
+	// server whose keyspace we cannot read. The 0-holder branch is the dangerous one
+	// here too: it seeds the bootstrap master over what may be the whole dataset.
+	if plan, veto := unprovablyEmptyVeto(state); veto {
+		return plan
+	}
+
+	// 5. Act by data-holder set.
 	holders := state.DataHolders()
 	if len(holders) == 0 {
 		if bootstrapMasterIP == "" {
@@ -184,6 +192,18 @@ func (r *LittleRedReconciler) recoverGhostMasterDeadlock(
 		log.Info(msg)
 		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataPresent, msg)
 		return r.setGhostMasterCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataPresent, msg)
+
+	case recoveryRefuseUnverified:
+		// LR-051, the twin of Rule L's branch. See there.
+		msg := fmt.Sprintf("Ghost-master deadlock: %s. Refusing to elect — a pod that refuses "+
+			"the operator's credential is a live server whose keyspace cannot be read, so it "+
+			"cannot be shown to be empty and electing around it may discard the entire dataset. "+
+			"Fix the credential (see the OperatorCannotAuthenticate condition); "+
+			"allowUnsafeRebootstrapOnDeadlock deliberately does NOT override this.",
+			unverifiedPodSummary(plan.unverified))
+		log.Info(msg)
+		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataUnverified, msg)
+		return r.setGhostMasterCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataUnverified, msg)
 
 	case recoveryUnsafeElect:
 		best := state.RedisNodes[plan.masterIP]

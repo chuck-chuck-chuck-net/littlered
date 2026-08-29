@@ -2127,3 +2127,189 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   what extends the gate from "a template rollout" to "any pod of ours that has just left", which is the
   state the false signature actually lives in, and the failure direction is a withheld accusation rather
   than a wrongly-deleted instance.
+
+## [LR-051] `Reachable:false` Conflated Three Facts — a Credential Mismatch Voided the One Gate That Stops Data Loss
+- **Date:** 2026-08-29
+- **Commit:** (pending)
+- **ID note:** LR-047 is taken on `fix/cluster-rollout-state-gate`; LR-048/049/050 are the
+  master-name-rename branch's. Allocated with the LR-039 cross-branch loop over **every**
+  branch, not by reading the tip of one line — the highest ID visible anywhere is LR-050.
+- **Scope:** Phase 0 milestone M0.1 of `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`,
+  the §6 invariant sweep of `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` item 1. It ships **ahead
+  of** the mechanism it was found by, because it is a present, data-losing defect on the shipped
+  build and not a hazard of a future feature. It also **shrinks the auth design's WP1**
+  (`docs/AUTH_ENABLEMENT_AND_ROTATION_DESIGN.md`, prospective ADR-019), which had scheduled the
+  "operator cannot authenticate" condition.
+
+- **Problem — an unreachable pod carried no reason, so a live pod full of data was
+  indistinguishable from a dead one.** `internal/redis/gather.go` discarded the probe error on
+  the spot, at all three of its sites, with no log line on the branch:
+
+      rs, err := g.GetRedisState(ctx, name, ip)
+      if err != nil {
+          rs = &RedisNodeState{PodName: name, IP: ip, Reachable: false}
+      }
+
+  `RedisNodeState` had no error field, and **the zero value of every other field is exactly what
+  a credential mismatch produces** — `Role:""`, `Keys:0`, `LinkStatus:""`, `Replid:""`. So
+  "cannot route", "process dead" and "wrong credential" were byte-identical to every rule in the
+  operator, and nothing in the tree had ever inspected a Redis error for `NOAUTH`, `WRONGPASS`
+  or `AUTH` at any layer.
+
+  **The consequence is not diagnostic, it is a data-safety gate that cannot fire.** `DataHolders()`
+  filters on `Reachable`, so under a credential mismatch **every pod reads as 0 keys and not a
+  data holder**. Rule L's `>=2`-holder REFUSE — the only gate in the product whose purpose is to
+  stop the operator discarding data, and the only one requiring
+  `allowUnsafeRebootstrapOnDeadlock` — can therefore **never fire**, and Rule L always takes its
+  **no-opt-in** `recoverySeedNoData` branch: it points the whole Sentinel quorum at `redis-0` on
+  the belief that the instance holds nothing, while the instance holds everything.
+
+- **Reachable today, by a supported edit, and the route is worth stating exactly** (auth design
+  §3.5a, whose per-path analysis is authoritative). Editing the password inside the Secret
+  **rolls nothing**, so the fleet stays coherent on the old password and only the OPERATOR moves
+  to the new one — every healing rule then goes silently dead, indefinitely, with nothing rolling
+  to end it. That alone does not reach Rule L (`AllSentinelsBare` needs a reachable Sentinel).
+  Add any later event that restarts the **Sentinel** pods but not the **Redis** pods — a drain,
+  an eviction, an OOM, an operator upgrade, or `kubectl rollout restart statefulset/<n>-sentinel`,
+  which is `docs/USAGE.md`'s own documented escape hatch — and the shape is complete: Sentinels
+  back on the new password and bare (EmptyDir, pillar 3.1), Redis pods still on the old one and
+  unreachable. `recoverySeedNoData` fires. The **damage is delivered later** by ordinary
+  mechanisms: when the Redis pods do restart, `redis-0` returns **empty** as the Sentinel-blessed
+  master and every pod that restarts after it full-syncs from empty. **The edit, the trigger and
+  the loss are separated by days and by three unrelated causes**, which is why nothing has ever
+  connected them.
+
+  **Not the enablement direction, and this is a correction worth keeping.** go-redis sends the
+  THREE-argument `HELLO <ver> AUTH default <pw>`, which hits ACL's `nopass` short-circuit and
+  **succeeds** against a password-less server, so turning auth ON produces no mismatch at all.
+  Only **rotation** (`WRONGPASS`) and **disable** (`NOAUTH`) do. The classifier is correct about
+  what it sees; it does not manufacture a failure that does not occur.
+
+- **Fix — unreachability carries WHY, and an unproven-empty pod vetoes every action that
+  discards data.** Three parts, in the order they matter:
+    1. **A pure classifier** (`internal/redis/probe_failure.go`): `ClassifyProbeError(err)` onto a
+       closed enum — `ProbeOK | ProbeUnroutable | ProbeTimedOut | ProbeAuthFailed |
+       ProbeProtocolError | ProbeUnknown`. `RedisNodeState`, `SentinelNodeState` and
+       `ClusterNodeState` gain `ProbeFailure` + the (bounded) raw `ProbeError`, and the three
+       gather sites stop discarding.
+    2. **The veto** (`unprovablyEmptyVeto`, shared by both sentinel planners; the same predicate
+       inline in `planFailover`): a node classified `AuthFailed` is **not provably empty** — it
+       ANSWERED us, in the protocol, to refuse us, so a live server is running there and its
+       keyspace is unknown rather than zero. It is placed **after** the detection and cooldown
+       gates and **before** the act step, because the veto is about ACTIONS THAT DISCARD DATA and
+       not about observing: hoisting it above the gates would strand the `LeaderlessSince` marker
+       and make a credential problem look like a deadlock.
+    3. **The condition** `OperatorCannotAuthenticate` (True is bad, matching `Forsaken` /
+       `StaleMasterName` / `LegacyClusterTopology`), one Warning per **transition**, never per
+       pass (LR-042's lesson). The message names the pods **and what each distinct server said**,
+       because the reply IS the diagnosis and the two point at opposite remedies: `WRONGPASS`
+       means the Secret moved and the pods did not, `NOAUTH` means the operator lost a password
+       the pods still enforce.
+- **`quarantineDataRisk` reuses LR-044's existing `unverified` concept rather than growing a
+  fourth clause** — and the change there is smaller and sharper than it looks. LR-044's clause
+  rests on LR-023's premise: a not-Ready redis is DOWN, therefore holds no data. **An
+  `AuthFailed` probe falsifies that premise directly**, so an auth-failed pod is unverified
+  *whatever the kubelet says*: a negative inference must not overrule a positive observation.
+  Nor is the combination exotic — sentinel-mode readiness requires `role:master` or
+  `master_link_status:up`, and a credential mismatch is exactly what breaks replication, so **the
+  characteristic shape is a live pod, full of data, reading not-Ready while refusing our probes.**
+- **ACCEPTED RESIDUAL, and it is the cost LR-044 refused to pay in the other direction.** A
+  **permanent** credential mismatch now vetoes the ADR-016 quarantine **indefinitely**, keeping a
+  captor's failover-candidate set poisoned for exactly as long — which is, word for word, the
+  failure mode LR-044 rejected when it rekeyed `unverified` off the operator's dial (*"one
+  permanently crash-looping pod would veto the quarantine forever and keep the captor dirty for
+  exactly as long"*), reached through a different door. **The two are not in conflict, and the
+  discriminator is the direction of the evidence:** a crash-looping pod is evidence of a *dead*
+  server, so LR-023's premise holds and refusing on it buys nothing; an `AuthFailed` pod is
+  positive evidence of a *live* one, so the premise is false and refusing on it is the only
+  honest reading. The trade is also asymmetric in the same direction every guard in this file
+  is: the residual is a healthy neighbour left dirty until a human fixes a Secret, against
+  deleting the last copy of a live dataset. Recorded rather than left to be rediscovered by
+  someone reading pillar 3.15 against this code and concluding one of them must be wrong —
+  **pillar 3.15 is amended in the same change** to state the keying accurately (kubelet
+  readiness for the did-not-answer case; an auth failure overriding it because it falsifies the
+  premise), with LR-044's original argument left intact for the case it was written about.
+- **The opt-in deliberately does NOT override the veto**, in any of the three planners.
+  `allowUnsafeRebootstrapOnDeadlock` authorizes discarding a set of holders the owner could
+  **see** — the message it answers names them and their key counts. Under a credential mismatch
+  the operator cannot see the set at all, so the authorization was never given with knowledge of
+  what it authorizes, and `BestDataHolder` would be choosing among the pods that happen to still
+  answer rather than among the pods that hold data. The remedy is trivial, always available and
+  non-destructive (fix the Secret; or delete and recreate the CR, ADR-015 §9.2's accepted
+  fallback), so a knob that overrides *"I cannot see"* buys nothing and costs the dataset. This
+  is the LR-047 direction of the asymmetry, not LR-043's: **the chosen failure is a loud stall,
+  and the alternative is silent destruction.**
+- **Cross-mode parity audit (CLAUDE.md §7 rule 11) — and it found a fourth veto site the
+  milestone did not name:**
+
+  | mode | verdict | why |
+  |---|---|---|
+  | sentinel — `planLeaderlessRecovery` (Rule L) | **FIXED** | the reported defect; `recoverySeedNoData` over a live dataset |
+  | sentinel — `planGhostMasterRecovery` (LR-024) | **FIXED** | same 0-holder seed branch, same `DataHolders()` input |
+  | sentinel — `quarantineDataRisk` (LR-044) | **FIXED** | `unverified` rekeyed so an `AuthFailed` pod vetoes regardless of kubelet readiness |
+  | **failover — `planFailover`** | **FIXED — not named in the milestone, found by this audit** | the identical 0-holder branch. A rotation ALONE does not reach it (`planMasterDeath` correctly HOLDs, since no reachable replica can corroborate — LR-017 doing its job), but add an ordinary master-pod replacement and the K8s-authoritative arm declares death on kubelet readiness, `planFailover` runs, and it seeds the **fresh** pod — reachable precisely because it restarted onto the current credential, hence empty — while the survivors holding the only copy are invisible |
+  | cluster — gather + `planClusterWipeRecovery` | **classified, deliberately no veto** | the discard is fixed for parity and diagnosis, but no cluster decision keys on it: the one cluster decision that deletes pods already takes its evidence from the **kubelet's** readiness probe rather than from the operator's dial (LR-023). The condition is still wired, so a rotated Secret is NAMED here too |
+  | standalone | **nothing here** | it issues no Redis probe at all — no gather, nothing to classify, no decision to veto |
+
+- **What this does NOT close.** It makes the operator refuse rather than destroy; it does not make
+  a mixed-credential fleet work. The instance stays `Ready=False` and unmanaged until a human
+  fixes the credential — which is the auth design's §3.5a Path B, still open and still that
+  design's subject. Also unchanged: the discarded errors on the sentinel WRITE paths
+  (`_ = podSC.Set(...)`), so a stale `SENTINEL SET auth-pass` still fails silently; and
+  `failover_monitor.go`'s `return err == nil`, where an auth failure still counts as "master
+  down" (harmless — the watcher only makes a reconcile look sooner and never declares death
+  itself, and `planMasterDeath` then HOLDs).
+- **Tests, red-first at every tier:**
+  - *Classifier* (`internal/redis/probe_failure_test.go`): the 18-row table was authored against
+    a stub returning `ProbeOK` for everything and observed **RED on 17 of 18** — the nil row
+    passes vacuously by construction — e.g. `ClassifyProbeError(failed to get info: WRONGPASS
+    invalid username-password pair or user is disabled.) = "", want "AuthFailed"`. A companion
+    test drives a REAL go-redis client against a scripted server that answers each of the four
+    auth replies, **RED on 4 of 4**, so the strings are pinned against the actual error surface
+    rather than against a hand-built stand-in.
+  - *The headline red — the data-losing defect itself*: `TestLeaderlessRecoveryRefusesWhen
+    PodsRefuseOurCredential` builds the §3.5a Path C fleet through the **real gather** (a stub
+    Gatherer returning `WRONGPASS` for every Redis pod and bare-but-reachable Sentinels), asserts
+    its four preconditions rather than assuming them, and was **RED** as
+    `planLeaderlessRecovery = 3, want recoveryRefuseUnverified` — action 3 being
+    `recoverySeedNoData`, i.e. the operator reseeding an instance that holds everything. The
+    siblings went red the same way: `planGhostMasterRecovery = 3`, and
+    `planFailover = 2` (`failoverSeed`).
+  - *Quarantine*: one new row in `TestQuarantineDataRisk`, **RED on exactly that row** —
+    `unverified = false, want true` — with every pre-existing row green throughout, which is what
+    makes the single red attributable.
+  - *Mutation checks, both directions.* The refuse tests would pass vacuously against an
+    always-veto implementation, so two **positive controls** pin that an ordinary dead pod
+    (`ProbeTimedOut` / `ProbeUnroutable`) must STILL be reseeded — the mass-restart case Rule L
+    and failover mode exist for. Those two are green from birth and are disclosed as such; their
+    teeth were shown with the mutant a reasonable implementer writes first (veto on **any**
+    unreachable pod), which fails both — `planFailover = 6` and `planLeaderlessRecovery = 7`,
+    i.e. the veto swallowing the ordinary recovery whole. `TestPlanAuthReport` was authored after
+    the implementation (a rendering, no honest red available) and mutation-checked two ways:
+    dropping the server reply from the message, and reporting True with no failures.
+  - *Stop condition (LR-048's K2b), verified*: **every existing planner table passes with no row
+    edited and no call line changed.** The veto reads the state the planners already receive, so
+    unlike LR-050 not even a `false` argument had to be threaded.
+- **Not verified live.** No cluster was used or authorized for this milestone; validation is unit
+  + envtest. The failure mode of the veto is **over-suppression** — refusing a recovery that
+  should have proceeded — and unit tests cannot prove its absence; the positive controls above
+  are what guard the direction. The e2e tiers that would exercise it are the leaderless-recovery
+  Describe and the failover deadlock tiers, and staging a credential mismatch there needs a
+  fixture that rotates a Secret without rolling the pods. Recorded as owed.
+- **Regresses:** None on any path where every pod answers: `ProbeOK` is the zero value, so a
+  state built without a probe error reads exactly as before, and `HasAuthFailure()` is false, so
+  every planner takes the branch it took yesterday. No gate, cadence, requeue interval or
+  decision table changed. `OperatorCannotAuthenticate` is never introduced just to say "all
+  fine" — an instance that has never had a credential problem does not carry the condition at
+  all. The one behaviour change is the intended one: while a pod refuses the operator's
+  credential, Rule L, the ghost-master election, `planFailover` and the ADR-016 quarantine all
+  refuse instead of acting.
+- **Impacts:** `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` §6 item 1 (the invariant is now stated
+  in code: *unreachability must carry why*); `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`
+  §7 Phase 0 (M0.1 done; M0.2 and M0.3 unaffected — this change touches neither `client.go` nor
+  `ValidIPs`); `docs/AUTH_ENABLEMENT_AND_ROTATION_DESIGN.md` **§3.5/§3.5a — WP1 shrinks, since
+  the condition ships here**; `docs/API_SPEC.md` (the new condition and its two reasons, plus
+  `RefusedDataUnverified` on `LeaderlessRecovery` / `GhostMasterRecovery` / `FailoverRecovery`).
+  Builds on LR-017 (the operator's own dial is never sufficient evidence for a verdict) and
+  LR-023 (kubelet readiness is the blackhole-proof signal) — and adds the case neither covered:
+  **a pod that answered, to say no.**

@@ -6,7 +6,12 @@ currently holds 001…009, 011, 013…018, so **018 is the highest and 019 is fr
 the rename shipped as 018. Re-check with `ls docs/adr/` before writing the file.)
 
 **Changelog ID:** unallocated. Allocate with the LR-039 cross-branch loop over **every** branch,
-not by reading the tip of one line. The highest ID visible on `e2e-0821` is **LR-050**.
+not by reading the tip of one line. **LR-051 is now TAKEN** — Phase 0 M0.1, the probe-failure
+classifier and the unprovably-empty veto, which is this document's §3.5a turned into code and
+shipped ahead of the feature (see WP1). **LR-052 and LR-053 are spoken for** by Phase 0's
+M0.2 (`FailoverActive`'s evidence pipeline) and M0.3 (the `ValidIPs` split), so this
+feature's own entry is LR-054 or later — but re-run the loop rather than trusting this
+line, which is exactly the mistake LR-039 records making.
 
 **Scope:** all four modes (`standalone`, `sentinel`, `failover`, `cluster`).
 **Companion, already shipped:** the in-place Sentinel master-name rename (ADR-018 / LR-048 /
@@ -456,6 +461,19 @@ the instance — while Path C is the one that ends in lost data. **Recommendatio
 own LR entry and Path B's fix (WP1, plus surfacing "the operator cannot authenticate to its own
 pods" as a loud condition) ships AHEAD of the feature**, because it is small, independently
 valuable, and an owner can hit it today without ever attempting a staged rotation.
+
+> **⚠ THIS HAS NOW PARTLY HAPPENED — LR-051** (Phase 0 M0.1 of
+> `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`), landed ahead of this feature.
+> Read the three paths above as the analysis that *motivated* it, not as current behaviour:
+> the probe error is classified rather than discarded, the
+> `OperatorCannotAuthenticate` condition exists in all four modes, and **Path C's data loss
+> is closed** — an `AuthFailed` pod is not provably empty, so it vetoes the leaderless reseed,
+> the ghost-master election, `planFailover` and the ADR-016 quarantine, and
+> `allowUnsafeRebootstrapOnDeadlock` cannot override that refusal. **Path A is untouched**
+> (it is a peer-edge problem — Sentinel and replication, not the operator's view — and is
+> this design's own subject), and **Path B is only made LOUD, not fixed**: the instance still
+> stops being managed until a human fixes the credential, which is what §4 exists to make
+> unreachable. See WP1 in §9 for exactly what remains.
 
 ### 3.6 Rollout and change-detection machinery
 
@@ -1036,7 +1054,7 @@ Ordered by dependency. Disjoint file ownership is noted so siblings can run in p
 | WP | What | Owns | Depends on |
 |---|---|---|---|
 | **WP0** | **Observation, build nothing.** Two throwaway sentinel instances, 1s sampling of `status`, the operator log and `DBSIZE`. **(a) Path B, the cheap one:** rotate the password inside the Secret and change nothing else; assert that no pod restarts, that clients keep working, that the CR goes `Ready=False`, and that **no healing rule fires again** — then kill the master and observe whether the `role: master` label follows it. **(b) Path C:** after (a), `kubectl rollout restart statefulset/<n>-sentinel` and watch for `LeaderlessRecovery=…/Reseeded`. Exit criterion: each path's verdict observed, **or** its absence with an explanation — §3.5a's chain must be re-derived before anything is built on it. The equivalent of the rename's WP0; **do this first**. | nothing | — |
-| **WP1** | `getRedisPassword` returns `(string, error)`; a Secret read failure becomes a `Warning` + condition instead of `""`. Un-discard the four `SENTINEL SET auth-pass` errors. Log the auth-vs-timeout distinction in the failover monitor. | `littlered_controller.go`, `failover_monitor.go` | — (independently valuable; ship it even if the feature slips) |
+| **WP1** ⚠ **SHRUNK — part of it has SHIPPED** | **Already delivered by LR-051** (Phase 0 M0.1 of the declared-operations plan, landed ahead of this feature exactly as §3.5a recommended): the auth-vs-timeout distinction now exists as a classified `ProbeFailure` on `RedisNodeState`/`SentinelNodeState`/`ClusterNodeState`, the three `gather.go` sites no longer discard the probe error, and **the `OperatorCannotAuthenticate` condition + its one-Warning-per-transition event ship there**, in all four modes. LR-051 also went further than this WP asked, closing the §3.5a **Path C** data loss directly: an `AuthFailed` pod is not provably empty, so it vetoes `planLeaderlessRecovery`, `planGhostMasterRecovery`, `planFailover` and `quarantineDataRisk` — a refusal `allowUnsafeRebootstrapOnDeadlock` deliberately cannot override. **What REMAINS in WP1:** `getRedisPassword` returns `(string, error)` so a Secret *read* failure becomes a `Warning` + condition instead of `""`; un-discard the four `SENTINEL SET auth-pass` errors; and the failover monitor's `return err == nil`, where an auth failure still counts as "master down" (harmless today — the watcher only makes a reconcile look sooner and `planMasterDeath` then HOLDs — but it is now the last place the distinction is thrown away). | `littlered_controller.go`, `failover_monitor.go` | — (independently valuable; ship it even if the feature slips) |
 | **WP2** | The pure seam: `planAuthStage` + `authArgs`, red-first, both mutants. | `internal/controller/auth_stage_plan.go` + tests | — |
 | **WP2b** | Extend LR-050's `rolling` to the OR over both sentinel StatefulSets (§Q6(c)). Red-first with a fixture where the Redis STS is settled and the Sentinel STS is not. | `littlered_controller.go` | — |
 | **WP3** | The substrate: `AnnotationAuthHash` (HMAC-keyed on the instance UID), stamped in all four modes; the stage resolver reading applied hashes uncached; `AuthReady` condition + events. | `resources.go` (hash helper), the four apply sites | WP2 |

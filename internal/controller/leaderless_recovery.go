@@ -46,6 +46,13 @@ const (
 	// recoveryUnsafeElect: two or more pods hold data and the opt-in is on; force-
 	// elect the most-complete pod, discarding the rest.
 	recoveryUnsafeElect
+	// recoveryRefuseUnverified: at least one Redis pod REFUSED the operator's
+	// credential (LR-051). Such a pod is a LIVE server whose keyspace we cannot
+	// read, so no election can be shown to be lossless — refuse, loudly, until a
+	// human fixes the credential. Distinct from recoveryRefuse, which means "we can
+	// see the holders and there are too many": here we cannot see them at all, and
+	// the two want opposite remedies.
+	recoveryRefuseUnverified
 )
 
 // leaderlessPlan is the decision returned by planLeaderlessRecovery.
@@ -54,6 +61,37 @@ type leaderlessPlan struct {
 	masterIP string // pod to elect (seed/promote/unsafe actions only)
 	diverged bool   // unsafe action: holders span multiple replication lineages
 	holders  int    // number of reachable data holders (for messaging)
+	// unverified: pods that refused the operator's credential, so their keyspace is
+	// unknown (recoveryRefuseUnverified only). Carried for the message — naming the
+	// pods and what the server said is what turns this from "stuck" into "fix the
+	// Secret" (auth design §3.5a Path B).
+	unverified []*redisclient.RedisNodeState
+}
+
+// unprovablyEmptyVeto is the shared LR-051 guard for both recovery planners.
+//
+// It sits AFTER the detection and cooldown gates and BEFORE the act step, and that
+// placement is the whole of it: the veto is about ACTIONS THAT DISCARD DATA, not
+// about observing. Hoisting it above the gates would strand the LeaderlessSince
+// marker (the clear-marker branch is a no-op, not an action) and would make a
+// credential problem look like a deadlock; putting it after the act step would be
+// no veto at all.
+//
+// It is deliberately NOT overridable by allowUnsafeRebootstrapOnDeadlock. That
+// opt-in authorizes discarding a set of holders the owner could SEE — the message
+// it is answering names them and their key counts. Under a credential mismatch the
+// operator cannot see the set at all, so the authorization was never given with
+// knowledge of what it authorizes, and BestDataHolder would be choosing among the
+// pods that happen to still answer rather than among the pods that hold data. The
+// remedy is trivial, always available and non-destructive (fix the Secret, or
+// delete and recreate the CR — ADR-015 §9.2's accepted fallback), so a knob that
+// overrides "I cannot see" buys nothing and costs the dataset.
+func unprovablyEmptyVeto(state *redisclient.ReplicationState) (leaderlessPlan, bool) {
+	unverified := state.AuthFailedRedisNodes()
+	if len(unverified) == 0 {
+		return leaderlessPlan{}, false
+	}
+	return leaderlessPlan{action: recoveryRefuseUnverified, unverified: unverified}, true
 }
 
 // planLeaderlessRecovery is the pure decision function for Rule L. It performs no
@@ -88,6 +126,13 @@ func planLeaderlessRecovery(
 	}
 	if now.Sub(*leaderlessSince) < cooldown {
 		return leaderlessPlan{action: recoveryWait}
+	}
+
+	// LR-051: every branch below this line either elects a master or refuses to. A
+	// pod that refused our credential is a live server whose keyspace is unknown, so
+	// none of them can be shown to be lossless.
+	if plan, veto := unprovablyEmptyVeto(state); veto {
+		return plan
 	}
 
 	holders := state.DataHolders()

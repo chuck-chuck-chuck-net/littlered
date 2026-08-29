@@ -931,6 +931,19 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	g := &operatorGatherer{password: password, tlsEnabled: littleRed.Spec.TLS.Enabled}
 	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, sentinelMasterName)
 
+	// 2a. Can we still talk to our own pods? (LR-051)
+	//
+	// Reported BEFORE the forsaken/quarantine switch below, because that switch
+	// returns early on a capture and this is precisely the state an owner needs
+	// named when the operator has otherwise gone quiet. A pod that refuses our
+	// credential ANSWERED us, so it is a live server whose keyspace is unknown —
+	// which is why unprovablyEmptyVeto refuses every action that discards data while
+	// this holds. The report is a rendering only; no decision depends on it having
+	// been computed.
+	if err := r.reportOperatorAuth(ctx, littleRed, replicationAuthFailures(state)); err != nil {
+		log.Error(err, "failed to report the operator's authentication state")
+	}
+
 	// 2b. Is this instance still ours to manage?
 	//
 	// If another Sentinel deployment sharing our master name has captured us, every
@@ -2075,6 +2088,21 @@ func (r *LittleRedReconciler) recoverLeaderlessDeadlock(
 		// Surface loudly and durably; keep LeaderlessSince set so the state stays visible.
 		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataPresent, msg)
 		return r.setLeaderlessCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataPresent, msg)
+
+	case recoveryRefuseUnverified:
+		// LR-051. Distinct from recoveryRefuse above and the difference is the whole
+		// point: there we can SEE the holders and there are too many, here we cannot
+		// see them at all, and the two want opposite remedies. The marker is kept so
+		// the state stays visible; OperatorCannotAuthenticate carries the detail.
+		msg := fmt.Sprintf("Bootstrap deadlock: %s. Refusing to rebootstrap — a pod that "+
+			"refuses the operator's credential is a live server whose keyspace cannot be read, "+
+			"so it cannot be shown to be empty and seeding a master over it may discard the "+
+			"entire dataset. Fix the credential (see the OperatorCannotAuthenticate condition); "+
+			"allowUnsafeRebootstrapOnDeadlock deliberately does NOT override this.",
+			unverifiedPodSummary(plan.unverified))
+		log.Info(msg)
+		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataUnverified, msg)
+		return r.setLeaderlessCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataUnverified, msg)
 
 	case recoveryUnsafeElect:
 		best := state.RedisNodes[plan.masterIP]

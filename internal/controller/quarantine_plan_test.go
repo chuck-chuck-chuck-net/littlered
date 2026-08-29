@@ -193,6 +193,16 @@ func TestQuarantineDataRisk(t *testing.T) {
 			Role: "slave", MasterHost: masterHost, LinkStatus: link,
 		}
 	}
+	// authFailed is a pod that ANSWERED us — in the protocol, to refuse our
+	// credential (LR-051). It is unreachable to the gather and very much alive on
+	// the wire.
+	authFailed := func(ip string) *redisclient.RedisNodeState {
+		return &redisclient.RedisNodeState{
+			PodName: "redis-" + ip, IP: ip, Reachable: false,
+			ProbeFailure: redisclient.ProbeAuthFailed,
+			ProbeError:   wrongPassReply,
+		}
+	}
 	build := func(nodes ...*redisclient.RedisNodeState) *redisclient.ReplicationState {
 		s := redisclient.NewReplicationState()
 		for _, n := range nodes {
@@ -261,6 +271,21 @@ func TestQuarantineDataRisk(t *testing.T) {
 			// conservative direction is the same as an unreachable Ready pod.
 			state:     build(node(ourM, true, 0, foreign, "up"), node(ourR1, false, 0, "", "")),
 			ready:     map[string]bool{"redis-" + ourM: true},
+			unverifid: true,
+		},
+		{
+			name: "a pod that REFUSED our credential is never provably empty, even not-Ready",
+			// LR-051. The readiness clause above rests on LR-023: a not-Ready redis is
+			// DOWN, so it holds nothing. An AuthFailed pod falsifies that premise — it
+			// answered, which means a live server is running there — so the kubelet's
+			// negative cannot overrule our own positive observation.
+			//
+			// And the combination is not exotic, it is the CHARACTERISTIC shape of a
+			// credential mismatch: sentinel-mode readiness requires role:master or
+			// master_link_status:up, and a mismatch is exactly what breaks replication,
+			// so a live pod full of data reads not-Ready while refusing our probes.
+			state:     build(node(ourM, true, 0, foreign, "up"), authFailed(ourR1)),
+			ready:     ready("redis-" + ourM),
 			unverifid: true,
 		},
 	}

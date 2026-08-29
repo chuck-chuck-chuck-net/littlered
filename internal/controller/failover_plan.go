@@ -173,6 +173,11 @@ const (
 	// failoverUnsafeElect: >=2 lineages and the opt-in is on; force-elect the
 	// most-complete holder, flagging the divergence loudly.
 	failoverUnsafeElect
+	// failoverRefuseUnverified: at least one Redis pod REFUSED the operator's
+	// credential (LR-051), so its keyspace cannot be read and no election can be
+	// shown to be lossless. The sentinel-mode twin is recoveryRefuseUnverified;
+	// this is rule §7.11 applied to the identical 0-holder seed branch.
+	failoverRefuseUnverified
 )
 
 // failoverPlan is the decision returned by planFailover.
@@ -181,6 +186,9 @@ type failoverPlan struct {
 	masterIP string // pod to elect (seed/promote/unsafe actions only)
 	diverged bool   // unsafe action: holders span multiple replication lineages
 	holders  int    // number of reachable data holders (for messaging)
+	// unverified: pods that refused the operator's credential, so their keyspace is
+	// unknown (failoverRefuseUnverified only). Carried for the message.
+	unverified []*redisclient.RedisNodeState
 }
 
 // planFailover is the pure "who should be master" decision for failover mode
@@ -231,6 +239,17 @@ func planFailover(
 	}
 	if transitionSince != nil && now.Sub(*transitionSince) < cooldown {
 		return failoverPlan{action: failoverWait}
+	}
+
+	// 3b. LR-051: everything below elects a master, and a pod that refused our
+	// credential is a live server whose keyspace we cannot read. Placed after the
+	// serialization gates and before the act step, exactly as the sentinel twin is —
+	// this vetoes ACTIONS, not observation.
+	// The shared predicate is state.AuthFailedRedisNodes() itself (LR-045: one
+	// definition, not a per-mode copy); only the plan type differs, which is why this
+	// is not the sentinel planners' unprovablyEmptyVeto wrapper verbatim.
+	if unverified := state.AuthFailedRedisNodes(); len(unverified) > 0 {
+		return failoverPlan{action: failoverRefuseUnverified, unverified: unverified}
 	}
 
 	// 4. No data anywhere: seed the deterministic bootstrap candidate.

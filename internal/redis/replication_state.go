@@ -18,6 +18,7 @@ package redis
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 )
 
@@ -40,6 +41,33 @@ type RedisNodeState struct {
 	// Replids differ. Ignoring it makes a normal post-failover survivor look divergent.
 	Replid2   string
 	Reachable bool
+
+	// ProbeFailure says WHY this node is unreachable, and ProbeError carries what
+	// the server actually said (bounded, see DescribeProbeError). Both are ProbeOK/""
+	// when Reachable.
+	//
+	// Before LR-051 the probe error was discarded on the spot, so a credential
+	// mismatch and a dial timeout were byte-identical to every rule in the operator:
+	// Role:"", Keys:0, LinkStatus:"", Reachable:false. That is not a cosmetic loss.
+	// DataHolders() filters on Reachable, so an AuthFailed pod reads as "holds no
+	// data" while it may be holding ALL of it — which voids Rule L's >=2-holder
+	// REFUSE, the single gate whose purpose is to stop the operator discarding data.
+	// See ProbeFailure, LR-051, and the auth design §3.5a Path C.
+	ProbeFailure ProbeFailure
+	ProbeError   string
+}
+
+// UnprovablyEmpty reports whether this node CANNOT be shown to hold no data.
+//
+// A node the operator could not authenticate to answered us — in the protocol, to
+// refuse us — so a live server is running there and its keyspace is unknown rather
+// than zero. Every decision that discards data must treat it as a potential sole
+// copy. A node that did not answer AT ALL is a different case and is deliberately
+// NOT covered here: that judgement belongs to the kubelet's readiness probe
+// (authoritative and blackhole-proof, LR-023), never to the operator's own dial
+// (LR-017).
+func (n *RedisNodeState) UnprovablyEmpty() bool {
+	return n != nil && !n.Reachable && n.ProbeFailure == ProbeAuthFailed
 }
 
 // SentinelNodeState represents the monitoring state of a Sentinel pod
@@ -82,6 +110,14 @@ type SentinelNodeState struct {
 	// not a dead Sentinel (LR-041's class of mistake). Callers must therefore not
 	// read emptiness as evidence of absence.
 	MonitoredMasters []MonitoredMaster
+
+	// ProbeFailure / ProbeError: why this Sentinel is unreachable and what it said.
+	// Same rationale as RedisNodeState's (LR-051). A Sentinel we cannot authenticate
+	// to is not a dead Sentinel — it is one whose monitoring view we simply cannot
+	// read, which is exactly the state that made every Monitoring-gated rule go
+	// quietly inert in LR-041.
+	ProbeFailure ProbeFailure
+	ProbeError   string
 }
 
 // ReplicationState represents the combined "Ground Truth" of a replication-based
@@ -178,6 +214,46 @@ func (s *ReplicationState) AllSentinelsBare() (bare bool, reachable int) {
 		}
 	}
 	return reachable > 0 && monitoring == 0, reachable
+}
+
+// AuthFailedRedisNodes returns the Redis pods the operator reached but could not
+// authenticate to, sorted by pod name for a deterministic message.
+//
+// These are NOT unreachable pods in any useful sense: something answered on that
+// address and spoke the protocol well enough to refuse us. They are the nodes
+// UnprovablyEmpty is about, and the ones that must veto any action that discards
+// data (Rule L, the ghost-master recovery, the quarantine).
+func (s *ReplicationState) AuthFailedRedisNodes() []*RedisNodeState {
+	var out []*RedisNodeState
+	for _, rn := range s.RedisNodes {
+		if rn.UnprovablyEmpty() {
+			out = append(out, rn)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PodName < out[j].PodName })
+	return out
+}
+
+// AuthFailedSentinelNodes is AuthFailedRedisNodes' twin for Sentinel pods. It
+// changes no decision — no rule discards data on the strength of a Sentinel's
+// answer — but it is reported, because a quorum the operator cannot read is the
+// LR-041 shape and an owner needs to see it named rather than inferred from
+// silence.
+func (s *ReplicationState) AuthFailedSentinelNodes() []*SentinelNodeState {
+	var out []*SentinelNodeState
+	for _, sn := range s.SentinelNodes {
+		if sn != nil && !sn.Reachable && sn.ProbeFailure == ProbeAuthFailed {
+			out = append(out, sn)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PodName < out[j].PodName })
+	return out
+}
+
+// HasAuthFailure reports whether ANY pod of this instance refused the operator's
+// credential — the predicate the data-discarding planners veto on.
+func (s *ReplicationState) HasAuthFailure() bool {
+	return len(s.AuthFailedRedisNodes()) > 0 || len(s.AuthFailedSentinelNodes()) > 0
 }
 
 // DataHolders returns the reachable Redis nodes that currently hold keys.

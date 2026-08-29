@@ -39,6 +39,28 @@ type ClusterNodeState struct {
 	MasterNodeID string // "-" if master
 	LinkStatus   string // "up" or "down"
 	Reachable    bool
+
+	// ProbeFailure / ProbeError: why this node is unreachable and what it said.
+	// The cluster-mode half of LR-051 — see RedisNodeState's field comment for the
+	// full rationale. Carried for parity and diagnosis; no cluster-mode decision
+	// keys on it, because the one cluster decision that deletes pods
+	// (planClusterWipeRecovery) already takes its evidence from the kubelet's
+	// readiness probe rather than from the operator's dial (LR-023).
+	ProbeFailure ProbeFailure
+	ProbeError   string
+}
+
+// AuthFailedNodes returns the cluster pods that refused the operator's credential,
+// sorted by pod name. Diagnosis only — see the field comment.
+func (gt *ClusterGroundTruth) AuthFailedNodes() []*ClusterNodeState {
+	var out []*ClusterNodeState
+	for _, n := range gt.Nodes {
+		if n != nil && !n.Reachable && n.ProbeFailure == ProbeAuthFailed {
+			out = append(out, n)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].PodName < out[j].PodName })
+	return out
 }
 
 // ClusterGroundTruth represents the combined view of the Redis Cluster topology
