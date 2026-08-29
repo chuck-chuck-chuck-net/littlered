@@ -347,10 +347,33 @@ For anyone planning this, these are the cases that motivate each part:
 10. **The static precedence order (from D4).** What order, and justified how? Two interactions are
     already known (§7.3's capture-before-rename; the auth/rename EmptyDir coincidence). Whether a
     total order is derivable or must be asserted per pair is open.
-11. **Narrow-first or general?** Recommendation: **narrow**. Auth is the first operation that
-   genuinely needs the risk-acceptance signal; the rename shipped without one, which is evidence
-   that the general case is harder to justify than the auth case. Build it for auth, generalise
-   when a second customer appears.
+11. **Narrow-first or general?** Recommendation: **narrow — build it for auth, generalise when a
+   second customer appears.**
+
+   *Corrected 2026-08-28.* This item previously justified auth as the first customer because it
+   "needs the risk-acceptance signal". That reasoning is stale — it belongs to the abandoned
+   spec-declared D1 (§5.0) — and it **contradicts D7**, which cites the auth design's own
+   conclusion that **neither** of its features needs a window. The auth design engineers the
+   window away rather than accepting risk: each stage keeps both credential states acceptable on
+   every edge (`nopass` short-circuits go-redis's 3-arg `AUTH default <pw>`; `masteruser default`
+   tolerates a nopass master; `auth-user`/`auth-pass` lets a Sentinel read one; the `user`
+   directive in argv holds two passwords across restarts). The price is stages — two rollouts for
+   enablement, three for rotation — not a window.
+
+   The conclusion stands on three better reasons, all from the converged D1-D4:
+
+   - **Rotation has no observable signature at all.** The password is a `secretKeyRef` that
+     changes no pod template, so there is nothing to derive from even in principle. It is the case
+     that makes intent capture (D1/D2) **mandatory** rather than merely tidy — and note that the
+     defect and the underivability are the same problem (§5.0).
+   - **Serialization already has a stated requirement here.** The auth design's N9 refuses to do
+     the rename in the same window — *"both operations roll the same StatefulSets and both
+     interact with the LR-050 attribution gate"* — which is D4's first real customer, written down
+     before D4 existed.
+   - **Its staged rollouts must not be fought by regular healing**, which is D5/D6.
+
+   The rename shipping without any of this remains evidence that the general case is harder to
+   justify than the auth case.
 
 ---
 
