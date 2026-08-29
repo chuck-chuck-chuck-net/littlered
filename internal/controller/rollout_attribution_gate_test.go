@@ -40,7 +40,8 @@ import (
 // the instance heals itself.
 //
 // A just-replaced pod of ours and a captor's master are structurally indistinguishable
-// from Sentinel's vantage — both are absent from ValidIPs, both unflagged. The
+// from Sentinel's vantage — neither is attributable to a pod object of ours any more,
+// both unflagged. The
 // discriminator that DOES exist is not in the gather at all: whether the pod that used
 // to hold that address is one we are in the middle of replacing. The StatefulSet
 // answers exactly that, and needs no new state.
@@ -52,7 +53,7 @@ import (
 // below are the ones that pin this.
 
 // justReplacedIP is the address of a pod the rollout has just taken down: no longer in
-// ValidIPs (the pod object is gone), and not yet flagged down by Sentinel, because
+// our address sets (the pod object is gone), and not yet flagged down by Sentinel, because
 // s_down needs a whole down-after-milliseconds.
 const justReplacedIP = "10.233.192.110"
 
@@ -63,7 +64,7 @@ const justReplacedIP = "10.233.192.110"
 func k9Shape() *redisclient.ReplicationState {
 	s := redisclient.NewReplicationState()
 	for _, ip := range []string{ipMaster, ipReplica, senIP1, senIP2, senIP3} {
-		s.ValidIPs[ip] = true
+		s.AddLiveTopologyIP(ip)
 	}
 	for _, sip := range []string{senIP1, senIP2, senIP3} {
 		withMonitoredSentinel(s, sip, true, justReplacedIP, "master",
@@ -87,7 +88,7 @@ func k9Shape() *redisclient.ReplicationState {
 func bareShape() *redisclient.ReplicationState {
 	s := redisclient.NewReplicationState()
 	for _, ip := range []string{ipMaster, ipReplica, senIP1, senIP2, senIP3} {
-		s.ValidIPs[ip] = true
+		s.AddLiveTopologyIP(ip)
 	}
 	for _, sip := range []string{senIP1, senIP2, senIP3} {
 		withMonitoredSentinel(s, sip, false, "", "")
@@ -175,7 +176,7 @@ func TestPlanForsakenRolloutGate(t *testing.T) {
 }
 
 // Rule N's G5 half of the same defect (design §9.2): the discriminator
-// `!ValidIPs[ip] && !flaggedDown(flags)` is byte-identical to planForsaken clause 3, so
+// `!IsOurs(ip) && !flaggedDown(flags)` is byte-identical to planForsaken clause 3, so
 // during the same window a stale entry pointing at the just-replaced pod reads as
 // somebody else's master and the operator emits a Warning reading "this instance may be
 // captured — do not rename to escape a capture" at the exact moment the owner is

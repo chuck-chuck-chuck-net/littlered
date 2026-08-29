@@ -48,9 +48,10 @@ func TestDetectCrossInstance(t *testing.T) {
 	}
 	state := func(nodes ...*SentinelNodeState) *ReplicationState {
 		s := &ReplicationState{
-			SentinelNodes: map[string]*SentinelNodeState{},
-			ValidIPs:      ourPods,
-			RedisNodes:    map[string]*RedisNodeState{},
+			SentinelNodes:   map[string]*SentinelNodeState{},
+			LiveTopologyIPs: ourPods,
+			OwnedIPs:        ourPods,
+			RedisNodes:      map[string]*RedisNodeState{},
 		}
 		for i, n := range nodes {
 			s.SentinelNodes[string(rune('a'+i))] = n

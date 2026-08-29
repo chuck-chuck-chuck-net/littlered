@@ -35,11 +35,11 @@ const (
 	surveyForeign   = "10.9.9.9"
 )
 
-// stateWithSentinels builds a ReplicationState whose ValidIPs are our two pod IPs.
+// stateWithSentinels builds a ReplicationState whose pod addresses are our two pod IPs.
 func stateWithSentinels(sns ...*SentinelNodeState) *ReplicationState {
 	st := NewReplicationState()
-	st.ValidIPs[surveyOurIP] = true
-	st.ValidIPs[surveyOurIP2] = true
+	st.AddLiveTopologyIP(surveyOurIP)
+	st.AddLiveTopologyIP(surveyOurIP2)
 	for _, sn := range sns {
 		st.SentinelNodes[sn.IP] = sn
 	}
@@ -47,7 +47,7 @@ func stateWithSentinels(sns ...*SentinelNodeState) *ReplicationState {
 }
 
 // TestSurveyMonitoredNames is the rendering half of Rule N's G5 discriminator: an
-// address in ValidIPs or flagged down is debris of ours, anything else is somebody
+// address of ours (OwnedIPs) or one flagged down is debris of ours, anything else is somebody
 // else's live master. The classes must not drift from the planner's, because the two
 // are read side by side by whoever is deciding whether a rename is safe.
 func TestSurveyMonitoredNames(t *testing.T) {

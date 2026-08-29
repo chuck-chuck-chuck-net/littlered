@@ -127,7 +127,7 @@ func TestDetermineFailoverLiveMaster(t *testing.T) {
 		s := redisclient.NewReplicationState()
 		for _, n := range nodes {
 			s.RedisNodes[n.IP] = n
-			s.ValidIPs[n.IP] = true
+			s.AddLiveTopologyIP(n.IP)
 		}
 		return s
 	}

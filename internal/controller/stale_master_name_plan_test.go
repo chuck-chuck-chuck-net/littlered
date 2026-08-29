@@ -44,7 +44,7 @@ const (
 	capturedForeignIP = "10.233.192.152"
 
 	// An ordinary post-failover ghost: a dead ex-master of ours whose pod is gone, so
-	// its address is no longer in ValidIPs, and which Sentinel has flagged down.
+	// its address is no longer attributable to a pod of ours, and which Sentinel has flagged down.
 	deadExMasterIP = "10.0.0.99"
 )
 
@@ -70,7 +70,7 @@ func setMasters(s *redisclient.ReplicationState, ip, pod string, masters ...redi
 func staleBase() *redisclient.ReplicationState {
 	s := redisclient.NewReplicationState()
 	for _, ip := range []string{ipMaster, ipReplica, ipNode3, senIP1, senIP2, senIP3} {
-		s.ValidIPs[ip] = true
+		s.AddLiveTopologyIP(ip)
 	}
 	s.RedisNodes[ipMaster] = &redisclient.RedisNodeState{PodName: podRedis0, IP: ipMaster, Reachable: true, Role: RoleMaster}
 	s.RedisNodes[ipReplica] = &redisclient.RedisNodeState{
@@ -192,7 +192,9 @@ func TestPlanStaleMasterNames(t *testing.T) {
 						mon(staleName, deadExMasterIP, "s_down,master", ""),
 					)
 				}
-				delete(s.ValidIPs, ipMaster)
+				// G2 asks for a LIVE master to keep monitoring, so the live-topology
+				// set is the one that must lose it (LR-053).
+				delete(s.LiveTopologyIPs, ipMaster)
 				return s
 			}(),
 			desired:    desiredName,

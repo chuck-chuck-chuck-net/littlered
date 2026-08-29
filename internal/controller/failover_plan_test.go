@@ -368,7 +368,7 @@ func TestPlanFailover(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			// failover mode has no Sentinels: only RedisNodes/ValidIPs are populated.
+			// failover mode has no Sentinels: only RedisNodes and the address sets are populated.
 			state := buildState(nil, tc.redis)
 			got := planFailover(state, tc.liveMasterIP, tc.allowUnsafe, tc.bootstrapIP,
 				tc.unsettled, tc.since, now, cooldown)

@@ -50,7 +50,7 @@ func buildState(sentinels []snSpec, redis []rnSpec) *redisclient.ReplicationStat
 		}
 	}
 	for _, rn := range redis {
-		s.ValidIPs[rn.ip] = true
+		s.AddLiveTopologyIP(rn.ip)
 		s.RedisNodes[rn.ip] = &redisclient.RedisNodeState{
 			IP: rn.ip, PodName: "pod-" + rn.ip, Reachable: rn.reachable,
 			Keys: rn.keys, Offset: rn.offset, Replid: rn.replid, Replid2: rn.replid2, Role: rn.role,

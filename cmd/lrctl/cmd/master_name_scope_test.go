@@ -59,8 +59,8 @@ const (
 // two pod IPs of "our" instance marked valid.
 func scopeState(sns ...*redisclient.SentinelNodeState) *redisclient.ReplicationState {
 	st := redisclient.NewReplicationState()
-	st.ValidIPs[ipMaster] = true
-	st.ValidIPs[scopeOurIP2] = true
+	st.AddLiveTopologyIP(ipMaster)
+	st.AddLiveTopologyIP(scopeOurIP2)
 	for _, sn := range sns {
 		st.SentinelNodes[sn.IP] = sn
 	}

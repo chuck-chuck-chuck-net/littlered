@@ -76,7 +76,7 @@ func gatherFailover(
 	}
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
 	// failover mode has no Sentinels, so no master name and no Sentinel probe.
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, nil, "")
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, nil, "", ownedPodIPs(redisMap, nil))
 	return failoverPodViews(cCtx), state
 }
 

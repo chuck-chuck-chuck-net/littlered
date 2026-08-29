@@ -42,7 +42,8 @@ import (
 // to raise its voice.
 
 // renameWindow is the measured shape: the stale entry points at the address of the pod
-// the rename has just replaced — gone from ValidIPs (the pod object is gone) and NOT yet
+// the rename has just replaced — gone from every address set of ours (the pod object is
+// gone) and NOT yet
 // flagged down (Sentinel is still inside down-after-milliseconds).
 func renameWindow() *redisclient.ReplicationState {
 	s := staleBase()

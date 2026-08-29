@@ -206,7 +206,7 @@ func TestQuarantineDataRisk(t *testing.T) {
 	build := func(nodes ...*redisclient.RedisNodeState) *redisclient.ReplicationState {
 		s := redisclient.NewReplicationState()
 		for _, n := range nodes {
-			s.ValidIPs[n.IP] = true
+			s.AddLiveTopologyIP(n.IP)
 			s.RedisNodes[n.IP] = n
 		}
 		return s

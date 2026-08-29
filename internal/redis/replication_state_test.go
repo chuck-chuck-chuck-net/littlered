@@ -32,9 +32,9 @@ const (
 // pod) that Rule D would legitimately want to prune via SENTINEL RESET.
 func healthySentinelState() *ReplicationState {
 	s := NewReplicationState()
-	s.ValidIPs[masterIP] = true
-	s.ValidIPs[replicaIP] = true
-	// ghostRepIP intentionally absent from ValidIPs → IsGhost(ghostRepIP) == true
+	s.AddLiveTopologyIP(masterIP)
+	s.AddLiveTopologyIP(replicaIP)
+	// ghostRepIP intentionally absent from the live topology → IsGhost(ghostRepIP) == true
 	s.RealMasterIP = masterIP
 	s.RedisNodes[masterIP] = &RedisNodeState{IP: masterIP, Role: roleMaster, Reachable: true}
 	s.RedisNodes[replicaIP] = &RedisNodeState{IP: replicaIP, Role: flagSlave, Reachable: true}
@@ -84,8 +84,11 @@ func TestGhostReplicaResetSafe(t *testing.T) {
 			want:         false,
 		},
 		{
-			name:         "consensus master is a ghost -> stay passive",
-			mutate:       func(s *ReplicationState) { delete(s.ValidIPs, masterIP) },
+			name: "consensus master is a ghost -> stay passive",
+			// Live topology only: the pod object is gone, so IsGhost(masterIP) holds.
+			// Whether the address is still ATTRIBUTABLE to us (OwnedIPs) is a different
+			// question and not this gate's (LR-053).
+			mutate:       func(s *ReplicationState) { delete(s.LiveTopologyIPs, masterIP) },
 			ghostFound:   true,
 			clusterWhole: true,
 			want:         false,

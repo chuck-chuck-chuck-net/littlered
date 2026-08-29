@@ -153,7 +153,31 @@ func (sn *SentinelNodeState) MasterFailoverInProgress() bool {
 type ReplicationState struct {
 	RedisNodes    map[string]*RedisNodeState
 	SentinelNodes map[string]*SentinelNodeState
-	ValidIPs      map[string]bool
+
+	// LiveTopologyIPs and OwnedIPs are the two answers one `ValidIPs` map used to
+	// give to two different questions (LR-053; concept R5).
+	//
+	// LiveTopologyIPs — "does this address count as live topology?" The set the
+	// gather actually probed: pods that have an address and NO deletionTimestamp.
+	// The terminating-pod filter is load-bearing and stays exactly as LR-038 left
+	// it — a reachable, still-mastering terminating pod admitted here reads as a
+	// LIVE master to determineFailoverLiveMaster and as a candidate to
+	// BestDataHolder, so a dying pod could be elected. IsGhost and
+	// DetermineRealMaster's majority clause read this one.
+	//
+	// OwnedIPs — "is this address one of OURS?" Every pod of this instance,
+	// TERMINATING INCLUDED, because for that question a terminating pod of ours is
+	// still ours. Every attribution question reads this one: planForsaken clause 3,
+	// Rule N's G5, ClassifyMonitoredName, DetectCrossInstance. Answering it from the
+	// live-topology set is what let a pod of our own, moments after we deleted it,
+	// read as somebody else's live master — the LR-050 defect, whose timing LR-050's
+	// rollout gate closes and whose concept this split closes.
+	//
+	// INVARIANT: LiveTopologyIPs ⊆ OwnedIPs, maintained by construction
+	// (AddLiveTopologyIP writes both) rather than asserted, so no caller can build a
+	// state in which an address counts as live topology but not as ours.
+	LiveTopologyIPs map[string]bool
+	OwnedIPs        map[string]bool
 
 	// Derived Truth
 	RealMasterIP   string
@@ -163,10 +187,32 @@ type ReplicationState struct {
 // NewReplicationState initializes an empty ReplicationState
 func NewReplicationState() *ReplicationState {
 	return &ReplicationState{
-		RedisNodes:    make(map[string]*RedisNodeState),
-		SentinelNodes: make(map[string]*SentinelNodeState),
-		ValidIPs:      make(map[string]bool),
+		RedisNodes:      make(map[string]*RedisNodeState),
+		SentinelNodes:   make(map[string]*SentinelNodeState),
+		LiveTopologyIPs: make(map[string]bool),
+		OwnedIPs:        make(map[string]bool),
 	}
+}
+
+// AddLiveTopologyIP records ip as the address of a pod of ours that counts as live
+// topology. It maintains the LiveTopologyIPs ⊆ OwnedIPs invariant: a live pod is
+// always also one of ours, so both sets are written and no caller has to remember.
+func (s *ReplicationState) AddLiveTopologyIP(ip string) {
+	if ip == "" {
+		return
+	}
+	s.LiveTopologyIPs[ip] = true
+	s.OwnedIPs[ip] = true
+}
+
+// AddOwnedIP records ip as the address of a pod of ours WITHOUT admitting it to the
+// live topology — a terminating pod, whose address is still ours for every
+// attribution question but must never be treated as live (LR-038).
+func (s *ReplicationState) AddOwnedIP(ip string) {
+	if ip == "" {
+		return
+	}
+	s.OwnedIPs[ip] = true
 }
 
 // DetermineRealMaster uses the gathered information to decide who the authoritative master is.
@@ -202,7 +248,7 @@ func (s *ReplicationState) DetermineRealMaster() {
 		if s.IsGhost(ip) {
 			ghostMasterCount += count
 		}
-		if count >= (reachableSentinels/2)+1 && s.ValidIPs[ip] {
+		if count >= (reachableSentinels/2)+1 && s.LiveTopologyIPs[ip] {
 			s.RealMasterIP = ip
 			return
 		}
@@ -402,12 +448,33 @@ func holdersDiverged(holders []*RedisNodeState) bool {
 	return len(comps) > 1
 }
 
-// IsGhost returns true if the given IP is not in the set of valid pod IPs
+// IsGhost reports whether the given IP does not belong to this instance's LIVE
+// topology — i.e. no pod of ours that has an address and is not terminating holds
+// it. It is the "is there anything of ours alive there" question, and it is what
+// ghost detection, Rule D's pruning and the LR-008 correction are keyed on.
+//
+// It is NOT the attribution question. An address our own terminating pod still
+// holds is a ghost by this definition and is nevertheless ours; use IsOurs for
+// "whose address is this?" (LR-053).
 func (s *ReplicationState) IsGhost(ip string) bool {
 	if ip == "" {
 		return false
 	}
-	return !s.ValidIPs[ip]
+	return !s.LiveTopologyIPs[ip]
+}
+
+// IsOurs reports whether the given IP belongs to a pod of THIS instance,
+// terminating pods included. It is the attribution question — "is this address one
+// of ours?" — and is deliberately broader than !IsGhost: a pod we deleted one
+// second ago is not live topology, but calling its address somebody else's is how
+// an ordinary rename accused a healthy instance of being captured (LR-050/LR-053).
+//
+// An empty address is nobody's and can never be attributed to us.
+func (s *ReplicationState) IsOurs(ip string) bool {
+	if ip == "" {
+		return false
+	}
+	return s.OwnedIPs[ip]
 }
 
 // HasHealthyKnownReplica reports whether at least one monitoring sentinel knows a

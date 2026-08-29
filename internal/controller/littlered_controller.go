@@ -852,9 +852,26 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		return err
 	}
 
+	// Two sets, because there are two questions (LR-053).
+	//
+	// redisMap is the LIVE TOPOLOGY: what we probe, and what every "is anything of
+	// ours alive there" judgement reads. Terminating pods are filtered out and must
+	// stay filtered out — LR-038 established that a reachable, still-mastering
+	// terminating pod in the gather reads as a live master to the failover-mode
+	// planner and as an election candidate to BestDataHolder.
+	//
+	// ownedIPs is ATTRIBUTION: every address a pod of ours holds, terminating
+	// included, because for "is this address ours?" a terminating pod of ours is
+	// still ours. Built from the same two unfiltered pod lists the maps below are
+	// built from, so the two views cannot disagree about which pods exist.
 	redisMap := make(map[string]string)
+	ownedIPs := make(map[string]bool, len(redisPods.Items)+len(sentinelPods.Items))
 	for _, p := range redisPods.Items {
-		if p.Status.PodIP != "" && p.DeletionTimestamp.IsZero() {
+		if p.Status.PodIP == "" {
+			continue
+		}
+		ownedIPs[p.Status.PodIP] = true
+		if p.DeletionTimestamp.IsZero() {
 			redisMap[p.Status.PodIP] = p.Name
 		}
 	}
@@ -873,7 +890,11 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 
 	sentinelMap := make(map[string]string)
 	for _, p := range sentinelPods.Items {
-		if p.Status.PodIP != "" && p.DeletionTimestamp.IsZero() {
+		if p.Status.PodIP == "" {
+			continue
+		}
+		ownedIPs[p.Status.PodIP] = true
+		if p.DeletionTimestamp.IsZero() {
 			sentinelMap[p.Status.PodIP] = p.Name
 		}
 	}
@@ -892,15 +913,18 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// This is the one input that separates "an address that is not one of our pods" from
 	// "an address that is not one of our pods ANY MORE". While the StatefulSet is mid-roll
 	// — or simply short of its Ready count — a pod of ours has just left and its address is
-	// still in the air: absent from ValidIPs the instant the pod object goes, and not yet
-	// flagged down by Sentinel for a whole down-after-milliseconds. That reading is
+	// still in the air: its pod OBJECT is gone, so nothing can attribute the address to us,
+	// and Sentinel does not flag it down for a whole down-after-milliseconds. That reading is
 	// byte-identical to a captor's live master, which is how an ORDINARY rename settled a
 	// false capture verdict and quarantined a healthy instance (design §16: the verdict
 	// fired at T+30 of a 42.5s window, 12.5s before the instance healed itself).
 	//
 	// So while this is false the operator does not ATTRIBUTE addresses: it will not arm a
 	// new capture verdict (planForsaken) and it will not call a stale entry foreign
-	// (Rule N's G5). It is deliberately not a licence to stop working — Rule N still runs,
+	// (Rule N's G5). It is NOT made redundant by LR-053's OwnedIPs: that set covers the
+	// pod of ours that is still in the pod list (terminating), this gate covers the one
+	// whose object is already GONE — no list can hold an address whose object no longer
+	// exists. Both stay. It is deliberately not a licence to stop working — Rule N still runs,
 	// and an already-armed verdict is neither advanced nor retracted by a roll of our own
 	// making.
 	//
@@ -929,7 +953,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 
 	// 2. Gather Cluster State (Ground Truth)
 	g := &operatorGatherer{password: password, tlsEnabled: littleRed.Spec.TLS.Enabled}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, sentinelMasterName)
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, sentinelMasterName, ownedIPs)
 
 	// 2a. Can we still talk to our own pods? (LR-051)
 	//

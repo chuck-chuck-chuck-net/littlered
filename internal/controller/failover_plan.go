@@ -193,7 +193,9 @@ type failoverPlan struct {
 
 // planFailover is the pure "who should be master" decision for failover mode
 // (ADR-011 §5, guards §6). It performs no I/O: given the gathered ground truth
-// (only RedisNodes/ValidIPs are populated in this mode — there are no Sentinels)
+// (only RedisNodes and the two address sets are populated in this mode — there are
+// no Sentinels, and nothing here reads OwnedIPs: failover mode asks no attribution
+// question, LR-053)
 // and the timing inputs, it returns what the operator should do. Decision order:
 //
 //  1. A live master exists (liveMasterIP != "") -> none. Stragglers are repointed

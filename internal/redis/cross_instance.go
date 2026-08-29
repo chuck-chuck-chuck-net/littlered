@@ -88,11 +88,16 @@ func (s *ReplicationState) DetectCrossInstance(expectedSentinels, expectedReplic
 			continue
 		}
 
-		if sn.MasterIP != "" && s.IsGhost(sn.MasterIP) && !flaggedDown(sn.MasterFlags) {
+		// The question here is ATTRIBUTION — "is this somebody else's?" — so it reads
+		// the owned set, not the live-topology one (LR-053). Keyed on IsGhost it
+		// reported our own master as a foreign deployment for the whole preStop window
+		// of every graceful handover, because a terminating pod of ours leaves the
+		// live topology at once and is not flagged down for a down-after-milliseconds.
+		if sn.MasterIP != "" && !s.IsOurs(sn.MasterIP) && !flaggedDown(sn.MasterFlags) {
 			masters[sn.MasterIP] = true
 		}
 		for _, r := range sn.Replicas {
-			if r.IP != "" && s.IsGhost(r.IP) && !flaggedDown(r.Flags) {
+			if r.IP != "" && !s.IsOurs(r.IP) && !flaggedDown(r.Flags) {
 				replicas[r.IP] = true
 			}
 		}
@@ -137,8 +142,9 @@ func sortedKeys(m map[string]bool) []string {
 // The three classes a monitored master name can fall into, from the vantage of an
 // instance that wants exactly one name. They are the rendering half of Rule N's
 // per-entry discriminator (design §7.3 / §9 gate G5) and must stay identical to it:
-// an address in ValidIPs, or an address Sentinel flags down, is ordinary debris of
-// OURS; anything else is somebody else's live master.
+// an address of OURS (OwnedIPs — terminating pods included, LR-053), or an address
+// Sentinel flags down, is ordinary debris of ours; anything else is somebody else's
+// live master.
 const (
 	// MasterNameDesired is the name the CR asks for.
 	MasterNameDesired = "desired"
@@ -237,7 +243,9 @@ func (s *ReplicationState) SurveyMonitoredNames(desired string) MasterNameScope 
 			f := MonitoredNameFinding{
 				SentinelPod: sn.PodName, Name: m.Name, IP: m.IP, Flags: m.Flags,
 			}
-			f.Class = ClassifyMonitoredName(m.Name, m.IP, m.Flags, desired, s.ValidIPs)
+			// OwnedIPs, not LiveTopologyIPs: this is the attribution question, and a
+			// pod of ours that is terminating is still ours (LR-053).
+			f.Class = ClassifyMonitoredName(m.Name, m.IP, m.Flags, desired, s.OwnedIPs)
 			switch f.Class {
 			case MasterNameStale:
 				stale[m.Name] = true

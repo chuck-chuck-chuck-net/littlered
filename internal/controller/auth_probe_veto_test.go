@@ -113,7 +113,7 @@ func gatherWrongPassFleet() *redisclient.ReplicationState {
 	g := &wrongPassGatherer{sentinelIPs: map[string]bool{
 		authVetoS1: true, authVetoS2: true, authVetoS3: true,
 	}}
-	return redisclient.GatherReplicationState(context.Background(), g, redisPods, sentinelPods, "ns.inst")
+	return redisclient.GatherReplicationState(context.Background(), g, redisPods, sentinelPods, "ns.inst", nil)
 }
 
 // TestLeaderlessRecoveryRefusesWhenPodsRefuseOurCredential is LR-051's headline red.
@@ -186,7 +186,7 @@ func TestGhostMasterRecoveryRefusesWhenPodsRefuseOurCredential(t *testing.T) {
 	// no healthy known replica.
 	for _, sn := range state.SentinelNodes {
 		sn.Monitoring = true
-		sn.MasterIP = "10.9.9.9" // not in ValidIPs -> a ghost
+		sn.MasterIP = "10.9.9.9" // no pod of ours holds it -> a ghost
 	}
 	if !state.SentinelsMonitorGhostMaster() || state.HasHealthyKnownReplica() {
 		t.Fatalf("fixture is not the ghost-master deadlock")
@@ -270,13 +270,13 @@ func TestPlanAuthReport(t *testing.T) {
 func TestFailoverRefusesWhenPodsRefuseOurCredential(t *testing.T) {
 	state := redisclient.NewReplicationState()
 	// The replaced master: fresh pod, new password, reachable, EMPTY.
-	state.ValidIPs[ipMaster] = true
+	state.AddLiveTopologyIP(ipMaster)
 	state.RedisNodes[ipMaster] = &redisclient.RedisNodeState{
 		PodName: authVetoRedis0, IP: ipMaster, Reachable: true, Role: RoleMaster, Keys: 0,
 	}
 	// The survivors: never restarted, still on the old password, holding everything.
 	for i, ip := range []string{ipReplica, ipNode3} {
-		state.ValidIPs[ip] = true
+		state.AddLiveTopologyIP(ip)
 		state.RedisNodes[ip] = &redisclient.RedisNodeState{
 			PodName:      "redis-" + string(rune('1'+i)),
 			IP:           ip,
@@ -309,7 +309,7 @@ func TestFailoverRefusesWhenPodsRefuseOurCredential(t *testing.T) {
 func TestFailoverAuthVetoDoesNotFireOnAnOrdinaryDeadPod(t *testing.T) {
 	state := redisclient.NewReplicationState()
 	for i, ip := range []string{ipMaster, ipReplica, ipNode3} {
-		state.ValidIPs[ip] = true
+		state.AddLiveTopologyIP(ip)
 		state.RedisNodes[ip] = &redisclient.RedisNodeState{
 			PodName: "redis-" + string(rune('0'+i)), IP: ip, Reachable: false,
 			ProbeFailure: redisclient.ProbeUnroutable, ProbeError: "connection refused",
@@ -331,13 +331,13 @@ func TestFailoverAuthVetoDoesNotFireOnAnOrdinaryDeadPod(t *testing.T) {
 func TestAuthVetoDoesNotFireOnAnOrdinaryDeadPod(t *testing.T) {
 	state := redisclient.NewReplicationState()
 	for i, ip := range []string{authVetoS1, authVetoS2, authVetoS3} {
-		state.ValidIPs[ip] = true
+		state.AddLiveTopologyIP(ip)
 		state.SentinelNodes[ip] = &redisclient.SentinelNodeState{
 			PodName: "sentinel-" + string(rune('0'+i)), IP: ip, Reachable: true,
 		}
 	}
 	for i, ip := range []string{ipMaster, ipReplica, ipNode3} {
-		state.ValidIPs[ip] = true
+		state.AddLiveTopologyIP(ip)
 		state.RedisNodes[ip] = &redisclient.RedisNodeState{
 			PodName: "redis-" + string(rune('0'+i)), IP: ip, Reachable: false,
 			ProbeFailure: redisclient.ProbeTimedOut, ProbeError: "i/o timeout",

@@ -318,9 +318,18 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 		return nil, err
 	}
 	redisMap := make(map[string]string)
+	// Every address a pod of ours holds, terminating included — the attribution set
+	// (LR-053). Failover mode asks no attribution question today (there is no capture
+	// verdict and no master-name scope), so nothing reads OwnedIPs here; it is built
+	// correctly rather than passed as nil so the mode cannot silently inherit the
+	// live-topology answer to an "is this ours?" question the day it grows one.
+	ownedIPs := make(map[string]bool, len(podList.Items))
 	anyTerminating := false
 	for i := range podList.Items {
 		p := &podList.Items[i]
+		if p.Status.PodIP != "" {
+			ownedIPs[p.Status.PodIP] = true
+		}
 		if !p.DeletionTimestamp.IsZero() {
 			anyTerminating = true
 			continue
@@ -338,7 +347,7 @@ func (r *LittleRedReconciler) reconcileFailoverAssignments(ctx context.Context, 
 	g := &operatorGatherer{password: password, tlsEnabled: lr.Spec.TLS.Enabled}
 	// No Sentinels in failover mode, so no master name to supply and no Sentinel
 	// probe is issued.
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, map[string]string{}, "")
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, map[string]string{}, "", ownedIPs)
 
 	// 2a. Can we still talk to our own pods? (LR-051, rule §7.11.) Failover mode has
 	// the same defect as sentinel mode and reaches it the same way — planFailover's

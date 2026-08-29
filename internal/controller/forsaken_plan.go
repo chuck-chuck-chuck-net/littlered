@@ -78,10 +78,12 @@ type forsakenPlan struct {
 //
 // The `rolling` parameter is the ONE thing the four clauses cannot see, and without it
 // they are structurally unable to tell "an address that is not one of our pods" from "an
-// address that is not one of our pods ANY MORE" (LR-050). A pod of ours that has just
-// been replaced leaves `ValidIPs` the instant its object goes and is not flagged down for
-// a whole `down-after-milliseconds`, so for that window it is byte-identical to a
-// captor's live master. That is not hypothetical: it quarantined a healthy instance
+// address that is not one of our pods ANY MORE" (LR-050). A pod of ours that has just been
+// replaced has no pod object left to attribute its address to — so not even LR-053's
+// OwnedIPs can hold it — and is not flagged down for a whole `down-after-milliseconds`, so
+// for that window it is byte-identical to a captor's live master. The two fixes are
+// complementary and neither subsumes the other: OwnedIPs covers the pod that is still in
+// the list (terminating); this covers the pod whose object is already gone. That is not hypothetical: it quarantined a healthy instance
 // during an ordinary supported rename, at T+30 of a 42.5s window, 12.5s before the
 // instance healed itself.
 //
@@ -191,8 +193,13 @@ func forsakenSignature(state *redisclient.ReplicationState) (bool, string) {
 			} else if foreign != m.IP {
 				return false, "" // clause 2: no consensus, no verdict
 			}
-			// clause 3: alive, and not ours
-			if !state.IsGhost(m.IP) || flaggedDown(m.Flags) {
+			// clause 3: alive, and not ours. "Ours" is the OWNED set, which includes
+			// our terminating pods (LR-053): keyed on IsGhost — "is anything of ours
+			// ALIVE there" — a pod we deleted a second ago answered this clause as a
+			// captor, because it leaves the live topology the instant its object
+			// gains a deletionTimestamp while it goes on holding its address and
+			// answering on it for the whole preStop window.
+			if state.IsOurs(m.IP) || flaggedDown(m.Flags) {
 				return false, ""
 			}
 		}

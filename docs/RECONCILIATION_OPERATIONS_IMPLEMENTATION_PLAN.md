@@ -316,6 +316,14 @@ shippable and does not depend on anything else in this plan.**
 
 ### Phase 0 — the §6 invariant sweep (ships first, ahead of the mechanism)
 
+> **STATUS: code complete.** M0.1 = **LR-051** (`7f57600`), M0.2 = **LR-052** (`7e1f858` /
+> `b2beaf1` / `06e8015`, corrected by `29b4e53`), M0.3 = **LR-053**. Phase 0 is **not
+> declared done** until the sentinel e2e suite (`E2E_LABEL_FILTER=sentinel`) runs green
+> against a deployed build carrying all three — LR-051 and LR-052 are both safety-behaviour
+> changes whose failure mode (over-suppression, over-attribution) unit tests cannot disprove,
+> so they are gated jointly rather than separately. The focused `Sentinel Failover` tier is
+> already green (4/4).
+
 | M | What | Owns | LR |
 |---|---|---|---|
 | **M0.1** | **Unreachability must carry why.** `RedisNodeState`/`SentinelNodeState` gain a classified probe failure (`None \| Unroutable \| Timeout \| AuthFailed \| ProtocolError`); `gather.go:78-81`, `:93-96`, `:175-179` stop discarding the error. Classify `NOAUTH`, `WRONGPASS`, `ERR Client sent AUTH, but no password is set`, `ERR invalid password` as `AuthFailed`; deadline/net errors as `Timeout`/`Unroutable`. **The fix that matters:** a node that is `AuthFailed` is *not* provably empty, so it must veto — reuse LR-044's existing `unverified` concept rather than inventing one — in `planLeaderlessRecovery`, `planGhostMasterRecovery` and `quarantineDataRisk`. New condition `OperatorCannotAuthenticate` (True is bad), one event per transition. | `internal/redis/replication_state.go`, `internal/redis/gather.go`, `internal/controller/gatherer.go`, `internal/controller/leaderless_recovery.go`, `ghost_master_recovery.go`, `quarantine_plan.go`, `api/v1alpha1` (condition const) | **LR-051** |

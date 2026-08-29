@@ -248,6 +248,26 @@ func verifyCluster(
 	return nil
 }
 
+// ownedPodIPs is the attribution set the gather takes (LR-053): every address a pod
+// of this instance holds, terminating pods included.
+//
+// lrctl's own pod maps are built from the discovered pod list with no
+// deletionTimestamp filter — unlike the operator's, which excludes terminating pods
+// from the live topology (LR-038) — so here the two sets coincide and this is a
+// faithful superset rather than a widening. It is written out rather than passed as
+// nil so the CLI states which question it is answering, and so it keeps answering it
+// correctly if that filter is ever added.
+func ownedPodIPs(redisMap, sentinelMap map[string]string) map[string]bool {
+	owned := make(map[string]bool, len(redisMap)+len(sentinelMap))
+	for ip := range redisMap {
+		owned[ip] = true
+	}
+	for ip := range sentinelMap {
+		owned[ip] = true
+	}
+	return owned
+}
+
 func verifySentinel(
 	ctx context.Context, coreClient *kubernetes.Clientset, config *rest.Config,
 	cCtx *types.ClusterContext,
@@ -268,7 +288,8 @@ func verifySentinel(
 
 	fmt.Println("Gathering Cluster Ground Truth...")
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx))
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx),
+		ownedPodIPs(redisMap, sentinelMap))
 
 	fmt.Println("\nSentinel Status:")
 	for _, sn := range state.SentinelNodes {
@@ -381,7 +402,8 @@ func verifySentinelJSON(
 		}
 	}
 	g := &cliGatherer{coreClient: coreClient, config: config, cCtx: cCtx}
-	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx))
+	state := redisclient.GatherReplicationState(ctx, g, redisMap, sentinelMap, masterNameOf(cCtx),
+		ownedPodIPs(redisMap, sentinelMap))
 	return buildSentinelVerifyJSON(name, namespace, redisMap, state, masterNameOf(cCtx),
 		cCtx.SentinelMasterName, len(cCtx.SentinelPods), max(len(cCtx.RedisPods)-1, 0))
 }

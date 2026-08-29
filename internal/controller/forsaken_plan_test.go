@@ -29,7 +29,7 @@ import (
 func forsakenState(ourRedis, ourSentinels []string) *redisclient.ReplicationState {
 	s := redisclient.NewReplicationState()
 	for _, ip := range append(append([]string{}, ourRedis...), ourSentinels...) {
-		s.ValidIPs[ip] = true
+		s.AddLiveTopologyIP(ip)
 	}
 	return s
 }
@@ -212,7 +212,7 @@ func TestPlanForsakenIsNameAgnostic(t *testing.T) {
 		desired             = "team-a.cache"
 		stale               = "mymaster"
 		// The address WP0 measured: the just-replaced redis-0, no longer in
-		// ValidIPs and not yet s_down (down-after-milliseconds still running).
+		// our address sets and not yet s_down (down-after-milliseconds still running).
 		replacedRedis0 = "10.233.192.110"
 	)
 	ourSentinels := []string{ourS1, ourS2, ourS3}
@@ -274,7 +274,7 @@ func TestPlanForsakenIsNameAgnostic(t *testing.T) {
 		{
 			// WP0's measured rename window, t0+89.1s: the master pod has just been
 			// replaced, BOTH names still name its address, that address is a ghost
-			// (not in ValidIPs) and not yet flagged down, and no reachable pod of
+			// (not attributable to any pod object of ours) and not yet flagged down, and no reachable pod of
 			// ours is a master. All four clauses hold — they held before this
 			// change too, on the desired name alone.
 			//

@@ -64,7 +64,7 @@ type node struct {
 func mkState(nodes ...node) *redisclient.ReplicationState {
 	s := redisclient.NewReplicationState()
 	for _, n := range nodes {
-		s.ValidIPs[n.ip] = true
+		s.AddLiveTopologyIP(n.ip)
 		s.RedisNodes[n.ip] = &redisclient.RedisNodeState{
 			PodName:    n.pod,
 			IP:         n.ip,

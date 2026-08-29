@@ -222,7 +222,7 @@ func TestDetermineRealMasterFailoverActive(t *testing.T) {
 
 			state := redisclient.NewReplicationState()
 			state.SentinelNodes[host] = sn
-			state.ValidIPs["10.0.0.1"] = true
+			state.AddLiveTopologyIP("10.0.0.1")
 			state.DetermineRealMaster()
 
 			if state.FailoverActive != tc.want {
@@ -270,8 +270,8 @@ func TestFailoverActiveSuppressesTheRedisOnlyFallback(t *testing.T) {
 		state := redisclient.NewReplicationState()
 		state.SentinelNodes[hostA] = gatherOne(t, hostA, "sentinel-0")
 		state.SentinelNodes[hostB] = gatherOne(t, hostB, "sentinel-1")
-		state.ValidIPs[podA] = true
-		state.ValidIPs[podB] = true
+		state.AddLiveTopologyIP(podA)
+		state.AddLiveTopologyIP(podB)
 		state.RedisNodes[podA] = &redisclient.RedisNodeState{IP: podA, Role: RoleMaster, Reachable: true}
 		state.RedisNodes[podB] = &redisclient.RedisNodeState{IP: podB, Role: roleSlave, Reachable: true}
 		state.DetermineRealMaster()

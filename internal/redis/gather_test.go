@@ -264,7 +264,7 @@ func TestGatherReplicationState_ProbesRunConcurrently(t *testing.T) {
 	g := &fakeGatherer{nodeID: map[string]string{}, dead: map[string]bool{}, probeDelay: delay}
 
 	start := time.Now()
-	GatherReplicationState(context.Background(), g, redisPods, sentinelPods, "ns.inst")
+	GatherReplicationState(context.Background(), g, redisPods, sentinelPods, "ns.inst", nil)
 	elapsed := time.Since(start)
 
 	// Serial would be >= totalPods*delay (720ms). Concurrent should be a small

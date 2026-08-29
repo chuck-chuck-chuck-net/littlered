@@ -191,7 +191,7 @@ the value is in the refusals. Every one must hold:
 |---|---|---|
 | G0 | A capture is **in evidence** (`planForsaken`'s `Captured`, computed once per pass and passed in) stands the whole rule down: reason `Foreign`, prune nothing | fed `Captured` and not `Forsaken`, because a *settled* `Forsaken` returns from the switch long before this line — `Forsaken` would be a structurally dead gate |
 | G1 | `desired != ""` | LR-041: with an empty desired name **every** name reads as stale, so the failure mode is "prune everything" |
-| G2 | a living, reachable master of **ours** — `RealMasterIP` set, in `ValidIPs`, and its own Redis view reporting a reachable master | LR-008's gate reused; pruning without it manufactures LR-015's leaderless deadlock. All three clauses: `RealMasterIP != ""` alone is not the gate |
+| G2 | a living, reachable master of **ours** — `RealMasterIP` set, in `LiveTopologyIPs`, and its own Redis view reporting a reachable master | LR-008's gate reused; G2 asks for a master to KEEP MONITORING, so it reads the live-topology set and deliberately not `OwnedIPs` (LR-053) — anchoring a destructive `REMOVE` on a pod that is leaving is how LR-015's deadlock is manufactured; pruning without it manufactures LR-015's leaderless deadlock. All three clauses: `RealMasterIP != ""` alone is not the gate |
 | G3 | no monitored master, **under any name**, reports an in-flight failover | a failover under the stale name is still a real state machine reconfiguring our pods |
 | G4 | reachable Sentinels ≥ quorum | do not operate on a minority |
 | G5 | every stale entry's address is one of our pods **or** is flagged down; else `Foreign` — **unless our own Redis StatefulSet is mid-rollout, in which case `Deferred`** | the capture trap. Byte-identical to `planForsaken` clause 3 (and to `lrctl`'s copy, pinned by a parity test). The rollout clause is LR-050 |
@@ -342,7 +342,7 @@ merely leaves the previous behaviour.
 
 **Plus one input that is not a clause (LR-050): while our own Redis StatefulSet is not settled, the
 operator does not ATTRIBUTE addresses at all** — neither here nor at Rule N's G5. A pod of ours that
-has just been replaced has left `ValidIPs` and has not yet reached `s_down`, which is byte-identical
+has just been replaced has left `OwnedIPs` — its pod object is gone, so no address set can hold it (LR-053) — and has not yet reached `s_down`, which is byte-identical
 to a captor's live master; an ordinary rename presented the whole signature for a measured 42.5s
 against the 30s cooldown and quarantined a healthy instance. The predicate is LR-021's
 `statefulSetRolloutSettled`, read **uncached**, passed into both planners in-signature. **The gate

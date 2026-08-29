@@ -103,8 +103,9 @@ func planStaleMasterNames(
 ) StaleMasterNamePlan {
 	// `rolling` — our own Redis StatefulSet is not settled (LR-050). G5's discriminator
 	// is byte-identical to planForsaken clause 3, and it goes true during an ORDINARY
-	// rename: a pod we have just replaced leaves ValidIPs at once and is not flagged
-	// down for a whole down-after-milliseconds. Reported as `Foreign` that emits a
+	// rename: a pod we have just replaced has no pod object left to attribute its
+	// address to — so not even LR-053's OwnedIPs can hold it — and is not flagged down
+	// for a whole down-after-milliseconds. Reported as `Foreign` that emits a
 	// Warning reading "this instance may be captured — do not rename to escape a
 	// capture" at the exact moment the owner is performing the rename the runbook asked
 	// for.
@@ -177,6 +178,10 @@ func planStaleMasterNames(
 			allStale[m.Name] = true
 			// G5's discriminator, same as planForsaken clause 3: an address that is
 			// not ours and is NOT flagged down means something else is alive there.
+			// "Ours" is the OWNED set — terminating pods included, LR-053 — because a
+			// pod we have just deleted still holds its address and still answers on it;
+			// reading that as somebody else's is what made this gate accuse the owner
+			// mid-handover.
 			// A dead ex-master of ours (ordinary post-failover debris) is flagged
 			// down; a captor's master answers with clean flags, which is exactly why
 			// no failover ever fires on it.
@@ -184,7 +189,7 @@ func planStaleMasterNames(
 			// An entry with no address at all lands here too, and deliberately: it
 			// cannot be attributed to one of our pods, and refusing to prune is the
 			// safe direction for an entry we cannot read.
-			if !state.ValidIPs[m.IP] && !flaggedDown(m.Flags) {
+			if !state.IsOurs(m.IP) && !flaggedDown(m.Flags) {
 				entry := fmt.Sprintf("%q (at %s)", m.Name, addrOrUnknown(m.IP))
 				if rolling {
 					unattributable = append(unattributable, entry)
@@ -250,9 +255,16 @@ func planStaleMasterNames(
 	switch {
 	case state.RealMasterIP == "":
 		return deferStaleNames("G2", "no living master of ours is known", staleList)
-	case !state.ValidIPs[state.RealMasterIP]:
+	case !state.LiveTopologyIPs[state.RealMasterIP]:
+		// LIVE topology, deliberately, and this is the one clause in Rule N that is
+		// NOT the attribution question (LR-053). G2 asks whether there is a master to
+		// keep monitoring after the prune; a terminating pod of ours is ours but is
+		// not that, and admitting it would let a destructive REMOVE be anchored on a
+		// pod that is leaving — the LR-015 leaderless deadlock this gate exists to
+		// prevent. The clause below reads RedisNodes, which is keyed on the same live
+		// set, so any other choice would make the three clauses disagree.
 		return deferStaleNames("G2",
-			fmt.Sprintf("the consensus master %s is not one of our pods", state.RealMasterIP), staleList)
+			fmt.Sprintf("the consensus master %s is not one of our live pods", state.RealMasterIP), staleList)
 	case master == nil || !master.Reachable || master.Role != RoleMaster:
 		return deferStaleNames("G2",
 			fmt.Sprintf("the consensus master %s does not report itself a reachable master",
@@ -261,13 +273,21 @@ func planStaleMasterNames(
 
 	// G3 — the per-entry test is the load-bearing half and covers every monitored name,
 	// stale ones included: a failover under the stale name is still a real state machine
-	// reconfiguring our pods. state.FailoverActive is OR-ed in for form only; it is
-	// permanently false in sentinel mode today (design §15b, a pre-existing dead-key
-	// defect tracked separately), so nothing may rest on it.
+	// reconfiguring our pods.
+	//
+	// state.FailoverActive is no longer along for the ride. It was permanently false
+	// when this was written (a dead wire key, LR-052) and the comment here said so; it
+	// is now live, and it genuinely fires where the per-entry test cannot: failoverUnder
+	// is collected from MonitoredMasters, which degrades to an EMPTY list on a read
+	// failure (LR-041's deliberate choice), whereas FailoverActive comes from the
+	// desired name's own successful probe. So `SENTINEL MASTERS` failing while
+	// `SENTINEL master <desired>` succeeds is exactly the case the OR covers — a
+	// strengthening in the refusal direction, which is G3's safe direction.
+	//
+	// That case is also why the message is built rather than formatted straight: with
+	// failoverUnder empty it rendered `under master name(s) []`, naming nothing.
 	if len(failoverUnder) > 0 || state.FailoverActive {
-		return deferStaleNames("G3",
-			fmt.Sprintf("a failover is in flight under master name(s) %s",
-				quoteJoin(dedupSorted(failoverUnder))), staleList)
+		return deferStaleNames("G3", failoverInFlightMessage(dedupSorted(failoverUnder)), staleList)
 	}
 
 	// G4.
@@ -309,6 +329,22 @@ func describeStaleEntries(entries []staleEntry) string {
 		parts = append(parts, fmt.Sprintf("%s=%s", e.SentinelPod, quoteJoin(e.Names)))
 	}
 	return strings.Join(parts, ", ")
+}
+
+// failoverInFlightMessage renders G3's refusal.
+//
+// It exists because the name list can legitimately be EMPTY: G3 also refuses on
+// state.FailoverActive, which comes from the desired name's own probe, and that case
+// is reachable exactly when `SENTINEL MASTERS` could not be read at all — so there
+// are no per-entry names to quote (LR-052 found this rendering, LR-053 fixes it).
+// `a failover is in flight under master name(s) []` names nothing and reads like a
+// bug in the operator rather than a state of the instance.
+func failoverInFlightMessage(names []string) string {
+	if len(names) == 0 {
+		return "a Sentinel reports a failover in flight for " + "the desired master name " +
+			"(the full monitored-master list could not be read this pass, so no other name can be named)"
+	}
+	return fmt.Sprintf("a failover is in flight under master name(s) %s", quoteJoin(names))
 }
 
 func quoteJoin(names []string) string {

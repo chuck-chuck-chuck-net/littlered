@@ -2571,3 +2571,204 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
   error, and every rule downstream goes quietly inert.** Makes LR-011/LR-013's RESET-into-a-running-
   failover hazard less reachable, and — verified against the source — leaves LR-024's ghost-master
   recovery unblocked.
+
+## [LR-053] `ValidIPs` Answered Two Questions — a Terminating Pod of Ours Was Not "Ours"
+- **Date:** 2026-08-29
+- **Commit:** (pending)
+- **ID note:** LR-047 is taken on `fix/cluster-rollout-state-gate`; LR-048/049/050 are the
+  master-name-rename branch's; LR-051 and LR-052 are this branch's two commits directly
+  beneath. Allocated with the LR-039 cross-branch loop over **every** branch, not by reading
+  the tip of one line — the highest ID visible anywhere was LR-052.
+- **Scope:** Phase 0 milestone M0.3 of `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`,
+  the §6 invariant sweep of `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` item 3 / **R5**:
+  *suspect any data structure that answers two different questions — this is how the bug
+  class is born.* LR-050 fixed the symptom by adding a second input; this splits the
+  concept.
+- **This is a LATENT defect, closed at its source. It is not an incident write-up**, and the
+  distinction is drawn on the LR-043 precedent rather than blurred: the shape is
+  constructible from the shipped code and is argued reachable below, but nothing was
+  observed in the field and no live run was made for this milestone.
+
+- **Problem — one map, two questions, and it is only right about one of them.**
+  `ReplicationState.ValidIPs` was populated from the pod maps the gather is handed, which
+  `reconcileSentinelCluster` builds as `PodIP != "" && DeletionTimestamp.IsZero()`. So it
+  means **"pods that count as live topology"**, and for that it is exactly right: LR-038
+  established that a reachable, still-mastering *terminating* pod admitted to the ground
+  truth reads as a **live master** to `determineFailoverLiveMaster` and as a candidate to
+  `BestDataHolder`, so a dying pod could be elected.
+
+  It was also read as **"pods that are ours"** — and for that question the same filter is
+  a defect, because a terminating pod of ours is still ours. Five sites asked it that way:
+  `planForsaken` clause 3 (via `IsGhost`), Rule N's G5, `ClassifyMonitoredName` through
+  `SurveyMonitoredNames`, and — not named in the milestone, found by reading the file —
+  **both halves of `DetectCrossInstance`**, `lrctl verify`'s capture diagnostic, which asks
+  it of the monitored master *and* of every Sentinel-known replica.
+
+  **The gather could not have answered the second question even in principle.** Its inputs
+  arrive already filtered — a terminating pod of ours never reaches `GatherReplicationState`
+  at all — so `ValidIPs` could only ever be the live-topology set, and the attribution
+  question had no set of its own to read. That is why this is a milestone rather than a
+  rename: the missing concept had to be given an input before it could have a consumer.
+
+- **Why it matters, stated at its real size.** The window is the one LR-050 measured from
+  the other side: from the instant a pod object gains a `deletionTimestamp` the address
+  leaves our view, while the pod goes on holding it and answering on it, so Sentinel does
+  not flag it down for a whole `down-after-milliseconds`. The operator's own StatefulSet can
+  read **settled** through part of that window — `status.replicas` and `status.readyReplicas`
+  both count a Terminating-but-Ready pod, and a plain pod delete bumps no generation — which
+  in sentinel mode is the master's entire preStop window, **measured at ~21s in LR-048**. In
+  that window all four `planForsaken` clauses hold on our own pod with `rolling == false`.
+  Reaching a *verdict* additionally needs the signature to outlast `forsakenCooldown` (30s),
+  which an ordinary graceful handover ends long before by giving the instance a master of
+  its own again — so the honest reading is **a false accusation the timing usually beats,
+  not a quarantine waiting to happen**. The cheaper consequences are reachable throughout:
+  Rule N's G5 renders `Foreign` and emits a `Warning` telling the owner they may be captured
+  and must not rename, and `lrctl verify` reports our own departing master as a foreign
+  deployment and exits non-zero.
+
+- **Fix — two fields, two names, no alias.**
+    - **`LiveTopologyIPs`** — the probed set, LR-038's terminating-pod filter intact. Read
+      by `IsGhost` and `DetermineRealMaster`'s majority clause, i.e. everything asking *"is
+      anything of ours ALIVE there?"*.
+    - **`OwnedIPs`** — every address a pod of ours holds, **terminating included**. Read by
+      every attribution question: `planForsaken` clause 3, Rule N's G5,
+      `ClassifyMonitoredName`, `DetectCrossInstance`. Exposed as `IsOurs(ip)`, the
+      deliberate counterpart to `IsGhost(ip)` so a future reader cannot reach for the wrong
+      one by autocomplete.
+    - **No `ValidIPs` alias is kept.** An alias preserves precisely the ambiguity being
+      removed, and deleting the name is what made the compiler enumerate the call sites —
+      the LR-039 technique (`redisclient.SentinelMasterName` was deleted rather than left
+      unused for the same reason).
+- **The owned set is a PARAMETER on `GatherReplicationState`, on LR-041's rule.** *A
+  required value held as construction state has no enforcement, and a required string's
+  zero value is a plausible input rather than an obvious error — put mandatory values in the
+  signature.* That is why `masterName` is a parameter, and it is why this is one too.
+- **Its zero value fails SAFE, and this was designed rather than discovered.** The dangerous
+  mistake with a new attribution set is not forgetting to widen it, it is a caller passing
+  `nil` and **every** monitored address then reading as foreign — capture verdicts
+  manufactured everywhere, which is the LR-050 outcome with no window at all. So the gather
+  unions the probed addresses into `OwnedIPs`, giving the invariant
+  **`LiveTopologyIPs` ⊆ `OwnedIPs`** by construction (`AddLiveTopologyIP` writes both), and a
+  `nil` argument degrades to exactly the pre-split behaviour instead of to "nothing is ours".
+- **⚠ This does NOT make LR-050's rollout gate redundant, and it was checked rather than
+  assumed.** The two cover different windows and neither subsumes the other:
+  `OwnedIPs` covers the pod of ours that is **still in the pod list** (terminating);
+  LR-050's gate also covers the pod whose **object is already gone** — a replaced pod, a
+  force-delete, the seconds between deletion and the replacement being scheduled — and **no
+  address set can hold an address whose object no longer exists**. LR-050's own measurement
+  is of that second half: the 42.5s rename window is dominated by
+  `downAfterMilliseconds` *after* the old pod is gone. The gate stays, untouched, and both
+  planners keep the `rolling` parameter; the new tests set `rolling = false` on purpose so
+  they fail if the split is undone even while the gate stands.
+- **`lrctl` had a divergence worth recording, and it is pre-existing.** Its own pod maps are
+  built with **no** `deletionTimestamp` filter, so the CLI probes terminating pods and its
+  two sets coincide. Not changed here (it is a behaviour change to the CLI's gather, not to
+  this concept), but it means the operator and the CLI have always disagreed about what
+  counts as live topology, in the direction that makes the CLI *more* inclusive. Recorded so
+  the next reader does not take the coincidence for the invariant.
+- **Also fixed, carried over from LR-052, which reported them rather than editing an
+  unowned file:** Rule N's G3 comment claimed `state.FailoverActive` was *"OR-ed in for form
+  only … permanently false, so nothing may rest on it"*. LR-052 made it live, and M0.2
+  established the OR genuinely fires where the per-entry test cannot — `failoverUnder` comes
+  from `MonitoredMasters`, which **degrades to an empty list on a read failure** (LR-041's
+  deliberate choice), while `FailoverActive` comes from the desired name's own successful
+  probe. That case also made a rendering defect reachable: with `failoverUnder` empty the
+  message read `a failover is in flight under master name(s) []`, naming nothing. The
+  message is now built by `failoverInFlightMessage`, which states the read failure instead
+  of quoting an empty list.
+- **One judgement call the milestone left open: Rule N's G2 reads `LiveTopologyIPs`, not
+  `OwnedIPs`.** G2 asks whether there is a master to **keep monitoring** after the prune,
+  which is a liveness question, not an attribution one — a terminating pod of ours is ours
+  but is not that, and anchoring a destructive `REMOVE` on a pod that is leaving is how
+  LR-015's leaderless deadlock is manufactured. Its sibling clause reads `state.RedisNodes`,
+  which is keyed on the same live set, so any other choice would make the three clauses of
+  one gate disagree. The existing G2 table row is what pins it: it is expressed as removing
+  the master from the live set, and it goes red if G2 is repointed at `OwnedIPs`.
+- **Cross-mode parity audit (CLAUDE.md §7 rule 11) — which modes ask an attribution question
+  at all:**
+
+  | mode / site | verdict | why |
+  |---|---|---|
+  | sentinel — `planForsaken` clause 3 | **FIXED** | reads `IsOurs`; the capture verdict, the site with the worst consequence (ADR-016 deletes pods) |
+  | sentinel — Rule N G5 (`planStaleMasterNames`) | **FIXED** | the same discriminator, one severity down (a `Warning`, never a prune) |
+  | sentinel — `SurveyMonitoredNames` → `ClassifyMonitoredName` | **FIXED at the call site** | the predicate already took the set as a parameter and was never wrong; it was being handed the wrong map, which is this defect's exact shape one layer up |
+  | sentinel — `DetectCrossInstance` (`lrctl verify`) | **FIXED — not named in the milestone, found by reading the file** | master *and* replica halves; it is the tool the LR-039 runbook tells an owner to trust |
+  | sentinel — `IsGhost` and its consumers (Rule D, LR-005/LR-008 correction, `HasHealthyKnownReplica`, `DetermineRealMaster`) | **unchanged, deliberately** | these ask *"is anything of ours alive there"* and a departed address of ours **is** a ghost to them. LR-050's audit already recorded why they are safe: they read a departed address as ours-and-dead (the safe reading) and act by repointing at our own consensus master — they never accuse a third party |
+  | failover mode | **N/A — and the set is still built correctly** | no capture verdict and no address-attribution judgement (LR-050's audit). `reconcileFailoverAssignments` nonetheless passes a real `ownedIPs` rather than `nil`, so the mode cannot silently inherit the live-topology answer the day it grows such a question |
+  | cluster mode | **N/A, different structure** | its attribution is `AttributeMeetTarget` / `confirmPodIP` (LR-043) over `ClusterGroundTruth`, which has no `ValidIPs` and is grounded in an **uncached K8s fact** rather than in a gathered set. Note that LR-043's correction refuses a **terminating** pod on purpose (`podIPTerminating`) — the opposite direction, and correct there: it is answering *"may I create an identity binding at this address"*, where a terminating pod's address may already have been handed on by the CNI, not *"is this address ours"* |
+  | standalone | **N/A** | one pod, no topology and no gather |
+
+- **Tests, red-first.** `internal/controller/owned_ips_test.go` and
+  `internal/redis/owned_ips_test.go`. The fixtures build the fleet through the **real
+  gather** against a stub Gatherer (LR-051/LR-052's precedent), so the parameter is
+  exercised as the reconciler supplies it rather than hand-set on the state, which could be
+  made to say anything. Observed **RED on 4 of 6 assertions** against the split-but-unwired
+  code — the plumbing landed first with the semantics unchanged, so the red is behavioural
+  rather than an undefined symbol:
+
+      TestTerminatingPodOfOursIsNotAForeignCaptor
+          planForsaken.Captured = true (foreign_master=10.0.0.1), want false: the address
+          is our own terminating master, not another deployment's
+      TestStaleMasterNameG5DoesNotCallOurTerminatingPodForeign
+          planStaleMasterNames.Reason = "Foreign", want anything but Foreign: stale master
+          name(s) "mymaster" (at 10.0.0.1) point at an address that is not one of our pods
+          and is not flagged down — something else is alive there and this instance may be
+          captured …
+      TestSurveyMonitoredNamesAttributesOurTerminatingPod
+          SurveyMonitoredNames.Foreign = [mymaster], want none: the address is our own
+          terminating pod
+      TestDetectCrossInstanceDoesNotReportOurTerminatingPod
+          DetectCrossInstance.ForeignMasterIPs = [10.0.0.1], want none: that is our own
+          terminating pod
+          DetectCrossInstance.ForeignReplicaIPs = [10.0.0.1], want none: that is our own
+          terminating pod
+
+  **Two assertions are green from birth and are disclosed as such.**
+  `TestClassifyMonitoredNameAttributesOurTerminatingPod` pins a predicate that already took
+  the set as a parameter and was therefore never wrong; its teeth were shown by feeding it
+  `LiveTopologyIPs`, which fails its first row (`= "foreign", want "stale"`).
+  `TestOwnedIPsFailSafeWhenTheCallerSuppliesNothing` pins the union above; its teeth were
+  shown by dropping the union from `AddLiveTopologyIP`, which fails it on both addresses
+  (`IsOurs(10.0.0.2) = false with a nil ownedIPs`) **and** takes two pre-existing
+  `TestSurveyMonitoredNames` rows down with it.
+  **Mutation-checked in the other direction too**, because every new row is a *refusal* and
+  a blanket "everything is ours" would pass them all: making `IsOurs` return true
+  unconditionally fails **11 rows across four pre-existing tables** — `TestPlanForsaken`
+  (all four capture rows), `TestPlanForsakenIsNameAgnostic` (all four), the settled-instance
+  positive control in `TestPlanForsakenRolloutGate`, and three `TestDetectCrossInstance`
+  rows. That is M0.1's observation doing its job: **the existing tables are the
+  over-suppression guard**, and they have teeth against exactly the failure mode this change
+  could have.
+- **Stop condition (LR-048's K2b), verified: no existing decision-table row's inputs or
+  expected verdict was edited.** Two *mutation expressions* were adapted mechanically
+  because the map they name no longer exists — `delete(s.ValidIPs, masterIP)` becomes
+  `delete(s.LiveTopologyIPs, masterIP)` in `TestGhostReplicaResetSafe` and in
+  `TestPlanStaleMasterNames`' G2 row. Both rows keep their inputs, their intent and their
+  expected verdict; the second is the pin for the G2 judgement above.
+- **Not verified live.** No cluster was used or authorized for this milestone; validation is
+  unit + envtest. The failure mode of a widened ownership set is **over-attribution** —
+  calling somebody else's address ours and thereby *missing* a real capture — and unit tests
+  cannot prove its absence. The pre-existing capture tables above are the guard that has
+  teeth against it; the e2e tiers that would exercise it are `Sentinel Forsaken-Gated
+  Quarantine` (all three) and `Sentinel Master Name Rename` (whose tier 2 requires a real
+  capture verdict to *survive* a rename). None was run.
+- **Regresses:** None. On any pass where no pod of ours is terminating the two sets are
+  identical and every predicate takes the branch it took yesterday — which is why the whole
+  existing test corpus passes unedited. The one behaviour change is the intended one, and it
+  is a refusal in all four places: while an address belongs to a pod of ours that is on its
+  way out, the operator will not call it a captor (`planForsaken`), will not call a stale
+  entry pointing at it foreign (Rule N G5), will not classify it foreign
+  (`SurveyMonitoredNames`) and will not report it as cross-instance evidence
+  (`lrctl verify`). No gate, cadence, requeue interval or decision table changed. `IsGhost`
+  and every rule keyed on it are untouched, and LR-038's terminating-pod filter on the
+  gather is untouched — this change deliberately gives the attribution question its own set
+  rather than widening the ground truth, which LR-038 warns changes every rule at once.
+- **Impacts:** `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` **R5** and §6 item 3 (the split
+  the concept asks for is now in code);
+  `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md` §7 Phase 0 (M0.3 done — Phase 0 is
+  complete); `CLAUDE.md` pillar 3.15 (one sentence, which named `ValidIPs` and now names
+  both sets and states that neither subsumes the other). Discharges the two items LR-052
+  reported rather than edited (G3's stale comment and its empty-list rendering). Completes
+  for **attribution** what LR-038 established for the **ground truth**: *a guard is only as
+  good as what its input is allowed to contain* — and the answer here was not to widen the
+  input every rule shares, but to give the second question its own.

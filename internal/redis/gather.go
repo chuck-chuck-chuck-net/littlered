@@ -51,10 +51,33 @@ type Gatherer interface {
 // masterName is the instance's Sentinel master name (LittleRed.SentinelMasterName()).
 // It is required whenever sentinelPods is non-empty; callers with no Sentinels
 // (failover mode) pass "" and no Sentinel probe is issued.
+//
+// ownedIPs is EVERY address this instance's pods hold, TERMINATING INCLUDED, and it
+// is a parameter rather than a set the gather could derive (LR-053). It cannot be
+// derived here: redisPods/sentinelPods arrive already filtered to the live topology
+// — a terminating pod of ours never reaches this function — which is exactly why
+// `ValidIPs` could only ever mean "live topology" and the attribution question had
+// no set of its own to read. It is in the signature for LR-041's reason: a required
+// value held as construction state has no enforcement, and the compiler now asks
+// every caller.
+//
+// Its zero value fails SAFE by construction: the probed addresses are unioned in, so
+// a nil ownedIPs degrades to exactly the pre-split behaviour (OwnedIPs ==
+// LiveTopologyIPs) rather than to "nothing is ours", which would make every
+// monitored address read as foreign and manufacture capture verdicts everywhere.
 func GatherReplicationState(
-	ctx context.Context, g Gatherer, redisPods, sentinelPods map[string]string, masterName string,
+	ctx context.Context, g Gatherer, redisPods, sentinelPods map[string]string,
+	masterName string, ownedIPs map[string]bool,
 ) *ReplicationState {
 	state := NewReplicationState()
+
+	// Recorded first, so the union below can only ever widen: every probed address is
+	// also an owned one (the LiveTopologyIPs subset OwnedIPs invariant), and any
+	// address of ours the caller knows about but did not hand us to probe — a
+	// terminating pod — is owned and nothing more.
+	for ip := range ownedIPs {
+		state.AddOwnedIP(ip)
+	}
 
 	type redisResult struct {
 		ip string
@@ -71,7 +94,7 @@ func GatherReplicationState(
 	var wg sync.WaitGroup
 
 	for ip, name := range redisPods {
-		state.ValidIPs[ip] = true
+		state.AddLiveTopologyIP(ip)
 		wg.Add(1)
 		go func(ip, name string) {
 			defer wg.Done()
@@ -93,7 +116,7 @@ func GatherReplicationState(
 	}
 
 	for ip, name := range sentinelPods {
-		state.ValidIPs[ip] = true
+		state.AddLiveTopologyIP(ip)
 		wg.Add(1)
 		go func(ip, name string) {
 			defer wg.Done()
