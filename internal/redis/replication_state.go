@@ -72,13 +72,26 @@ func (n *RedisNodeState) UnprovablyEmpty() bool {
 
 // SentinelNodeState represents the monitoring state of a Sentinel pod
 type SentinelNodeState struct {
-	PodName        string
-	IP             string
-	Monitoring     bool
-	MasterIP       string
-	FailoverStatus string
-	Reachable      bool
-	Replicas       []ReplicaInfo
+	PodName    string
+	IP         string
+	Monitoring bool
+	MasterIP   string
+	Reachable  bool
+	Replicas   []ReplicaInfo
+
+	// MasterFailoverState is the monitored master's `failover-state` field as this
+	// Sentinel reports it, and it is the evidence behind FailoverActive.
+	//
+	// It was `FailoverStatus`, populated from a `failover-status` key that neither
+	// Redis nor Valkey has ever emitted, so it was permanently "" and every guard
+	// downstream of it was dead (LR-052). Renamed rather than repointed: the old
+	// name is the one that made the wrong wire key look plausible, and leaving it
+	// would let the next reader re-derive the same mistake.
+	//
+	// Absent in steady state (Sentinel emits the key only while the master carries
+	// SRI_FAILOVER_IN_PROGRESS), so read it through MasterFailoverInProgress rather
+	// than comparing it — absence is idle, not unknown.
+	MasterFailoverState string
 
 	// MasterFlags is the monitored master's `flags` field as this Sentinel reports it
 	// (e.g. "master", "s_down,master"). It is the discriminator between a master that
@@ -120,6 +133,18 @@ type SentinelNodeState struct {
 	ProbeError   string
 }
 
+// MasterFailoverInProgress reports whether this Sentinel says a failover is
+// running for the master it monitors.
+//
+// It reads the two independent signals the same reply carries — the
+// `failover_in_progress` token in the master's flags, and a non-idle
+// `failover-state` — through the one shared predicate, so this path and Rule N's
+// MonitoredMaster path cannot drift about what "in progress" means (the
+// IsLinkUpReplicaOf precedent).
+func (sn *SentinelNodeState) MasterFailoverInProgress() bool {
+	return sn != nil && failoverInProgress(sn.MasterFlags, sn.MasterFailoverState)
+}
+
 // ReplicationState represents the combined "Ground Truth" of a replication-based
 // instance — every data pod's replication view plus (in sentinel mode) every
 // Sentinel's monitoring view. It is the shared state container for the
@@ -146,10 +171,14 @@ func NewReplicationState() *ReplicationState {
 
 // DetermineRealMaster uses the gathered information to decide who the authoritative master is.
 func (s *ReplicationState) DetermineRealMaster() {
-	// 1. Check for active failover
+	// 1. Check for active failover.
+	//
+	// One reachable, monitoring Sentinel reporting a failover is enough: this is a
+	// reason to stand back (Rule A, pillar 3.5), not a verdict, and the conservative
+	// direction for "should the operator keep its hands off" is to believe the first
+	// Sentinel that says yes.
 	for _, sn := range s.SentinelNodes {
-		if sn.Reachable && sn.Monitoring && sn.FailoverStatus != "" &&
-			sn.FailoverStatus != failoverStateNone && sn.FailoverStatus != "no-failover" {
+		if sn.Reachable && sn.Monitoring && sn.MasterFailoverInProgress() {
 			s.FailoverActive = true
 			break
 		}

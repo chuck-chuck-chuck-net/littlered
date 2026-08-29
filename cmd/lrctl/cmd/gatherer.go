@@ -113,8 +113,11 @@ func (g *cliGatherer) GetSentinelState(
 			// Resolve hostname to IP
 			state.MasterIP = g.resolveIdentityToIP(mIP)
 		}
-		if line == "failover-status" {
-			state.FailoverStatus = strings.TrimSpace(lines[i+1])
+		// Source-confirmed key name; there is no `failover-status` in either
+		// project and reading one is LR-052 — `lrctl` is the ground-truth tool and
+		// must not report a failover state it read from a key that does not exist.
+		if line == "failover-state" {
+			state.MasterFailoverState = strings.TrimSpace(lines[i+1])
 		}
 		// Retained for the cross-instance diagnostic: `flags` distinguishes a master
 		// that is dead from one that is alive but not ours, and the counts are the

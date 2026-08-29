@@ -90,16 +90,16 @@ func (g *operatorGatherer) GetSentinelState(
 	}
 
 	state := &redisclient.SentinelNodeState{
-		PodName:           podName,
-		IP:                ip,
-		Monitoring:        true,
-		MonitoredMasters:  g.monitoredMasters(ctx, sc, podAddr),
-		MasterIP:          masterInfo.IP,
-		MasterFlags:       masterInfo.Flags,
-		FailoverStatus:    masterInfo.FailoverStatus,
-		NumOtherSentinels: masterInfo.NumOtherSentinels,
-		NumSlaves:         masterInfo.NumSlaves,
-		Reachable:         true,
+		PodName:             podName,
+		IP:                  ip,
+		Monitoring:          true,
+		MonitoredMasters:    g.monitoredMasters(ctx, sc, podAddr),
+		MasterIP:            masterInfo.IP,
+		MasterFlags:         masterInfo.Flags,
+		MasterFailoverState: masterInfo.FailoverState,
+		NumOtherSentinels:   masterInfo.NumOtherSentinels,
+		NumSlaves:           masterInfo.NumSlaves,
+		Reachable:           true,
 	}
 
 	if reps, err := sc.GetReplicas(ctx, masterName); err == nil {

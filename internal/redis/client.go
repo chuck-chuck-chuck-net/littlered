@@ -125,11 +125,22 @@ func newBoundedRedisClient(addr, password string, tlsEnabled bool) *redis.Client
 
 // MasterInfo contains information about the current master
 type MasterInfo struct {
-	IP             string
-	Port           string
-	Name           string
-	Flags          string
-	FailoverStatus string
+	IP    string
+	Port  string
+	Name  string
+	Flags string
+	// FailoverState is the `failover-state` field of the `SENTINEL master` reply.
+	//
+	// The name is source-confirmed and it is NOT "failover-status" — see
+	// MonitoredMaster.FailoverState for the citations. Reading the wrong key here
+	// is LR-052: the field parsed as a miss, so it was permanently "", so
+	// ReplicationState.FailoverActive was permanently false and Rule A's second
+	// half never fired.
+	//
+	// Emitted ONLY while the instance carries SRI_FAILOVER_IN_PROGRESS, so its
+	// ordinary steady-state value is *absent*, not "none". Read it through
+	// FailoverInProgress rather than comparing it here.
+	FailoverState string
 	// NumOtherSentinels / NumSlaves are the peer and replica counts this Sentinel
 	// reports for the master. Free on the wire (the reply is already a map) and the
 	// loudest available sign that another Sentinel deployment shares our master name.
@@ -195,7 +206,7 @@ func (c *SentinelClient) GetMasterState(ctx context.Context, name string) (*Mast
 			IP:                result["ip"],
 			Port:              result["port"],
 			Flags:             result["flags"],
-			FailoverStatus:    result["failover-status"],
+			FailoverState:     result["failover-state"],
 			NumOtherSentinels: atoiOrZero(result["num-other-sentinels"]),
 			NumSlaves:         atoiOrZero(result["num-slaves"]),
 		}, nil
@@ -221,9 +232,10 @@ func (c *SentinelClient) IsFailoverInProgress(ctx context.Context, name string) 
 			continue
 		}
 		reachable = true
-		status := result["failover-status"]
-		// Valid statuses when NO failover is happening are typically empty or "none" (depending on version)
-		if status != "" && status != failoverStateNone && status != "no-failover" {
+		// Both signals, one predicate (LR-052). The previous body compared
+		// result["failover-status"] — a key neither project emits — against a
+		// hand-written idle set, so it could only ever answer false.
+		if failoverInProgress(result["flags"], result["failover-state"]) {
 			return true, nil
 		}
 	}
@@ -710,10 +722,29 @@ var idleFailoverStates = map[string]bool{"": true, failoverStateNone: true}
 // somehow carried the flag without the field, or a version that emits the field
 // unconditionally, is still read correctly.
 func (m MonitoredMaster) FailoverInProgress() bool {
-	if strings.Contains(m.Flags, "failover_in_progress") {
+	return failoverInProgress(m.Flags, m.FailoverState)
+}
+
+// failoverInProgress is the ONE definition of "this Sentinel says a failover is
+// running", shared by MonitoredMaster (SENTINEL MASTERS) and MasterInfo
+// (SENTINEL master) — the same reply fields reached by two different commands.
+//
+// One definition on purpose, the IsLinkUpReplicaOf precedent: a second copy is
+// literally how LR-045 happened, and LR-052 is the same class one level down —
+// the `SENTINEL master` path re-derived the predicate against a key that does not
+// exist while this one, written for Rule N, was correct all along.
+func failoverInProgress(flags, state string) bool {
+	if strings.Contains(flags, "failover_in_progress") {
 		return true
 	}
-	return !idleFailoverStates[strings.TrimSpace(m.FailoverState)]
+	return !idleFailoverStates[strings.TrimSpace(state)]
+}
+
+// FailoverInProgress reports whether the Sentinel that produced this MasterInfo
+// says a failover is running for the master. Same two signals, same one predicate
+// as MonitoredMaster's — see failoverInProgress.
+func (m *MasterInfo) FailoverInProgress() bool {
+	return m != nil && failoverInProgress(m.Flags, m.FailoverState)
 }
 
 // GetMonitoredMasters asks ONE Sentinel which masters it monitors.

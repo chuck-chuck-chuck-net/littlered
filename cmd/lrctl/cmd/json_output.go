@@ -176,12 +176,16 @@ func parseClusterNodesJSON(output string) []clusterNodeInspectJSON {
 // =============================================================================
 
 type sentinelNodeVerifyJSON struct {
-	PodName        string `json:"podName"`
-	IP             string `json:"ip"`
-	Monitoring     bool   `json:"monitoring"`
-	MasterIP       string `json:"masterIP,omitempty"`
-	FailoverStatus string `json:"failoverStatus,omitempty"`
-	Reachable      bool   `json:"reachable"`
+	PodName    string `json:"podName"`
+	IP         string `json:"ip"`
+	Monitoring bool   `json:"monitoring"`
+	MasterIP   string `json:"masterIP,omitempty"`
+	// FailoverState is Sentinel's own `failover-state`, absent unless a failover is
+	// running. It was `failoverStatus`, read from a key neither project emits, so
+	// it was ALWAYS empty and (being omitempty) never appeared in any output —
+	// which is why renaming the JSON key breaks no consumer (LR-052).
+	FailoverState string `json:"failoverState,omitempty"`
+	Reachable     bool   `json:"reachable"`
 	// MonitoredMasters is EVERY master name this Sentinel carries, not only the
 	// one we asked about. Empty means the list could not be read, never that the
 	// Sentinel monitors nothing (LR-041).
@@ -339,12 +343,12 @@ func buildSentinelVerifyJSON(
 
 	for _, sn := range state.SentinelNodes {
 		entry := sentinelNodeVerifyJSON{
-			PodName:        sn.PodName,
-			IP:             sn.IP,
-			Monitoring:     sn.Monitoring,
-			MasterIP:       sn.MasterIP,
-			FailoverStatus: sn.FailoverStatus,
-			Reachable:      sn.Reachable,
+			PodName:       sn.PodName,
+			IP:            sn.IP,
+			Monitoring:    sn.Monitoring,
+			MasterIP:      sn.MasterIP,
+			FailoverState: sn.MasterFailoverState,
+			Reachable:     sn.Reachable,
 		}
 		for _, m := range sn.MonitoredMasters {
 			entry.MonitoredMasters = append(entry.MonitoredMasters, monitoredMasterJSON{

@@ -28,6 +28,19 @@ import (
 	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
 )
 
+// Field names of the `SENTINEL master` reply, and the two flag strings the rows
+// discriminate on. Named because the whole subject of LR-052 is that one of these
+// keys was wrong, so they are worth having in exactly one place.
+const (
+	fieldName      = "name"
+	fieldPort      = "port"
+	fieldFlags     = "flags"
+	fieldNumSlaves = "num-slaves"
+
+	flagsFailingOver = "master,failover_in_progress"
+	respEmptyArray   = "*0\r\n"
+)
+
 // failoverSentinel is a scripted fake Sentinel that answers
 // `SENTINEL master <name>` with a caller-supplied field set, so a test can feed
 // DetermineRealMaster the EXACT reply a real Sentinel emits mid-failover.
@@ -89,7 +102,7 @@ func failoverSentinel(t *testing.T, host, name string, fields []string) {
 						}
 					case len(args) >= 3 && strings.EqualFold(args[0], "sentinel") &&
 						strings.EqualFold(args[1], "replicas"):
-						reply = "*0\r\n"
+						reply = respEmptyArray
 					case len(args) >= 2 && strings.EqualFold(args[0], "sentinel") &&
 						strings.EqualFold(args[1], "masters"):
 						reply = "*1\r\n" + record(fields)
@@ -107,12 +120,12 @@ func failoverSentinel(t *testing.T, host, name string, fields []string) {
 // the key altogether, which is what a Sentinel with no failover running sends.
 func masterReply(masterIP, flags, failoverState string) []string {
 	f := []string{
-		"name", "ns.inst",
+		fieldName, "ns.inst",
 		"ip", masterIP,
-		"port", "6379",
-		"flags", flags,
+		fieldPort, "6379",
+		fieldFlags, flags,
 		"num-other-sentinels", "2",
-		"num-slaves", "2",
+		fieldNumSlaves, "2",
 	}
 	if failoverState != "" {
 		f = append(f, "failover-state", failoverState)
@@ -162,7 +175,7 @@ func TestDetermineRealMasterFailoverActive(t *testing.T) {
 			// The headline row. This is the reply a Sentinel that has elected itself
 			// leader and is picking a replica actually sends.
 			name:          "failover-state select_slave means a failover is running",
-			flags:         "master,failover_in_progress",
+			flags:         flagsFailingOver,
 			failoverState: "select_slave",
 			want:          true,
 		},
@@ -171,7 +184,7 @@ func TestDetermineRealMasterFailoverActive(t *testing.T) {
 			// independent signals from the same reply so that a version emitting one
 			// without the other is still read correctly.
 			name:          "the failover_in_progress flag alone, no failover-state field at all",
-			flags:         "master,failover_in_progress",
+			flags:         flagsFailingOver,
 			failoverState: "",
 			want:          true,
 		},
@@ -181,13 +194,13 @@ func TestDetermineRealMasterFailoverActive(t *testing.T) {
 			// steady state, so if absence read as "in progress" then Rule A would skip
 			// ALL healing on every pass, forever.
 			name:          "steady state: no failover-state key in the reply",
-			flags:         "master",
+			flags:         RoleMaster,
 			failoverState: "",
 			want:          false,
 		},
 		{
 			name:          "explicit none is idle",
-			flags:         "master",
+			flags:         RoleMaster,
 			failoverState: "none",
 			want:          false,
 		},
@@ -195,7 +208,7 @@ func TestDetermineRealMasterFailoverActive(t *testing.T) {
 			// An unrecognised value must fail SAFE, i.e. read as in-flight. The idle
 			// set is a whitelist for exactly this reason.
 			name:          "a value neither project emits today fails safe",
-			flags:         "master",
+			flags:         RoleMaster,
 			failoverState: "brand_new_state",
 			want:          true,
 		},
@@ -247,20 +260,20 @@ func TestFailoverActiveSuppressesTheRedisOnlyFallback(t *testing.T) {
 
 	build := func(t *testing.T, failingOver bool) *redisclient.ReplicationState {
 		t.Helper()
-		flagsA, stateA := "master", ""
+		flagsA, stateA := RoleMaster, ""
 		if failingOver {
-			flagsA, stateA = "master,failover_in_progress", "reconf_slaves"
+			flagsA, stateA = flagsFailingOver, "reconf_slaves"
 		}
 		failoverSentinel(t, hostA, "ns.inst", masterReply(podA, flagsA, stateA))
-		failoverSentinel(t, hostB, "ns.inst", masterReply(podB, "master", ""))
+		failoverSentinel(t, hostB, "ns.inst", masterReply(podB, RoleMaster, ""))
 
 		state := redisclient.NewReplicationState()
 		state.SentinelNodes[hostA] = gatherOne(t, hostA, "sentinel-0")
 		state.SentinelNodes[hostB] = gatherOne(t, hostB, "sentinel-1")
 		state.ValidIPs[podA] = true
 		state.ValidIPs[podB] = true
-		state.RedisNodes[podA] = &redisclient.RedisNodeState{IP: podA, Role: "master", Reachable: true}
-		state.RedisNodes[podB] = &redisclient.RedisNodeState{IP: podB, Role: "slave", Reachable: true}
+		state.RedisNodes[podA] = &redisclient.RedisNodeState{IP: podA, Role: RoleMaster, Reachable: true}
+		state.RedisNodes[podB] = &redisclient.RedisNodeState{IP: podB, Role: roleSlave, Reachable: true}
 		state.DetermineRealMaster()
 		return state
 	}
