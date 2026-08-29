@@ -146,16 +146,60 @@ unsplit.
 
 ## 5. Design decisions already taken
 
-**D1 — The runlevel lives in `spec`, not `status`.** Human-declared intent, never operator-written.
-This resolves the ADR-006 tension (it is intent, not derived state), survives operator restarts,
-removes the question of who clears it if the operator dies mid-operation, and matches the
-precondition that these operations are human-initiated.
+**D1 — The runlevel is DERIVED, and therefore stored nowhere.** Not spec, not status, not
+annotations.
 
-**D2 — Operations are rejected outside their runlevel.** The error surface D1 introduces is a
-human who does not know about runlevels and edits a field anyway. The answer is to refuse: editing
-`spec.sentinel.masterName` outside maintenance is rejected with a condition that says why. This is
-also the natural home for the rename design's R6 (*"safe to do nothing: defer loudly rather than
-act"*). Whether the refusal is CEL or operator-side is an open question (§8).
+*Revised 2026-08-28 after review. The first draft said "spec, not status", on the grounds of
+ADR-006, surviving operator restarts, and who clears it if the operator dies. That was wrong on
+usability and, more importantly, against the grain of the codebase.*
+
+The usability objection, and it is decisive: **the human has no intent for "maintenance mode".**
+Their intent is "the master name should be X" or "auth should be enabled". Requiring a second,
+separate declaration is making them drive the train when they only wanted to write the timetable.
+
+The consistency objection is stronger still — five consecutive ADRs say the same thing:
+
+| ADR | |
+|---|---|
+| 006 | *"Nothing is persisted — not a status field (a status field is a monitoring surface…)"*; the executor *"resumes from the cluster's own IMPORTING/MIGRATING markers — no persisted operator cursor"*. It explicitly rejected persisting a capability as **either** status **or** annotation. |
+| 011 | Annotations carry intent, but the epoch is *"derived from live state when bumped… never read back from status"*; every step is *"resumable from live state (ADR-006 discipline)"*. |
+| 013 | Even the migration, which genuinely has phases, *"re-derives phase from live cluster state every pass"*. |
+| 017 | *"the StatefulSet's own partition field is the cursor, so nothing new is persisted"*. |
+| 018 | Rule N: *"Nothing is remembered; no 'from' name, no phase, no cursor."* |
+
+**Derive the runlevel from (spec, observed state) each pass.** It works for every candidate:
+
+- **rename** — `spec.sentinel.masterName` ≠ what the Sentinels monitor. Already Rule N's input;
+  self-clears on convergence.
+- **auth enablement** — the desired pod template carries auth and the StatefulSet is unsettled.
+  `statefulSetRolloutSettled` already answers it.
+- **auth rotation, staged/args-driven** — template changes, same derivation.
+- **rotation as it works today** — *not* derivable, because the password is a `secretKeyRef`
+  changing no template. But that is precisely defect A1, and the auth design's fix (drive it from
+  args) makes it derivable. **The defect and the underivability are the same problem** — a good
+  sign the design cuts along the grain.
+
+*Operator restart mid-operation* is descoped by owner decision: a heavy reconfiguration
+interrupted by an operator death may leave the instance broken, and rollback is undeploy and
+redeploy. "Do not switch off your device during a firmware upgrade."
+
+**D2 — No global gate on operations; a narrow per-operation opt-in where a waiver is genuinely
+unavoidable.**
+
+*Also revised.* The first draft had operations rejected outside the runlevel. With D1 derived
+there is no mode to be outside of, so that catch is gone — and a typo or GitOps drift can start a
+heavy reconfiguration with no confirmation.
+
+Accepted, on this principle: **if an operation is safe enough not to need a window, it does not
+need a waiver either; if it is not safe enough, the fix is to make it safe, not to make the human
+sign for it.** ADR-018 shipped exactly this way — preconditions in the runbook, N4 documenting
+non-robustness under concurrent disruption as an explicit non-requirement — and the auth design
+concludes no window is needed for either of its features.
+
+Where a waiver *is* unavoidable, the project already has the right shape:
+`sentinel.allowUnsafeRebootstrapOnDeadlock` — a **narrow, per-operation opt-in in spec** for one
+specific unsafe path, not a global mode. One line in the timetable saying "yes, I accept *this*
+risk".
 
 **D3 — An early branch, not a second loop.** Two loops means two places that must know the same
 things, and they drift. The existing quarantine/`Forsaken` shape is the model: read the runlevel
@@ -227,10 +271,15 @@ For anyone planning this, these are the cases that motivate each part:
 6. **Forever-in-maintenance.** An instance silently unmanaged because someone forgot to exit needs
    a loud condition. Per ADR-017's lesson, **not** an auto-exit timer — a timer would be the
    defect with a delay.
-7. **Refusal mechanism for D2.** CEL transition rule, or operator-side refusal with a condition?
-   CEL can read `self.status`, so a transition rule may be expressible; the project has no
-   webhooks and has preferred conditions so far.
-8. **Narrow-first or general?** Recommendation: **narrow**. Auth is the first operation that
+7. **~~Refusal mechanism for D2~~** — settled by the D2 revision: no global gate. What remains is
+   per-operation: does any auth path genuinely need an `allowUnsafe…`-style opt-in? The auth
+   design says no; revisit if WP0 says otherwise.
+8. **Derivation's own failure mode (new, from D1).** A derived runlevel is only as good as the
+   comparison that derives it. "`spec` disagrees with observed" is also what a *half-failed*
+   operation looks like, and what a *stuck* one looks like — so the derivation must not confuse
+   "in progress" with "wedged". This is the same shape as the accepted stuck-rollout hole in
+   LR-050 and probably wants the same answer (name it, do not paper over it).
+9. **Narrow-first or general?** Recommendation: **narrow**. Auth is the first operation that
    genuinely needs the risk-acceptance signal; the rename shipped without one, which is evidence
    that the general case is harder to justify than the auth case. Build it for auth, generalise
    when a second customer appears.
