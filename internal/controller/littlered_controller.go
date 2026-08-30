@@ -531,10 +531,7 @@ func (r *LittleRedReconciler) deleteIfExists(ctx context.Context, littleRed *lit
 func requeueAfterNotRunning(
 	phase littleredv1alpha1.LittleRedPhase, conditions []metav1.Condition, fast, steady time.Duration,
 ) time.Duration {
-	if c := meta.FindStatusCondition(conditions, littleredv1alpha1.ConditionOperationInProgress); c != nil &&
-		c.Status == metav1.ConditionTrue && c.Reason == operationReasonRunning {
-		return fast
-	}
+	// EXPERIMENT a2ac091+1: the operation clause removed, one variable.
 	if phase == littleredv1alpha1.PhaseRunning {
 		return steady
 	}
