@@ -17,7 +17,11 @@ limitations under the License.
 package controller
 
 import (
+	"bufio"
 	"fmt"
+	"net"
+	"strings"
+	"sync"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -55,6 +59,12 @@ import (
 const (
 	opTestImage    = "redis:8"
 	opTestRevision = "rev-1"
+	opFieldFlags   = "flags"
+	// The three loopback addresses the scripted Sentinels bind. Named because only one
+	// listener can hold 127.0.0.x:26379 at a time.
+	opSentinelIP0 = "127.0.0.1"
+	opSentinelIP1 = "127.0.0.2"
+	opSentinelIP2 = "127.0.0.3"
 )
 
 var _ = Describe("ADR-020 declared operations (sentinel mode)", func() {
@@ -66,7 +76,7 @@ var _ = Describe("ADR-020 declared operations (sentinel mode)", func() {
 		reconciler *LittleRedReconciler
 		recorder   *events.FakeRecorder
 		lr         *littleredv1alpha1.LittleRed
-		sentinelIP = []string{"127.0.0.1", "127.0.0.2", "127.0.0.3"}
+		sentinelIP = []string{opSentinelIP0, opSentinelIP1, opSentinelIP2}
 	)
 
 	// opStatefulSets gives the instance both of the StatefulSets it owns, in a chosen
@@ -141,7 +151,7 @@ var _ = Describe("ADR-020 declared operations (sentinel mode)", func() {
 		}
 
 		lr = &littleredv1alpha1.LittleRed{
-			ObjectMeta: metav1.ObjectMeta{GenerateName: "ops-", Namespace: "default"},
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "ops-", Namespace: testNamespaceDefault},
 			Spec: littleredv1alpha1.LittleRedSpec{
 				Mode:     ModeSentinel,
 				Sentinel: &littleredv1alpha1.SentinelSpec{Quorum: 2, MasterName: desired},
@@ -270,5 +280,357 @@ var _ = Describe("ADR-020 declared operations (sentinel mode)", func() {
 		Expect(acks()).To(HaveKeyWithValue(opRename,
 			littleredv1alpha1.OperationFingerprint(lr.UID, opRename, "the-previous-name")),
 			"the Sentinel StatefulSet is one of ours too")
+	})
+})
+
+// ---- ADR-020: convergence must survive an operation, rescue must not ----
+
+// opRecordingSentinel is a Sentinel that monitors exactly one name, reports one healthy
+// replica plus one GHOST replica, and records every command it is asked to run — which
+// is what makes "no SENTINEL RESET was issued" assertable rather than merely believed.
+//
+// It is a separate fake from scriptedSentinel (stale_master_name_wiring_test.go) because
+// that one answers SENTINEL REPLICAS with an empty array, and a ghost replica is the
+// whole precondition of Rule D.
+type opRecordingSentinel struct {
+	mu       sync.Mutex
+	name     string
+	masterIP string
+	replicas [][2]string // ip, flags
+	commands [][]string
+}
+
+func newOpRecordingSentinel(
+	t GinkgoTInterface, host, name, masterIP string, replicas [][2]string,
+) *opRecordingSentinel {
+	f := &opRecordingSentinel{name: name, masterIP: masterIP, replicas: replicas}
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, littleredv1alpha1.SentinelPort))
+	if err != nil {
+		Skip(fmt.Sprintf("cannot bind %s:%d (in use?): %v", host, littleredv1alpha1.SentinelPort, err))
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				r := bufio.NewReader(c)
+				for {
+					args, err := readRESPCommand(r)
+					if err != nil {
+						return
+					}
+					if _, err := c.Write([]byte(f.reply(args))); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return f
+}
+
+func (f *opRecordingSentinel) reply(args []string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(args) > 0 && strings.EqualFold(args[0], "hello") {
+		return respNoHelloResp
+	}
+	if len(args) < 2 || !strings.EqualFold(args[0], "sentinel") {
+		return respOK
+	}
+	f.commands = append(f.commands, append([]string(nil), args...))
+	verb := strings.ToLower(args[1])
+	name := ""
+	if len(args) >= 3 {
+		name = args[2]
+	}
+	known := name == f.name
+	switch verb {
+	case "masters":
+		return "*1\r\n" + sentinelMasterRecord(f.name, f.masterIP)
+	case RoleMaster:
+		if !known {
+			return respNoSuchName
+		}
+		return sentinelMasterRecord(f.name, f.masterIP)
+	case "get-master-addr-by-name":
+		if !known {
+			return "*-1\r\n"
+		}
+		return fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$4\r\n6379\r\n", len(f.masterIP), f.masterIP)
+	case "replicas", "slaves":
+		if !known {
+			return respNoSuchName
+		}
+		var b strings.Builder
+		fmt.Fprintf(&b, "*%d\r\n", len(f.replicas))
+		for _, rep := range f.replicas {
+			fields := []string{"ip", rep[0], fieldPort, "6379", opFieldFlags, rep[1]}
+			fmt.Fprintf(&b, "*%d\r\n", len(fields))
+			for _, fl := range fields {
+				fmt.Fprintf(&b, "$%d\r\n%s\r\n", len(fl), fl)
+			}
+		}
+		return b.String()
+	}
+	return respOK
+}
+
+// sawReset reports whether Rule D's destructive primitive reached this Sentinel.
+func (f *opRecordingSentinel) sawReset() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.commands {
+		if len(c) >= 2 && strings.EqualFold(c[1], "reset") {
+			return true
+		}
+	}
+	return false
+}
+
+// opRecordingRedis answers INFO with a chosen replication view and records REPLICAOF,
+// which is how Rule R's one action is observed.
+type opRecordingRedis struct {
+	mu        sync.Mutex
+	info      string
+	replicaOf [][]string
+}
+
+func newOpRecordingRedis(t GinkgoTInterface, host, info string) *opRecordingRedis {
+	f := &opRecordingRedis{info: info}
+	ln, err := net.Listen("tcp", fmt.Sprintf("%s:%d", host, littleredv1alpha1.RedisPort))
+	if err != nil {
+		Skip(fmt.Sprintf("cannot bind %s:%d (in use?): %v", host, littleredv1alpha1.RedisPort, err))
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			go func(c net.Conn) {
+				defer func() { _ = c.Close() }()
+				r := bufio.NewReader(c)
+				for {
+					args, err := readRESPCommand(r)
+					if err != nil {
+						return
+					}
+					reply := respOK
+					switch {
+					case len(args) > 0 && strings.EqualFold(args[0], "hello"):
+						reply = respNoHelloResp
+					case len(args) > 0 && strings.EqualFold(args[0], "info"):
+						f.mu.Lock()
+						reply = fmt.Sprintf("$%d\r\n%s\r\n", len(f.info), f.info)
+						f.mu.Unlock()
+					case len(args) > 0 &&
+						(strings.EqualFold(args[0], "replicaof") || strings.EqualFold(args[0], "slaveof")):
+						f.mu.Lock()
+						f.replicaOf = append(f.replicaOf, append([]string(nil), args[1:]...))
+						f.mu.Unlock()
+					}
+					if _, err := c.Write([]byte(reply)); err != nil {
+						return
+					}
+				}
+			}(conn)
+		}
+	}()
+	return f
+}
+
+func (f *opRecordingRedis) sawReplicaOf() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.replicaOf) > 0
+}
+
+// This is the M3.1 regression guard, and it is an A/B with exactly ONE variable: the
+// acknowledgment. Everything else — pods, Sentinels, the straggler, the ghost replica,
+// the unsettled StatefulSet — is identical between the two specs.
+//
+// The regression it pins was measured on t3e, three runs, and cost the first-replaced
+// pod ~180s: the branch returned before Rule A, which suppressed RULE R, which is the
+// one rule that repoints a replaced pod still following the old master. That pod then
+// never became Ready, so the StatefulSet never settled, so the operation never
+// completed, so Rule R stayed suppressed. The operation suppressed the healing its own
+// completion condition depends on.
+//
+// So the fork is CONVERGENCE versus RESCUE, not operation versus healing:
+//
+//	Rule R  — convergence. One idempotent SLAVEOF at the master the operation is itself
+//	          converging on. Must run. (The name lies: "Replica Rescue" is not rescue.)
+//	Rule D  — rescue. SENTINEL RESET wipes the whole replica list and is LR-024's
+//	          self-inflicted deadlock trigger. Must not run.
+var _ = Describe("ADR-020 an operation suppresses rescue, never convergence", func() {
+	const (
+		opDesired  = "ops-c.cache"
+		opMasterIP = "127.0.0.30"
+		opHealthy  = "127.0.0.31"
+		opStragglr = "127.0.0.32"
+		opGhostIP  = "10.99.99.99"
+	)
+	var (
+		reconciler *LittleRedReconciler
+		lr         *littleredv1alpha1.LittleRed
+		sentinels  []*opRecordingSentinel
+		straggler  *opRecordingRedis
+		sentinelIP = []string{opSentinelIP0, opSentinelIP1, opSentinelIP2}
+	)
+
+	BeforeEach(func() {
+		reconciler = &LittleRedReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: events.NewFakeRecorder(64),
+		}
+		lr = &littleredv1alpha1.LittleRed{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "opconv-", Namespace: testNamespaceDefault},
+			Spec: littleredv1alpha1.LittleRedSpec{
+				Mode:     ModeSentinel,
+				Sentinel: &littleredv1alpha1.SentinelSpec{Quorum: 2, MasterName: opDesired},
+			},
+		}
+		Expect(k8sClient.Create(ctx, lr)).To(Succeed())
+		lr.Status.Phase = littleredv1alpha1.PhaseRunning
+		Expect(k8sClient.Status().Update(ctx, lr)).To(Succeed())
+
+		makePod := func(name, ip string, labels map[string]string) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: lr.Name + "-" + name, Namespace: lr.Namespace, Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: ComponentRedis, Image: opTestImage}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status.PodIP = ip
+			pod.Status.Phase = corev1.PodRunning
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: ComponentRedis, Ready: true}}
+			// PodReady is load-bearing for this fixture, not decoration:
+			// getSentinelAddresses skips any Sentinel pod without it, so without this the
+			// SENTINEL RESET goes only to the Service FQDN, reaches no fake, and the
+			// "no RESET was issued" assertion below passes having tested nothing. The
+			// control spec is what caught exactly that.
+			pod.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+		makePod("redis-0", opMasterIP, redisSelectorLabels(lr))
+		makePod("redis-1", opHealthy, redisSelectorLabels(lr))
+		makePod("redis-2", opStragglr, redisSelectorLabels(lr))
+		for i, ip := range sentinelIP {
+			makePod(fmt.Sprintf("sentinel-%d", i), ip, sentinelSelectorLabels(lr))
+		}
+
+		// The Redis side: a master, a healthy replica, and a straggler still following
+		// an address that is nobody's master any more — precisely the state a replaced
+		// pod returns in, and the only thing Rule R acts on.
+		newOpRecordingRedis(GinkgoT(), opMasterIP,
+			"# Replication\r\nrole:master\r\nconnected_slaves:2\r\nmaster_replid:abc\r\n"+
+				"master_replid2:0000000000000000000000000000000000000000\r\nmaster_repl_offset:100\r\n")
+		newOpRecordingRedis(GinkgoT(), opHealthy,
+			"# Replication\r\nrole:slave\r\nmaster_host:"+opMasterIP+"\r\nmaster_link_status:up\r\n"+
+				"master_replid:abc\r\nmaster_repl_offset:100\r\n")
+		straggler = newOpRecordingRedis(GinkgoT(), opStragglr,
+			"# Replication\r\nrole:slave\r\nmaster_host:10.99.99.98\r\nmaster_link_status:down\r\n"+
+				"master_replid:abc\r\nmaster_repl_offset:90\r\n")
+
+		// The Sentinel side: a ghost replica (dead IP, s_down) plus a healthy one, which
+		// is the exact shape Rule D fires on — LR-011 requires >=1 healthy known replica
+		// and LR-013 requires the instance to be whole, and both hold here.
+		sentinels = make([]*opRecordingSentinel, 0, len(sentinelIP))
+		for _, ip := range sentinelIP {
+			sentinels = append(sentinels, newOpRecordingSentinel(GinkgoT(), ip, opDesired, opMasterIP,
+				[][2]string{{opHealthy, roleSlave}, {opGhostIP, "s_down," + roleSlave}}))
+		}
+
+		// Both StatefulSets exist and are UNSETTLED in both specs, so the only thing
+		// that differs between them is the acknowledgment.
+		for _, n := range []struct {
+			name   string
+			labels map[string]string
+		}{{statefulSetName(lr), redisSelectorLabels(lr)}, {sentinelStatefulSetName(lr), sentinelSelectorLabels(lr)}} {
+			replicas := int32(3)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: n.name, Namespace: lr.Namespace},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{MatchLabels: n.labels},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: n.labels},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: ComponentRedis, Image: opTestImage}}},
+					},
+					ServiceName: n.name,
+				},
+			}
+			Expect(k8sClient.Create(ctx, sts)).To(Succeed())
+			sts.Status = appsv1.StatefulSetStatus{
+				ObservedGeneration: sts.Generation,
+				Replicas:           3, ReadyReplicas: 2, UpdatedReplicas: 1,
+				CurrentRevision: opTestRevision, UpdateRevision: opTestRevision + "-next",
+			}
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		}
+	})
+
+	setAck := func(value string) {
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		latest.Status.AcknowledgedOperations = []littleredv1alpha1.OperationAck{{
+			Name:           opRename,
+			Fingerprint:    littleredv1alpha1.OperationFingerprint(latest.UID, opRename, value),
+			AcknowledgedAt: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		lr.Status.AcknowledgedOperations = latest.Status.AcknowledgedOperations
+	}
+
+	sawAnyReset := func() bool {
+		for _, s := range sentinels {
+			if s.sawReset() {
+				return true
+			}
+		}
+		return false
+	}
+
+	It("runs Rule R and withholds Rule D while an operation is in progress", func() {
+		setAck("the-previous-name") // fingerprint differs => the rename is pending
+
+		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
+
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		Expect(latest.Status.Operation).NotTo(BeNil(), "precondition: an operation must be in progress")
+		Expect(latest.Status.Operation.Reason).To(Equal(operationReasonRunning))
+
+		Expect(straggler.sawReplicaOf()).To(BeTrue(),
+			"Rule R is CONVERGENCE and must still run: this is the M3.1 regression, where the "+
+				"replaced pod was never repointed, so it never became Ready, so the StatefulSet "+
+				"never settled, so the operation never completed")
+		Expect(sawAnyReset()).To(BeFalse(),
+			"Rule D is RESCUE and must stand down: SENTINEL RESET wipes the replica list and is "+
+				"LR-024's self-inflicted deadlock trigger")
+	})
+
+	It("runs both once no operation is in progress (the control)", func() {
+		setAck(opDesired) // fingerprint matches => converged, no operation
+
+		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
+
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		Expect(latest.Status.Operation).To(BeNil(), "precondition: no operation may be in progress")
+
+		Expect(straggler.sawReplicaOf()).To(BeTrue(), "Rule R runs here too")
+		Expect(sawAnyReset()).To(BeTrue(),
+			"the control that stops the spec above passing vacuously: with no operation, Rule D "+
+				"MUST fire on this fixture, so 'no RESET' there is attributable to the operation "+
+				"and not to a fixture that never reaches Rule D at all")
 	})
 })
