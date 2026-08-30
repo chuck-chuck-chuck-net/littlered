@@ -1158,7 +1158,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// make the gate structurally dead. `Captured` is the reachable — and strictly more
 	// conservative — reading of "a capture is in evidence": while one is, Rule N stands
 	// down entirely and ADR-016 owns the instance.
-	staleReason, err := r.reconcileStaleMasterNames(ctx, littleRed, state, sentinelMasterName,
+	stalePlan, err := r.reconcileStaleMasterNames(ctx, littleRed, state, sentinelMasterName,
 		sentinelQuorum(littleRed), password, forsakenPlan.Captured, rolling)
 	if err != nil {
 		auditLog.Error(err, "failed to reconcile stale Sentinel master names")
@@ -1185,7 +1185,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// a pod is terminating from the moment of the edit, so Rule A already returned before
 	// every one of those rules. What this adds is that the suppression is explicit,
 	// uniform and REPORTED.
-	opDone, opBlocked := operationDriverReport(staleReason)
+	opDone, opBlocked := operationDriverReport(stalePlan)
 	opInput.DriverDone, opInput.DriverBlocked = opDone, opBlocked
 	opPlan, err := r.reconcileOperation(ctx, littleRed, opInput)
 	if err != nil {
@@ -2538,15 +2538,15 @@ func planStaleMasterNameReport(plan StaleMasterNamePlan) staleNameReport {
 // why this repairs an instance a PREVIOUS botched rename (or a hand-issued MONITOR)
 // already broke (R4).
 //
-// It returns the plan's reason as well as its error, because Rule N is the DRIVER of
-// ADR-020's one registered heavy operation and its verdict is that operation's progress
-// report: Converged is Complete, Deferred and Foreign are Blocked, Pruning is in flight.
-// Nothing about Rule N's own behaviour depends on that — it is a value the caller reads,
-// not a gate the rule gained.
+// It returns the plan as well as its error, because Rule N is the DRIVER of ADR-020's
+// one registered heavy operation and its verdict is that operation's progress report
+// (see operationDriverReport, which reads Reason and Gate). Nothing about Rule N's own
+// behaviour depends on that — the plan is a value the caller reads, not a gate the rule
+// gained.
 func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState,
 	desired string, quorum int, password string, forsaken, rolling bool,
-) (string, error) {
+) (StaleMasterNamePlan, error) {
 	plan := planStaleMasterNames(state, desired, quorum, forsaken, rolling)
 	audit := r.getLogger(ctx, lr, LogCategoryAudit)
 
@@ -2560,7 +2560,7 @@ func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	}
 	plan.Message = msg
 
-	return plan.Reason, r.setStaleMasterNameCondition(ctx, lr, planStaleMasterNameReport(plan))
+	return plan, r.setStaleMasterNameCondition(ctx, lr, planStaleMasterNameReport(plan))
 }
 
 // executeStaleMasterNamePrune issues the REMOVEs the plan asks for and returns the pods

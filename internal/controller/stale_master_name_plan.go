@@ -63,6 +63,25 @@ type StaleMasterNamePlan struct {
 	Skipped []string
 	Reason  string
 	Message string
+
+	// Gate names WHICH gate refused, for a Deferred verdict, and is empty for every
+	// other reason. It is the same identity deferStaleNames already writes into the
+	// message; this field exists so a caller can act on it without parsing prose,
+	// which is how the next defect gets written.
+	//
+	// It changes no decision of Rule N's. Its one consumer is ADR-020's driver report
+	// (operationDriverReport), which must distinguish a gate that is STUCK from one
+	// that is merely waiting for the next pass: G6 — "no Sentinel carries the desired
+	// name yet; Rule 0 registers it next pass" — is PROGRESS, discharged by Rule 0 in
+	// the very next pass by design, and it fires on the first pass of every ordinary
+	// rename. Reporting that as Blocked raises a Warning on the happy path, and a
+	// check that cries wolf is a check nobody reads. This is ADR-017's rule verbatim,
+	// where an attached-but-link-down pod is an unbounded full sync and therefore
+	// genuine progress, so ClusterRolloutBlocked is deliberately never raised for it.
+	//
+	// G1-G5 are different in kind: each names a state that persists until something
+	// outside this rule changes, so each stays Blocked.
+	Gate string
 }
 
 // planStaleMasterNames decides which stale Sentinel master-name entries may be removed.
@@ -300,7 +319,7 @@ func planStaleMasterNames(
 		// Every Sentinel carrying a stale name is waiting on Rule 0 to give it the
 		// desired one. Nothing to do this pass, and saying "Pruning" with an empty
 		// plan would be a lie.
-		return deferStaleNames("G6",
+		return deferStaleNames(staleGateRule0Pending,
 			fmt.Sprintf("no Sentinel carries %q yet; Rule 0 registers it next pass", desired), staleList)
 	}
 
@@ -313,14 +332,23 @@ func planStaleMasterNames(
 	return StaleMasterNamePlan{Prune: entries, Skipped: skipped, Reason: staleNamesPruning, Message: msg}
 }
 
+// staleGateRule0Pending is G6 as a whole-instance deferral: not one Sentinel carries the
+// desired name yet, so there is nothing this rule may prune without leaving a Sentinel
+// bare on purpose. It is the ONE deferral that is discharged by the operator's own next
+// pass (Rule 0 registers the name), which is why it reads as progress rather than as a
+// refusal that needs a human.
+const staleGateRule0Pending = "G6"
+
 // deferStaleNames builds the Deferred verdict. The gate is named in the message because
-// a refusal that does not say which gate refused is indistinguishable from a stall.
+// a refusal that does not say which gate refused is indistinguishable from a stall, and
+// carried in the Gate field because a caller must not have to parse the message to
+// tell those two apart.
 func deferStaleNames(gate, why string, stale []string) StaleMasterNamePlan {
 	msg := fmt.Sprintf("deferred by gate %s: %s", gate, why)
 	if len(stale) > 0 {
 		msg += fmt.Sprintf("; stale master name(s) still present: %s", quoteJoin(stale))
 	}
-	return StaleMasterNamePlan{Reason: staleNamesDeferred, Message: msg}
+	return StaleMasterNamePlan{Reason: staleNamesDeferred, Message: msg, Gate: gate}
 }
 
 func describeStaleEntries(entries []staleEntry) string {

@@ -23,6 +23,8 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
+	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
@@ -157,33 +159,114 @@ func TestBuildOperationInputBootstrapping(t *testing.T) {
 
 // TestOperationDriverReport pins the driver contract for registry v1's one member: the
 // rename's driver is the code that already ships (Rule 0 then Rule N), and its verdict
-// IS Rule N's reason. Nothing new was written to carry it.
+// IS Rule N's own plan. Nothing new was written to carry it.
+//
+// The G6 row is the one that matters. "No Sentinel carries the desired name yet; Rule 0
+// registers it next pass" fires on the FIRST pass of every ordinary rename — measured on
+// t3e — and Rule 0 discharges it in the very next pass, by design. Reporting it as
+// Blocked emits a Warning on the happy path, and a check that cries wolf is a check
+// nobody reads. Every other gate names a state that persists until something outside
+// Rule N changes, so every other gate stays Blocked.
 func TestOperationDriverReport(t *testing.T) {
 	cases := []struct {
-		reason        string
+		name          string
+		plan          StaleMasterNamePlan
 		done, blocked bool
 	}{
-		// Converged is Rule N's desired state — every Sentinel monitors exactly the
-		// desired name and nothing else — which is exactly what the rename is for.
-		{staleNamesConverged, true, false},
-		// A gate refuses. Never auto-skipped: head-of-line blocking is correct here, and
-		// Foreign in particular is a capture, which is the one state in which a rename
-		// must not be allowed to look like progress.
-		{staleNamesDeferred, false, true},
-		{staleNamesForeign, false, true},
-		// Work in flight.
-		{staleNamesPruning, false, false},
-		// An unrecognised verdict must never read as Complete: acknowledging on a value
-		// nobody defined is the acknowledge-on-sight failure by another route.
-		{"SomethingNobodyHasWrittenYet", false, false},
-		{"", false, false},
+		{
+			// Rule N's desired state — every Sentinel monitors exactly the desired name
+			// and nothing else — which is exactly what the rename is for.
+			name: "converged is complete",
+			plan: StaleMasterNamePlan{Reason: staleNamesConverged},
+			done: true,
+		},
+		{
+			// Work in flight.
+			name: "pruning is progress",
+			plan: StaleMasterNamePlan{Reason: staleNamesPruning},
+		},
+		{
+			// The carve-out, and the reason this function takes a plan rather than a
+			// reason string: the gate identity has to be readable without parsing prose.
+			name: "G6 is progress, not blockage — Rule 0 discharges it next pass",
+			plan: StaleMasterNamePlan{Reason: staleNamesDeferred, Gate: staleGateRule0Pending},
+		},
+		{
+			name:    "G1 (empty desired name) is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesDeferred, Gate: "G1"},
+			blocked: true,
+		},
+		{
+			name:    "G2 (no living master of ours) is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesDeferred, Gate: "G2"},
+			blocked: true,
+		},
+		{
+			name:    "G3 (a failover is in flight) is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesDeferred, Gate: "G3"},
+			blocked: true,
+		},
+		{
+			name:    "G4 (below quorum) is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesDeferred, Gate: "G4"},
+			blocked: true,
+		},
+		{
+			name:    "G5 (an address we cannot attribute) is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesDeferred, Gate: "G5"},
+			blocked: true,
+		},
+		{
+			// A capture is in evidence and ADR-016 owns the instance: the one state in
+			// which a rename must never be allowed to look like progress.
+			name:    "foreign is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesForeign},
+			blocked: true,
+		},
+		{
+			// An unrecognised verdict must never read as Complete: acknowledging on a
+			// value nobody defined is the acknowledge-on-sight failure by another route.
+			name: "an unknown reason is neither",
+			plan: StaleMasterNamePlan{Reason: "SomethingNobodyHasWrittenYet"},
+		},
+		{
+			// A Deferred verdict whose gate a future contributor forgot to name must
+			// fail SAFE — blocked, i.e. loud — rather than quietly read as progress.
+			name:    "a Deferred verdict with no gate is blocked",
+			plan:    StaleMasterNamePlan{Reason: staleNamesDeferred},
+			blocked: true,
+		},
 	}
 	for _, tc := range cases {
-		done, blocked := operationDriverReport(tc.reason)
-		if done != tc.done || blocked != tc.blocked {
-			t.Errorf("operationDriverReport(%q) = (done=%v, blocked=%v), want (%v, %v)",
-				tc.reason, done, blocked, tc.done, tc.blocked)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			done, blocked := operationDriverReport(tc.plan)
+			if done != tc.done || blocked != tc.blocked {
+				t.Errorf("operationDriverReport(%+v) = (done=%v, blocked=%v), want (%v, %v)",
+					tc.plan, done, blocked, tc.done, tc.blocked)
+			}
+		})
+	}
+}
+
+// TestPlanStaleMasterNamesCarriesTheGateIdentity — the Gate field must actually be
+// populated by the planner, not merely declared. Without this the carve-out above is
+// unreachable in production while its unit table passes.
+//
+// It asserts ONLY the new field. No verdict, message or prune decision is asserted here;
+// those are TestPlanStaleMasterNames' rows and none of them moved.
+func TestPlanStaleMasterNamesCarriesTheGateIdentity(t *testing.T) {
+	// G1: the desired name is empty. Reached before the survey, so it needs no fixture.
+	if got := planStaleMasterNames(nil, "", 2, false, false); got.Gate != "G2" {
+		t.Errorf("nil ground truth: Gate = %q, want G2", got.Gate)
+	}
+	if got := planStaleMasterNames(&redisclient.ReplicationState{}, "", 2, false, false); got.Gate != "G1" {
+		t.Errorf("empty desired name: Gate = %q, want G1", got.Gate)
+	}
+	// A verdict that is not a deferral carries no gate.
+	forsakenPlan := planStaleMasterNames(&redisclient.ReplicationState{}, "a.b", 2, true, false)
+	if forsakenPlan.Reason != staleNamesForeign || forsakenPlan.Gate != "" {
+		t.Errorf("forsaken: Reason=%q Gate=%q, want Foreign with no gate",
+			forsakenPlan.Reason, forsakenPlan.Gate)
 	}
 }
 

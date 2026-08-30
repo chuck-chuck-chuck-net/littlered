@@ -325,21 +325,41 @@ func operationStatusEqual(a, b *littleredv1alpha1.OperationStatus) bool {
 //
 // For registry v1 the driver is the code that already ships — Rule 0 (bare-Sentinel
 // re-registration) then Rule N (the stale-master-name prune) — and its verdict is Rule
-// N's own reason. No new healing logic exists anywhere in this mechanism.
+// N's own plan. No new healing logic exists anywhere in this mechanism, and nothing here
+// changes what Rule N decides: this reads a value the planner already computes.
 //
-//	Complete ⟺ planStaleMasterNames reports Converged: every Sentinel monitors exactly
-//	           the desired name and nothing else, which IS the rename's desired state.
-//	Blocked  ⟺ Deferred or Foreign: a gate refuses. Never auto-skipped — head-of-line
-//	           blocking here is correct, and a capture (Foreign) is precisely the state
-//	           in which a rename must not be allowed to look like progress.
-//	neither  ⟸ Pruning: the driver is doing its work this pass.
-func operationDriverReport(staleReason string) (done, blocked bool) {
-	switch staleReason {
+//	Complete ⟺ Converged: every Sentinel monitors exactly the desired name and nothing
+//	           else, which IS the rename's desired state.
+//	Blocked  ⟸ Foreign — a capture is in evidence and ADR-016 owns the instance — and
+//	           every Deferred gate EXCEPT G6. Never auto-skipped: head-of-line blocking
+//	           here is correct.
+//	neither  ⟸ Pruning (work in flight) and Deferred by G6.
+//
+// G6 is the carve-out and it is not a convenience. "No Sentinel carries the desired name
+// yet; Rule 0 registers it next pass" is discharged by the operator's own next pass, by
+// design — so it is PROGRESS, and it fires on the first pass of every ordinary rename
+// (measured on t3e: one Warning per rename, on the happy path, before this). A check that
+// cries wolf on the happy path is a check nobody reads, and ADR-020's whole loud-condition
+// story rests on Blocked meaning something. This is ADR-017's rule verbatim: a cluster pod
+// that is attached but link-down is mid-full-sync, hence genuine progress, and
+// ClusterRolloutBlocked is deliberately never raised for it.
+//
+// G1-G5 stay Blocked. Each names a state that persists until something OUTSIDE this rule
+// changes — an empty desired name, no living master of ours, a failover in flight, a lost
+// quorum, an address we cannot attribute — which is exactly what Blocked is for.
+func operationDriverReport(plan StaleMasterNamePlan) (done, blocked bool) {
+	switch plan.Reason {
 	case staleNamesConverged:
 		return true, false
-	case staleNamesDeferred, staleNamesForeign:
+	case staleNamesForeign:
 		return false, true
+	case staleNamesDeferred:
+		return false, plan.Gate != staleGateRule0Pending
 	default:
+		// Pruning, and anything a future contributor adds: work in flight, or a verdict
+		// nobody has taught this function about. Neither may read as Complete —
+		// acknowledging on a value nobody defined is the acknowledge-on-sight failure by
+		// another route.
 		return false, false
 	}
 }
