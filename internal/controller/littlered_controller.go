@@ -1209,7 +1209,8 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	if err != nil {
 		auditLog.Error(err, "failed to record the declared heavy operation")
 	}
-	operationRunning := opPlan.Run != ""
+	operationRunning := false // EXPERIMENT 2: report only, gate nothing
+	_ = opPlan.Run
 	if operationRunning {
 		log.Info("A declared heavy operation is in progress. Rescue actions stand down; "+
 			"convergence continues.",
