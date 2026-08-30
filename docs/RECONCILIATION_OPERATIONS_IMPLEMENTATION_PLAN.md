@@ -130,7 +130,6 @@ type fingerprintInput struct {
 type heavyOperation struct {
     Name       string   // stable identity; appears in status, conditions, events, lrctl
     Modes      []string // spec.mode values this applies to
-    Precedence int      // static; lower runs first. See precedenceRationale below.
     Citation   string   // admission-test clause B. Non-empty, asserted by test.
     StallAfter time.Duration
 
@@ -153,28 +152,26 @@ type heavyOperation struct {
 
 **v1 contents — exactly one entry:**
 
-| Name | Field | Modes | Precedence | Citation | StallAfter |
+| Name | Field | Modes | Citation | StallAfter |
 |---|---|---|---|---|---|
-| `SentinelMasterNameRename` | `spec.sentinel.masterName` | `sentinel` | 100 | `LR-050: measured 42.5s in which planForsaken read our own rename churn as a capture` | 15m |
+| `SentinelMasterNameRename` | `spec.sentinel.masterName` | `sentinel` | `LR-050: measured 42.5s in which planForsaken read our own rename churn as a capture` | 15m |
 
 `StallAfter` = 15m against a measured settle of **176.8s** (ADR-018's verification) plus ~30s at
 the master edge — roughly 4× the measured window, deliberately generous, because the failure
 direction of a too-tight stall signal is a false alarm on a slow cluster.
 
-**Precedence is asserted per pair, not derived [settles §8.10].** With one entry the order is
-vacuous; the *rule* is not. When a second entry is added, a `precedenceRationale` map keyed by the
-ordered pair must gain an entry, and a unit test fails if any registered pair lacks one. The
-concept's own worked pairs show why no total order is derivable: §7.3's remedy order is
-capture → quarantine → rename, while the auth/rename EmptyDir interaction points the other way
-(enabling auth rolls the Sentinel StatefulSet and wipes the EmptyDir the rename otherwise needs
-cleared). **Do not** try to compute the order from the fields; assert it and justify it in prose.
+**There is no precedence field and no precedence table (ADR-020, Alternatives E and F).** Order
+comes from three places instead: a running operation orders anything sequential (`status.operation`
+is the record); simultaneous CR-resident heavy changes are refused at **admission** by a CEL
+transition rule, so no order has to be invented; and what admission cannot see — a Secret-driven
+intent such as rotation — contributes at most one counterpart, leaving a single known pair with a
+documented order (the auth design's N9).
 
-**The rename × auth pair already has its justification written**, before D4 existed: the auth
-design's **N9** refuses to run the two in one window because *"both operations roll the same
-StatefulSets and both interact with the LR-050 attribution gate"*. That is the citation the
-`precedenceRationale` entry must carry when auth is admitted — and note what it is evidence of:
-the project has been writing D4's requirement as unenforceable runbook prose for two designs
-running. Serialization is what turns it into a mechanism.
+**The admission rule is a deliverable of this plan** and is already verified live (ADR-020,
+Verification). It is a spec-level `+kubebuilder:validation:XValidation` transition rule, one term per
+CR-resident heavy field, `has()`-guarded for optional parents; it does not fire on create.
+**Watch the coupling:** the registry is Go, the rule is CRD — generate the terms from the registry or
+assert their agreement in a test, or the two will drift and admission will disagree with reconcile.
 
 **A driver** is the code that carries one operation out. For v1 it is the code that already
 exists: **Rule 0 (bare-Sentinel re-registration) + Rule N (`reconcileStaleMasterNames`)**. The
@@ -244,7 +241,6 @@ These are R1/R3/D3 as concrete instructions. Put them in the ADR and in the code
 ```go
 type operationCandidate struct {
     Name        string
-    Precedence  int
     Fingerprint string
     StallAfter  time.Duration
 }
@@ -254,7 +250,11 @@ type operationInput struct {
     Acks        map[string]string    // name -> acknowledged fingerprint
     Quarantined bool                 // status.quarantinedSince != nil
     Bootstrapping bool               // status.phase == "" || status.bootstrapRequired
-    FirstObservation bool            // len(Acks) == 0 && !Bootstrapping  (operator upgrade)
+    // NOTE: deliberately no whole-list "first observation" flag. Seeding is decided
+    // PER CANDIDATE (row 3): a candidate with no ack row on an initialized instance is
+    // seeded, never run. Keying it on len(Acks)==0 is a whole-list heuristic doing a
+    // per-row job — correct for a one-entry registry, and it silently re-runs a
+    // completed operation as soon as there are two.
     Settled     bool                 // ALL of this instance's own StatefulSets are settled
     DriverDone  bool                 // the running driver reported Complete this pass
     DriverBlocked bool               // ... reported Blocked
@@ -279,10 +279,10 @@ func planOperation(in operationInput) operationPlan
 |---|---|---|---|---|
 | 1 | `Quarantined` | `""` | none | `Quarantined` |
 | 2 | `Bootstrapping` | `""` | **all candidates** | `Seeded` |
-| 3 | `FirstObservation` (existing instance, operator just upgraded) | `""` | **all candidates** | `Seeded` |
+| 3 | any candidate with **no ack row**, on an already-initialized instance | `""` | **those candidates** | `Seeded` |
 | 4 | no candidate's fingerprint differs from its ack | `""` | none | `Converged` |
 | 5 | exactly one differs | that one | none | `Running` |
-| 6 | two or more differ | lowest `Precedence` | none | `Running` (rest in `Pending`) |
+| 6 | two or more differ (only the CR+Secret pair is reachable — see §3) | the CR-resident one | none | `Running` (rest in `Pending`) |
 | 7 | running, `DriverDone`, **`!Settled`** | the same one | **none** | `Running` — the transition guard |
 | 8 | running, `DriverDone`, `Settled` | next pending or `""` | **that one** | `Running`/`Converged` |
 | 9 | running, `DriverBlocked` | the same one | none | `Blocked` — **never auto-skip** |
@@ -293,6 +293,13 @@ a rename it never asked for (the spec value differs from a nonexistent ack), and
 **every instance in an existing fleet declares one the moment the operator is upgraded.** Seeding
 writes the ack without running anything, which is the correct reading of *"this instance is
 already in the state its spec asks for."*
+
+Row 3 is **per candidate**, not per instance, and that is the whole of it: the fleet-upgrade case is
+then the special case where every candidate is missing, rather than a second rule. It also makes a
+missing row harmless — re-seeded, never re-run — which is why the ack list needs no expiry and an
+age-based GC would be a defect rather than hygiene. The list is bounded by the registry anyway: one
+row per operation *name*, updated in place. The only real accumulation is a row whose operation has
+been **de-registered**, which is a registry-driven prune, not a timer.
 
 **Row 7 is the transition guard §8.4 asks for.** "The driver is done" is not "the operation is
 over": Rule N converges the moment the Sentinels agree, which can be well before the Redis

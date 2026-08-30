@@ -70,7 +70,9 @@ Concretely:
    restarts.
 3. **A heavy operation runs in an early branch** of the mode's reconcile, after the quarantine
    decision and before regular healing, with a short enumerated list of what still runs.
-4. **Heavy operations serialize**, in a static precedence order asserted per pair.
+4. **Heavy operations serialize.** Order comes from the operation already running; simultaneous
+   CR-resident heavy changes are refused at **admission** by a CEL transition rule, so no order has
+   to be invented. There is no precedence table.
 5. **The acknowledgment is never an operational input.** It answers *was this asked for?* and
    nothing else reads it.
 6. **No global gate and no waiver knob.** If an operation is safe enough not to need a window it
@@ -78,7 +80,8 @@ Concretely:
 7. **The invariant guards stay, unchanged and unreferenced by the operation set.**
 
 **Registry v1 has exactly one member:** `SentinelMasterNameRename` (`spec.sentinel.masterName`,
-sentinel mode, precedence 100, `StallAfter` 15m, citation *LR-050*). Auth joins by adding a row.
+sentinel mode, `StallAfter` 15m, citation *LR-050*). Auth joins by adding a row — and, for its
+CR-resident fields, a term in the admission rule.
 
 The pure decision is `planOperation`, a ten-row table. The full table, the storage shapes and the
 milestone breakdown are in the implementation plan and are not repeated here.
@@ -117,12 +120,29 @@ Three independent reasons, each sufficient.
    fifth operation leaves every invariant provably still correct**, because it never enumerated the
    operations. This holds only if heavy operations do not overlap, which is what serialization buys.
 
-### Intent is a change EVENT, and the acknowledgment happens on completion
+### Intent is a diff over the heavy projection of the SPEC — never over the world
 
-The change is observable exactly once. After it passes, all that remains is a discrepancy, and a
-discrepancy is ambiguous by construction: someone changed the spec, or the world broke, or a capture
-occurred. Deriving intent from drift is the same conflation that produced LR-050, where
-`planForsaken` could not tell our own churn from a captor because both present as drift.
+Stated precisely, intent is
+
+> `diff( heavy(spec_now), heavy(spec_baseline) )`
+
+— a diff of the **heavy projection of the declaration**, and of nothing else. That framing is worth
+more than "a change event", because it says exactly what intent is *not*: the world is not an input.
+`spec` disagreeing with *observed* is **drift**, and drift has many causes — someone changed the
+spec, or the world broke, or a capture occurred. Deriving intent from drift is the same conflation
+that produced LR-050, where `planForsaken` could not tell our own churn from a captor because both
+present as drift.
+
+**The baseline is `spec_last_completed`, not `spec_previous_revision`**, and that single choice is
+what makes the record survive operator death: the question is "is there unfinished work", not "what
+changed most recently".
+
+There is a GitOps reading of this worth stating, because it draws the two mechanisms' boundary in
+storage: detecting that *something heavy changed* needs only the declaration — a `git diff` with
+everything but the heavy fields filtered out, no cluster access at all. Detecting that it is *still
+pending* needs the completion record, which is cluster state and **cannot** live in git, because
+whether work finished is not a property of the declaration. Intent is declarative; completion is
+observed. That is the ADR's whole thesis, appearing again one layer down.
 
 **The bar for telling intent from drift is 100% — no false positive, no false negative.** This is
 *not* a safety bar and must not be read as one. It is what keeps the two mechanisms separate: if
@@ -132,19 +152,25 @@ doing two jobs again.
 Acknowledging on *observation* fails that bar: the operator dies between the write and the action and
 the intent is lost silently — a false negative of exactly the forbidden kind. Acknowledging on
 **completion** means the record says "the work this fingerprint stands for is finished", which is an
-observation of an event and therefore not recomputable. That is the same ground on which
-`LeaderlessSince`, `GhostMasterStuckSince`, `ForsakenSince`, `QuarantinedSince` and
-`QuarantineAttempts` are consistent with ADR-006 while a derived capability flag was not.
+observation of an event and therefore not recomputable — see Alternative A for why that is what makes
+it consistent with ADR-006 rather than an exception to it.
 
-### The fingerprint is an HMAC, and that is structural rather than decorative
+### The fingerprint is a keyed hash, and it serves three purposes
 
-ADR-018 refused to remember the previous master name; Rule N derives what to prune from evidence,
-which is what lets it repair an instance a *previous* botched rename broke. That refusal stands.
+An **HMAC** is a hash computed with a key — here the instance UID — so an attacker holding the digest
+cannot recover the input by hashing candidate values. Three reasons, and the first is the one that
+forced the shape:
 
-A hash **enforces** it: no rule can recover a name from the record, so the refusal cannot be quietly
-walked back by a later contributor who notices a convenient field. The key is the instance UID,
-which matters the moment auth is admitted and the fingerprinted value is a **password** — a bare
-digest of a short secret is a dictionary lookup.
+1. **Never confuse one intent for another.** The obvious alternative is to name an intent by the
+   *field* it changes. That fails: the same field changes repeatedly, so "finished" would match the
+   wrong edit and an operation would be acknowledged that never ran for the value now in `spec`. The
+   fingerprint identifies **which value** completed, not merely which field.
+2. **Never leak the value.** The moment auth is admitted, the fingerprinted value is a **password**.
+   A bare digest of a short secret is a dictionary lookup, so the key is not optional.
+3. **Structurally enforce ADR-018's refusal.** Rule N derives what to prune from evidence — anything
+   that is not the desired name is stale — which is what lets it repair an instance a *previous*
+   botched rename broke. A keyed digest cannot be reversed into a name, so a later contributor
+   cannot quietly start reading the record as "the old name" and walk that refusal back.
 
 ### The admission test, and why clause B is a citation and not a judgement
 
@@ -191,22 +217,53 @@ cooldown already elapsed.
 terminating from the moment of the edit, so Rule A already returns before every suppressed rule. The
 branch makes the existing, accidental suppression explicit, uniform and *reported*.
 
-### Serialization, and why precedence is asserted rather than derived
+### Serialization, without a precedence table
 
 With K heavy operations there are K(K−1)/2 pairs, and not one has ever been analysed. Serializing
-collapses that surface to zero: a pair never occurs, so a pair never needs analysis. It is also what
-makes the arithmetic above sound — "this invariant holds" is proven against one operation at a time,
-and if two overlap the proof does not carry.
+collapses that surface: a pair never runs concurrently, so a pair never needs concurrent analysis. It
+is also what makes the arithmetic above sound — "this invariant holds" is proven against one
+operation at a time, and if two overlap the proof does not carry.
 
-**Serialize, do not refuse.** Two pending intents run one after the other. Refusing and telling the
-human to un-declare one is making them drive the train when they only wrote the timetable.
+An earlier draft answered *"in what order?"* with a static precedence list justified per pair. That
+is rejected. Ordering is not purely a property of the operations' definitions — it can depend on
+context unavailable when the table is written (whether the instance is currently captured, for one) —
+so a table formalizes a decision it is not always in a position to make, and it grows as K².
+**Three mechanisms replace it, and between them the table has nothing left to decide.**
 
-The order is a **static precedence list, justified per pair**, not derived and not arrival order. No
-total order is derivable: the remedy order for a capture is quarantine-then-rename, while the
-auth/rename interaction points the other way. The rename × auth justification is already written, as
-the auth design's **N9** — *both operations roll the same StatefulSets and both interact with the
-LR-050 attribution gate*. That the project has been writing D4's requirement as unenforceable runbook
-prose across two designs is the case for the mechanism.
+**1. A running operation is itself the record of order.** If A is in progress,
+`status.operation.name` is set and a later intent B queues behind it. That is chronological, for
+free, with no timestamps and nothing persisted — and it covers every case where the operator was up
+across the two edits. `metadata.managedFields` was considered as a timestamp source and rejected: a
+single `apply` puts both fields in one fieldset under one timestamp, so it does not answer the case
+that needs answering.
+
+**2. Simultaneous CR-resident heavy changes are refused at ADMISSION, so the ambiguous state is
+unrepresentable.** A CEL transition rule on `spec` permits at most one heavy field to change per
+update. This is deliberately *not* a reconcile-time refusal, and the distinction is the whole point:
+**the operation is not what changes the spec.** Editing `masterName` rewrites the pod template
+immediately and the StatefulSet rolls whether or not Rule N runs, so declining to run a driver holds
+nothing back — it leaves the instance half-changed, which is exactly LR-048's two-names-forever
+state. Refusal has to happen before the spec changes or not at all. It also lands the error at
+`kubectl apply`, which is the best place an error can land, and it makes the auth design's **N9** —
+*do the rename and the auth change in separate windows* — enforceable rather than runbook prose.
+
+Transition rules do not fire on create, so a CR that sets every field at once is unaffected. Scoped
+to updates, verified live (see Verification).
+
+**3. What admission cannot see is exactly one counterpart.** CEL evaluates the CR, and rotation's
+fingerprint is the **Secret's content**, which is not in the CR — so admission structurally cannot
+refuse "rotate and rename in one go". That is a real limit, and counting what survives it is what
+retires the table: at most **one** CR-resident intent can pend (clause 2), rotation contributes at
+most **one** more, and anything sequential is already ordered by clause 1. The orderless residual is
+therefore **a single pair, always the same pair** — one CR intent and one Secret intent — resolved by
+one documented rule rather than a matrix. Its order is already written down (N9), and a second
+Secret-driven operation would be the trigger to revisit this, not a reason to build for it now.
+
+**Serialize, do not refuse — with one correction.** Two *well-formed* pending intents run one after
+the other; refusing those would be making the human drive the train. But a single delta changing two
+heavy fields is not a well-formed timetable, it is a broken one: a train cannot be in two places at
+once. Refusing that is not driving the train, it is declining to invent a schedule the author never
+wrote.
 
 ### Three traps for the implementer
 
@@ -226,10 +283,22 @@ prose across two designs is the case for the mechanism.
 
 Two objections, the second decisive. *Usability:* the human has no intent for "maintenance mode";
 their intent is "the master name should be X" or "auth should be enabled". A second declaration makes
-them drive the train. *Consistency:* five consecutive ADRs say derive from live state and never
-invent persistence — ADR-006 (which rejected persisting a capability as **either** status **or**
+them drive the train.
+
+*Consistency:* ADR-006 (which rejected persisting a capability as **either** status **or**
 annotation), ADR-011, ADR-013, ADR-017 (*"the StatefulSet's own partition field is the cursor"*) and
-ADR-018 (*"no 'from' name, no phase, no cursor"*).
+ADR-018 (*"no 'from' name, no phase, no cursor"*) each declined to persist something.
+
+**The principle those five support is narrower than "never persist", and stating it broadly would
+make this ADR self-refuting, since it introduces persistence.** What they establish is ADR-006's
+actual rule: **do not persist what is recomputable.** In all five the value could be re-derived from
+live state, so persisting it created a second source of truth that could disagree with the first — a
+capability, a phase, a cursor. `acknowledgedOperations` is consistent with that rule rather than an
+exception to it, because "this work finished" is an observation of an event at a point in time and is
+**not** recomputable from live state — the same ground on which `LeaderlessSince`,
+`GhostMasterStuckSince`, `ForsakenSince`, `QuarantinedSince` and `QuarantineAttempts` already sit.
+Five cases where persistence was unnecessary do not establish that it is never necessary, and the
+sixth case is this one.
 
 ### B. Pure derivation from drift — rejected
 
@@ -250,12 +319,37 @@ and it cannot serialize. Worth wiring on its own merits; it is not this mechanis
 positive is still a false positive, and the whole value of the separation is that intent detection is
 never approximate.
 
-### E. A second reconcile loop for maintenance — rejected
+### E. A static precedence table for concurrent heavy operations — rejected
+
+The first draft of this ADR. Rejected for three reasons, in increasing weight. It is K² documentation
+for a K-entry data structure. Ordering is not purely a property of the operations' definitions — it
+can depend on context unavailable when the table is written — so the table formalizes a decision it
+is not always in a position to make. And, decisively, it is **unnecessary**: admission refusal caps
+CR-resident intents at one, a running operation orders anything sequential, and the residual is a
+single known pair. A table would have been machinery built for a combinatorial problem the design
+does not actually have.
+
+Kept as the fallback if a second Secret-driven operation ever appears, since that is the one
+direction admission cannot constrain.
+
+### F. Chronological ordering from observed arrival — rejected
+
+The intuitive answer, and it fails twice. **Order is frequently undefined:** in a GitOps flow two
+heavy fields usually change in one commit and one apply, and `managedFields` then carries a single
+timestamp for both. **And where order matters most, chronology is wrong:** operations that do not
+commute — enabling auth and rotating a password, say — have a safe order that is a property of the
+*operations*, not of the sequence someone happened to type. Honouring the typed order would execute
+the impossible one first. Chronology captures intent about *what*, never about *how*.
+
+What survives from it is real and is adopted: when the operator *did* observe the edits sequentially,
+the running operation already encodes that order at no cost.
+
+### G. A second reconcile loop for maintenance — rejected
 
 Two loops means two places that must know the same things, and they drift. The existing
 quarantine/`Forsaken` shape is the model: read the state early, take a different branch.
 
-### F. A global gate or a blanket `allowUnsafeOperation` — rejected
+### H. A global gate or a blanket `allowUnsafeOperation` — rejected
 
 D7. Where a waiver is genuinely unavoidable the shape already exists and is narrow:
 `sentinel.allowUnsafeRebootstrapOnDeadlock`, one specific unsafe path, not a mode. Registry v1 ships
@@ -285,9 +379,27 @@ project has twice written as runbook prose becomes enforceable. Rotation becomes
   detection strategy. Any withholding this mechanism performs must say that it withheld.
 - **The registry is an API surface.** Adding a field changes behaviour, so it is versioned and
   documented, and the citation field is enforced by test.
-- **Two plan rows carry more weight than their size suggests**, and both are upgrade-safety: seeding
-  the acknowledgment for a bootstrapping instance and for an existing fleet on first observation.
-  Without them, every instance in a fleet declares an operation the moment the operator is upgraded.
+- **The registry and the admission rule can drift**, and this is the new coupling to watch: the
+  registry lives in Go, the CEL rule in the CRD. A heavy field added to one and not the other means
+  admission and reconcile silently disagree. Mitigate by generating the rule's terms from the
+  registry, or failing that by a test that asserts the two agree — but record it as a maintenance
+  cost rather than pretending it is free.
+- **Admission cannot see anything outside the CR.** Rotation's fingerprint is the Secret's content,
+  so a batched rotate-plus-rename is not refusable at apply time. This is bounded rather than open
+  (see Rationale: it leaves exactly one pair), but it is a genuine asymmetry between CR-resident and
+  externally-resident heavy state, and a second Secret-driven operation is the trigger to revisit.
+- **Seeding carries more weight than its size suggests, and it must be PER CANDIDATE.** An
+  already-initialized instance with no ack row for a candidate is *seeded*, never run. Keying this on
+  "the whole ack list is empty" — the first draft — is a whole-list heuristic doing a per-row job, so
+  it works for a one-entry registry and silently re-runs a completed operation as soon as there are
+  two. Per-candidate seeding makes the fleet-upgrade case fall out as the special case where every
+  candidate is missing, instead of being its own rule. Without it, every instance in a fleet declares
+  an operation the moment the operator is upgraded.
+- **The ack list is bounded by the registry, not by time** — one row per operation *name*, updated in
+  place. It needs no expiry, and an age-based one would be a defect rather than hygiene: with
+  per-candidate seeding an expired row is merely re-seeded, and without it the row's absence reads as
+  pending and re-runs finished work. The only real accumulation is a row whose operation has been
+  *de-registered*, which is a registry-driven prune and not a timer.
 
 **Neutral.** Retrofitting the rename changes little at runtime — Rule A already returns before every
 suppressed rule during a rename — so the delta is reporting, not suppression. That is deliberate: it
@@ -320,6 +432,23 @@ ones:
 | e2e | operator killed **mid-rename** resumes and completes | red against acknowledge-on-observation — D1's claim, end to end |
 | e2e | a **non-heavy** field edit declares nothing and suppresses nothing | red against the rejected generation-only mechanism |
 | e2e | operator upgrade over an existing fleet declares **nothing** | red against a build missing the seeding row |
+| CRD | the admission rule permits a create with every field set, permits a one-heavy-field update, and **refuses** a two-heavy-field update | red before the rule exists |
+
+**The admission rule is already verified live** (t3e, 2026-08-30, throwaway CRD in a separate group,
+deleted afterwards and confirmed). A first attempt with a synthetic create-guard failed to compile
+(`undefined field`), which is the useful part: a transition rule needs no create-guard, because it
+does not fire on create. The working form, with `has()` guards for the optional parents:
+
+```
+( (has(self.sentinel) && has(oldSelf.sentinel) &&
+   self.sentinel.masterName != oldSelf.sentinel.masterName ? 1 : 0)
++ (has(self.auth) && has(oldSelf.auth) &&
+   self.auth.enabled != oldSelf.auth.enabled ? 1 : 0) ) <= 1
+```
+
+Observed: create with everything set — **accepted**; update of one heavy field — **accepted**;
+update of two — **refused** with the rule's message. The project already carries three spec-level
+`XValidation` rules, so this is an established surface rather than a new one.
 
 ## References
 
