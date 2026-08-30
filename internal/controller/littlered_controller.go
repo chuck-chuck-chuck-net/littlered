@@ -516,9 +516,25 @@ func (r *LittleRedReconciler) deleteIfExists(ctx context.Context, littleRed *lit
 // Only sentinel mode can ever be Forsaken today, but the predicate is written against
 // the generic (phase, conditions) shape so every future mode-specific status path is
 // safe by construction rather than by omission.
+// A declared heavy operation (ADR-020) is the second exception, and it pulls the other
+// way: while one is RUNNING the operator has suppressed the instance's regular healing,
+// so it must see the operation finish promptly — every steady interval it waits is an
+// extra interval of suppression, and the acknowledgment that ends it can only be written
+// on a pass. That is why this clause outranks the phase check: an instance mid-operation
+// is frequently Running (its pods are healthy between rollout waves) and would otherwise
+// be polled at the steady cadence for the whole window.
+//
+// It is deliberately narrow — only Running. A Blocked, Stalled or Quarantined operation
+// is permanent until a human acts (there is no auto-exit timer, ADR-017), so polling it
+// fast forever buys nothing but log noise: LR-042's lesson, in the same shape as
+// Forsaken above.
 func requeueAfterNotRunning(
 	phase littleredv1alpha1.LittleRedPhase, conditions []metav1.Condition, fast, steady time.Duration,
 ) time.Duration {
+	if c := meta.FindStatusCondition(conditions, littleredv1alpha1.ConditionOperationInProgress); c != nil &&
+		c.Status == metav1.ConditionTrue && c.Reason == operationReasonRunning {
+		return fast
+	}
 	if phase == littleredv1alpha1.PhaseRunning {
 		return steady
 	}
@@ -1007,11 +1023,28 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		Now:              now,
 	})
 
+	// 2d. Declared heavy operations (ADR-020).
+	//
+	// The input is assembled here — after the quarantine DECISION and before any healing
+	// — because that is where the two branches part: a quarantined instance reports its
+	// held operation (row 1) and returns, while every other instance runs the driver
+	// first, since the driver's completion is an INPUT to the decision (rows 7-10)
+	// rather than an output of it, and takes the branch below Rule N.
+	//
+	// Settledness spans BOTH of this instance's StatefulSets and is read uncached. It is
+	// deliberately NOT LR-050's `rolling` gate above: that one names a fact about our own
+	// churn and therefore also covers the image bump, the drain and the eviction that
+	// nobody declares. Unifying the two is the exact mistake ADR-020 exists to prevent
+	// (its trap 1), and it is tempting precisely because during a rename they fire
+	// together.
+	opInput := buildOperationInput(littleRed, r.instanceStatefulSetsSettled(ctx, littleRed), now)
+
 	switch {
 	case qPlan.ScaleToZero:
 		// Quarantine in force — armed this pass, settling, or latched. Stop managing:
 		// with the pods gone there is nothing to heal, and the desired replica count
 		// is computed from the marker this records.
+		//
 		prevReason := ""
 		if c := meta.FindStatusCondition(littleRed.Status.Conditions,
 			littleredv1alpha1.ConditionForsaken); c != nil {
@@ -1027,6 +1060,16 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 				"Sentinel deployment sharing its master name. Halting management.",
 				"foreign_master", forsakenPlan.ForeignMaster, "quarantine", string(qPlan.Phase),
 				"attempt", qPlan.NextAttempts, "attempt_limit", qPlan.AttemptLimit)
+		}
+		// A declared heavy operation is HELD here and still REPORTED (ADR-020 row 1): a
+		// replicas:0 StatefulSet reads SETTLED, so an operation allowed to proceed would
+		// acknowledge work no pod ever executed — and a change held invisibly is exactly
+		// what LR-054 says this mechanism must never do. Quarantined is taken from the
+		// quarantine plan rather than from the marker, because on the ARMING pass the
+		// marker is written by setForsaken above and the input was built before it.
+		opInput.Quarantined = true
+		if _, err := r.reconcileOperation(ctx, littleRed, opInput); err != nil {
+			forsakenLog.Error(err, "failed to report the held heavy operation")
 		}
 		return nil
 	case forsakenPlan.Captured:
@@ -1115,9 +1158,43 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// make the gate structurally dead. `Captured` is the reachable — and strictly more
 	// conservative — reading of "a capture is in evidence": while one is, Rule N stands
 	// down entirely and ADR-016 owns the instance.
-	if err := r.reconcileStaleMasterNames(ctx, littleRed, state, sentinelMasterName,
-		sentinelQuorum(littleRed), password, forsakenPlan.Captured, rolling); err != nil {
+	staleReason, err := r.reconcileStaleMasterNames(ctx, littleRed, state, sentinelMasterName,
+		sentinelQuorum(littleRed), password, forsakenPlan.Captured, rolling)
+	if err != nil {
 		auditLog.Error(err, "failed to reconcile stale Sentinel master names")
+	}
+
+	// The declared-operation branch (ADR-020). Everything above it is what an operation
+	// deliberately does NOT suppress — every resource apply (they are what DRIVE the
+	// operation), the quarantine decision, the gather, Rule 0 (Rule N's G6 depends on it
+	// in the same pass), the role:master label (writer routing; suppressing it strands
+	// writes on a dead pod) and the whole status/condition/event surface, because the
+	// instance must not go dark exactly when someone is watching it hardest.
+	//
+	// Rule 0 and Rule N together ARE registry v1's driver: no new healing logic exists
+	// anywhere in this mechanism, and the driver's verdict is Rule N's own reason.
+	//
+	// What it suppresses is precisely Rule A's set, reached one gate earlier: Rule D, the
+	// LR-005/LR-008 ghost-master correction, Rule R, Rule L and the LR-024 recovery. And
+	// for Rule L and LR-024 that is a HOLD, not a skip — status.leaderlessSince and
+	// status.ghostMasterStuckSince are stamped by those rules themselves and are never
+	// cleared on this path, so the moment the operation completes the recovery fires with
+	// its cooldown already elapsed (LR-038: the timer never resets on a veto).
+	//
+	// The delta against today's behaviour is close to nil, deliberately: during a rename
+	// a pod is terminating from the moment of the edit, so Rule A already returned before
+	// every one of those rules. What this adds is that the suppression is explicit,
+	// uniform and REPORTED.
+	opDone, opBlocked := operationDriverReport(staleReason)
+	opInput.DriverDone, opInput.DriverBlocked = opDone, opBlocked
+	opPlan, err := r.reconcileOperation(ctx, littleRed, opInput)
+	if err != nil {
+		auditLog.Error(err, "failed to record the declared heavy operation")
+	}
+	if opPlan.Run != "" {
+		log.Info("A declared heavy operation is in progress. Suppressing regular healing.",
+			"operation", opPlan.Run, "reason", opPlan.Reason, "pending", opPlan.Pending)
+		return nil
 	}
 
 	// Rule A: Guardrails
@@ -1745,7 +1822,13 @@ func (r *LittleRedReconciler) updateSentinelStatus(ctx context.Context, lr *litt
 		return ctrl.Result{}, nil
 	}
 
-	return ctrl.Result{RequeueAfter: steady}, nil
+	// A Running instance normally polls at the steady cadence — but not while a declared
+	// heavy operation is running, because its healing is suppressed until that operation
+	// is acknowledged and the acknowledgment can only be written on a pass (ADR-020).
+	// Routed through the same shared predicate rather than re-deciding here: a duplicated
+	// cadence predicate is literally how LR-045 happened.
+	return ctrl.Result{RequeueAfter: requeueAfterNotRunning(
+		latest.Status.Phase, latest.Status.Conditions, fast, steady)}, nil
 }
 
 // setFailedStatus sets the LittleRed status to Failed
@@ -2454,10 +2537,16 @@ func planStaleMasterNameReport(plan StaleMasterNamePlan) staleNameReport {
 // a Sentinel monitors that is not the desired name is stale by definition, which is also
 // why this repairs an instance a PREVIOUS botched rename (or a hand-issued MONITOR)
 // already broke (R4).
+//
+// It returns the plan's reason as well as its error, because Rule N is the DRIVER of
+// ADR-020's one registered heavy operation and its verdict is that operation's progress
+// report: Converged is Complete, Deferred and Foreign are Blocked, Pruning is in flight.
+// Nothing about Rule N's own behaviour depends on that — it is a value the caller reads,
+// not a gate the rule gained.
 func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState,
 	desired string, quorum int, password string, forsaken, rolling bool,
-) error {
+) (string, error) {
 	plan := planStaleMasterNames(state, desired, quorum, forsaken, rolling)
 	audit := r.getLogger(ctx, lr, LogCategoryAudit)
 
@@ -2471,7 +2560,7 @@ func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	}
 	plan.Message = msg
 
-	return r.setStaleMasterNameCondition(ctx, lr, planStaleMasterNameReport(plan))
+	return plan.Reason, r.setStaleMasterNameCondition(ctx, lr, planStaleMasterNameReport(plan))
 }
 
 // executeStaleMasterNamePrune issues the REMOVEs the plan asks for and returns the pods
