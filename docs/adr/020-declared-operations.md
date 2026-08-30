@@ -261,7 +261,22 @@ CR intent and one Secret intent.
 
 That pair does not need a rule invented for it, because its order is a **fact about one of the
 operations**: rotation requires auth to be on. So the registry entry carries a `Requires` edge —
-`PasswordRotation` requires `AuthEnablement` to be **complete** — and the ordering falls out of it.
+`PasswordRotation` requires `AuthEnablement` — and the ordering falls out of it.
+
+**`Requires X` means "X is not pending", NOT "X has run", and the difference is the whole of it.**
+The event reading deadlocks the common case: an instance created with `auth.enabled: true` never
+performs an enablement, so a rotation would wait forever for something that will never happen. Under
+the state reading every case is right — auth on since creation is seeded at bootstrap and therefore
+not pending; auth on before the operator upgrade is seeded per candidate (table row 3) and likewise;
+auth being enabled *now* is pending, so rotation waits, correctly; and with auth off, rotation's
+`Applies` is false and there is no candidate at all. The seeding rows are what make the dependency
+work, which is the second job they do beyond upgrade-safety.
+
+Note the deliberate asymmetry, because it is the same distinction twice and in opposite directions:
+completion is **recorded as an event** (whether work finished is not recomputable from live state),
+and dependencies are **evaluated as state** (whether an operation ever ran is the wrong question).
+A `Requires` that is genuinely blocked *does* hold its dependants, which is ordinary head-of-line
+blocking and correct — rotating through a half-applied enablement is exactly what it should prevent.
 
 **A dependency is a better primitive than a precedence number, for exactly the reason the table was
 rejected.** A precedence integer demands knowledge the author does not have: where does this
@@ -274,7 +289,7 @@ It also degrades correctly in every direction:
 - **Rename × rotation** — no edge. They commute in the sense that matters (either order works), and
   serialization already prevents concurrency, so an arbitrary-but-deterministic tiebreak suffices.
   "Arbitrary is fine" is what commuting *means*.
-- **Auth-enable × rotation** — one edge, stating the fact.
+- **Auth-enable × rotation** — one edge, stating the fact; inert whenever auth was already on.
 - **Auth-disable × rotation** — resolves itself: rotation's `Applies` is "auth is on", so once
   disabled it is not a candidate and there is no pair to order.
 - **A genuine cycle** — A requires B requires C requires A — is **detectable**, where precedence
