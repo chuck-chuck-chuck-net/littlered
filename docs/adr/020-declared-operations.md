@@ -71,8 +71,9 @@ Concretely:
 3. **A heavy operation runs in an early branch** of the mode's reconcile, after the quarantine
    decision and before regular healing, with a short enumerated list of what still runs.
 4. **Heavy operations serialize.** Order comes from the operation already running; simultaneous
-   CR-resident heavy changes are refused at **admission** by a CEL transition rule, so no order has
-   to be invented. There is no precedence table.
+   CR-resident heavy changes are refused at **admission** by a CEL transition rule; and the one pair
+   admission cannot see carries a declared `Requires` dependency. There is no precedence table, and
+   nothing encodes "A before B because I said so".
 5. **The acknowledgment is never an operational input.** It answers *was this asked for?* and
    nothing else reads it.
 6. **No global gate and no waiver knob.** If an operation is safe enough not to need a window it
@@ -250,14 +251,44 @@ state. Refusal has to happen before the spec changes or not at all. It also land
 Transition rules do not fire on create, so a CR that sets every field at once is unaffected. Scoped
 to updates, verified live (see Verification).
 
-**3. What admission cannot see is exactly one counterpart.** CEL evaluates the CR, and rotation's
-fingerprint is the **Secret's content**, which is not in the CR — so admission structurally cannot
-refuse "rotate and rename in one go". That is a real limit, and counting what survives it is what
-retires the table: at most **one** CR-resident intent can pend (clause 2), rotation contributes at
-most **one** more, and anything sequential is already ordered by clause 1. The orderless residual is
-therefore **a single pair, always the same pair** — one CR intent and one Secret intent — resolved by
-one documented rule rather than a matrix. Its order is already written down (N9), and a second
-Secret-driven operation would be the trigger to revisit this, not a reason to build for it now.
+**3. What admission cannot see is exactly one counterpart, and it is resolved by a DEPENDENCY rather
+than by a rule.** CEL evaluates the CR, and rotation's fingerprint is the **Secret's content**, which
+is not in the CR — so admission structurally cannot refuse "rotate and rename in one go". That is a
+real limit, and counting what survives it is what retires the table: at most **one** CR-resident
+intent can pend (clause 2), rotation contributes at most **one** more, and anything sequential is
+already ordered by clause 1. The orderless residual is **a single pair, always the same pair** — one
+CR intent and one Secret intent.
+
+That pair does not need a rule invented for it, because its order is a **fact about one of the
+operations**: rotation requires auth to be on. So the registry entry carries a `Requires` edge —
+`PasswordRotation` requires `AuthEnablement` to be **complete** — and the ordering falls out of it.
+
+**A dependency is a better primitive than a precedence number, for exactly the reason the table was
+rejected.** A precedence integer demands knowledge the author does not have: where does this
+operation sit relative to every operation anyone will ever add? A dependency demands only what the
+author *does* have: what must be true for my own operation to make sense. It is local knowledge,
+available at authoring time, which is precisely what the table was missing.
+
+It also degrades correctly in every direction:
+
+- **Rename × rotation** — no edge. They commute in the sense that matters (either order works), and
+  serialization already prevents concurrency, so an arbitrary-but-deterministic tiebreak suffices.
+  "Arbitrary is fine" is what commuting *means*.
+- **Auth-enable × rotation** — one edge, stating the fact.
+- **Auth-disable × rotation** — resolves itself: rotation's `Applies` is "auth is on", so once
+  disabled it is not a candidate and there is no pair to order.
+- **A genuine cycle** — A requires B requires C requires A — is **detectable**, where precedence
+  integers accepted it silently by being unable to express it. That is the honest place for refusal:
+  not "two things changed at once", but "you have declared something unorderable."
+
+The edge is an **explicit `Requires` field**, not an implicit precondition folded into `Applies`.
+The two are equivalent in effect; they are not equivalent in maintainability. Hiding an ordering
+constraint inside a predicate that reads like a mode filter is how it gets deleted in a refactor by
+someone who never knew what it was holding.
+
+**The net result is that nothing in this design encodes "A before B because I said so."** Sequential
+edits are ordered by the operation already running; simultaneous CR edits are unrepresentable; the
+one remaining pair carries a dependency that states a fact about itself.
 
 **Serialize, do not refuse — with one correction.** Two *well-formed* pending intents run one after
 the other; refusing those would be making the human drive the train. But a single delta changing two
@@ -319,18 +350,19 @@ and it cannot serialize. Worth wiring on its own merits; it is not this mechanis
 positive is still a false positive, and the whole value of the separation is that intent detection is
 never approximate.
 
-### E. A static precedence table for concurrent heavy operations — rejected
+### E. A static precedence table for concurrent heavy operations — rejected, and replaced
 
 The first draft of this ADR. Rejected for three reasons, in increasing weight. It is K² documentation
-for a K-entry data structure. Ordering is not purely a property of the operations' definitions — it
-can depend on context unavailable when the table is written — so the table formalizes a decision it
-is not always in a position to make. And, decisively, it is **unnecessary**: admission refusal caps
+for a K-entry data structure. **Ordering is not purely a property of the operations' definitions** —
+it can depend on context unavailable when the table is written — so the table formalizes a decision
+it is not always in a position to make. And, decisively, it is unnecessary: admission refusal caps
 CR-resident intents at one, a running operation orders anything sequential, and the residual is a
-single known pair. A table would have been machinery built for a combinatorial problem the design
-does not actually have.
+single known pair.
 
-Kept as the fallback if a second Secret-driven operation ever appears, since that is the one
-direction admission cannot constrain.
+It is **replaced rather than merely deleted**, which matters if a second Secret-driven operation ever
+appears: `Requires` edges form a DAG, each declared from the authoring operation's own preconditions.
+That scales in the direction precedence did not — a new entry states what it needs, never where it
+ranks — and a cycle is an error rather than a silently-accepted ordering.
 
 ### F. Chronological ordering from observed arrival — rejected
 

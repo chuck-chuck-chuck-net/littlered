@@ -131,6 +131,11 @@ type heavyOperation struct {
     Name       string   // stable identity; appears in status, conditions, events, lrctl
     Modes      []string // spec.mode values this applies to
     Citation   string   // admission-test clause B. Non-empty, asserted by test.
+    // Requires names operations that must be COMPLETE before this one may run — a
+    // fact about this operation's own preconditions (rotation requires auth to be
+    // on), never a ranking against other entries. Edges form a DAG; a cycle is an
+    // error, not an ordering. Empty for operations that commute.
+    Requires   []string
     StallAfter time.Duration
 
     // Fingerprint is PURE. It never dials anything and never reads the cluster:
@@ -164,8 +169,10 @@ direction of a too-tight stall signal is a false alarm on a slow cluster.
 comes from three places instead: a running operation orders anything sequential (`status.operation`
 is the record); simultaneous CR-resident heavy changes are refused at **admission** by a CEL
 transition rule, so no order has to be invented; and what admission cannot see — a Secret-driven
-intent such as rotation — contributes at most one counterpart, leaving a single known pair with a
-documented order (the auth design's N9).
+intent such as rotation — contributes at most one counterpart, and that pair is ordered by a declared
+`Requires` edge rather than by a rule (`PasswordRotation` requires `AuthEnablement` complete, because
+rotation presupposes auth is on). Nothing encodes "A before B because I said so"; a cycle in the
+edges is an error rather than a silently-accepted order.
 
 **The admission rule is a deliverable of this plan** and is already verified live (ADR-020,
 Verification). It is a spec-level `+kubebuilder:validation:XValidation` transition rule, one term per
