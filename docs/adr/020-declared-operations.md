@@ -210,9 +210,14 @@ discovered case by case:
 Suppressed: Rule D, the LR-005/LR-008 ghost-master correction, Rule R, Rule L, and the LR-024
 recovery — precisely Rule A's set, reached one gate earlier.
 
-**Suppressing Rule L and LR-024 is a HOLD, not a skip.** Their markers keep accruing (LR-038: *the
-timer never resets on a veto*), so the instant the operation completes the recovery fires with its
-cooldown already elapsed.
+**Suppressing Rule L and LR-024 is a HOLD, not a skip — stated precisely, because the first draft
+overclaimed it.** A clock that has *already started* is **never reset** by the suppression (LR-038:
+*the timer never resets on a veto*), so the instant the operation completes, a recovery whose
+cooldown had begun fires with that cooldown already elapsed. A clock that would have *started*
+during the operation starts when the operation ends, because `setLeaderlessSince` and
+`setGhostMasterStuckSince` are called from inside the rules being suppressed. That is Rule A's
+existing behaviour verbatim — a zero delta, not a regression — but "the markers keep accruing" was
+the stronger claim and it is not the one delivered.
 
 **This is close to a no-op against today's behaviour, deliberately.** During a rename a pod is
 terminating from the moment of the edit, so Rule A already returns before every suppressed rule. The

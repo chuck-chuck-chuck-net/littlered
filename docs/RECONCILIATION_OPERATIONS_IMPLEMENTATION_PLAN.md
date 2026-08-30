@@ -218,7 +218,7 @@ Rule D (ghost-replica `SENTINEL RESET`), the LR-005/LR-008 ghost-master `REMOVE`
 Rule R (straggler `SLAVEOF`), Rule L (leaderless recovery) and the LR-024 ghost-master recovery.
 
 **The suppression of Rule L and LR-024 is a HOLD, not a skip.** `leaderlessSince` and
-`ghostMasterStuckSince` keep accruing while suppressed (LR-038's rule: *the timer never resets on
+`ghostMasterStuckSince` are **never reset** by the suppression (LR-038's rule: *the timer never resets on
 a veto*), so the instant the operation completes the recovery fires with its cooldown already
 elapsed. The `OperationInProgress` message names what is being held.
 
@@ -445,8 +445,12 @@ M2.2 and M2.3 are parallel-safe (disjoint files); both need M2.1's types.
 
 ### Phase 3 — wiring (sentinel mode)
 
-**M3.1** — the early branch in `reconcileSentinelCluster`, placed **after** the quarantine/
-`Forsaken` switch and **before** Rule 0. When `plan.Run != ""`: run Rule 0, run the driver, write
+**M3.1** — the early branch in `reconcileSentinelCluster`. The **input** is assembled after the
+quarantine/`Forsaken` switch; the suppressing `return` sits **immediately before Rule A**, i.e. after
+Rule 0 and Rule N. An earlier draft said "before Rule 0" and that was wrong: `DriverDone` is an
+*input* to rows 7-10, not an output, so the decision cannot precede the driver. Rule 0 and Rule N are
+the only code between those two points and they are exactly ADR-020's survives list, so the
+suppressed set is byte-identical to Rule A's. When `plan.Run != ""`: run Rule 0, run the driver, write
 condition + status + the one-per-transition event, `return nil`. Acknowledgment written via
 `retry.RetryOnConflict` on a re-fetched object (rule §7.1). Owns `littlered_controller.go`.
 
