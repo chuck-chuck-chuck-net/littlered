@@ -481,21 +481,48 @@ ones:
 | e2e | operator upgrade over an existing fleet declares **nothing** | red against a build missing the seeding row |
 | CRD | the admission rule permits a create with every field set, permits a one-heavy-field update, and **refuses** a two-heavy-field update | red before the rule exists |
 
-**The admission rule is already verified live** (t3e, 2026-08-30, throwaway CRD in a separate group,
-deleted afterwards and confirmed). A first attempt with a synthetic create-guard failed to compile
-(`undefined field`), which is the useful part: a transition rule needs no create-guard, because it
-does not fire on create. The working form, with `has()` guards for the optional parents:
+**The admission rule is verified live** (t3e, throwaway CRDs in a separate group, deleted and
+confirmed). Two rounds, and the second corrected the first.
+
+**Round 1 (2026-08-30) established the shape and one useful negative.** A synthetic create-guard
+failed to compile (`undefined field`), which is the point: a transition rule needs no create-guard,
+because it does not fire on create. Observed: create with everything set — **accepted**; one heavy
+field changed — **accepted**; two — **refused** with the rule's message.
+
+**⚠ Round 1's form was nevertheless BROKEN, and the ADR recorded it as verified. Corrected during
+M2.3.** It guarded the optional *parents* (`has(self.sentinel)`) but not the optional **leaf**, and
+`spec.sentinel.masterName` is optional — an instance predating ADR-015 legally omits it, which is
+exactly what `SentinelMasterName()` falls back to `LegacySentinelMasterName` for. Against such an
+object CEL raises `no such key: masterName` and the API server **rejects every update, including to
+an entirely unrelated field**. Reproduced in review:
 
 ```
-( (has(self.sentinel) && has(oldSelf.sentinel) &&
-   self.sentinel.masterName != oldSelf.sentinel.masterName ? 1 : 0)
-+ (has(self.auth) && has(oldSelf.auth) &&
-   self.auth.enabled != oldSelf.auth.enabled ? 1 : 0) ) <= 1
+The AdrForm "noleaf" is invalid: spec: Invalid value: "object":
+  no such key: masterName evaluating rule: ADR-020 as committed (leaf unguarded)
 ```
 
-Observed: create with everything set — **accepted**; update of one heavy field — **accepted**;
-update of two — **refused** with the rule's message. The project already carries three spec-level
-`XValidation` rules, so this is an established surface rather than a new one.
+The round-1 probe never saw it because its fixture always set the leaf. **The verification was real
+but its inputs were not representative, which is the more dangerous kind of green** — the shipped
+rule would have frozen every legacy instance at its next edit.
+
+**The shipped form compares the EFFECTIVE name**, defaulting an absent leaf to the legacy value so
+it mirrors `SentinelMasterName()` exactly:
+
+```
+(has(self.sentinel) && has(oldSelf.sentinel) &&
+ (has(self.sentinel.masterName)    ? self.sentinel.masterName    : 'mymaster') !=
+ (has(oldSelf.sentinel.masterName) ? oldSelf.sentinel.masterName : 'mymaster') ? 1 : 0) <= 1
+```
+
+Re-verified on the same object shape: an unrelated-field update — **accepted**; absent leaf set
+explicitly to `mymaster` — **accepted**, correctly, because the *effective* name did not change;
+and the two-heavy-field refusal is intact. The project already carries three spec-level
+`XValidation` rules, so the surface is established rather than new.
+
+**Generalizable, and it is this ADR's own subject turned on itself:** a guard is only as good as the
+inputs it was exercised against, and an optional field's *absence* is an input. Compare the effective
+value an accessor would return, never the raw one — the rule and the accessor must agree about what
+"unset" means, or they disagree in exactly the population that predates the field.
 
 ## References
 

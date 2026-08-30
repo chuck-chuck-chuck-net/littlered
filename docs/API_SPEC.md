@@ -1269,6 +1269,7 @@ type ConfigSpec struct {
 | `cluster.shards` must be ≥ `3` | Enforced by the CRD schema (minimum 3, default 3) and mirrored in controller validation (`cluster mode requires at least 3 shards`) |
 | `cluster.replicasPerShard` must be `0` or `1` | Currently only 0 or 1 replica per shard supported |
 | `maxmemory` must parse as quantity | Invalid memory format |
+| At most one registered **CR-resident heavy field** may change per update (ADR-020) | Rejected at admission, on `kubectl apply`. A CEL **transition** rule on `spec`: it does not fire on create, so a CR that sets every field at once is unaffected. **Today the constraint is vacuously true** — the declared-operations registry has exactly one CR-resident member (`spec.sentinel.masterName`), so the count of changed heavy fields can never exceed one, and **no apply is refused by it**. It is shipped now so the second member (auth) adds a term rather than a rule, and a unit test fails if a member is registered without one. |
 
 ### 7.2 Status Condition on Validation Failure
 

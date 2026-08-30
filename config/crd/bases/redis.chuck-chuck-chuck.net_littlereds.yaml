@@ -59,7 +59,13 @@ spec:
           metadata:
             type: object
           spec:
-            description: LittleRedSpec defines the desired state of LittleRed
+            description: |-
+              LittleRedSpec defines the desired state of LittleRed
+              At most one registered CR-resident heavy field may change per update, so a spec
+              delta the operator could not order is refused at apply time (ADR-020). It is a
+              TRANSITION rule and does not fire on create. The rationale, and the reason it is
+              vacuously true while the registry has one CR-resident member, are on
+              heavyOperations in internal/controller/operation_registry.go.
             properties:
               auth:
                 description: Auth defines authentication settings
@@ -2114,6 +2120,11 @@ spec:
               rule: self.mode == 'sentinel' || !has(self.sentinel)
             - message: spec.failover may only be set when spec.mode is 'failover'
               rule: self.mode == 'failover' || !has(self.failover)
+            - message: 'at most one heavy field may change per update (ADR-020): apply
+                them one at a time'
+              rule: '(has(self.sentinel) && has(oldSelf.sentinel) && (has(self.sentinel.masterName)
+                ? self.sentinel.masterName : ''mymaster'') != (has(oldSelf.sentinel.masterName)
+                ? oldSelf.sentinel.masterName : ''mymaster'') ? 1 : 0) <= 1'
           status:
             description: LittleRedStatus defines the observed state of LittleRed
             properties:

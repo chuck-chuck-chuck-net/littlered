@@ -30,6 +30,12 @@ import (
 // +kubebuilder:validation:XValidation:rule="self.mode == 'cluster' || !has(self.cluster)",message="spec.cluster may only be set when spec.mode is 'cluster'"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'sentinel' || !has(self.sentinel)",message="spec.sentinel may only be set when spec.mode is 'sentinel'"
 // +kubebuilder:validation:XValidation:rule="self.mode == 'failover' || !has(self.failover)",message="spec.failover may only be set when spec.mode is 'failover'"
+// At most one registered CR-resident heavy field may change per update, so a spec
+// delta the operator could not order is refused at apply time (ADR-020). It is a
+// TRANSITION rule and does not fire on create. The rationale, and the reason it is
+// vacuously true while the registry has one CR-resident member, are on
+// heavyOperations in internal/controller/operation_registry.go.
+// +kubebuilder:validation:XValidation:rule="(has(self.sentinel) && has(oldSelf.sentinel) && (has(self.sentinel.masterName) ? self.sentinel.masterName : 'mymaster') != (has(oldSelf.sentinel.masterName) ? oldSelf.sentinel.masterName : 'mymaster') ? 1 : 0) <= 1",message="at most one heavy field may change per update (ADR-020): apply them one at a time"
 type LittleRedSpec struct {
 	// Mode is the deployment mode: standalone, sentinel, cluster, or failover (experimental)
 	// +kubebuilder:validation:Enum=standalone;sentinel;cluster;failover
