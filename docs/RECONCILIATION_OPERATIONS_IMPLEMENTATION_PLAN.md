@@ -291,7 +291,7 @@ func planOperation(in operationInput) operationPlan
 
 | # | Condition | Run | Ack | Reason |
 |---|---|---|---|---|
-| 1 | `Quarantined` | `""` | none | `Quarantined` |
+| 1 | `Quarantined` | `""` | none | `Quarantined` — nothing RUNS, but a pending operation is still REPORTED in `status.operation` with this reason; a held change must not be invisible |
 | 2 | `Bootstrapping` | `""` | **all candidates** | `Seeded` |
 | 3 | any candidate with **no ack row**, on an already-initialized instance | `""` | **those candidates** | `Seeded` |
 | 4 | no candidate's fingerprint differs from its ack | `""` | none | `Converged` |

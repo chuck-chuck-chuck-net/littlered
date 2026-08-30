@@ -780,6 +780,23 @@ const (
 	// sentinel.allowUnsafeRebootstrapOnDeadlock: the remedy is to fix the
 	// credential, which is trivial and destroys nothing.
 	ConditionOperatorCannotAuthenticate = "OperatorCannotAuthenticate"
+
+	// ConditionOperationInProgress reports that a declared HEAVY operation is being
+	// carried out on this instance: a human edited one of the small, registered set of
+	// spec fields whose change cannot safely proceed alongside regular healing, and the
+	// operator has taken the early branch that suppresses that healing until the work
+	// completes (ADR-020).
+	//
+	// Polarity: True means an operation is running — which is a normal, expected state,
+	// not a fault. It is nonetheless reported loudly, because the instance is
+	// deliberately not being healed while it holds, and an operation that never
+	// completes is the failure mode this mechanism has to make visible. There is no
+	// auto-exit timer (ADR-017's lesson: a timer is the defect with a delay), so a
+	// stalled or blocked operation stays True until a human acts.
+	//
+	// It never affects Ready. An instance mid-rename is not an unhealthy instance, and
+	// conflating the two trains an operator to ignore the signal that matters.
+	ConditionOperationInProgress = "OperationInProgress"
 )
 
 // LittleRedStatus defines the observed state of LittleRed
@@ -850,6 +867,53 @@ type LittleRedStatus struct {
 	// +optional
 	QuarantineAttempts int32 `json:"quarantineAttempts,omitempty"`
 
+	// AcknowledgedOperations records, per registered heavy operation (ADR-020), the
+	// value fingerprint the operator has FINISHED carrying out. A candidate whose
+	// freshly computed fingerprint differs from its row here is unfinished work from a
+	// spec change; equal means converged. A candidate with no row at all on an
+	// already-initialized instance is SEEDED — the ack is written without anything
+	// being run — which is what stops an operator upgrade declaring an operation for
+	// every instance in a fleet.
+	//
+	// This is persisted state, and it is consistent with ADR-006 rather than an
+	// exception to it. ADR-006's rule is "do not persist what is RECOMPUTABLE": the
+	// cases it and ADR-011/013/017/018 declined — a capability probe, a phase, a
+	// cursor, a remembered name — could all be re-derived from live state, so
+	// persisting them created a second source of truth able to disagree with the
+	// first. "This work finished at T" is an observation of an event at a point in
+	// time and is by construction not recomputable from live state; the world cannot
+	// be asked whether a change was ever asked for. That is the same ground on which
+	// LeaderlessSince, GhostMasterStuckSince, ForsakenSince, QuarantinedSince and
+	// QuarantineAttempts already sit. See ADR-020 Alternative A.
+	//
+	// The record is acknowledged on COMPLETION, never on observation: acknowledging
+	// on sight loses the intent silently if the operator dies between the write and
+	// the action, which is a false negative of exactly the kind the mechanism must
+	// not have. It is never an operational input — it answers "was this asked for?"
+	// and nothing else reads it — and the fingerprint is a keyed digest precisely so
+	// that no later rule can extract the previous value from it (ADR-018).
+	//
+	// The list is bounded by the registry, not by time: one row per operation NAME,
+	// updated in place. It needs no expiry, and an age-based one would be a defect
+	// rather than hygiene — a missing row is re-seeded, never re-run.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	AcknowledgedOperations []OperationAck `json:"acknowledgedOperations,omitempty"`
+
+	// Operation is the heavy operation currently in progress and the queue behind it
+	// (ADR-020). MONITORING SURFACE ONLY: every field is re-derived on every pass from
+	// (spec, AcknowledgedOperations, live StatefulSets) and is never read back by any
+	// decision. Losing it costs nothing — at worst a stall clock restarts.
+	//
+	// Heavy operations serialize, so at most one is ever running; Pending lists what
+	// is queued behind it. There is no precedence field and none is coming: ordering
+	// comes from the operation already running, simultaneous heavy spec edits are
+	// refused at admission, and the one pair admission cannot see carries a declared
+	// dependency on the registry entry (ADR-020 Alternatives E and F).
+	// +optional
+	Operation *OperationStatus `json:"operation,omitempty"`
+
 	// ObservedGeneration is the last observed generation
 	// +optional
 	ObservedGeneration int64 `json:"observedGeneration,omitempty"`
@@ -883,6 +947,60 @@ type LittleRedStatus struct {
 	// Failover contains failover-mode state (failover mode only)
 	// +optional
 	Failover *FailoverStatus `json:"failover,omitempty"`
+}
+
+// OperationAck is one row of the completion record: the value fingerprint of a
+// registered heavy operation that the operator has finished carrying out, and when
+// (ADR-020). One row per operation name, updated in place.
+type OperationAck struct {
+	// Name is the registry key of the heavy operation, e.g. "SentinelMasterNameRename".
+	Name string `json:"name"`
+
+	// Fingerprint identifies WHICH VALUE completed — an HMAC-SHA256 keyed on the
+	// instance UID, hex-truncated (see OperationFingerprint). It is deliberately not
+	// the value: the record must never leak it (the value is a password once auth
+	// joins the registry) and must never be readable as "the previous value" by a
+	// later rule, which is how ADR-018's refusal to remember a name is structurally
+	// enforced. Naming an intent by its FIELD instead would match the wrong edit,
+	// since the same field changes repeatedly.
+	Fingerprint string `json:"fingerprint"`
+
+	// AcknowledgedAt is when the operator observed this operation complete — or, for
+	// a seeded row, when it first recorded that the instance was already in the state
+	// its spec asks for.
+	AcknowledgedAt metav1.Time `json:"acknowledgedAt"`
+}
+
+// OperationStatus is the monitoring view of the heavy operation in progress and the
+// queue behind it (ADR-020). Nothing here is load-bearing; see
+// LittleRedStatus.Operation.
+type OperationStatus struct {
+	// Name is the registry key of the running operation.
+	Name string `json:"name"`
+
+	// StartedAt is when the operator first ran this operation. It anchors the
+	// operation's StallAfter budget, which raises a condition and an event and then
+	// waits — there is deliberately no auto-exit timer (ADR-017).
+	StartedAt metav1.Time `json:"startedAt"`
+
+	// Reason is what the operation is doing: Running; Blocked (the driver reported it
+	// cannot proceed — never auto-skipped); Stalled (past StallAfter); or Quarantined
+	// (a heavy change is pending but held, because a quarantined instance has no pods
+	// to carry it out).
+	//
+	// Quarantined is deliberately reported rather than left absent. A pending change
+	// that is silently held would otherwise show up nowhere at all, and ADR-020's
+	// standing requirement — taken from LR-054, where a withheld invariant was silent
+	// by construction — is that anything this mechanism withholds must SAY that it
+	// withheld. The planner's other reasons (Converged, Seeded) mean no operation is
+	// pending, so this whole field is absent for them.
+	Reason string `json:"reason"`
+
+	// Pending lists the operations queued behind this one, in the order they will
+	// run. Heavy operations serialize, so a wedged operation holds the queue
+	// indefinitely and loudly rather than being skipped.
+	// +optional
+	Pending []string `json:"pending,omitempty"`
 }
 
 // FailoverStatus contains failover-mode state. Both fields are monitoring

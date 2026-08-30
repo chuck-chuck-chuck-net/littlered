@@ -2117,6 +2117,73 @@ spec:
           status:
             description: LittleRedStatus defines the observed state of LittleRed
             properties:
+              acknowledgedOperations:
+                description: |-
+                  AcknowledgedOperations records, per registered heavy operation (ADR-020), the
+                  value fingerprint the operator has FINISHED carrying out. A candidate whose
+                  freshly computed fingerprint differs from its row here is unfinished work from a
+                  spec change; equal means converged. A candidate with no row at all on an
+                  already-initialized instance is SEEDED — the ack is written without anything
+                  being run — which is what stops an operator upgrade declaring an operation for
+                  every instance in a fleet.
+
+                  This is persisted state, and it is consistent with ADR-006 rather than an
+                  exception to it. ADR-006's rule is "do not persist what is RECOMPUTABLE": the
+                  cases it and ADR-011/013/017/018 declined — a capability probe, a phase, a
+                  cursor, a remembered name — could all be re-derived from live state, so
+                  persisting them created a second source of truth able to disagree with the
+                  first. "This work finished at T" is an observation of an event at a point in
+                  time and is by construction not recomputable from live state; the world cannot
+                  be asked whether a change was ever asked for. That is the same ground on which
+                  LeaderlessSince, GhostMasterStuckSince, ForsakenSince, QuarantinedSince and
+                  QuarantineAttempts already sit. See ADR-020 Alternative A.
+
+                  The record is acknowledged on COMPLETION, never on observation: acknowledging
+                  on sight loses the intent silently if the operator dies between the write and
+                  the action, which is a false negative of exactly the kind the mechanism must
+                  not have. It is never an operational input — it answers "was this asked for?"
+                  and nothing else reads it — and the fingerprint is a keyed digest precisely so
+                  that no later rule can extract the previous value from it (ADR-018).
+
+                  The list is bounded by the registry, not by time: one row per operation NAME,
+                  updated in place. It needs no expiry, and an age-based one would be a defect
+                  rather than hygiene — a missing row is re-seeded, never re-run.
+                items:
+                  description: |-
+                    OperationAck is one row of the completion record: the value fingerprint of a
+                    registered heavy operation that the operator has finished carrying out, and when
+                    (ADR-020). One row per operation name, updated in place.
+                  properties:
+                    acknowledgedAt:
+                      description: |-
+                        AcknowledgedAt is when the operator observed this operation complete — or, for
+                        a seeded row, when it first recorded that the instance was already in the state
+                        its spec asks for.
+                      format: date-time
+                      type: string
+                    fingerprint:
+                      description: |-
+                        Fingerprint identifies WHICH VALUE completed — an HMAC-SHA256 keyed on the
+                        instance UID, hex-truncated (see OperationFingerprint). It is deliberately not
+                        the value: the record must never leak it (the value is a password once auth
+                        joins the registry) and must never be readable as "the previous value" by a
+                        later rule, which is how ADR-018's refusal to remember a name is structurally
+                        enforced. Naming an intent by its FIELD instead would match the wrong edit,
+                        since the same field changes repeatedly.
+                      type: string
+                    name:
+                      description: Name is the registry key of the heavy operation,
+                        e.g. "SentinelMasterNameRename".
+                      type: string
+                  required:
+                  - acknowledgedAt
+                  - fingerprint
+                  - name
+                  type: object
+                type: array
+                x-kubernetes-list-map-keys:
+                - name
+                x-kubernetes-list-type: map
               bootstrapRequired:
                 description: |-
                   BootstrapRequired indicates that the cluster needs initial master election.
@@ -2358,6 +2425,56 @@ spec:
                 description: ObservedGeneration is the last observed generation
                 format: int64
                 type: integer
+              operation:
+                description: |-
+                  Operation is the heavy operation currently in progress and the queue behind it
+                  (ADR-020). MONITORING SURFACE ONLY: every field is re-derived on every pass from
+                  (spec, AcknowledgedOperations, live StatefulSets) and is never read back by any
+                  decision. Losing it costs nothing — at worst a stall clock restarts.
+
+                  Heavy operations serialize, so at most one is ever running; Pending lists what
+                  is queued behind it. There is no precedence field and none is coming: ordering
+                  comes from the operation already running, simultaneous heavy spec edits are
+                  refused at admission, and the one pair admission cannot see carries a declared
+                  dependency on the registry entry (ADR-020 Alternatives E and F).
+                properties:
+                  name:
+                    description: Name is the registry key of the running operation.
+                    type: string
+                  pending:
+                    description: |-
+                      Pending lists the operations queued behind this one, in the order they will
+                      run. Heavy operations serialize, so a wedged operation holds the queue
+                      indefinitely and loudly rather than being skipped.
+                    items:
+                      type: string
+                    type: array
+                  reason:
+                    description: |-
+                      Reason is what the operation is doing: Running; Blocked (the driver reported it
+                      cannot proceed — never auto-skipped); Stalled (past StallAfter); or Quarantined
+                      (a heavy change is pending but held, because a quarantined instance has no pods
+                      to carry it out).
+
+                      Quarantined is deliberately reported rather than left absent. A pending change
+                      that is silently held would otherwise show up nowhere at all, and ADR-020's
+                      standing requirement — taken from LR-054, where a withheld invariant was silent
+                      by construction — is that anything this mechanism withholds must SAY that it
+                      withheld. The planner's other reasons (Converged, Seeded) mean no operation is
+                      pending, so this whole field is absent for them.
+                    type: string
+                  startedAt:
+                    description: |-
+                      StartedAt is when the operator first ran this operation. It anchors the
+                      operation's StallAfter budget, which raises a condition and an event and then
+                      waits — there is deliberately no auto-exit timer (ADR-017).
+                    format: date-time
+                    type: string
+                required:
+                - name
+                - reason
+                - startedAt
+                type: object
               phase:
                 description: Phase is the overall phase
                 type: string
