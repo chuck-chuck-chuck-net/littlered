@@ -296,7 +296,7 @@ func planOperation(in operationInput) operationPlan
 | 3 | any candidate with **no ack row**, on an already-initialized instance | `""` | **those candidates** | `Seeded` |
 | 4 | no candidate's fingerprint differs from its ack | `""` | none | `Converged` |
 | 5 | exactly one differs | that one | none | `Running` |
-| 6 | two or more differ (only the CR+Secret pair is reachable — see §3) | the CR-resident one | none | `Running` (rest in `Pending`) |
+| 6 | two or more differ (only the CR+Secret pair is reachable — see §3) | the first **runnable** candidate in stable name order | none | `Running` (rest in `Pending`) |
 | 7 | running, `DriverDone`, **`!Settled`** | the same one | **none** | `Running` — the transition guard |
 | 8 | running, `DriverDone`, `Settled` | next pending or `""` | **that one** | `Running`/`Converged` |
 | 9 | running, `DriverBlocked` | the same one | none | `Blocked` — **never auto-skip** |
@@ -314,6 +314,12 @@ missing row harmless — re-seeded, never re-run — which is why the ack list n
 age-based GC would be a defect rather than hygiene. The list is bounded by the registry anyway: one
 row per operation *name*, updated in place. The only real accumulation is a row whose operation has
 been **de-registered**, which is a registry-driven prune, not a timer.
+
+Row 6 deliberately does **not** say "the CR-resident one", though an earlier draft did. That
+phrasing presupposed registry knowledge the seam does not have — `planOperation` takes candidates,
+and nothing in its input says where a field lives. Ordering that matters is carried by a `Requires`
+edge; where there is no edge the candidates commute, and a stable tiebreak is *by definition*
+sufficient. Expect the unedged pair to pick by name and not by residence: that is correct.
 
 **Row 7 is the transition guard §8.4 asks for.** "The driver is done" is not "the operation is
 over": Rule N converges the moment the Sentinels agree, which can be well before the Redis
