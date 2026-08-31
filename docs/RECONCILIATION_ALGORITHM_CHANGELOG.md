@@ -3079,3 +3079,266 @@ refutation of a second, very close LR-051 near-miss.
   LR-013** (whose gates are what make Rule D safe to leave running); **ADR-020** (whose
   authority boundary depends on Rule D's classification); **LR-048** (the rename is the
   operation this was measured on).
+
+## [LR-056] `planForsaken` Has No Quorum Floor — With Its Peers Bare, One Sentinel's Word Deletes the Instance
+- **Date:** 2026-09-01
+- **Commit:** (pending)
+- **ID note:** the highest ID visible on any branch was LR-055; allocated with the LR-039
+  cross-branch loop over **every** branch, not by reading the tip of one line.
+- **Status: FOUND AND RECORDED, NOT FIXED — by owner decision.** The defect is
+  pre-existing (ADR-016 / LR-042, and it predates the work that found it), and the fix is a
+  data-safety change to a shipped planner that gates a scale-to-zero on EmptyDir storage. It
+  gets its own pass rather than a tail-end of a test milestone. What landed here is the
+  diagnosis, a committed reproduction, and the skip that keeps the suite honest.
+- **Scope:** found by the post-operation arbitrary-state tier (ADR-020 Phase 4, M4.1), whose
+  entire premise is that the regular loop must be safe against states it did not produce.
+  This is that tier's headline finding. It is **not** an ADR-020 defect: the mechanism is
+  unchanged since LR-042 and reachable with no operation involved.
+
+- **The finding, in one sentence: `planForsaken`'s "unanimity among reachable monitoring
+  Sentinels" degrades to "one Sentinel's opinion" the moment its peers are bare, and it is
+  the only verdict in the product that DELETES PODS without a quorum floor anywhere.**
+
+- **The fixture, exactly, so this is reproducible without the transcript**
+  (`internal/controller/operation_exit_edge_test.go`,
+  `TestACaptureVerdictIsNeverCarriedByASingleSentinel`):
+    - `sentinel-0` — reachable, monitoring, `MasterIP = 10.9.9.9`, `MasterFlags = "master"`
+      (**not** flagged down), and the same address in `MonitoredMasters` under the desired
+      name. `10.9.9.9` is in neither `LiveTopologyIPs` nor `OwnedIPs`.
+    - `sentinel-1`, `sentinel-2` — reachable, **bare**: `Monitoring:false`, empty
+      `MonitoredMasters`.
+    - `redis-0/1/2` — reachable, `role:slave`, no keys. No pod of ours is a master.
+    - `since = now - 60s` (i.e. past `forsakenCooldown`), `rolling = false`.
+  Verdict: `Captured: true, Forsaken: true, ForeignMaster: 10.9.9.9`.
+
+- **Mechanism, at `file:line`.** `forsakenSignature`
+  (`internal/controller/forsaken_plan.go:174`) iterates the Sentinels and, at **:183**,
+  `continue`s on any Sentinel whose `monitoredAddresses` list is empty — i.e. a bare
+  Sentinel — **before** the `monitoring++` at **:186**. So a bare Sentinel is not merely
+  excluded from the vote, it is excluded from the **denominator**. Clause 1 (**:207**) then
+  asks only `monitoring != 0`, and clause 2 (**:193**) compares addresses only among the
+  Sentinels that survived that `continue`. With two peers bare, "every reachable monitoring
+  Sentinel agrees on ONE address" is satisfied by one Sentinel. Nothing at the call site
+  supplies a floor either: `littlered_controller.go:1001` passes `state`, `ForsakenSince`,
+  `now` and `rolling`, and no quorum.
+
+- **This contradicts the reasoning the verdict was validated under.** LR-044's M4a run
+  states outright that the injection had to hit **all three** of the victim's Sentinels
+  "because `planForsaken` clause 2 requires unanimity among reachable monitoring Sentinels
+  and a 1-of-3 injection reads as a transition, not a verdict". That is true only while all
+  three are monitoring. It is written down, and it is conditional on something the predicate
+  does not check.
+
+- **Blast radius — the verdict is not a log line.** `Forsaken` gates ADR-016's quarantine.
+  The test asserts the whole chain in the same run: `planQuarantine` returns
+  `Phase: "Quarantined", ScaleToZero: true`, which `sentinelDesiredReplicas` turns into
+  `.spec.replicas: 0` on **both** StatefulSets at build time, on EmptyDir storage (pillar
+  3.1). The attempt is counted against a budget that **latches** at 1 for a configuration
+  that is auth-off with the legacy name. LR-050 classified precisely this outcome —
+  a false verdict scaling a healthy instance to zero — as *"data destruction on a supported
+  operation, gated by luck"*.
+
+- **And the write is UNRECOVERABLE, which is why this is worse than a wrong verdict.**
+  `status.quarantinedSince` is the sole authority on scale-to-zero from the moment it is set:
+  no later evidence of any kind revokes it, and neither data clause is ever consulted again.
+  That is deliberate and load-bearing rather than an oversight — LR-044 established that the
+  capture signature **provably self-clears** once the pods are gone (no pods ⇒ no reachable
+  monitoring Sentinel ⇒ clause 1 fails), so the marker, not the signature, must carry the
+  state; deciding an armed quarantine pre-gather from the marker alone is also what stops the
+  SSA `ForceOwnership` 0→3→0 flap. Re-checking the data clauses in the armed branch would
+  require a gather that by construction has nothing to gather.
+  **The consequence for THIS entry:** the arming pass is the only moment any evidence is
+  weighed, so a false verdict there is not a mistake the loop can walk back — it is a wrong
+  write to the one field that decides, after which only the planner's own release or a human
+  clearing the field can intervene. The absent quorum floor is therefore a single point of
+  failure with no downstream check, not one guard among several.
+
+- **THE STRONGEST SINGLE ARGUMENT, and it is inside this repo: every sibling predicate
+  refuses the identical state.** Each of the three below is asserted in the test as a
+  precondition, so the disagreement is executable rather than argued:
+
+  | predicate | floor | verdict on this state |
+  |---|---|---|
+  | `SentinelsMonitorGhostMaster` (`replication_state.go`) | majority over **all reachable** Sentinels, bare ones counted | **false** |
+  | `planLeaderlessRecovery` (LR-015) | `reachable >= quorum` **and** all bare | **clearMarker** |
+  | `planStaleMasterNames` G4 (LR-048) | `reachable >= quorum` | **not Pruning** |
+  | `planForsaken` (LR-042) | **none** | **CAPTURED, and the pods go** |
+
+  The one verdict whose consequence is destructive is the only one without a floor. That
+  asymmetry is what makes this indefensible as a deliberate design property rather than an
+  omission.
+
+- **Reachability: ARGUED, NOT OBSERVED — and the distinction is load-bearing.** The *state*
+  is constructed and the verdict on it is measured; the *path to it* is an inference from
+  documented mechanisms, exactly like ADR-016's "the captor heals via Rule D" (which held)
+  and LR-050's stronger reading of its own gate (which was falsified live within minutes).
+  Treat it as the weaker half of this entry. The argued path: bare Sentinels beside
+  monitoring ones is the ordinary state after the **Sentinel** StatefulSet is replaced —
+  Sentinel storage is EmptyDir, so a restarted Sentinel re-learns its peer set from gossip
+  (pillar 3.7 says so in as many words), and Rule 0 exists precisely because a bare Sentinel
+  cannot rejoin on its own. LR-050's attribution gate watches the **Redis** StatefulSet, so
+  a Sentinel-side replacement leaves `rolling == false`. Redis settled + Sentinels part-way
+  back is the fixture. What is **not** established is how a not-ours, not-flagged-down
+  address comes to be monitored by the surviving Sentinel for a full `forsakenCooldown` in
+  that same window; the observed shapes that produce such an address (LR-050's measured
+  42.5s rename window, LR-053's terminating-pod window) are the candidates and neither has
+  been observed **together with** a bare majority. **No live run was made for this entry.**
+
+- **Deliberately NOT proposed here.** The obvious fix is a quorum floor on clause 1, matching
+  the three siblings. It is probably right and it is still a data-safety change to a shipped
+  planner: it makes the verdict strictly harder to reach, which trades a false-positive
+  deletion against leaving a **genuine** captor poisoned for longer — the trade LR-044's
+  whole design is about — and ADR-016's conservatism argument runs in the opposite direction
+  from LR-042's. That is a decision, not a patch.
+
+- **Tests.** `TestACaptureVerdictIsNeverCarriedByASingleSentinel` is committed and
+  **skipped**, naming this entry and the un-skip condition inline (the
+  `test/e2e/sentinel_master_name_test.go` / LR-054 precedent). It is deliberately **not**
+  inverted into a characterisation of the current verdict: a test that asserts the defect is
+  correct has to be un-written by whoever fixes it, and until then it actively defends the
+  defect. It carries a positive control (all three Sentinels naming the stranger must
+  **still** reach the verdict) so it cannot be satisfied by a predicate that never arms.
+- **Regresses:** nothing — no production code changed in this entry.
+- **Impacts:** **LR-042** (its clause 2 is weaker than its own text says); **LR-044** (M4a's
+  "a 1-of-3 injection reads as a transition" is conditional and does not say so); **ADR-016**
+  (the quarantine's trigger); `BACKLOG.md`. Found by ADR-020 Phase 4 / M4.1, which is the
+  first thing in this project to feed the planners states with no story attached.
+
+## [LR-057] The Ghost-Master Recovery's Lineage Gate Assumes the Holders Are REPLICAS — Two Live Masters Are Resolved by Discarding One
+- **Date:** 2026-09-01
+- **Commit:** (pending)
+- **ID note:** allocated with the LR-039 cross-branch loop; LR-056 is this milestone's
+  sibling finding, directly above.
+- **Status: FOUND AND RECORDED, NOT FIXED — and this one needs its OWN INVESTIGATION, not
+  just its own pass.** See "Why this is deferred rather than fixed" below: the naive fix may
+  re-create the deadlock this planner was built to break, and that has to be worked through
+  before a gate whose purpose is to break wedges is narrowed.
+- **Scope:** the second finding of the ADR-020 Phase 4 / M4.1 arbitrary-state tier. Not an
+  ADR-020 defect; the mechanism is unchanged since LR-024.
+
+- **The finding, in one sentence: `planGhostMasterRecovery`'s lineage gate rests on a written
+  premise — that the data holders are *replicas of one dead master* — and that premise is
+  false for two holders that both report `role:master`, so the planner elects one and
+  discards the other's acknowledged writes with no opt-in.**
+
+- **The fixture, exactly** (`internal/controller/operation_exit_edge_test.go`,
+  `TestTwoLiveMastersAreNeverResolvedByElectingOneOfThem`):
+    - all three Sentinels reachable and monitoring `10.0.0.99`, a **ghost** (in neither
+      address set), flags `"master"`; no `Replicas` reported by any of them, so
+      `HasHealthyKnownReplica()` is false — which is what a whole-list `SENTINEL RESET`
+      leaves behind (LR-013/LR-024).
+    - `redis-0` — reachable, **`role:master`**, `Keys: 500`, `Replid: A`.
+    - `redis-1` — reachable, **`role:master`**, `Keys: 400`, `Replid: A2`, `Replid2: A`
+      (an ordinary promotion chain: a promotion rotates the replid and keeps the old one).
+    - `redis-2` — reachable slave following the ghost, no keys.
+    - `stuckSince = now - 60s` (past `ghostMasterRecoveryCooldown`), `allowUnsafe = false`,
+      `quorum = 2`.
+  Verdict: `recoveryPromoteSurvivor`, electing `redis-0`, `holders: 2`, `diverged: false`.
+
+- **Mechanism, at `file:line`.** `planGhostMasterRecovery`
+  (`internal/controller/ghost_master_recovery.go:63`) passes its detection and cooldown
+  gates, takes the holder set at **:100**, and at **:108** asks `BestDataHolder()` for the
+  winner **and** for `diverged`. `diverged` is `holdersDiverged`
+  (`internal/redis/replication_state.go:405`), a union-find over each holder's
+  `{Replid, Replid2}` — so the promotion chain above is **one** connected component,
+  `diverged == false`, the opt-in branch at **:115** is skipped entirely, and **:121** returns
+  `recoveryPromoteSurvivor`. Nothing anywhere on that path reads `Role`.
+
+- **The premise, verbatim, and why it fails.** LR-024 chose lineage over holder count and
+  wrote down why: *"the ghost-master survivors are replicas of the **same** dead master, so
+  electing the highest-offset one discards nothing (the losers resync from it)"*. That is
+  true of replicas, and it is the state the gate was written for. Two nodes that both report
+  `role:master` are not that: they are **two write endpoints that have diverged**, each
+  accepting and acknowledging writes independently since they parted. A shared replid says
+  they share a **history**; it never says either one is a superset of the other. So the
+  offsets are not comparable in the way the gate assumes, and the loser's writes are
+  discarded silently.
+
+- **SIBLING CONTRAST — the same holder set, the opposite verdict, and only the shape of the
+  gate differs.** Asserted in the test, not argued: handed the identical two holders (with
+  the Sentinels rewritten bare so its own detection gate passes), `planLeaderlessRecovery`
+  returns **`recoveryRefuse`** — because Rule L's safety gate is **holder count** (`>= 2`
+  refuses without `allowUnsafeRebootstrapOnDeadlock`, `leaderless_recovery.go:148`), which
+  does not care what role the holders report. Two sibling planners, one input, one refusing
+  and one electing. That is the sharpest available evidence that this is a gap in the
+  discriminator rather than a considered policy.
+
+- **Blast radius.** `recoveryPromoteSurvivor` reaches `electMaster` — `SENTINEL REMOVE` +
+  `MONITOR` + `REPLICAOF NO ONE` on the winner — after which the loser is repointed at it and
+  full-syncs, i.e. **its keyspace is replaced**. Storage is EmptyDir, so nothing is
+  recoverable afterwards. There is no opt-in in the path and no condition that says data was
+  discarded; `allowUnsafeRebootstrapOnDeadlock` — the knob that exists for exactly this
+  decision — is never consulted, because `diverged` is false.
+
+- **Reachability: ARGUED, NOT OBSERVED.** No live run was made, and the two-master half is
+  the part to be sceptical of. The argued path composes three separately-documented shapes:
+  two pods reporting `role:master` at once **has** been observed on this project's own
+  clusters (~2 minutes, mid-rollout); an emptied Sentinel replica list is Rule D's
+  self-inflicted LR-024 signature; and a ghost-pinned quorum is that same entry's subject.
+  What has **not** been observed is the three together, and in particular whether a state
+  with two live masters can persist past the 30s `ghostMasterRecoveryCooldown` without Rule R
+  or the LR-008 correction resolving it first. Treat the composition as a hypothesis the
+  investigation must confirm or kill — the mistake to avoid is LR-050's, where a stronger
+  reading of a gate was believed until a cluster falsified it in minutes.
+
+- **WHY THIS IS DEFERRED RATHER THAN FIXED — the open question the investigation must
+  answer.** The obvious narrowing is "refuse when two or more holders report `role:master`".
+  It may be wrong, and the reason is what this planner is FOR. `planGhostMasterRecovery`
+  exists to break a **wedge**: a Sentinel quorum pinned to a dead master with no promotable
+  replica, which Redis's own `no-good-slave` abort never resolves and which LR-024 measured
+  as permanent. Every refusal added to it is a state in which the operator now does nothing
+  forever. A role-based refusal is exactly the shape that could re-create the wedge — a
+  restarted pod returns as an empty master by default (LR-004, LR-014's empty-master
+  subject), so "two holders report `role:master`" may be an ordinary transient of the very
+  recovery scenario, and refusing on it would strand the instance the rule was built to
+  rescue. So the question is not "should it refuse" but: **is there a discriminator that
+  separates "two write endpoints that diverged" from "two survivors of one dead master",
+  using evidence the operator actually has?** Candidates worth weighing, none endorsed here:
+  `master_repl_offset` comparability under a shared replid; whether either holder has ever
+  been told `REPLICAOF` by us this incarnation; the intent already recorded elsewhere in the
+  status. And the fallback that needs judging on its own merits: refuse **loudly** into
+  `allowUnsafeRebootstrapOnDeadlock`, accepting a wedge that needs a human over a silent
+  discard — which is LR-047's asymmetry (a loud stall beats silent destruction), against
+  LR-043's (a guard that denies a legitimate own state is a permanent stall). **Both
+  precedents are in this file and they point opposite ways here.** That is the decision, and
+  it is why this is not a patch.
+
+- **Tests.** `TestTwoLiveMastersAreNeverResolvedByElectingOneOfThem` is committed and
+  **skipped**, naming this entry and the un-skip condition inline. Deliberately **not**
+  inverted into a characterisation, for the reason given in LR-056: it would pin an election
+  that discards acknowledged writes. Its preconditions are asserted rather than assumed (the
+  ghost signature holds, no healthy replica is known, there are exactly two holders, and they
+  read as one lineage), so a green after the fix cannot be green because the fixture drifted
+  into not being the state at all.
+- **Regresses:** nothing — no production code changed in this entry.
+- **Impacts:** **LR-024** (its lineage gate's stated premise, and the reason it chose lineage
+  over Rule L's holder count); **LR-015** (Rule L's holder-count gate is the contrast that
+  exposes it); **LR-004 / LR-014** (the empty-master transient that makes the naive fix
+  dangerous); prospective **ADR-010**, which already owns Rule D's fate and is where the
+  emptied-replica-list precondition of this state belongs; `BACKLOG.md`.
+
+### Method note, for both entries — mutation-checking by inspection does not work
+
+The tier these two findings came from carries seven other tests that are **green from birth**
+(they pin behaviour that is already correct, so no honest red exists for them). Each was given
+a mutation check: break the guard the assertion depends on, observe it fail for that reason,
+revert. **Two of the seven claims were wrong until they were actually run**, and both failures
+were instructive rather than cosmetic:
+
+- The `AllSentinelsBare` mutant was predicted to make the planner *start a cooldown*
+  (`recoveryStartCooldown`). It in fact returned `recoveryPromoteSurvivor` — with the marker
+  already set and the cooldown already elapsed, the mutant does not begin counting down, it
+  **elects a master** out from under a Sentinel quorum that still has opinions. The mutation
+  was more dangerous than predicted.
+- The `captorsCopy` link-clause mutant was predicted to fail its test and **did not**: the
+  original fixture's holder followed a *different* address, so the `MasterHost` clause caught
+  it and the `LinkStatus == "up"` clause was never exercised. A second sub-case had to be
+  added — a pod pointed at the captor whose link is **down**, which is LR-044's own shape and
+  the one that matters — before the clause was pinned at all. The test had a hole that reading
+  it could not reveal.
+
+Recorded because a mutation check written from inspection is a claim, and the whole point of
+the discipline is that a claim about a test is worth exactly as much as a claim about code:
+**run it, or do not write it down.** The full mutation table (seven tests, the exact mutation
+applied to each, and the verbatim failure it produced) is in the file's own comments, beside
+each test.
