@@ -213,9 +213,13 @@ D6 is exclusivity in both directions. Enumerated deliberately, sentinel mode, in
 | Status, conditions, events, `lrctl` surfaces | §8.2: the instance must not go dark exactly when someone is watching it hardest. |
 | The background sentinel monitor | Detection only; it decides nothing. |
 
-**Suppressed during an operation** — precisely Rule A's set, reached one gate earlier:
-Rule D (ghost-replica `SENTINEL RESET`), the LR-005/LR-008 ghost-master `REMOVE`+`MONITOR`,
-Rule R (straggler `SLAVEOF`), Rule L (leaderless recovery) and the LR-024 ghost-master recovery.
+**Suppressed during an operation** — only the rules that **assign authority**, a strict subset of
+Rule A's set: Rule L (leaderless recovery) and the LR-024 ghost-master recovery. **Everything else
+continues** — Rule 0, Rule D (ghost pruning), Rule R (straggler `SLAVEOF`) and the LR-005/LR-008
+correction reach Rule A as they always did, because an operation must never suppress the healing its
+own completion condition depends on (measured: 311s vs 162s, see ADR-020). Rule D is not authority
+assignment: LR-007 established that `SENTINEL RESET` does not change the monitored master IP, which
+is why LR-008 needed `REMOVE`+`MONITOR`.
 
 **The suppression of Rule L and LR-024 is a HOLD, not a skip.** `leaderlessSince` and
 `ghostMasterStuckSince` are **never reset** by the suppression (LR-038's rule: *the timer never resets on

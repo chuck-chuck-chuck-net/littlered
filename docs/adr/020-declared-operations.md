@@ -192,9 +192,55 @@ there is nothing to cite. An operation that is safe under concurrent healing is 
 
 ### What survives the branch
 
-Exclusivity runs both ways: regular healing does not run during a heavy operation, and heavy actions
-do not run outside one. The short list of what still runs, enumerated deliberately rather than
-discovered case by case:
+Exclusivity runs both ways, and the boundary is:
+
+> **During a heavy operation the operator does not ASSIGN AUTHORITY.** It may *propagate* an
+> authority decision already made, and it may *clean up debris*. Everything else runs under its
+> normal guards.
+
+**Assigning authority** means creating a new fact about who holds data — which pod is master, or
+which node owns a slot range. **Propagating** means making reality match a decision that already
+exists. What "authority" is differs per mode, and naming it per mode is what makes the rule usable:
+
+| mode | authority is | suppressed — assigns it | still runs — propagates or cleans |
+|---|---|---|---|
+| **standalone** | nothing: one pod, no authority exists | *(empty by construction)* | — |
+| **sentinel** | which pod the quorum monitors as master | **Rule L** (seed / promote / force-elect), **the LR-024 recovery** (elect a survivor) | Rule 0, Rule D, Rule R, the LR-005/LR-008 correction |
+| **failover** | which pod the operator stamps as master | `planFailover`'s seed / promote / unsafe-elect | the straggler repoint, the outgoing-master fence |
+| **cluster** | which node owns a slot range | Step 0/1 `CLUSTER FAILOVER TAKEOVER`, Step 3 missing-slot assignment, Step 3b's destination choice | `MEET`, `FORGET`, `REPLICATE`, the shard-aware reattach |
+
+> **⚠ D6 originally said "regular healing does not run during a heavy operation", and measurement
+> proved that wrong. Corrected 2026-08-30.** The first build suppressed everything Rule A skips, on
+> the reasoning that a rename keeps a pod terminating so Rule A would have returned anyway. That
+> holds only *while* something is terminating. Once the last pod is created and nothing is
+> terminating, Rule A lets healing run and the operation branch did not — a suppression strictly
+> longer than Rule A's, whose extra window is exactly when the instance needs help converging.
+
+**Two rejected formulations, kept because each is the obvious next guess.** *"The operator does not
+elect a master"* is too narrow: it misses cluster **Step 3**, which is not an election at all, and
+which LR-047 caught reassigning an orphaned range to a reachable empty master — correctly by its own
+contract — thereby *"healing an already-dead shard into a healthy-looking empty one"* and erasing the
+failure. *"The operator does not change topology"* is too broad: `MEET`, `FORGET`, `REPLICATE` and
+Rule R are all topology changes and all safe, because none of them decides anything.
+
+**Ghost pruning is not authority assignment, and that is a ledger fact rather than a judgement
+call.** Rule D issues `SENTINEL RESET`, and **LR-007 established by incident that RESET does not
+change the monitored master IP** — it clears the replica and sentinel lists and nothing else. That
+finding is precisely why LR-008 had to introduce `REMOVE` + `MONITOR` to repoint a stuck Sentinel.
+So Rule D is *structurally incapable* of assigning authority. It reads like a topology operation and
+is one, but not of the kind that decides.
+
+The classification is a **local property of each rule, declared where the rule lives**, never a
+central list to keep in sync — the same shape as `Requires` beating a precedence table. And it
+**cannot be applied by reading rule names**: Rule R is literally called *"Replica Rescue"* and
+assigns nothing.
+
+**The failover and cluster rows are proposed, not verified.** Registry v1 is sentinel-only, so
+nothing exercises them; they are confirmed when those modes are wired. Step 3b's key-preserving
+relocation is the one row worth arguing about — it is listed as assigning because it chooses a
+destination.
+
+The short list of what still runs, enumerated deliberately rather than discovered case by case:
 
 - **Every resource apply.** The operation is *driven* by the pod template; suppressing the applies
   suppresses the operation.
@@ -207,8 +253,13 @@ discovered case by case:
 - **Status, conditions, events, `lrctl`.** The instance must not go dark exactly when someone is
   watching it hardest.
 
-Suppressed: Rule D, the LR-005/LR-008 ghost-master correction, Rule R, Rule L, and the LR-024
-recovery — precisely Rule A's set, reached one gate earlier.
+- **Rule D, Rule R and the LR-005/LR-008 correction**, which reach Rule A exactly as they always
+  did, so Rule A's `!anyTerminating` / `!FailoverActive` guards still apply. Narrowing the
+  suppression is deliberate and hoisting them earlier is not: those guards exist for their own
+  reasons, and moving the rules ahead of Rule A would change behaviour far beyond this feature.
+
+Suppressed: **Rule L and the LR-024 recovery** — the two sentinel-mode rules that assign authority,
+a strict subset of Rule A's set.
 
 **Suppressing Rule L and LR-024 is a HOLD, not a skip — stated precisely, because the first draft
 overclaimed it.** A clock that has *already started* is **never reset** by the suppression (LR-038:
@@ -218,6 +269,16 @@ during the operation starts when the operation ends, because `setLeaderlessSince
 `setGhostMasterStuckSince` are called from inside the rules being suppressed. That is Rule A's
 existing behaviour verbatim — a zero delta, not a regression — but "the markers keep accruing" was
 the stronger claim and it is not the one delivered.
+
+**Measured cost of getting this wrong, kept as the reason the rule exists.** With the whole of Rule
+A's set suppressed, a rename took **311s** against **162s** on the build without the branch, three
+runs, cluster idle. Two of the three pods were identical across builds; the entire difference was the
+**first-replaced pod**, which returns following the old master's address with `link:down`, fails the
+`link:up` readiness gate, and is precisely what Rule R repoints. Pod unready → StatefulSet unsettled
+→ operation pending → Rule R suppressed → pod unready. It cost 180s here and has **no exit** in the
+case Rule R was written for, where Sentinel never repoints at all. The generalizable form:
+**an operation must never suppress the healing its own completion condition depends on** — which is
+why Rule 0 was on this list from the first draft, and the reason simply was not generalized.
 
 **This is close to a no-op against today's behaviour, deliberately.** During a rename a pod is
 terminating from the moment of the edit, so Rule A already returns before every suppressed rule. The
