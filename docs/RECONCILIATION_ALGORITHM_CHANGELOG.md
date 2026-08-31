@@ -2990,3 +2990,92 @@ refutation of a second, very close LR-051 near-miss.
   with a pointer from its entry to here); `docs/RECONCILIATION_RUNLEVELS_CONCEPT.md` **R5** and
   §8.8, and `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md` Phase 0 / Phase 1, where
   this is now the worked example for R5.
+
+## [LR-055] Rule A Has No Escape From a Persistent `FailoverActive` — LR-052's Latch, Measured at 178s in an Ordinary Rename
+- **Date:** 2026-08-30
+- **Commit:** (pending)
+- **ID note:** the highest ID visible on any branch was LR-054; allocated with the LR-039
+  cross-branch loop over **every** branch, not by reading the tip of one line.
+- **Status: RECORDED, NOT FIXED, and deliberately so.** No timer (ADR-017: a timer is the
+  defect with a delay) and no narrowing is proposed here — the right answer needs its own
+  design pass. What landed is the measurement, the ordering that makes it inescapable, and
+  the identification of the one thing that prevents it in practice.
+- **Not an ADR-020 defect.** It is a Phase 0 consequence, found by ADR-020's M3.1 live work
+  because that milestone happened to remove the mitigation for a while.
+
+- **Problem — the guard is unbounded and everything that could clear it sits after it.**
+  Rule A returns on `anyTerminating || state.FailoverActive`
+  (`internal/controller/littlered_controller.go:1217`). Before **LR-052** the second half was
+  permanently false: `MasterInfo.FailoverStatus` was parsed from `failover-status`, a key
+  neither Redis nor Valkey has ever emitted, so Rule A had never once blocked on it in the
+  product's history. LR-052 made the guard real, and correctly — it removes the
+  RESET-into-a-running-failover hazard LR-011/LR-013 are about. But it made it real **without
+  a bound**: while a Sentinel keeps reporting a failover in flight, Rule A returns on every
+  pass and **all** sentinel healing stops, and there is no operator path out, because every
+  rule that could act on the situation is **below** that line — Rule D's `SENTINEL RESET` at
+  `:1416`, the leaderless/ghost-master recoveries, Rule R. The operator can only wait for
+  Sentinel's own timers.
+- **LR-052 predicted the latch and judged it narrow. The measurement says the bound was
+  optimistic.** That entry recorded, source-confirmed at both Redis 8.0 and Valkey 8.1, that
+  `sentinelFailoverDetectEnd` returns early when the promoted replica is `NULL` or
+  `SRI_S_DOWN` — *before* its `elapsed > failover_timeout` force-end — so a replica dying
+  inside the reconfiguration window leaves that Sentinel in `RECONF_SLAVES` **with no timer to
+  end it**. It bounded the concern with *"the window is the measured 1.84 s, and the replica
+  must die inside it"*. Measured here on t3e, in an **ordinary supported rename of a healthy
+  3-pod instance**, not a chaos scenario: `failoverActive=true` on **84-86 consecutive
+  reconcile passes spanning ~178s** (`+130s..+308s` and `+131s..+309s` across two runs), with
+  one Redis pod stranded `link:down` and not-Ready for that entire window because Rule R —
+  the rule that repoints exactly that pod — is below `:1217`. The rename settled in **308s /
+  308s / 323s** against a **166s / 167s** baseline.
+- **Why the window is so much wider than 1.84s in practice:** a rename replaces all three
+  Redis pods in sequence, and the master's replacement produces a genuine Sentinel failover
+  *while the other two pods are themselves being replaced*. The promoted replica going
+  `s_down` inside the reconfiguration window is not a coincidence to wait for; it is the
+  ordinary shape of the operation.
+- **What prevents it, and it is prevention rather than recovery — the ordering matters.**
+  Rule D's ghost-replica `SENTINEL RESET` prunes the debris left by the FIRST pod replacement
+  early (measured at **+47s** on the baseline build, with `reachableRedis=3`, i.e. its LR-013
+  wholeness gate satisfied), and a `RESET` clears that Sentinel's state — which is the manual
+  escape LR-052 itself names for this latch. Because Rule D sits at `:1416`, **after** Rule A
+  at `:1217`, it cannot *break* a latch that has already formed: once `FailoverActive` is
+  true, Rule D never runs. It can only stop the latch forming. That asymmetry is the whole of
+  the operational picture: **the operator's only lever against this is an early prune, and it
+  is available only before the state it prevents exists.**
+- **How it was isolated (recorded because the first two hypotheses were wrong).** ADR-020's
+  M3.1 suppressed Rule D during a heavy operation, which removed the early prune and exposed
+  the latch reproducibly. Three one-variable experiments settled the cause against a
+  same-input control on the pre-M3.1 build, per LR-054's rule that *"the way to settle it is
+  to run the same input against both builds, not to reason from the diff"*:
+
+  | build | settle |
+  |---|---|
+  | pre-M3.1 `1d915e4` (control) | **167s**, **166s** |
+  | M3.1 with Rule D suppressed | 308s, 308s |
+  | ... with the operation's fast-requeue clause removed | **323s** — cadence REFUTED |
+  | ... with the operation branch reporting but gating NOTHING | **166s** — the gating is the cause |
+
+  Per-pass Sentinel action counts were equal between builds (Rule 0: 5 vs 3, prunes 3 vs 3,
+  ghost-master correction 9 vs 9), and Rule L and the LR-024 recovery never fired in either —
+  which is what left Rule D as the only remaining difference and made the log line the proof:
+  `Issuing SENTINEL RESET … reachableRedis=3` at **+47s and +164s** on the control, against a
+  single one at **+309s** on the suppressed build, two seconds after the latch cleared.
+- **Fixed in the same session, but only by restoring the mitigation:** ADR-020's suppressed
+  set is now exactly the two sentinel-mode rules that ASSIGN AUTHORITY (Rule L and the LR-024
+  recovery), and Rule D — structurally incapable of assigning authority, since **LR-007
+  established by incident that `SENTINEL RESET` does not change the monitored master IP**,
+  which is why LR-008 needed `REMOVE`+`MONITOR` — runs under its own gate chain as before.
+  **That closes the regression, not this defect.** Any future change that delays or gates the
+  ghost prune re-opens it, and so does any instance whose topology does not produce a prunable
+  ghost early.
+- **Deliberately NOT proposed here.** A `failoverTimeout`-derived bound on Rule A is a margin
+  against a user-settable, unbounded field — LR-050's rejected fix in a new place. Moving Rule
+  D above Rule A re-opens exactly the RESET-into-a-running-failover hazard LR-011/LR-013 added
+  the guard for. Both are real options and both need the design pass this entry declines to
+  pre-empt.
+- **Regresses:** nothing — no production code changed in this entry.
+- **Impacts:** **LR-052** (its `⚠ NEW RESIDUAL` is now measured rather than reasoned, and its
+  point 1 — *"the window is the measured 1.84 s"* — understates the exposure for a whole-
+  StatefulSet rollout); **LR-007** (its finding is what classifies Rule D); **LR-011 /
+  LR-013** (whose gates are what make Rule D safe to leave running); **ADR-020** (whose
+  authority boundary depends on Rule D's classification); **LR-048** (the rename is the
+  operation this was measured on).

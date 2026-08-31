@@ -455,20 +455,25 @@ func (f *opRecordingRedis) sawReplicaOf() bool {
 // acknowledgment. Everything else — pods, Sentinels, the straggler, the ghost replica,
 // the unsettled StatefulSet — is identical between the two specs.
 //
-// The regression it pins was measured on t3e, three runs, and cost the first-replaced
-// pod ~180s: the branch returned before Rule A, which suppressed RULE R, which is the
-// one rule that repoints a replaced pod still following the old master. That pod then
-// never became Ready, so the StatefulSet never settled, so the operation never
-// completed, so Rule R stayed suppressed. The operation suppressed the healing its own
-// completion condition depends on.
+// The boundary it pins (ADR-020): during a heavy operation the operator does not ASSIGN
+// AUTHORITY — it may PROPAGATE a decision already made, and it may CLEAN UP DEBRIS.
+// Sentinel mode's suppressed set is therefore exactly Rule L and the LR-024 recovery,
+// neither of which this fixture reaches (it has a living consensus master throughout).
+// What it does reach is the two rules that must KEEP running, and both were suppressed
+// by an earlier build at a measured cost of 145s on an ordinary rename:
 //
-// So the fork is CONVERGENCE versus RESCUE, not operation versus healing:
-//
-//	Rule R  — convergence. One idempotent SLAVEOF at the master the operation is itself
-//	          converging on. Must run. (The name lies: "Replica Rescue" is not rescue.)
-//	Rule D  — rescue. SENTINEL RESET wipes the whole replica list and is LR-024's
-//	          self-inflicted deadlock trigger. Must not run.
-var _ = Describe("ADR-020 an operation suppresses rescue, never convergence", func() {
+//	Rule R  — PROPAGATES. One idempotent SLAVEOF at a master the quorum already chose.
+//	          (The name lies: "Replica Rescue" assigns nothing.) Blocking it strands a
+//	          replaced pod unready, so the StatefulSet never settles, so the operation
+//	          never completes, so Rule R stays blocked — the operation suppressing the
+//	          healing its own completion condition depends on.
+//	Rule D  — CLEANS UP DEBRIS. LR-007 established by incident that SENTINEL RESET does
+//	          not change the monitored master IP (which is why LR-008 needed
+//	          REMOVE + MONITOR), so it is structurally incapable of assigning authority.
+//	          Blocking it removes the early ghost prune that stops Sentinel wedging in
+//	          RECONF_SLAVES; once wedged, FailoverActive pins Rule A and every rule below
+//	          it — Rule D included — is unreachable for ~178s. See LR-055.
+var _ = Describe("ADR-020 an operation suppresses authority assignment, nothing else", func() {
 	const (
 		opDesired  = "ops-c.cache"
 		opMasterIP = "127.0.0.30"
@@ -599,7 +604,7 @@ var _ = Describe("ADR-020 an operation suppresses rescue, never convergence", fu
 		return false
 	}
 
-	It("runs Rule R and withholds Rule D while an operation is in progress", func() {
+	It("runs both Rule R and Rule D while an operation is in progress", func() {
 		setAck("the-previous-name") // fingerprint differs => the rename is pending
 
 		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
@@ -610,12 +615,14 @@ var _ = Describe("ADR-020 an operation suppresses rescue, never convergence", fu
 		Expect(latest.Status.Operation.Reason).To(Equal(operationReasonRunning))
 
 		Expect(straggler.sawReplicaOf()).To(BeTrue(),
-			"Rule R is CONVERGENCE and must still run: this is the M3.1 regression, where the "+
-				"replaced pod was never repointed, so it never became Ready, so the StatefulSet "+
-				"never settled, so the operation never completed")
-		Expect(sawAnyReset()).To(BeFalse(),
-			"Rule D is RESCUE and must stand down: SENTINEL RESET wipes the replica list and is "+
-				"LR-024's self-inflicted deadlock trigger")
+			"Rule R PROPAGATES an authority decision already made and must still run: this is "+
+				"the M3.1 regression, where the replaced pod was never repointed, so it never "+
+				"became Ready, so the StatefulSet never settled, so the operation never completed")
+		Expect(sawAnyReset()).To(BeTrue(),
+			"Rule D CLEANS UP DEBRIS and must still run: LR-007 established that SENTINEL RESET "+
+				"cannot change the monitored master IP, so it assigns no authority — and "+
+				"suppressing it removes the early ghost prune that keeps Sentinel out of "+
+				"RECONF_SLAVES, which cost a measured 145s (LR-055)")
 	})
 
 	It("runs both once no operation is in progress (the control)", func() {
@@ -629,8 +636,8 @@ var _ = Describe("ADR-020 an operation suppresses rescue, never convergence", fu
 
 		Expect(straggler.sawReplicaOf()).To(BeTrue(), "Rule R runs here too")
 		Expect(sawAnyReset()).To(BeTrue(),
-			"the control that stops the spec above passing vacuously: with no operation, Rule D "+
-				"MUST fire on this fixture, so 'no RESET' there is attributable to the operation "+
-				"and not to a fixture that never reaches Rule D at all")
+			"the fixture control: Rule D must reach its RESET on this topology with no operation "+
+				"in play, so the spec above is asserting that an operation does not CHANGE that, "+
+				"rather than asserting over a fixture that never reaches Rule D at all")
 	})
 })

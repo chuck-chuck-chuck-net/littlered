@@ -1169,40 +1169,34 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// driver's verdict is Rule N's own plan — so the decision is taken here, after them,
 	// because a driver's completion is an INPUT to it (rows 7-10) and not an output.
 	//
-	// THE FORK IS CONVERGENCE VERSUS RESCUE, NOT OPERATION VERSUS HEALING, and getting
-	// that wrong cost a measured 180s. An earlier build of this branch returned here, one
-	// gate ahead of Rule A, on the reasoning that "during a rename a pod is terminating
-	// from the moment of the edit, so Rule A already returned before every suppressed
-	// rule". That holds only while something is TERMINATING. Once the last replacement
-	// pod has been created and nothing is terminating, Rule A lets healing run and the
-	// blanket return did not — so the suppression was strictly longer than Rule A's, and
-	// the extra window is exactly when convergence needs help. Measured on t3e, three
-	// runs, two of three pods identical across builds: the first-replaced pod went from
-	// +132s to +310s, because it returns following the OLD master's address with
-	// link:down, sentinel-mode readiness needs role:master or link:up, and the one rule
-	// that repoints exactly that straggler is Rule R. Pod unready => StatefulSet
-	// unsettled => operation pending => Rule R suppressed => pod unready: THE OPERATION
-	// SUPPRESSED THE HEALING ITS OWN COMPLETION CONDITION DEPENDS ON. Here Sentinel's own
-	// timers broke the loop after ~180s; in the case Rule R actually exists for — Sentinel
-	// not repointing at all — there is no exit.
+	// THE BOUNDARY IS AUTHORITY ASSIGNMENT, NOT "HEALING" (ADR-020), and getting it wrong
+	// cost a measured 145s. An earlier build of this branch returned here, one gate ahead
+	// of Rule A, on the reasoning that during a rename a pod is terminating from the
+	// moment of the edit so Rule A already returned before every suppressed rule. That
+	// holds only while something is TERMINATING. Once the last replacement pod is created
+	// and nothing is terminating, Rule A lets healing run and the blanket return did not —
+	// a suppression strictly longer than Rule A's, whose extra window is exactly when the
+	// instance needs help converging.
 	//
-	// So an operation suppresses RESCUE, never CONVERGENCE:
+	//	During a heavy operation the operator does not ASSIGN AUTHORITY. It may
+	//	PROPAGATE an authority decision already made, and it may CLEAN UP DEBRIS.
+	//	Everything else runs under its normal guards.
 	//
-	//   - CONVERGENCE drives the instance toward its declared topology and therefore
-	//     cannot fight an operation — it is pushing the same way. Rule 0, the LR-005 /
-	//     LR-008 ghost-master correction, and Rule R.
-	//   - RESCUE is discretionary and either destructive or topology-rewriting, and must
-	//     not fire mid-operation. Rule D, Rule L, and the LR-024 recovery.
+	// Assigning authority means creating a new fact about who holds data — in sentinel
+	// mode, which pod the quorum monitors as master. Propagating means making reality
+	// match a decision that already exists. So the suppressed set here is exactly two
+	// rules, Rule L and the LR-024 recovery, and it is a strict subset of Rule A's.
 	//
-	// THE NAMES LIE, so the classification is written at each site and justified there
-	// rather than collected into a central list somebody has to keep in sync. Rule R is
-	// called "Replica Rescue" and is functionally convergence; Rule D is a bare RESET
-	// with no name to warn you. A wrong call is invisible.
+	// An earlier formulation of this comment said "convergence versus rescue" and is
+	// RETRACTED: the classification cannot be applied by reading rule names, and that
+	// naming got it backwards — Rule R is literally called "Replica Rescue" and assigns
+	// nothing at all. Each rule's classification is therefore declared where the rule
+	// lives, with its reason, and never collected into a central list to keep in sync.
 	//
-	// The narrowing is implemented by NOT returning: the converging rules reach Rule A
-	// exactly as they always did and Rule A's own guards (!anyTerminating,
-	// !FailoverActive) still apply to them unchanged. Only the rescue sites consult
-	// operationRunning.
+	// The narrowing is implemented by NOT returning: every other rule reaches Rule A
+	// exactly as it always did and Rule A's own guards (!anyTerminating, !FailoverActive)
+	// still apply to them unchanged. Hoisting any of them earlier is not on the table —
+	// those guards exist for their own reasons.
 	opDone, opBlocked := operationDriverReport(stalePlan)
 	opInput.DriverDone, opInput.DriverBlocked = opDone, opBlocked
 	opPlan, err := r.reconcileOperation(ctx, littleRed, opInput)
@@ -1211,8 +1205,8 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	}
 	operationRunning := opPlan.Run != ""
 	if operationRunning {
-		log.Info("A declared heavy operation is in progress. Rescue actions stand down; "+
-			"convergence continues.",
+		log.Info("A declared heavy operation is in progress. Authority-assigning rules "+
+			"stand down; everything else runs under its normal guards.",
 			"operation", opPlan.Run, "reason", opPlan.Reason, "pending", opPlan.Pending)
 	}
 
@@ -1232,12 +1226,13 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// can clear stuck sentinels even during leaderless periods.
 
 	// Ghost pruning: only safe if the master Sentinel reports is a living pod
-	// CLASSIFICATION of the loop below: the LR-005 / LR-008 ghost-master correction is
-	// CONVERGENCE (ADR-020) and is NOT gated on operationRunning. It re-points a Sentinel
+	// CLASSIFICATION of the loop below: the LR-005 / LR-008 ghost-master correction
+	// PROPAGATES an existing authority decision (ADR-020) and is NOT gated on
+	// operationRunning. It re-points a Sentinel
 	// that has lost its failover notification at the master the rest of the quorum already
 	// agrees on — our own, living, reachable pod, established by the same gate chain
-	// LR-008 wrote. It moves a Sentinel toward the declared topology rather than choosing
-	// a new one, so it cannot contradict a declared change; and standing it down would
+	// LR-008 wrote. It makes reality match a decision the quorum already made rather than
+	// making a new one, so it cannot contradict a declared change; and standing it down would
 	// leave a diverged Sentinel diverged for the whole operation, which is how a rename
 	// ends up with two quorums (LR-048's measured 56.6s of two live masters).
 	//
@@ -1340,15 +1335,15 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		// the ghost-master failover deadlock (Sentinels pinned to a dead master, no
 		// promotable replica). Each no-ops when it is not its case.
 		//
-		// CLASSIFICATION: both are RESCUE (ADR-020), and this is the least ambiguous call
-		// of the three. Neither drives the instance toward its declared topology; both
-		// pick a winner and rewrite the topology around it — Rule L can seed redis-0 over
-		// an instance it believes empty, and the LR-024 recovery force-elects a survivor
-		// via REMOVE + MONITOR + REPLICAOF NO ONE. Running either while a declared change
-		// is mid-flight means electing a master on evidence the operation is still
-		// changing. LR-048 already records renaming a DEGRADED instance as out of scope,
-		// with Rule L as the safety net and the wedge; standing it down for the duration
-		// of the operation is that scope stated in code.
+		// CLASSIFICATION: both ASSIGN AUTHORITY (ADR-020), and they are sentinel mode's
+		// only two rules that do. Neither propagates a decision that already exists; each
+		// creates a new fact about who holds the data — Rule L seeds redis-0 or promotes
+		// a survivor, and the LR-024 recovery force-elects one via REMOVE + MONITOR +
+		// REPLICAOF NO ONE. Running either while a declared change is mid-flight means
+		// electing a master on evidence the operation is still changing. LR-048 already
+		// records renaming a DEGRADED instance as out of scope, with Rule L as the safety
+		// net and the wedge; standing it down for the duration of the operation is that
+		// scope stated in code.
 		//
 		// The return stays unconditional: with no consensus master nothing below can run
 		// anyway (Rule R would issue SLAVEOF at an empty address).
@@ -1396,16 +1391,29 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	}
 	clusterWhole := reachableRedis == int(littleredv1alpha1.SentinelRedisReplicas)
 
-	// CLASSIFICATION: Rule D is RESCUE (ADR-020). SENTINEL RESET wipes the whole replica
-	// list, which can only be rebuilt from the master's own INFO — it is the single most
-	// destructive primitive this rule family has, and it is the self-inflicted trigger of
-	// the LR-024 ghost-master deadlock. It also does not converge anything: a lingering
-	// ghost replica is correctness-benign and merely dirties the monitoring signal, so
-	// deferring it costs nothing while a declared change is in flight and firing it costs
-	// the replica list at the exact moment the topology is being rewritten. The gate is
-	// at this call site and NOT inside GhostReplicaResetSafe: no planner gains a "skip
-	// during an operation" clause (ADR-020 trap 2).
-	if !operationRunning && state.GhostReplicaResetSafe(ghostFound, clusterWhole) {
+	// CLASSIFICATION: Rule D CLEANS UP DEBRIS. It does NOT assign authority, and that is a
+	// ledger fact rather than a judgement call: LR-007 established BY INCIDENT that
+	// SENTINEL RESET does not change the monitored master IP — it clears the replica and
+	// sentinel lists and nothing else — which is precisely why LR-008 had to introduce
+	// REMOVE + MONITOR to repoint a stuck Sentinel. Rule D is therefore STRUCTURALLY
+	// INCAPABLE of deciding who is master, so an operation has no reason to stand it down
+	// (ADR-020). It reads like a topology operation and is one, but not of the kind that
+	// decides.
+	//
+	// It is consequently NOT gated on operationRunning, and un-gating it is what closed a
+	// measured 145s regression. Gated, an ordinary rename settled in ~308s against a
+	// ~166s baseline: the early ghost prune (measured at +47s on the pre-M3.1 control) is
+	// what stops Sentinel's failover state machine wedging in RECONF_SLAVES, and once it
+	// wedges, state.FailoverActive pins Rule A above — so every rule below that line,
+	// including this one, is unreachable until Sentinel's own timers clear it ~178s
+	// later. Rule D cannot BREAK that latch (it sits after Rule A); it prevents it from
+	// forming. See LR-055.
+	//
+	// Its own gate chain is what makes firing it safe here and is unchanged: a living,
+	// reachable consensus master (LR-008), at least one healthy known replica (LR-011),
+	// and a K8s-grounded whole instance (LR-013). An operation supplies no information
+	// those three clauses lack.
+	if state.GhostReplicaResetSafe(ghostFound, clusterWhole) {
 		auditLog.Info("Issuing SENTINEL RESET to clear ghost nodes from topology",
 			"master", sentinelMasterName, "reachableRedis", reachableRedis)
 		sentinelAddresses := r.getSentinelAddresses(ctx, littleRed)
@@ -1421,11 +1429,11 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// Ensure all living Redis pods that are not the consensus master are actually
 	// configured as replicas.
 	//
-	// CLASSIFICATION: CONVERGENCE (ADR-020), and THE NAME LIES — "Replica Rescue" reads
-	// like rescue and is nothing of the kind. It issues one idempotent SLAVEOF that points
-	// a pod at the consensus master the operation is itself converging on, so it cannot
-	// fight the operation; it is pushing the same way. It destroys nothing, elects
-	// nothing and chooses nothing: the target is already decided.
+	// CLASSIFICATION: Rule R PROPAGATES an authority decision that already exists (ADR-020),
+	// and THE NAME LIES — "Replica Rescue" reads like a rescue and assigns nothing at all.
+	// It issues one idempotent SLAVEOF pointing a pod at the consensus master the quorum
+	// has ALREADY chosen. It destroys nothing, elects nothing and decides nothing: the
+	// target is an input.
 	//
 	// It is therefore NOT gated on operationRunning, and that is the whole of the M3.1
 	// regression. A replaced pod comes back following the old master with link:down;
