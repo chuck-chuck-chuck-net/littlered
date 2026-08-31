@@ -103,6 +103,16 @@ forsaken", but the call site passes `forsakenPlan.Captured` and the loop doc/cha
 
 **Condition**: `anyTerminating || state.FailoverActive`.
 
+> **⚠ Rule A's guard is INESCAPABLE, and that is a property of the evaluation order documented in
+> §6 rather than of the rule itself (LR-055).** Rule A returns at `littlered_controller.go:1217`;
+> everything that could clear a stuck `FailoverActive` sits *below* it — Rule D's `SENTINEL RESET`
+> at `:1416` above all. So a Sentinel whose failover state persists blocks **all** healing, on every
+> pass, with no operator path out. Before LR-052 the field was permanently false and the guard never
+> fired at all; LR-052 made it real — correctly — and it is unbounded. Measured 2026-08-30:
+> `failoverActive` true for 84-86 consecutive passes, ~178s, during an ordinary rename of a healthy
+> instance, against LR-052's estimated ~1.84s window. Rule D's *early* prune is the only lever, and
+> only as prevention: once the state exists, Rule D can no longer run. **Recorded, not fixed.**
+
 - `anyTerminating` — any Redis or Sentinel pod carries a `DeletionTimestamp` (ADR-003 Decision 5's
   reasoning, generalised).
 - `state.FailoverActive` — **had never fired in the product's history until LR-052**: it was parsed
