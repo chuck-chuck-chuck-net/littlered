@@ -364,9 +364,30 @@ var _ = Describe("Sentinel Declared Operations", Label("sentinel"), func() {
 					"there is no other Sentinel deployment here, so this is LR-050's false positive, "+
 					"and a quarantine deletes the pods on EmptyDir", forsakenAt)
 
+			// ORDER MATTERS HERE, and it was chosen from an observed mutant run. The
+			// acknowledge-on-sight mutant fails EVERY one of these, and the first one
+			// to fire is the message a future reader gets — so the sharpest claim is
+			// asserted first. Assert sawDeclared first and the report reads "the edit
+			// was not recognised as a heavy operation at all", which is a true
+			// observation and the wrong diagnosis: the edit WAS recognised, and then
+			// acknowledged in the same pass, so the declaration existed for one
+			// reconcile interval instead of for the whole rollout. (LR-047 Addendum 2:
+			// a message that describes the wrong thing sends the reader to the wrong
+			// place.)
+			Expect(ackChanged).To(BeTrue(),
+				"the acknowledgment never changed within 10 minutes; the rename never completed")
+			Expect(settledAtAck).To(BeTrue(),
+				"the acknowledgment landed at +%s while a StatefulSet was still rolling. "+
+					"Row 7 was not enforced and the exit edge was handed into the churn LR-050 "+
+					"is about. With declared=%v driverDone=%v and an ack at +%s this is the "+
+					"ACKNOWLEDGE-ON-SIGHT signature: the record says the work is finished at "+
+					"the moment it is noticed, not when it is done (D1)",
+				ackAt, sawDeclared, sawDriverDone, ackAt)
 			Expect(sawDeclared).To(BeTrue(),
-				"OperationInProgress never went True/Running for the rename — the edit was not "+
-					"recognised as a declared heavy operation at all")
+				"OperationInProgress never went True/Running for the rename — the edit was "+
+					"either not recognised as a declared heavy operation, or it was recognised "+
+					"and acknowledged in the same pass, so the declaration never outlived one "+
+					"reconcile interval")
 			Expect(sawUnsettled).To(BeTrue(),
 				"the operation was never observed while the instance was unsettled, so this run "+
 					"proves nothing about the transition guard")
@@ -375,11 +396,6 @@ var _ = Describe("Sentinel Declared Operations", Label("sentinel"), func() {
 					"True — the driver's completion and the operation's completion were "+
 					"indistinguishable, which is exactly what row 7 exists to separate (D1: "+
 					"acknowledge on COMPLETION, not on observation)")
-			Expect(ackChanged).To(BeTrue(),
-				"the acknowledgment never changed within 10 minutes; the rename never completed")
-			Expect(settledAtAck).To(BeTrue(),
-				"the acknowledgment landed at +%s while a StatefulSet was still rolling — row 7 "+
-					"was not enforced, and the exit edge was handed into the churn LR-050 is about", ackAt)
 
 			By("the operation goes quiet and the rename converged")
 			Eventually(func(g Gomega) {
@@ -512,8 +528,17 @@ var _ = Describe("Sentinel Declared Operations", Label("sentinel"), func() {
 			renameMasterName(crName, newName)
 
 			By("waiting until the operator has actually declared the operation")
+			// The ack is read alongside so that a TIMEOUT here can say why. Against an
+			// acknowledge-on-observation build the operation is declared and
+			// acknowledged in the same pass, so this times out having never caught the
+			// declaration — and without the ack in the message that reads as "the edit
+			// was not recognised", which is the wrong diagnosis. Observed exactly that.
 			Eventually(func(g Gomega) {
-				g.Expect(operationCondStatus(crName)).To(Equal("True"))
+				g.Expect(operationCondStatus(crName)).To(Equal("True"),
+					"reason=%q ack-already-moved=%v — if the ack has ALREADY moved then the "+
+						"operation was acknowledged on OBSERVATION rather than on completion, "+
+						"and the declaration never outlived one reconcile interval (D1)",
+					operationCondReason(crName), renameAck(crName) != ack0)
 				g.Expect(operationCondReason(crName)).To(Equal("Running"))
 				g.Expect(operationStatusField(crName, "name")).To(Equal(heavyOpRename))
 			}, 2*time.Minute, 2*time.Second).Should(Succeed())
