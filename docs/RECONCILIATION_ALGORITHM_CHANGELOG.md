@@ -3600,3 +3600,68 @@ each test.
   operation), **LR-050** (the citation), **LR-007** (the ledger fact that classifies Rule D),
   **LR-038** (the timer never resets on a veto), **LR-045** (the requeue lesson) and **LR-054**
   (a withheld verdict must say that it withheld).
+
+---
+
+## [LR-059] A Pending Heavy Operation on a Leaderless Instance Wedges Forever
+
+**Status: FOUND AND RECORDED, NOT FIXED.** Found by ADR-020's own Phase 6 e2e (T4's release half),
+2026-09-01. Availability, not durability — but unbounded, and reachable by a route `docs/USAGE.md`
+was actively inviting.
+
+**The loop.** ADR-020 suppresses only the rules that **assign authority**; in sentinel mode that is
+Rule L and the LR-024 recovery. That boundary is correct as a *safety* rule — electing a master on
+evidence a declared change is still moving is exactly what must not happen. It opens a **liveness**
+hole precisely where there is no authority to protect, because a leaderless instance has no master
+to elect *around*:
+
+```
+rename pending → operation Running → Rule L suppressed → no master is seeded →
+pods park in the startup wait-loop → never Ready → StatefulSets never settle →
+row 7 withholds the acknowledgment → the operation stays Running → Rule L stays suppressed
+```
+
+Nothing breaks the cycle. The operation cannot complete because the instance cannot recover, and
+the instance cannot recover because the operation has not completed.
+
+**Measured on t3e, one variable, three directions** — not reasoned from the diff (LR-054's rule):
+
+| instance | leaderless | rename pending | outcome |
+|---|---|---|---|
+| `ctrl` | yes | **no** | recovered in **74s** (`Leaderless bootstrap deadlock suspected` → `seeded ctrl-redis-0 as master`) |
+| `diag` | yes | **yes** | **wedged 7m56s and still going** — only `A declared heavy operation is in progress` every ~4s, **zero** leaderless lines |
+| `diag` | yes | rename **reverted** | recovered in **84s** |
+
+**Why LR-058's rule did not catch it.** LR-058 generalized *"an operation must never suppress the
+healing its own completion condition depends on"* from Rule R, and stopped at the rules that do not
+assign authority. Rule L is in the suppressed set **deliberately**. So the rule as written is
+satisfied and the wedge still exists: settling depends on Rule L in exactly the state where Rule L
+is correctly suppressed. **The rule needs a second half about the case where there is nothing to
+protect.**
+
+**Reachability is a documented path, not a corner.** ADR-016's quarantine releases the pods
+**empty and leaderless** by design — Rule L's no-data reseed is what re-bootstraps them (pillar
+3.15). `docs/USAGE.md` promised a pending rename "is picked up once the instance is released and
+serving again", which is precisely what cannot happen. That sentence is corrected in the same
+change; the correction names the workaround (**revert the `masterName` edit**, which clears the
+pending operation and lets Rule L recover) rather than leaving an owner stuck.
+
+**Loud but slow.** `OperationInProgress` stays `Running` throughout, so the state is visible — but
+it does not reach `Stalled` for 15 minutes, and `Stalled` has **no auto-exit** either (ADR-017).
+Nothing self-corrects at any horizon.
+
+**Reproduction is committed and skipped**, per the LR-056/LR-057 pattern:
+`test/e2e/sentinel_operations_test.go` → *"Sentinel Declared Operations On A Leaderless Instance"*,
+with the un-skip condition inline. Deliberately **not** inverted into a characterisation test: that
+would assert the defect is correct and resist the fix.
+
+**Do not fix by un-suppressing Rule L.** That re-admits electing a master mid-operation, which is
+the hazard the boundary exists for, and LR-048 already records renaming a *degraded* instance as
+out of scope with Rule L as the safety net. The shape worth exploring is narrower: a heavy operation
+whose instance has **no authority to assign** has nothing for the suppression to protect, so the
+suppression is vacuous there and could be lifted on that fact — an invariant, not a timer.
+
+**Impacts:** ADR-020 (the boundary needs its second half), ADR-016 (the release path is the
+trigger), `docs/USAGE.md` (corrected here), LR-058 (the rule it generalized is incomplete).
+**Regresses:** nothing — the wedge requires a pending heavy operation, so it is unreachable before
+ADR-020.

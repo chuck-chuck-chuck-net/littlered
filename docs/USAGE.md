@@ -540,8 +540,19 @@ one holds, the instance keeps serving and no data action is taken.
 **3. `Quarantined` is a special case.** An instance captured by another Sentinel deployment is held
 at zero Redis and zero Sentinel pods while the capture is resolved. With no pods there is nothing
 to perform a heavy change on, so a pending rename is **recorded and held**, not run — the operator
-reports it rather than silently dropping it. It is picked up once the instance is released and
-serving again. Do not try to rename your way out of a capture; the remedy order is
+reports it rather than silently dropping it.
+
+> **⚠ It is NOT reliably picked up when the quarantine releases — LR-059.** The release hands the
+> pods back **empty and leaderless**, and recovering from that is Rule L's job — which a pending
+> operation stands down, because Rule L assigns authority. The pods then park in the wait-loop, never
+> become Ready, the StatefulSets never settle, and the acknowledgment that would end the operation
+> never lands. **Measured: wedged 7m56s and still going, against 74s to recover with no rename
+> pending, and 84s once the rename was reverted.** It is loud (`OperationInProgress` stays `Running`)
+> but it does not reach `Stalled` for 15 minutes, and `Stalled` has no auto-exit either. **If you hit
+> this, revert the `masterName` edit** — that clears the pending operation and lets Rule L recover
+> the instance; re-apply the rename once it is serving. Recorded, not yet fixed.
+
+Do not try to rename your way out of a capture; the remedy order is
 **capture → let the quarantine finish → then rename**.
 
 **4. Two heavy fields cannot be changed in one `kubectl apply`.** The CRD refuses an update that
