@@ -761,6 +761,10 @@ var _ = Describe("Sentinel Declared Operations Under Quarantine", Label("sentine
 		}
 		return strings.TrimSpace(out)
 	}
+	forsakenReasonOf := func(crName string) string {
+		r, _ := getConditionField(crName, "Forsaken", "reason")
+		return r
+	}
 	quarantinedSince := func(crName string) string {
 		out, _ := utils.Run(exec.Command("kubectl", "get", "littlered", crName,
 			"-n", testNamespace, "-o", "jsonpath={.status.quarantinedSince}"))
@@ -860,7 +864,8 @@ spec:
 		captor = fmt.Sprintf("op-q-captor-%d", stamp)
 		victim = fmt.Sprintf("op-q-victim-%d", stamp)
 		sharedName = fmt.Sprintf("opq.shared.%d", stamp)
-		newName = e2eMasterName(testNamespace, victim)
+		// See the rename step for why this is the legacy name and not a scoped one.
+		newName = "mymaster"
 		AddReportEntry("cr:" + victim)
 
 		for _, n := range []string{captor, victim} {
@@ -891,7 +896,7 @@ spec:
 		}
 	})
 
-	It("holds a pending rename, reports it as Quarantined, and picks it up on release", func() {
+	It("holds a pending rename and reports it as Quarantined", func() {
 		capture()
 
 		By("the operator quarantines the victim")
@@ -902,20 +907,45 @@ spec:
 		}, 5*time.Minute, 3*time.Second).Should(Succeed())
 
 		// ---- THE RENAME LANDS ON AN INSTANCE WITH NO PODS ------------------
+		//
+		// THE TARGET NAME IS THE LEGACY `mymaster`, AND THAT IS A DELIBERATE DEVICE
+		// RATHER THAN A SCENARIO. The claim under test — a quarantined instance
+		// advances nothing — is indifferent to WHICH name is asked for; what it needs
+		// is a window long enough to be evidence. A scoped target leaves the attempt
+		// budget at 2, so the quarantine releases 120s after arming and every
+		// assertion here races that timer (a first draft did, and it also opened its
+		// Consistently 0.096s after the patch, before the operator could possibly have
+		// reconciled — LR-050's own e2e flake, repeated).
+		//
+		// Auth is off in this fixture, so renaming TO `mymaster` makes the effective
+		// name the legacy shared one, which is `quarantineConfigDangerous`: the budget
+		// drops to 1, the single spent attempt LATCHES, and the instance stays at zero
+		// replicas indefinitely. The window becomes unbounded. This is the same device
+		// the Latched tier in sentinel_quarantine_test.go uses and documents, for the
+		// same reason.
 		By("renaming the quarantined instance to " + newName)
 		renameMasterName(victim, newName)
 
-		// The window is bounded by quarantineSettlePeriod (120s from arming, plus one
-		// steady interval of granularity). Detection above lands within a few seconds
-		// of arming, so 60s of sampling sits comfortably inside it — and the claim is
-		// about what happens WHILE quarantined, so it does not need to outlast it.
-		By("nothing advances, and the held change is REPORTED rather than dropped")
-		Consistently(func(g Gomega) {
+		By("the held change is REPORTED rather than dropped, and the latch engages")
+		// Eventually first, because this is a TRANSITION: the operator has to observe
+		// the patch, and while Forsaken holds it is polled at the STEADY interval
+		// (LR-045), so the state cannot be read the instant kubectl returns.
+		Eventually(func(g Gomega) {
 			g.Expect(operationCondStatus(victim)).To(Equal("True"),
 				"a pending heavy change over a quarantined instance must be REPORTED, not "+
 					"silently withheld (LR-054: anything this mechanism withholds must say so)")
 			g.Expect(operationCondReason(victim)).To(Equal("Quarantined"))
 			g.Expect(operationStatusField(victim, "name")).To(Equal(heavyOpRename))
+			g.Expect(forsakenReasonOf(victim)).To(Equal("QuarantineLatched"),
+				"the latch did not engage, so the window below would race the 120s settle")
+		}, 3*time.Minute, 3*time.Second).Should(Succeed())
+
+		By("and NOTHING advances, held past the timer that would otherwise have released it")
+		// 150s outlasts quarantineSettlePeriod (120s) plus a steady interval of
+		// granularity, so this is not merely "nothing happened yet": it is "nothing
+		// happened across the whole window in which the release would have fired".
+		Consistently(func(g Gomega) {
+			g.Expect(operationCondReason(victim)).To(Equal("Quarantined"))
 
 			// The trap this row exists for: a replicas:0 StatefulSet reads SETTLED, so a
 			// mechanism that let the operation proceed here would satisfy row 7's
@@ -928,34 +958,27 @@ spec:
 			// quarantine quietly ending.
 			g.Expect(quarantinedSince(victim)).NotTo(BeEmpty())
 			g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("0"))
-		}, 60*time.Second, 5*time.Second).Should(Succeed())
+			g.Expect(stsSpecReplicas(victim + "-sentinel")).To(Equal("0"))
+		}, 150*time.Second, 5*time.Second).Should(Succeed())
 
-		// ---- WHAT THIS TIER DELIBERATELY NO LONGER ASSERTS — LR-059 --------
+		// ---- WHAT THIS TIER DELIBERATELY DOES NOT ASSERT — LR-059 ----------
 		//
 		// docs/USAGE.md promises the held change "is picked up once the instance is
 		// released and serving again", and a first draft of this tier asserted exactly
-		// that. **The product does not deliver it, and the reason is a wedge this tier
+		// that. **The product does not deliver it, and that is the defect this tier
 		// found**: on release the instance comes back leaderless with bare Sentinels,
 		// the pending rename is picked up IMMEDIATELY (it is no longer quarantined),
 		// and Rule L — the only thing that can give it a master — is in the suppressed
-		// set, so the pods never become Ready, the StatefulSets never settle, row 7
+		// set. So the pods never become Ready, the StatefulSets never settle, row 7
 		// never acknowledges, and the operation runs forever.
 		//
-		// Measured, and it is NOT specific to the quarantine: a hand-staged leaderless
+		// Measured, and NOT specific to the quarantine: a hand-staged leaderless
 		// instance with a pending rename sat wedged for 7m56s with zero leaderless
-		// lines in the operator log, while an identical instance with no rename
-		// recovered in 74s. The deterministic reproduction and its positive control
-		// are the committed-and-skipped tier below; see LR-059.
-		//
-		// So this tier stops at the claim it can honestly make — the change is HELD
-		// and REPORTED, which is planOperation row 1 and is correct — and the release
-		// half moves to the tier that names the defect. Asserting the pickup here
-		// would be asserting a defect-free world; re-add it WITH the LR-059 fix.
-		By("the quarantine does release the pods, which is where LR-059 begins")
-		Eventually(func(g Gomega) {
-			g.Expect(quarantinedSince(victim)).To(BeEmpty())
-			g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("3"))
-		}, 5*time.Minute, 5*time.Second).Should(Succeed())
+		// lines in the operator log, while an identically-staged instance with no
+		// rename recovered in 74s, and reverting the rename recovered the first in 84s.
+		// The deterministic reproduction and its positive control are the
+		// committed-and-skipped tier below. Re-add the pickup assertion here WITH the
+		// LR-059 fix — asserting it now would be asserting a defect-free world.
 	})
 })
 
