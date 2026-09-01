@@ -705,11 +705,16 @@ var _ = Describe("Sentinel Declared Operations", Label("sentinel"), func() {
 			}, 3*time.Minute, 10*time.Second).Should(Succeed())
 
 			By("and the dataset is untouched")
-			bad, err := redisExec(testNamespace, masterBefore, "EVAL", sweep, "0", strconv.Itoa(keyCount))
-			Expect(err).NotTo(HaveOccurred())
-			Expect(strings.TrimSpace(bad)).To(Equal("0"),
-				"%s keys are missing or wrong on %s after a stalled operation",
-				strings.TrimSpace(bad), masterBefore)
+			// Swept against the CURRENT master rather than the pod that held the role
+			// before the patch. A StatefulSet rolls in reverse ordinal, so the wedged
+			// replacement is the HIGHEST ordinal and the master — seeded as redis-0 at
+			// bootstrap — is never reached; that is why masterBefore survived every
+			// observed run. But it is a property of the seeding, not an invariant of
+			// this tier, and pinning the sweep to a pod that a failover could have
+			// moved would make the assertion fail for a reason that has nothing to do
+			// with the stall.
+			expectKeysIntact(crName)
+			Expect(masterBefore).NotTo(BeEmpty())
 		})
 	})
 })
