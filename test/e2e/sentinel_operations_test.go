@@ -1230,6 +1230,7 @@ var _ = Describe("Sentinel Declared Operations Across an Operator Upgrade",
 	Label("sentinel"), Ordered, func() {
 
 		var instances []string
+		var churn string
 		var preOpsImage, currentImage string
 
 		// preOperationsOperatorImage returns the pre-ADR-020 operator image, or skips.
@@ -1253,9 +1254,14 @@ var _ = Describe("Sentinel Declared Operations Across an Operator Upgrade",
 			}
 
 			stamp := time.Now().Unix()
+			// Three settled instances plus one deliberately UNSETTLED at the moment of
+			// the upgrade — see the churn step below for why the fourth is what makes
+			// this tier able to fail at all.
 			for i := 0; i < 3; i++ {
 				instances = append(instances, fmt.Sprintf("op-fleet-%d-%d", stamp, i))
 			}
+			churn = fmt.Sprintf("op-fleet-%d-churn", stamp)
+			instances = append(instances, churn)
 			for _, n := range instances {
 				AddReportEntry("cr:" + n)
 			}
@@ -1281,7 +1287,7 @@ var _ = Describe("Sentinel Declared Operations Across an Operator Upgrade",
 			By("deploying the PRE-operations operator " + preOpsImage)
 			deployOperatorImage(preOpsImage)
 
-			By("creating a fleet of three healthy sentinel instances under it")
+			By("creating a fleet of healthy sentinel instances under it")
 			for _, n := range instances {
 				cmd := exec.Command("kubectl", "apply", "-f", "-")
 				cmd.Stdin = strings.NewReader(sentinelRenameCR(n, e2eMasterName(testNamespace, n)))
@@ -1304,6 +1310,43 @@ var _ = Describe("Sentinel Declared Operations Across an Operator Upgrade",
 				Expect(operationCondStatus(n)).To(BeEmpty(),
 					"%s already carries an OperationInProgress condition", n)
 			}
+
+			// ---- ONE INSTANCE MUST BE UNSETTLED ACROSS THE UPGRADE -----------
+			//
+			// THIS STEP IS WHAT MAKES THE TIER ABLE TO FAIL, and it was added because
+			// the mutation check said so rather than because it was reasoned. Against
+			// a build with row 3 REMOVED the three settled instances go green: with no
+			// ack row the candidate reads as pending, the driver (Rule N) has nothing
+			// stale to prune so it reports Converged on the very first pass, the
+			// StatefulSets are already settled, and row 8 therefore acknowledges in
+			// that same pass with Report empty — so the condition goes straight to
+			// False/Converged and NOTHING is ever observed declared. The regression
+			// ADR-020 warns about is invisible on a quiet fleet.
+			//
+			// It is not invisible on a fleet that is mid-anything, which is what a real
+			// upgrade meets: with the StatefulSets unsettled, row 8's completion
+			// condition is false, so row 7 keeps the operation RUNNING and healing
+			// stands down — for every instance in the fleet, until each one settles.
+			// On a leaderless one that is LR-059's permanent wedge.
+			//
+			// So one instance is wedged unsettled first, with a nodeSelector nothing
+			// matches. Only the highest ordinal is stranded Pending, so the instance
+			// keeps its master and stays a legitimate member of the fleet — it is
+			// simply not settled, which is the state under test.
+			By("wedging " + churn + " unsettled, so the upgrade meets a fleet that is mid-roll")
+			out, err := utils.Run(exec.Command("kubectl", "patch", "littlered", churn,
+				"-n", testNamespace, "--type=merge", "-p",
+				`{"spec":{"podTemplate":{"nodeSelector":{"littlered.e2e/unschedulable":"true"}}}}`))
+			Expect(err).NotTo(HaveOccurred(), "patch output: %s", out)
+			Eventually(func(g Gomega) {
+				out, err := utils.Run(exec.Command("kubectl", "get", "pods", "-n", testNamespace,
+					"-l", "app.kubernetes.io/instance="+churn,
+					"-o", "jsonpath={range .items[*]}{.metadata.name}={.status.phase} {end}"))
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(out).To(ContainSubstring("=Pending"),
+					"no pod of %s is Pending, so it is not unsettled and the tier is back to "+
+						"testing only the quiet case: %s", churn, out)
+			}, 4*time.Minute, 5*time.Second).Should(Succeed())
 
 			By("UPGRADING to " + currentImage)
 			deployOperatorImage(currentImage)
@@ -1333,8 +1376,14 @@ var _ = Describe("Sentinel Declared Operations Across an Operator Upgrade",
 				}
 			}, 3*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("and the fleet is still healthy under the new operator")
+			By("and the settled part of the fleet is still healthy under the new operator")
+			// churn is excluded by construction: it was wedged on purpose and cannot be
+			// Ready. Its claim is the one above — that it declared no operation while
+			// unsettled — which is the whole reason it is here.
 			for _, n := range instances {
+				if n == churn {
+					continue
+				}
 				Eventually(func(g Gomega) {
 					g.Expect(getPhase(n)).To(Equal("Running"))
 					st, _ := getConditionField(n, "Ready", "status")
