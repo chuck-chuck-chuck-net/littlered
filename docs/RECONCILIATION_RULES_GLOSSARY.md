@@ -406,10 +406,11 @@ restarts.
 gate for free: with `partition > 0`, `CurrentRevision` never advances, so later shards keep
 deferring. Governs **operator-triggered rollouts only**. LR-021, LR-047.
 
-⚠ **doc drift**: LR-021's predicate was renamed `clusterShardRolloutSettled` →
-**`statefulSetRolloutSettled`** when LR-050 reused it for sentinel mode. **ADR-007 (§ "rolls a single
-shard"), ADR-017 (three places) and the LR-021/LR-047 changelog entries still name the old symbol,
-which no longer exists in the tree.**
+**Naming**: LR-021's predicate was renamed `clusterShardRolloutSettled` →
+**`statefulSetRolloutSettled`** when LR-050 reused it for sentinel mode. ADR-007, ADR-017 and
+`CLAUDE.md` pillar 3.12 now carry that rename as a note beside the name they were decided under.
+The **changelog entries are left alone deliberately** — LR-021 and LR-047 record the symbol as it
+was at the time, and rewriting a dated record to look current destroys the audit trail.
 
 **Legacy → per-shard migration** — phases `Standup → Meet → Replicate → Failover → Decommission →
 Complete` (the pre-LR-025 phases `Draining` / `ReplicasAttached` are **retired**).
@@ -584,7 +585,7 @@ the **rule** that owns it once you have the ground truth.
 | **Rule D Extension** | retired alias | **Rule D**'s ghost-master half — which LR-008 then moved out of Rule D entirely into REMOVE+MONITOR |
 | **`SENTINEL RESET` for a ghost *master*** | superseded | LR-007 tried it, LR-008 replaced it with `REMOVE` + `MONITOR`: RESET does not change the monitored master IP |
 | **Topology-aware sentinel liveness probe** | superseded | LR-016 — reduced to a local `PING`; zombie redirect is Rule R, leaderless survival is Rule L |
-| **`clusterShardRolloutSettled`** | renamed | **`statefulSetRolloutSettled`** (`cluster_rollout.go`), when LR-050 reused it for sentinel mode. ADR-007/ADR-017 still use the old name |
+| **`clusterShardRolloutSettled`** | renamed | **`statefulSetRolloutSettled`** (`cluster_rollout.go`), when LR-050 reused it for sentinel mode. ADR-007, ADR-017 and CLAUDE.md pillar 3.12 keep the old name with a rename note beside it; the changelog entries keep it as the dated record it is |
 | **`GatherClusterState`** | renamed | `GatherReplicationState` (mode-neutral) |
 | **`ClusterProbeTimeout`** | renamed | `ProbeTimeout` (LR-017) |
 | **`MasterInfo.FailoverStatus` / `failover-status`** | deleted | `FailoverState` / `MasterFailoverState`, read from `failover-state`; the old wire key never existed (LR-052) |

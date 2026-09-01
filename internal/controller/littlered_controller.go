@@ -1221,9 +1221,15 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		return nil
 	}
 
-	// Note: state.RealMasterIP == "" (leaderless) used to be a hard blocker here.
-	// We now allow reconciliation to proceed so that Rule A+ (ghost pruning)
-	// can clear stuck sentinels even during leaderless periods.
+	// Note: state.RealMasterIP == "" (leaderless) used to be a hard early return here.
+	// Reconciliation now proceeds past this point so that the leaderless branch below —
+	// Rule L (LR-015) and the LR-024 ghost-master recovery — can own that state. It is NOT
+	// so that ghost pruning can act while leaderless: Rule D's SENTINEL RESET and the
+	// LR-005/LR-008 REMOVE+MONITOR correction are both gated on a living, reachable
+	// consensus master, which is precisely what leaderless means we do not have.
+	// ("Rule A+" was an early alias for Rule D and is retired; LR-001/LR-007 established
+	// by incident that pruning during a leaderless period resets Sentinel's s_down timer
+	// and blocks failover indefinitely.)
 
 	// Ghost pruning: only safe if the master Sentinel reports is a living pod
 	// CLASSIFICATION of the loop below: the LR-005 / LR-008 ghost-master correction

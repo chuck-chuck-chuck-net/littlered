@@ -123,7 +123,9 @@ asserts the same invariant, so a future regression goes red in CI.
 Splitting one StatefulSet into N dropped the global one-pod-at-a-time restart serialization the
 single StatefulSet gave for free. So `reconcileClusterStatefulSet` applies template **updates**
 one shard at a time — create-missing stays parallel (bootstrap), but an operator-driven template
-change rolls a single shard and defers the rest until it settles (`clusterShardRolloutSettled`;
+change rolls a single shard and defers the rest until it settles (`clusterShardRolloutSettled` —
+since **renamed `statefulSetRolloutSettled`** by LR-050, which reused the predicate for sentinel
+mode because it was never mode-specific; the decision below is recorded as it was taken;
 change detected cache-safely via an `AnnotationPodSpecHash` on the pod template). Without it a
 config change restarts every shard's master in one wave — a cluster-wide availability dip (not
 data loss) measured in the first e2e run. Governs operator-triggered rollouts only; a manual

@@ -46,7 +46,9 @@ graph TD
         Step2["Step 2: Forget Ghost Nodes<br/><i>CLUSTER FORGET</i>"]
         Step2 --> Step3
         Step3["Step 3: Recover Missing Shards<br/><i>CLUSTER ADDSLOTS</i>"]
-        Step3 --> Step4
+        Step3 --> Step3b
+        Step3b["Step 3b: Consolidated-Shard Reshard<br/><i>One master owns two shard ranges while<br/>another sits empty — relocate the surplus,<br/>keys preserved (LR-018)</i>"]
+        Step3b --> Step4
         Step4["Step 4: Replication Repair<br/><i>CLUSTER REPLICATE</i>"]
         Step4 --> Step5
         Step5["Step 5: Bootstrap<br/><i>Only if 0 slots AND 0 replicas</i>"]
@@ -240,6 +242,41 @@ The operator therefore blocks CLUSTER MEET while `HasOrphanedReplicas()` is true
 
 **Safety**: If the intended master pod isn't available, the operator waits rather than assigning to a different pod (which would cause split-ownership and "Slot already busy" errors).
 
+### Step 3b: Consolidated-Shard Reshard (LR-018, ADR-006)
+
+**Trigger**: all slots are assigned, but a **single reachable master owns more than one** expected
+shard range while another reachable master sits **empty** — so `CountMasters() < shards` and the
+instance never reaches healthy. No other step could act: Step 3 checks only that each range has *an*
+owner, never a *distinct* one, so it sees nothing missing; Step 4 only reattaches empty masters to
+*under-replicated* slot-masters, and both slot-masters may already have their replica. A field
+report sat in `Initializing` for ~19h in exactly this state.
+
+**Decision** (pure `PlanReshard`): keep the lowest-index shard on the over-consolidated master and
+relocate the surplus range onto the lowest-`PodName` reachable empty master — distinctness only.
+Defers on a fragmented/non-aligned range, on no empty master, and on a healthy topology.
+
+**Action** (`reshardConsolidated`), **keys preserved unconditionally** — a key-preserving reshard
+always exists here, so there is deliberately **no drop-keys opt-in** (contrast sentinel mode's
+`allowUnsafeRebootstrapOnDeadlock`). The mechanism is chosen by a **free gather-time capability
+probe** — the `cluster_slot_migration_*` fields already present in `CLUSTER INFO`, AND-ed over all
+reachable nodes so a mixed-version rolling upgrade falls back to the baseline; **nothing is
+persisted**, because an internal engine capability is not a monitoring surface (ADR-006):
+
+- **Redis 8.4+** — native atomic slot migration (`CLUSTER MIGRATION IMPORT`, re-entrant via
+  `STATUS`).
+- **pre-8.4** — the incremental `reshardViaDance`: mark IMPORTING/MIGRATING, drain bounded key
+  batches per reconcile, and flip `SETSLOT NODE` **only once the whole range is drained**. Ownership
+  flips at the end, so the plan re-emits the same move and the executor **resumes from the cluster's
+  own on-node markers** — no persisted operator state. Tunables:
+  `spec.cluster.reshard{KeyBatchSize,MaxKeysPerReconcile,MigrateTimeoutMillis}`.
+
+**Ordering**: before Step 4, so the freshly-created third master exists for the remaining empty
+master(s) to be reattached to as its replicas.
+
+**The cause is closed in Step 3**, not only the symptom: `SafeMissingShardTarget` restricts
+missing-shard assignment to a reachable **empty** master, so recovery can never pile a second range
+onto a master that already owns one — the drift that created this state in the first place.
+
 ### Step 4: Replication Repair
 
 **Trigger**: Master nodes with 0 slots (empty masters) in a cluster that has `replicasPerShard > 0`. An empty master is the cold-start state of any restarted pod (pure in-memory, no `cluster-config-file` to persist its old identity), so this is the normal path back from a pod replacement.
@@ -421,6 +458,7 @@ The operator reports `Phase: Running` when:
 
 ## References
 - [ADR-001: Strict IP-Only Identity (Cluster Amendment)](adr/001-strict-ip-identity.md#cluster-mode-has-an-active-fix-nodesconf-deletion)
+- [ADR-006: Consolidated-Shard Reshard Recovery](adr/006-cluster-consolidated-shard-reshard.md) — Step 3b
 - [ADR-017: State-Gated Intra-Shard Rolling Updates](adr/017-state-gated-cluster-rolling-updates.md)
 - [Reconciliation Algorithm Changelog](RECONCILIATION_ALGORITHM_CHANGELOG.md)
 - [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md) — high-level view

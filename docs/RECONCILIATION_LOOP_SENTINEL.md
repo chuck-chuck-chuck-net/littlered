@@ -56,21 +56,36 @@ graph TD
     subgraph HealingDetail ["reconcileSentinelCluster"]
         direction TB
         Gather["Gather Ground Truth<br/><i>Query all Redis + Sentinel pods</i>"]
-        Gather --> DetermineRM["DetermineRealMaster<br/><i>Sentinel majority vote → RealMasterIP</i>"]
-        DetermineRM --> Rule0
+        Gather --> DetermineRM
 
-        Rule0["Rule 0: Re-register bare sentinels<br/><i>Sentinel reachable but not monitoring</i><br/><i>→ SENTINEL MONITOR + SET</i>"]
+        DetermineRM["DetermineRealMaster<br/><i>Sentinel majority vote → RealMasterIP</i>"]
+        DetermineRM --> AuthReport
+
+        AuthReport["Report the operator's own auth state (LR-051)<br/><i>OperatorCannotAuthenticate — a pod that ANSWERED,<br/>to refuse us, is not provably empty</i><br/><i>Rendering only; reported BEFORE the switch below,<br/>because that switch returns early</i>"]
+        AuthReport --> Forsaken
+
+        Forsaken{"Forsaken / quarantined?<br/><i>planForsaken + planQuarantine</i>"}
+        Forsaken -- "Quarantined (ScaleToZero)" --> HeldOp["Record the quarantine; REPORT any held<br/>heavy operation (ADR-020 row 1) and return<br/><i>replicas:0 reads SETTLED, so an operation<br/>allowed to proceed would acknowledge<br/>work no pod ever executed</i>"]
+        Forsaken -- "Forsaken, not quarantined" --> StopHealing["Record the capture and return<br/><i>ADR-015 §9.2: the fight is unwinnable</i>"]
+        Forsaken -- No --> Rule0
+
+        Rule0["Rule 0: Re-register bare sentinels<br/><i>Sentinel reachable but not monitoring</i><br/><i>ONLY while RealMasterIP != '' — there must be<br/>a master to point it at</i><br/><i>→ SENTINEL MONITOR + SET</i>"]
         Rule0 --> RuleN
 
         RuleN["Rule N: Prune stale master names<br/><i>Any name monitored that is not the desired one</i><br/><i>→ SENTINEL REMOVE (gated)</i>"]
-        RuleN --> RuleA
+        RuleN --> Operation
+
+        Operation{"Declared heavy operation running?<br/><i>planOperation — ADR-020</i>"}
+        Operation -- Yes --> SuppressAuthority["Report it; the two AUTHORITY-ASSIGNING rules<br/>stand down: Rule L and the LR-024 recovery<br/><i>HELD, not skipped — their cooldowns keep<br/>their elapsed time</i>"]
+        Operation -- No --> RuleA
+        SuppressAuthority --> RuleA
 
         RuleA{"Rule A: Guardrails<br/>Any terminating pods?<br/>Failover active?"}
         RuleA -- Yes --> SkipAll["Skip all healing<br/><i>Let Sentinel/K8s finish</i>"]
         RuleA -- No --> Leaderless
 
         Leaderless{"RealMasterIP == ''?<br/><i>no living consensus master</i>"}
-        Leaderless -- Yes --> Deadlocks["Rule L (LR-015): all Sentinels BARE<br/>→ elect by data-holder count<br/><br/>Ghost-master recovery (LR-024):<br/>Sentinels pinned to a DEAD master,<br/>no promotable replica<br/>→ elect by replication lineage"]
+        Leaderless -- Yes --> Deadlocks["<i>(both stand down under a declared<br/>heavy operation — ADR-020)</i><br/>Rule L (LR-015): all Sentinels BARE<br/>→ elect by data-holder count<br/><br/>Ghost-master recovery (LR-024):<br/>Sentinels pinned to a DEAD master,<br/>no promotable replica<br/>→ elect by replication lineage"]
         Deadlocks --> ReturnLeaderless["Return — every other rule<br/>needs a consensus master"]
         Leaderless -- No --> GhostMaster
 
@@ -104,13 +119,21 @@ for ~146 s on a managed cloud, starving the recovery rules of the loop iteration
 | Source | Data Collected |
 |--------|---------------|
 | Each Redis pod (`INFO replication`) | Role, MasterHost, LinkStatus, Offset, Reachable |
-| Each Sentinel pod (`SENTINEL MASTER`, `SENTINEL REPLICAS`, `SENTINEL MASTERS`) | MasterIP, FailoverStatus, Monitoring, Reachable, Replica list, **MonitoredMasters** (every name that Sentinel carries, with its address and flags — LR-048) |
+| Each Sentinel pod (`SENTINEL MASTER`, `SENTINEL REPLICAS`, `SENTINEL MASTERS`) | MasterIP, MasterFlags, **MasterFailoverState**, Monitoring, Reachable, Replica list, **MonitoredMasters** (every name that Sentinel carries, with its address and flags — LR-048) |
 
 `SENTINEL MASTERS` is one extra bounded round trip per Sentinel per pass, paid **unconditionally**
 rather than only when a Sentinel reads bare: a Sentinel carrying *both* a leftover name and the
 desired one answers `Monitoring: true`, so a bareness-triggered probe would never see the two-name
 state — which is exactly the state a half-finished rename leaves behind. A failed read degrades to
 an **empty list**, never to `Reachable: false` (LR-041), so emptiness is not evidence of absence.
+
+`MasterFailoverState` is the monitored master's own `failover-state` field, and the name matters:
+it was `FailoverStatus`, populated from a `failover-status` key **neither Redis nor Valkey has ever
+emitted**, so `FailoverActive` was permanently false and Rule A's second half had never fired in the
+product's history (LR-052). The old name is what made the wrong wire key look plausible. Sentinel
+omits the field entirely unless a failover is running, so absence means idle — and `FailoverActive`
+is an **OR** over Sentinels rather than a majority, because only the election *leader* carries the
+flag (1 of 3, measured).
 
 ### DetermineRealMaster Algorithm
 
@@ -147,6 +170,13 @@ The **ghost-majority guard** (LR-004) is critical: if most sentinels still point
 **Trigger**: Sentinel pod is reachable but `Monitoring == false` (no master configured).
 
 **Cause**: A sentinel pod restarted with a new IP after bootstrapRequired was already cleared. Sentinel gossip cannot help here — without a MONITOR command, the pod doesn't know which pubsub channel to subscribe to.
+
+**Precondition, and it is easy to miss because it is the branch the whole rule lives inside**:
+`RealMasterIP != ""`. There has to be a master to point the bare Sentinel *at*, so while the
+instance is leaderless Rule 0 does not run at all — which is exactly why LR-015 needed Rule L: with
+every Sentinel bare, `RealMasterIP` is `""` by construction and Rule 0 cannot bootstrap the quorum
+out of it. ADR-003's Decision 2 states the trigger (`Reachable && !Monitoring`) without this clause;
+read the two together.
 
 **Action**: `SENTINEL MONITOR <masterName> <RealMasterIP>` + apply all settings (auth-pass, down-after, failover-timeout, parallel-syncs) directly to that pod's IP.
 
@@ -217,6 +247,45 @@ name — re-pointing that at a different address is LR-005/LR-008's job and stay
 reads `Monitoring:false, Reachable:true` — the single-name probe asks about the *new* name — while
 still carrying the old entry. Gating on `Monitoring` would make Rule N inert on exactly the pass it
 must act.
+
+### Declared Heavy Operations (ADR-020)
+
+**Position: after Rule 0 and Rule N, immediately before Rule A.** The *input* is assembled earlier —
+after the quarantine decision, so a quarantined instance reports a **held** operation (a
+`replicas: 0` StatefulSet reads *settled*, so one allowed to proceed would acknowledge work no pod
+ever executed) — but the *decision* cannot precede the driver, because whether the driver completed
+is an **input** to it, not an output. Rule 0 and Rule N together **are** registry v1's driver; no
+new healing logic exists anywhere in this mechanism.
+
+**Trigger**: a *heavy* spec field's current value differs from the fingerprint the operator has
+recorded as finished (`status.acknowledgedOperations`). Registry v1 has one member,
+`spec.sentinel.masterName` (ADR-018's rename, citation LR-050).
+
+**Effect — the boundary is AUTHORITY ASSIGNMENT, not "healing"**: while an operation runs, the two
+rules that would create a new fact about *which pod is master* stand down — **Rule L** and the
+**LR-024 ghost-master recovery**, a strict subset of Rule A's set. Everything else reaches Rule A
+exactly as it always did, under Rule A's own guards: Rule 0, **Rule D**, Rule R and the LR-005/LR-008
+correction. Rule D is *structurally incapable* of assigning authority — LR-007 established by
+incident that `SENTINEL RESET` does not change the monitored master IP, which is precisely why
+LR-008 needed `REMOVE` + `MONITOR`.
+
+Suppressing more than that was measured and reverted: with everything Rule A skips suppressed, a
+rename took **311s against 162s**, and the entire difference was one stranded pod that only **Rule
+R** repoints — pod unready ⇒ StatefulSet unsettled ⇒ operation pending ⇒ Rule R suppressed ⇒ pod
+unready. **An operation must never suppress the healing its own completion condition depends on.**
+The suppression is a **HOLD, not a skip**: `leaderlessSince` and `ghostMasterStuckSince` are never
+reset by it (LR-038), so a recovery whose cooldown had begun fires the instant the operation ends.
+
+**Reported** on `status.operation` (`Running` / `Blocked` / `Stalled` / `Quarantined` / `Converged`
+/ `Seeded`) and the `OperationInProgress` condition, one event per transition. `Blocked` and
+`Stalled` **never clear themselves** — there is deliberately no auto-exit timer (ADR-017: a timer is
+the defect with a delay). Rule N deferring on **G6** is *progress*, not blockage, and is deliberately
+not reported `Blocked`: Rule 0 discharges it in the very next pass, on every rename, and a `Warning`
+on the happy path is the crying-wolf failure.
+
+**Acknowledged on completion**, only once **both** of the instance's StatefulSets have settled — read
+uncached, because a stale-settled read acknowledges early and hands the exit edge into the churn
+LR-050 is about. See pillar 3.16 and LR-058.
 
 ### Rule A: Guardrails
 
@@ -460,5 +529,6 @@ This prevents premature "Running" status before Sentinel has fully discovered th
 - [ADR-015: Per-Instance Sentinel Master Name](adr/015-per-instance-sentinel-master-name.md)
 - [ADR-016: Forsaken-Gated Quarantine](adr/016-forsaken-gated-quarantine.md)
 - [ADR-018: In-Place Sentinel Master-Name Rename](adr/018-sentinel-master-name-rename.md) — Rule N
+- [ADR-020: Declared Operations](adr/020-declared-operations.md) — the heavy-operation branch
 - [Reconciliation Algorithm Changelog](RECONCILIATION_ALGORITHM_CHANGELOG.md)
 - [RECONCILIATION_LOOP.md](RECONCILIATION_LOOP.md) — high-level view

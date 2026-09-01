@@ -493,6 +493,67 @@ window with no monitoring at all.
 **Do not:** rename a degraded instance; rename to escape an active capture; rename and change the
 password in the same window.
 
+### While a declared operation is running
+
+Some spec edits cannot safely proceed alongside the operator's ordinary healing. The operator
+tracks those as **heavy operations**: it says one is running, carries it out, and stands down the
+rules that would fight it until it completes. Today the registry has exactly one member —
+**renaming `spec.sentinel.masterName`** (the runbook is directly above) — so this is what you will
+see during that rename, and nothing else declares an operation.
+
+**1. What you will see.** The condition `OperationInProgress` goes `True`, and `status.operation`
+names what is running:
+
+```bash
+kubectl get littlered store -o jsonpath='{.status.operation}{"\n"}'
+# {"name":"SentinelMasterNameRename","startedAt":"...","reason":"Running"}
+
+kubectl get littlered store -o jsonpath='{range .status.conditions[?(@.type=="OperationInProgress")]}{.status}{" "}{.reason}{" "}{.message}{"\n"}{end}'
+```
+
+`True` is a **normal, expected state, not a fault**. It never affects `Ready` — an instance
+mid-rename is not an unhealthy instance. It is reported loudly only because the operator is
+deliberately not applying some of its healing while it holds.
+
+What stands down is narrow: the two rules that would **assign a new master** — the leaderless
+recovery and the ghost-master recovery. Everything else keeps running under its normal guards, so
+the instance still re-registers bare Sentinels, still prunes ghosts, still repoints stragglers, and
+still routes writes to the master. Those two rules are **held, not skipped**: any cooldown that had
+already started keeps its elapsed time, so if one of them was about to act it acts the moment the
+operation finishes.
+
+**2. `Blocked` and `Stalled` mean a human has to act. Nothing will clear them for you.**
+
+| `status.operation.reason` | What it means | What to do |
+|---|---|---|
+| `Running` | Being carried out. | Wait. |
+| `Blocked` | The operator cannot proceed — a precondition the operation needs is not true, and it will not become true on its own. | Read the condition message: it names the gate that refused. Fix that, and the operation resumes by itself. |
+| `Stalled` | It has run past its budget (15 minutes for the rename) without completing. | Investigate. Usually the pod rollout is stuck — check `kubectl get pods` and the pod events. |
+| `Quarantined` | A heavy change is pending, but the instance is held at zero pods and cannot perform it. | See *"Recovering a sentinel instance captured by another Sentinel deployment"* below. Let the quarantine finish first. |
+
+**There is deliberately no auto-exit timer.** A `Blocked` or `Stalled` operation stays that way
+until the underlying problem is fixed — the operator will not "give up and proceed", because
+proceeding is precisely what would be unsafe. Neither state is a timeout that heals; both are the
+operator telling you it is waiting for you. Equally, neither state is dangerous on its own: while
+one holds, the instance keeps serving and no data action is taken.
+
+**3. `Quarantined` is a special case.** An instance captured by another Sentinel deployment is held
+at zero Redis and zero Sentinel pods while the capture is resolved. With no pods there is nothing
+to perform a heavy change on, so a pending rename is **recorded and held**, not run — the operator
+reports it rather than silently dropping it. It is picked up once the instance is released and
+serving again. Do not try to rename your way out of a capture; the remedy order is
+**capture → let the quarantine finish → then rename**.
+
+**4. Two heavy fields cannot be changed in one `kubectl apply`.** The CRD refuses an update that
+changes more than one registered heavy field at a time, at admission — so the error lands on your
+`kubectl apply`, not silently in the operator hours later. The remedy is simply to apply them one
+at a time, waiting for the first operation to complete before starting the second.
+
+Note honestly: **today only one heavy field lives on the CR** (`spec.sentinel.masterName`), so the
+count can never exceed one and this refusal cannot currently fire. The rule ships now because it is
+the shape later heavy fields slot into, and it is guarded by a test rather than left to be
+rediscovered.
+
 ### Verify
 
 ```bash

@@ -3342,3 +3342,261 @@ the discipline is that a claim about a test is worth exactly as much as a claim 
 **run it, or do not write it down.** The full mutation table (seven tests, the exact mutation
 applied to each, and the verbatim failure it produced) is in the file's own comments, beside
 each test.
+
+## [LR-058] Declared Operations — Managing Interference Separately From Safety (ADR-020, registry v1)
+- **Date:** 2026-09-01
+- **Commit:** `eda6987` (API + fingerprint) … `628ef54` (the authority boundary), branch
+  `feat/declared-operations`
+- **ID note:** the highest ID visible on **any** branch, local or remote, was LR-057 (this
+  branch's own M4.1 findings). Allocated with the LR-039 cross-branch loop over every branch,
+  not by reading the tip of one line.
+- **Scope note — this is a MECHANISM, not a fix, so it gets an entry rather than a
+  cross-reference** (contrast the ADR-011 entry, which is a whole new mode). It changes the
+  behaviour of an existing, shipped reconcile path — `reconcileSentinelCluster` — and it
+  suppresses two healing rules, so the ledger has to carry what it can regress. The design and
+  its alternatives are ADR-020; the milestone breakdown is
+  `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`. Neither is repeated here.
+
+- **Problem — the verification surface, not any one incident.** Every *intrusion* the operator
+  gains (deadlock rescue, ghost-master correction, quarantine, the master-name rename, auth next)
+  is a stronger action taken against an instance, and the cost is not that each one needs new
+  guards. It is that **each new intrusion requires re-verifying every existing guard, by
+  reasoning, with nothing forcing the check** — N intrusions × M guards, audited by hand.
+  **LR-048 → LR-050 is the proof, and it is in this file twice.** Rule N removed the stale
+  Sentinel entry; that entry was accidentally what made the outgoing master's baked-old-name
+  preStop `SENTINEL failover` succeed; removing it opened a measured **42.5s** window in which a
+  just-replaced pod of ours is byte-identical to a captor's live master; `planForsaken` then
+  quarantined a **healthy** instance 12.5s before it would have healed itself, six pods deleted
+  on EmptyDir. Nobody re-examined `planForsaken` when Rule N was designed, and only a live e2e
+  found it — because that milestone added a guard beyond its brief.
+  The operator also **already had an operation ladder, built by accident**: four "stop doing
+  things" gates at four depths with four different scopes, each added by a different incident —
+  the quarantine `ScaleToZero` return, the settled `Forsaken` return, Rule A
+  (`anyTerminating || FailoverActive`), and LR-050's attribution gate.
+
+- **Mechanism — two mechanisms with different jobs, and neither subsumes the other.** An
+  **operation** answers *what declared change is in progress* and its job is to manage
+  interference; an **invariant guard** answers *is the thing I am about to act on actually true*
+  and its job is to make the action safe. Concretely:
+    1. **Intent is `diff( heavy(spec_now), heavy(spec_last_completed) )`** — a diff over the
+       heavy projection of the **declaration**, never over the world. `spec` disagreeing with
+       *observed* is **drift**, and drift has many causes; deriving intent from drift is the same
+       conflation that produced LR-050, where `planForsaken` could not tell our own churn from a
+       captor because both present as drift.
+    2. **Acknowledged on COMPLETION**, per candidate, in `status.acknowledgedOperations`. The
+       baseline is `spec_last_completed` rather than `spec_previous_revision`, which is what makes
+       the record survive operator death: the question is *"is there unfinished work"*, not
+       *"what changed most recently"*. Acknowledging on **observation** loses the intent silently
+       when the operator dies between the write and the action.
+    3. **The record is an HMAC fingerprint** keyed on the instance UID — it identifies *which
+       value* completed rather than which field (the same field changes repeatedly, so a
+       field-keyed record matches the wrong edit), it never leaks the value (the fingerprinted
+       value is a **password** the moment auth is admitted), and it **structurally enforces
+       ADR-018's refusal to remember a previous name**: a keyed digest cannot be reversed, so a
+       later contributor cannot quietly start reading the record as "the old name".
+    4. **`Requires` edges, not a precedence table.** A precedence integer demands knowledge the
+       author does not have (where does this sit relative to every operation anyone will add); a
+       dependency demands only what the author *does* have (what must be true for my operation to
+       make sense). `Requires X` means *"X is not pending"*, never *"X has run"* — the event
+       reading deadlocks the common case, since an instance created with `auth.enabled: true`
+       never performs an enablement. A genuine cycle is **detectable**, where precedence integers
+       accepted one silently by being unable to express it.
+    5. **Simultaneous CR-resident heavy changes are refused at ADMISSION**, by a CEL transition
+       rule on `spec`, so the ambiguous state is unrepresentable. Deliberately not a
+       reconcile-time refusal: **the operation is not what changes the spec** — editing
+       `masterName` rewrites the pod template and the StatefulSet rolls whether or not Rule N
+       runs, so declining to run a driver leaves the instance half-changed, which is exactly
+       LR-048's two-names-forever state. Refusal has to happen before the spec changes or not at
+       all.
+    6. **No global gate and no waiver knob.** If an operation is safe enough not to need a window
+       it does not need a waiver; if it is not, the fix is to make it safe.
+  **Registry v1 has exactly one member:** `SentinelMasterNameRename` (`spec.sentinel.masterName`,
+  sentinel mode, `StallAfter` 15m, citation *LR-050*). Rule 0 and Rule N together **are** its
+  driver — no new healing logic exists anywhere in this mechanism.
+
+- **THE SUPPRESSION BOUNDARY, and it is the part with a scar. `D6 originally said "regular
+  healing does not run during a heavy operation", and measurement proved that wrong.`** The
+  first build (`937a62b`) suppressed everything Rule A skips, on the reasoning that a rename
+  keeps a pod terminating so Rule A would have returned anyway. **That holds only *while*
+  something is terminating.** Once the last replacement pod is created and nothing is
+  terminating, Rule A lets healing run and the blanket return did not — a suppression strictly
+  longer than Rule A's, whose extra window is exactly when the instance needs help converging.
+
+  | build | rename settles in |
+  |---|---|
+  | pre-branch control (`1d915e4`) | **162s** (three runs; later re-measured 166s / 167s) |
+  | M3.1, everything Rule A skips suppressed | **311s** (308s / 308s on the re-runs) |
+
+  Two of the three pods were identical across builds; **the entire difference was one stranded
+  pod** — the first-replaced one, which returns following the *old* master's address with
+  `link:down`, fails sentinel-mode readiness (`role:master` or `link:up`, LR-016), and is
+  precisely what **Rule R** repoints. Pod unready ⇒ StatefulSet unsettled ⇒ operation pending ⇒
+  Rule R suppressed ⇒ pod unready. Sentinel's own timers broke it after ~180s; in the case Rule R
+  exists for — Sentinel not repointing at all — **there is no exit**.
+  **The cause was isolated by two one-variable experiments** rather than reasoned from the diff
+  (LR-054's rule): dropping the operation's fast-requeue clause measured **323s**, so cadence is
+  **refuted**; letting the branch report but gate nothing measured **166s**, so the *gating* is
+  the cause. Per-pass Sentinel action counts were equal between builds (Rule 0: 5 vs 3, prunes 3
+  vs 3, ghost-master correction 9 vs 9) and neither Rule L nor the LR-024 recovery ever fired,
+  which is what left **Rule D** as the only remaining difference.
+  **Rule D PREVENTS the latch and cannot BREAK one, and the ordering is why:** Rule A returns at
+  `littlered_controller.go:1217` and Rule D's `SENTINEL RESET` is at `:1416`, below it — so once
+  `FailoverActive` latches, Rule D never runs. Its early ghost prune (measured at **+47s** on the
+  control, `reachableRedis=3`, i.e. LR-013's wholeness gate satisfied) is the only lever there is.
+  That is **LR-055**, recorded separately: it is LR-052's residual, not an ADR-020 defect.
+
+  **The boundary as shipped:** *during a heavy operation the operator does not **ASSIGN
+  AUTHORITY**. It may **propagate** an authority decision already made, and it may **clean up
+  debris**. Everything else runs under its normal guards.* In sentinel mode authority is which pod
+  the quorum monitors as master, so the suppressed set is exactly **Rule L and the LR-024
+  recovery** — a strict subset of Rule A's. **Rule D is not authority assignment, and that is a
+  ledger fact rather than a judgement:** **LR-007 established by incident that `SENTINEL RESET`
+  does not change the monitored master IP**, which is precisely why LR-008 had to introduce
+  `REMOVE` + `MONITOR`. Rule D is *structurally incapable* of assigning authority.
+  **Measured back at 161s / 157s** against the 166s / 167s control, with the first-replaced pod's
+  straggler window back to ~10s from 188s — and the signature that confirms the *mechanism*
+  rather than the timing is `failoverActive`, which **collapsed from 84-86 passes (~178s) to 1
+  and 0**, the control's own value. Data intact 500/500 both runs, one monitored name on all
+  three Sentinels, no `Forsaken`.
+  **Two rejected formulations, kept because each is the obvious next guess.** *"The operator does
+  not elect a master"* is too narrow — it misses cluster **Step 3**, which is not an election at
+  all and which LR-047 caught reassigning an orphaned range to a reachable empty master,
+  correctly by its own contract, thereby healing an already-dead shard into a healthy-looking
+  empty one. *"The operator does not change topology"* is too broad — `MEET`, `FORGET`,
+  `REPLICATE` and Rule R are all topology changes and all safe, because none of them decides
+  anything. An earlier *"convergence versus rescue"* framing is **retracted in both the code and
+  the ADR**: it cannot be applied by reading rule names, and it got them backwards — Rule R is
+  literally called *"Replica Rescue"* and assigns nothing.
+  The classification is therefore a **local property of each rule, declared where the rule
+  lives**, never a central list to keep in sync — the same shape as `Requires` beating a
+  precedence table.
+
+- **The suppression of Rule L and LR-024 is a HOLD, not a skip — stated precisely, because the
+  first draft overclaimed it.** A clock that has *already started* is **never reset** by the
+  suppression (LR-038: *the timer never resets on a veto*), so the instant the operation completes
+  a recovery whose cooldown had begun fires with that cooldown already elapsed. A clock that would
+  have *started* during the operation starts when the operation ends, because `setLeaderlessSince`
+  and `setGhostMasterStuckSince` are called from **inside** the rules being suppressed. That is
+  Rule A's existing behaviour verbatim — a zero delta, not a regression — but *"the markers keep
+  accruing"* was the stronger claim and it is not the one delivered.
+
+- **Placement, and why the branch is where it is.** The input is assembled **after** the
+  quarantine decision and the `Forsaken` switch (which sit above it and win outright — a
+  `replicas: 0` StatefulSet reads *settled*, so an operation over a quarantined instance would
+  "complete" work no pod ever executed, hence row 1 holds it and still **reports** it). The
+  suppressing gate sits **immediately before Rule A**, i.e. after Rule 0 and Rule N. An earlier
+  draft of the plan said *"before Rule 0"* and that was wrong: **`DriverDone` is an INPUT to rows
+  7-10, not an output**, so the decision cannot precede the driver. Rule 0 and Rule N are the only
+  code between those two points and they are exactly ADR-020's survives list, so the set the
+  branch can reach is byte-identical to Rule A's.
+
+- **Row 7 — acknowledgment waits for the StatefulSets, and it was observed doing so.** On M3.1's
+  live run the driver reported `Converged` at **T+4.6s** (Rule N's prune lands ~1.4s after the
+  patch, LR-048) while the acknowledgment was **withheld for 148s**, until both StatefulSets
+  settled. That is the row working: Rule N converging says the *Sentinel side* is done, not that
+  the *instance* is, and acknowledging on the driver's word would hand the exit edge straight into
+  the churn LR-050 is about. Settledness spans **both** StatefulSets the instance owns — the
+  Sentinel one carries the master name the rename is about — and is read **uncached**, because a
+  stale-settled read acknowledges early.
+
+- **G6 is progress, not blockage (`c18c897`), and this is ADR-017's carve-out reused.** M3.1's live
+  run emitted **two** events for an ordinary rename, one of them a `Warning`/`Blocked` on the very
+  first pass. That pass is Rule N deferring on **G6** — *"no Sentinel carries the desired name yet;
+  Rule 0 registers it next pass"* — which Rule 0 discharges in the very next pass, **by design**,
+  on **every** rename. A `Warning` on the happy path is the crying-wolf failure: if `Blocked` fires
+  on every rename then `Blocked` stops meaning anything, and this mechanism's whole loud-condition
+  story rests on it meaning something. The precedent is exact — ADR-017 deliberately never raises
+  `ClusterRolloutBlocked` for an attached-but-link-down pod, because an unbounded full sync is
+  genuine progress. Mapping: `Converged` → Complete; `Foreign` → Blocked (a capture is in evidence
+  and ADR-016 owns the instance); `Deferred` **by G6** → neither, so the operation reports
+  `Running`; `Deferred` by G1-G5 → Blocked, each naming a state that persists until something
+  *outside* Rule N changes; and a `Deferred` verdict whose gate a future contributor forgot to name
+  fails **safe**, i.e. Blocked. The gate identity had lived only inside the message string, and
+  parsing prose to make a control decision is how the next defect gets written, so
+  `StaleMasterNamePlan` gained a structured `Gate` field. **Rule N's decisions did not change** —
+  its three test files have an empty diffstat. **Measured after: 2 events → 1, zero Warnings.**
+
+- **The three traps, each held.** (1) **LR-050's `rolling` gate is byte-unchanged** and is not read
+  by any of this — it names a *fact* about our own churn and therefore covers the image bump, the
+  drain and the eviction that nobody declares, which the operation mechanism structurally cannot.
+  Unifying them is the exact mistake this whole design exists to prevent, and it is tempting
+  because in the rename case they fire together. (2) **No planner gained a "skip during an
+  operation" clause** — suppression lives at the branch, and every existing table passes with **no
+  row edited** (LR-048's K2b). (3) **Exactly one call site reads `acknowledgedOperations`**
+  (`buildOperationInput`); the only other mention is this mechanism's own write.
+
+- **Requeue (LR-045's lesson applied rather than inherited).** An instance under an operation is
+  frequently `Running`, so the phase check alone would poll it at the steady interval for the whole
+  window while its healing is suppressed. The new clause is deliberately narrow — `Running` only;
+  `Blocked` and `Stalled` are permanent until a human acts, so polling *them* fast is the churn
+  LR-042 removed.
+
+- **Tests, red-first.** `planOperation`'s ten rows plus three mutants (*always run*, *always
+  converged*, **acknowledge-on-sight** — the third is D1's central claim and has its own named
+  test); fingerprint determinism, UID sensitivity, and that no plaintext appears in the record; the
+  registry's refusals (8 test functions / 15 assertions against a stub — every entry must carry a
+  `Citation`, which is the admission test's clause B made mechanical; every `Requires` target must
+  exist; the edges must be **acyclic**, by a real DFS over seven fixture graphs including a diamond
+  and a dangling edge). The **admission-rule agreement test reads the GENERATED CRD rather than the
+  marker** — the marker is only input, the CRD is what the API server enforces — so it asserts
+  effect rather than intent and additionally catches an edited marker with no `make manifests`.
+  The envtest tier was authored first and observed **RED on 3 of 4**: row 3 (seeding), row 7 (the
+  transition guard) and row 8 (completion); the fourth passed vacuously pre-fix and its teeth were
+  shown by pointing `instanceStatefulSetsSettled` at the Redis StatefulSet alone. The authority
+  boundary is an A/B with one variable: the mutant restoring the blanket return fails the Rule R
+  assertion and nothing else, the mutant re-suppressing Rule D fails the Rule D assertion and
+  nothing else. **Phase 4's post-operation arbitrary-state tier** feeds each existing planner the
+  states an operation can leave behind and asserts no destructive verdict — it found **LR-056** and
+  **LR-057**, neither of them ADR-020 defects, both recorded and deferred, and its own method note
+  is worth reading: **two of seven mutation checks written from inspection were wrong until they
+  were actually run.**
+
+- **A defect in the ADR's own "verified live" admission rule was corrected by building it
+  (`1d915e4`).** The form recorded as verified guarded the optional *parents* (`has(self.sentinel)`)
+  but not the optional **leaf** — and `spec.sentinel.masterName` is optional, since an instance
+  predating ADR-015 legally omits it, which is exactly what `SentinelMasterName()` falls back to
+  `LegacySentinelMasterName` for. Against such an object CEL raises `no such key: masterName` and
+  the API server **rejects every update, including to an entirely unrelated field**: it would have
+  frozen every legacy instance at its next edit. The round-1 probe missed it because its fixture
+  always set the leaf. The shipped form compares the **effective** name, defaulting an absent leaf
+  to the legacy value so it mirrors the accessor exactly. **Generalizable, and it is this
+  mechanism's own subject turned on itself: a guard is only as good as the inputs it was exercised
+  against, an optional field's *absence* is an input, and a rule must agree with its accessor about
+  what "unset" means — or they disagree in exactly the population that predates the field.**
+
+- **Regresses:** **Two healing rules now stand down during a declared heavy operation** — Rule L
+  and the LR-024 recovery — which is the one behavioural change this entry can be blamed for, and
+  it is close to a no-op against today's behaviour: during a rename a pod is terminating from the
+  moment of the edit, so Rule A already returns before both of them, and the suppressed set is a
+  strict subset of Rule A's. It is a **hold**, not a skip (above). Nothing else changed: LR-050's
+  gate has 0 matching diff lines across the series, the six unowned planner files have an empty
+  diffstat, no existing decision-table row's inputs or expected verdict was edited, and every
+  pre-existing test file has 0 deletions. The requeue clause is additive and narrow. The admission
+  rule is **vacuous today** — with one CR-resident heavy field the count cannot exceed one, so no
+  apply is refused — and was shipped anyway because it is the shape auth's term slots into, with
+  the agreement test guarding it and the marker comment saying so where a reviewer stands.
+  Cluster, failover and standalone modes are not reached: the registry is mode-filtered and v1 has
+  one sentinel-only member.
+
+- **NOT covered, stated plainly.** **Failover and cluster modes are unwired** — the ADR's authority
+  rows for them are *proposed, not verified*, since nothing exercises them; Step 3b's key-preserving
+  relocation is the row worth arguing about, listed as assigning because it chooses a destination.
+  **The CEL constraint is vacuous** with one CR-resident heavy field, so only the agreement test is
+  live and the refusal itself has never fired in anger. The e2e tiers in the plan's Phase 6 are
+  owed. And the accepted holes are the ADR's, unchanged: the **exit edge** is where the first bug
+  is expected (Phase 4 exists for it and is not optional); a **stalled operation stalls forever,
+  loudly**, with no auto-exit timer (ADR-017: a timer is the defect with a delay); **head-of-line
+  blocking** must be answered twice, at the queue *and* at the invariant level, where LR-054 is the
+  worked case and **a withheld invariant is silent by construction**; and the **registry and the
+  admission rule can drift**, which is a maintenance cost recorded rather than pretended away.
+
+- **Impacts:** **ADR-020** (this is its implementation); `docs/RECONCILIATION_OPERATIONS_IMPLEMENTATION_PLAN.md`
+  Phases 2-5; `docs/API_SPEC.md` (`status.acknowledgedOperations`, `status.operation`, the
+  `OperationInProgress` condition); `docs/USAGE.md` (what an owner sees, and that `Blocked` and
+  `Stalled` never clear themselves); `docs/RECONCILIATION_LOOP_SENTINEL.md` (the branch, in
+  reconcile order); `CLAUDE.md` pillar **3.16** and §7. **LR-055** (found by M3.1's live work,
+  because that milestone briefly removed the mitigation — not an ADR-020 defect), **LR-056** and
+  **LR-057** (found by Phase 4's tier, both pre-existing, both deferred). Builds on **LR-048** (the
+  operation), **LR-050** (the citation), **LR-007** (the ledger fact that classifies Rule D),
+  **LR-038** (the timer never resets on a veto), **LR-045** (the requeue lesson) and **LR-054**
+  (a withheld verdict must say that it withheld).

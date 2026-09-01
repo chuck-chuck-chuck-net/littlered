@@ -76,7 +76,10 @@ be gated loud.
    simultaneously (a) at `UpdateRevision`, (b) Ready per the kubelet, and (c) a link-`up`
    replica of that shard's slot owner. The decision is a pure seam,
    `planShardRolloutPartition`, beside `clusterShardRolloutSettled` in
-   `internal/controller/cluster_rollout.go`.
+   `internal/controller/cluster_rollout.go`. *(`clusterShardRolloutSettled` was **renamed
+   `statefulSetRolloutSettled`** by LR-050, which reused it for sentinel mode — it was never
+   mode-specific. This ADR keeps the name it was decided under; the two later mentions below
+   are the same symbol.)*
 
 2. **When the gate cannot be satisfied, stall — forever, and loudly.** The partition holds, the
    old pods keep serving, and a `ClusterRolloutBlocked` condition plus one Warning event per

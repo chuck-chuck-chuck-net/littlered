@@ -499,8 +499,9 @@ valuable, and an owner can hit it today without ever attempting a staged rotatio
   intra-shard partition gate inside each.
 - **`statefulSetRolloutSettled`** (`cluster_rollout.go:62-75`) — `ObservedGeneration ==
   Generation`, non-empty `UpdateRevision`, `UpdateRevision == CurrentRevision`, and
-  `UpdatedReplicas == ReadyReplicas == Replicas == spec.Replicas`. **CLAUDE.md's
-  `clusterShardRolloutSettled` name is stale**; it was renamed by LR-050.
+  `UpdatedReplicas == ReadyReplicas == Replicas == spec.Replicas`. It was
+  `clusterShardRolloutSettled` until LR-050 renamed it; ADR-007, ADR-017 and CLAUDE.md pillar 3.12
+  keep the old name with a rename note beside it.
 - **LR-050's rollout attribution gate** — `rolling`, computed at
   `littlered_controller.go:890-928`, from an **uncached** read of the instance's own **Redis**
   StatefulSet (`statefulSetName(littleRed)`); `IsNotFound` → `false`, any other error → stays
@@ -513,10 +514,11 @@ valuable, and an owner can hit it today without ever attempting a staged rotatio
 Neither is this feature's to fix, and both would mislead its implementer, so they are recorded
 rather than silently corrected:
 
-- **`CLAUDE.md` pillar 3.12 still calls the settledness predicate `clusterShardRolloutSettled`.**
-  LR-050 renamed it `statefulSetRolloutSettled` (`cluster_rollout.go:45-75`) precisely because it
-  was never mode-specific — it is now the sentinel-mode attribution gate's predicate too. An
-  implementer grepping CLAUDE.md's name finds nothing.
+- ~~**`CLAUDE.md` pillar 3.12 still calls the settledness predicate
+  `clusterShardRolloutSettled`.**~~ **Fixed** (ADR-020 M5.2): pillar 3.12, ADR-007 and ADR-017 now
+  carry the rename to `statefulSetRolloutSettled` (`cluster_rollout.go`) as a note beside the name
+  they were decided under. LR-050 renamed it precisely because it was never mode-specific — it is
+  the sentinel-mode attribution gate's predicate too.
 - **`ConditionAuthReady` is declared-but-unused** (§3.1). Not wired to anything, in any mode.
 
 ### 3.7 Existing tests
