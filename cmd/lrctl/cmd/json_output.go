@@ -76,6 +76,20 @@ type statusJSON struct {
 	Cluster            *littleredv1alpha1.ClusterStatusInfo `json:"cluster,omitempty"`
 	Failover           *littleredv1alpha1.FailoverStatus    `json:"failover,omitempty"`
 	Conditions         []metav1.Condition                   `json:"conditions,omitempty"`
+
+	// Operation and AcknowledgedOperations are ADR-020's two status surfaces, mirrored
+	// under the CRD's own key names so this output and `kubectl get -o json` are the
+	// same shape. Both are omitempty, so an instance with no operation renders exactly
+	// what it rendered before.
+	//
+	// AcknowledgedOperations is a completion RECORD of keyed digests. It is emitted
+	// because --json is a faithful projection of the CR and a script may legitimately
+	// ask "did the rename finish, and when" — but nothing in lrctl derives a verdict
+	// from it (ADR-020 D3), and it is deliberately absent from the human output, where
+	// an HMAC identifies nothing a reader can look up and invites being misread as "the
+	// previous value" that ADR-018 refuses to remember.
+	Operation              *littleredv1alpha1.OperationStatus `json:"operation,omitempty"`
+	AcknowledgedOperations []littleredv1alpha1.OperationAck   `json:"acknowledgedOperations,omitempty"`
 }
 
 func lrToStatusJSON(lr *littleredv1alpha1.LittleRed) statusJSON {
@@ -93,6 +107,9 @@ func lrToStatusJSON(lr *littleredv1alpha1.LittleRed) statusJSON {
 		Cluster:            lr.Status.Cluster,
 		Failover:           lr.Status.Failover,
 		Conditions:         lr.Status.Conditions,
+
+		Operation:              lr.Status.Operation,
+		AcknowledgedOperations: lr.Status.AcknowledgedOperations,
 	}
 }
 
@@ -242,6 +259,10 @@ type sentinelVerifyJSON struct {
 	// absent for an --unmanaged target, where no CR names the wanted master name
 	// and classifying against a guess would accuse a correctly-named instance.
 	MasterNameScope *masterNameScopeJSON `json:"masterNameScope,omitempty"`
+
+	// Operation is the declared heavy operation in flight (ADR-020), absent when
+	// there is none and for --unmanaged targets, which have no CR to read it from.
+	Operation *operationJSON `json:"operation,omitempty"`
 }
 
 type sentinelCountJSON struct {
@@ -278,6 +299,9 @@ type clusterVerifyJSON struct {
 	Partitions   [][]string              `json:"partitions,omitempty"`
 	Nodes        []clusterNodeVerifyJSON `json:"nodes"`
 	Healthy      bool                    `json:"healthy"`
+
+	// Operation — see sentinelVerifyJSON.Operation.
+	Operation *operationJSON `json:"operation,omitempty"`
 }
 
 // buildSentinelVerifyJSON renders the sentinel verify result. wantedName is the
@@ -418,6 +442,9 @@ type failoverVerifyJSON struct {
 	Findings              []clifailover.Finding   `json:"findings"`
 	Healthy               bool                    `json:"healthy"`
 	Degraded              bool                    `json:"degraded"`
+
+	// Operation — see sentinelVerifyJSON.Operation.
+	Operation *operationJSON `json:"operation,omitempty"`
 }
 
 func buildFailoverVerifyJSON(
@@ -517,4 +544,35 @@ func buildClusterVerifyJSON(name, namespace string, gt *redisclient.ClusterGroun
 	expectedShards := int32(gt.CountMasters())
 	result.Healthy = gt.IsHealthy(expectedNodes, expectedShards)
 	return result
+}
+
+// verifyJSONResult is the little that the three mode-specific verify results have in
+// common: they all carry a `healthy` flag a script trusts, and a declared operation is
+// mode-neutral because status.operation is.
+//
+// It exists so the operation is attached in ONE place, beside the exit-code decision it
+// must agree with. A JSON consumer must not be able to read `healthy: true` off an
+// instance whose `verify` exited non-zero — the same property buildSentinelVerifyJSON
+// already guarantees for a two-name instance.
+type verifyJSONResult interface {
+	applyOperation(op *operationJSON)
+}
+
+func applyOperationTo(healthy *bool, dst **operationJSON, op *operationJSON) {
+	*dst = op
+	if op != nil && op.NeedsAction {
+		*healthy = false
+	}
+}
+
+func (j *sentinelVerifyJSON) applyOperation(op *operationJSON) {
+	applyOperationTo(&j.Healthy, &j.Operation, op)
+}
+
+func (j *clusterVerifyJSON) applyOperation(op *operationJSON) {
+	applyOperationTo(&j.Healthy, &j.Operation, op)
+}
+
+func (j *failoverVerifyJSON) applyOperation(op *operationJSON) {
+	applyOperationTo(&j.Healthy, &j.Operation, op)
 }

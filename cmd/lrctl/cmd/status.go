@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
@@ -94,6 +95,14 @@ func printStatus(lr *littleredv1alpha1.LittleRed) {
 		fmt.Printf("Replicas: %d/%d Ready\n", lr.Status.Replicas.Ready, lr.Status.Replicas.Total)
 	}
 	fmt.Printf("Redis Nodes: %d/%d Ready\n", lr.Status.Redis.Ready, lr.Status.Redis.Total)
+
+	// Surface a declared heavy operation (ADR-020) first among the extras: it is the
+	// mechanism that decides whether the operator is healing or standing down, so it must
+	// be impossible to miss. Absent when nothing is in flight — a permanent line here
+	// would be noise on every instance in the fleet.
+	for _, l := range renderOperationStatus(operationViewOf(lr), time.Now()) {
+		fmt.Println(l)
+	}
 
 	// Surface an in-progress in-place legacy→per-shard cluster migration (ADR-013).
 	// One line, only while migrating (nil / Complete render nothing, so non-migrating

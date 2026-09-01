@@ -88,6 +88,60 @@ assignment epoch mirrored from the pod annotations, `Master Down Since` while a 
 is running, `Last Transition` (the last master-intent stamp), and — when set — the
 `FailoverRecovery` condition (the refuse-and-wait state on diverged data holders).
 
+#### Declared heavy operations
+
+When a **declared heavy operation** is in progress (ADR-020 — a human edited one of the small,
+registered set of spec fields whose change cannot safely proceed alongside regular healing),
+`status` adds an `Operation:` line above every other extra, because that mechanism decides whether
+the operator is healing this instance or standing down. Captured live during a
+`spec.sentinel.masterName` rename:
+
+```text
+Cluster: m51
+Namespace: m51-ops
+Phase: Initializing
+Mode: sentinel
+Master: m51-redis-0 (IP: 10.233.192.221)
+Sentinels: 3/3 Ready
+Redis Nodes: 2/3 Ready
+Operation: SentinelMasterNameRename — Running for 3s
+  SentinelMasterNameRename converged, but the instance is still rolling; acknowledgment waits for it to settle
+```
+
+The line carries the operation's registry name, its reason, and how long it has been running; the
+indented line beneath is the `OperationInProgress` condition's message — the operator saying, in its
+own words, what it is waiting on. A queue behind the running operation is printed as a
+`  Pending: A, B` line. `Blocked` and `Stalled` additionally carry the
+`[!] ACTION MAY BE REQUIRED` marker `status` already uses for `FailoverRecovery` and
+`LeaderlessRecovery`, because neither state ever resolves on its own.
+
+**The block is absent whenever nothing is in flight**, so `status` for an instance that is not
+mid-operation is byte-for-byte what it always was — verified by diffing this build against the
+previous one on a live instance.
+
+The `--json` output additionally carries `operation` and `acknowledgedOperations` under the CRD's
+own key names, so it and `kubectl get littlered -o json` are the same shape. `acknowledgedOperations`
+is the completion record — one row per operation *name*, each a keyed digest of the value that
+finished, plus when. It is deliberately **not** in the human output: an HMAC identifies nothing a
+reader can look up, and printing it invites reading it as "the previous master name", which ADR-018
+refuses to remember and ADR-020 keeps unrecoverable by construction. Nothing in `lrctl` derives a
+verdict from it (ADR-020 D3); it is emitted only because `--json` is a faithful projection of the CR
+and a script may legitimately ask *did this finish, and when* (real output, other keys elided):
+
+```json
+{
+  "name": "m51",
+  "phase": "Running",
+  "acknowledgedOperations": [
+    {
+      "name": "SentinelMasterNameRename",
+      "fingerprint": "1d0f9affa9f03791",
+      "acknowledgedAt": "2026-09-01T06:10:09Z"
+    }
+  ]
+}
+```
+
 ---
 
 ### 2. inspect
@@ -289,6 +343,112 @@ single pointer to the recovery runbook.
 > for such an instance, and the new `masterNameScope` object plus the per-Sentinel
 > `monitoredMasters` array carry the detail.
 
+#### Declared operations — what the operator is standing down for
+
+A **declared heavy operation** (ADR-020) is a change to one of a small, registered set of spec
+fields whose reconciliation cannot safely proceed alongside regular healing — registry v1 has
+exactly one member, `SentinelMasterNameRename`. While one runs, the operator deliberately stands
+down the healing rules that **assign authority**. `verify` prints that state first, before the live
+gather, so the first thing an owner reads is whether the operator is healing this instance at all.
+The block is mode-neutral (it is read from `status.operation` on the CR) and is **absent** for
+`--unmanaged` targets, which have no CR.
+
+Captured live on t3e, mid-rename — three seconds after the `spec.sentinel.masterName` patch, with
+the Redis StatefulSet still rolling:
+
+```text
+Verifying Cluster: m51-ops/m51 (Mode: sentinel)
+
+Declared Operation:
+  SentinelMasterNameRename — Running for 3s (started 2026-09-01T08:11:10+02:00)
+  Operator: SentinelMasterNameRename converged, but the instance is still rolling; acknowledgment waits for it to settle
+  [OK] A declared heavy operation is in progress. This is a normal, expected
+       state and not a fault — regular healing that assigns authority is
+       deliberately stood down until it completes.
+Gathering Cluster Ground Truth...
+```
+
+**A healthy in-progress operation is not a failure**, and the `[OK]` is load-bearing. An owner doing
+the supported thing — renaming an instance per the runbook — must not see `verify` go red for it;
+a check that cries wolf on the happy path is a check nobody reads, which is the same reasoning that
+keeps `ClusterRolloutBlocked` off a held-but-progressing cluster rollout (ADR-017) and keeps Rule N's
+G6 deferral classified as progress rather than blockage.
+
+The severity and the exit code:
+
+| `status.operation.reason` | rendered | exit code | why |
+|---|---|---|---|
+| *(absent)* | nothing at all | unaffected | steady state; output is unchanged |
+| `Running` | `[OK]` | unaffected | a supported change is being carried out |
+| `Quarantined` | `[WARN]` | unaffected | the change is **held**, not broken: the instance is quarantined (ADR-016) and has no pods to carry it out. Reported so a held change is never invisible, but the quarantine is what to investigate — and such an instance already fails verification on its own topology, so failing twice would send the reader after the wrong thing |
+| `Blocked` | `[FAIL]` | **non-zero** | the driver cannot proceed and is never auto-skipped |
+| `Stalled` | `[FAIL]` | **non-zero** | the operation has outlived its `StallAfter` budget and is never auto-exited |
+| *(anything else)* | `[WARN]` | unaffected | this `lrctl` is older than the operator; an unrecognised state is not evidence of a defect |
+
+In the capture above `verify` nevertheless exited **1** — and for a live-topology reason, not for
+the operation: mid-roll, one replica was still `link:down` behind a replaced pod, so the ordinary
+`Recommended Healing Actions` path fired. That is exactly the separation this block is meant to
+preserve. The operation says *the operator is deliberately standing down*; the rest of `verify`
+still says what is actually true about the topology, and the two verdicts are independent.
+
+`Blocked` and `Stalled` reach the exit code for one reason: **ADR-020 guarantees neither ever
+auto-resolves.** There is no auto-exit timer and no auto-skip, on ADR-017's lesson that a timer is
+the defect with a delay — so each one is a standing request for a human, and a script that read
+exit 0 there would be told the opposite of the truth. `verify` counts a failing operation and a
+failing topology as **one** failing resource, not two.
+
+Captured live on t3e — the same instance, renamed again with one replacement pod deliberately made
+unschedulable so the rollout can never settle, fifteen minutes later:
+
+```text
+Verifying Cluster: m51-ops/m51 (Mode: sentinel)
+
+Declared Operation:
+  SentinelMasterNameRename — Stalled for 15m9s (started 2026-09-01T08:14:59+02:00)
+  Operator: SentinelMasterNameRename has run past its StallAfter budget; it is not auto-exited (a timer would be the defect with a delay)
+  [FAIL] The operation has outlived its StallAfter budget and is not auto-exited
+         (ADR-017: a timer would be the defect with a delay). It will stay in
+         this state until a human acts. Regular healing that ASSIGNS AUTHORITY
+         is stood down for as long as it holds.
+Gathering Cluster Ground Truth...
+```
+
+and in `status`, where the same state carries the `[!]` marker:
+
+```text
+Redis Nodes: 2/3 Ready
+Operation: [!] ACTION MAY BE REQUIRED — SentinelMasterNameRename — Stalled for 15m9s
+  SentinelMasterNameRename has run past its StallAfter budget; it is not auto-exited (a timer would be the defect with a delay)
+```
+
+The matching `--json` (other keys elided) — note that `needsAction` and the non-zero exit are the
+same decision:
+
+```json
+{
+  "name": "m51",
+  "healthy": false,
+  "operation": {
+    "name": "SentinelMasterNameRename",
+    "startedAt": "2026-09-01T06:14:59Z",
+    "reason": "Stalled",
+    "message": "SentinelMasterNameRename has run past its StallAfter budget; it is not auto-exited (a timer would be the defect with a delay)",
+    "needsAction": true
+  }
+}
+```
+
+`Blocked` renders the same shape with its own `[FAIL]` text (*"cannot proceed and is not
+auto-skipped — head-of-line blocking here is deliberate"*); it is covered by unit tests rather than
+by a live capture, because reaching it needs one of Rule N's G1-G5 refusals, which this validation
+run did not produce.
+
+In `--json`, the same information is under a mode-neutral `operation` object on every mode's result,
+carrying `name`, `startedAt`, `reason`, `pending`, the condition `message`, and `needsAction` —
+which is exactly the boolean that drives the exit code. A `Blocked` or `Stalled` operation also sets
+`healthy: false`, so a JSON consumer cannot read "healthy" off an instance whose `verify` exited
+non-zero. Instances with no operation emit no `operation` key and their `healthy` value is untouched.
+
 **Example Output (Cluster Mode):**
 ```text
 Verifying Cluster: default/store-cluster (Mode: cluster)
@@ -397,6 +557,11 @@ All major commands support the `--json` flag. This is ideal for CI/CD pipelines 
 if [ "$(lrctl verify store --json | jq '.[0].healthy')" = "true" ]; then
   echo "Cluster is OK"
 fi
+
+# Is a declared heavy operation stuck? (ADR-020 — neither Blocked nor Stalled
+# ever resolves on its own, so this is the one that needs a human.)
+lrctl verify store --json | jq -r '.[] | select(.operation.needsAction) |
+  "\(.name): \(.operation.name) is \(.operation.reason) — \(.operation.message)"'
 ```
 
 ## Troubleshooting Failovers

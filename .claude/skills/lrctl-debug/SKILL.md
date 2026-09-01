@@ -39,6 +39,7 @@ instances in the namespace.
 | "Is the CR healthy? what does the operator *think*?" | `status` | Reads CR `.status` only (Phase, Master, Ready counts, bootstrapRequired). Fast, no exec. |
 | "Is the actual topology consistent? split-brain? ghost?" | `verify` | Gathers live ground truth, computes the authority master, flags ghosts/partitions, and prints **recommended healing actions**. This is the workhorse for failover bugs. |
 | "Show me the raw redis-cli output from every pod" | `inspect` | Deep dive: per-pod `INFO replication` (sentinel) or `CLUSTER NODES`+`CLUSTER INFO` (cluster), plus `SENTINEL MASTER` from each sentinel. Use when `verify` flags something and you need the raw evidence. |
+| "Is a declared heavy operation stuck?" | `status`, then `verify` | `status` shows `status.operation` (name, reason, how long). `verify` prints a **Declared Operation** block and is the one that judges it: `Blocked` and `Stalled` **fail** and set a non-zero exit, `Running` and `Quarantined` do not. See below. |
 | "Capture everything for a bug report / later analysis" | `debug-dump` | Writes CR YAML, operator logs (last 10m), all pod logs (incl. previous for crashloops), live redis state, and k8s resources to a timestamped dir. Secrets auto-redacted. |
 
 ## Recommended debugging order
@@ -67,6 +68,17 @@ instances in the namespace.
   epoch bump), label↔authority disagreement, lineage divergence across data holders.
   Mid-transition captures legitimately show `[FAIL]` for a few seconds (epoch already
   bumped, promotion not settled) — re-run before concluding it's stuck.
+- **Declared operations (any mode, ADR-020):** a `Declared Operation` block appears only while
+  one is in flight. `[OK] Running` means the operator is deliberately standing down the healing
+  that **assigns authority** (Rule L and the LR-024 recovery in sentinel mode) until the declared
+  change completes — **this is normal and is not a fault**, and `verify` will not fail for it.
+  `[WARN] Quarantined` means a heavy change is pending but held because the instance has no pods;
+  the real problem is the quarantine (see `Forsaken`), not the operation. `[FAIL] Blocked` and
+  `[FAIL] Stalled` **never clear themselves** — no timer will rescue either, by design (ADR-017:
+  a timer would be the defect with a delay), so they mean a human has to act. Note that `verify`
+  can still exit non-zero for an ordinary topology reason *while* an operation reads `[OK]`; the
+  two verdicts are deliberately independent, and `--json` carries `operation.needsAction` so a
+  script agrees with the exit code.
 - **Cluster mode:** `Cluster State`, `Total Slots Assigned: N / 16384` (anything <16384
   = gaps), `Ghost Nodes` (in cluster but not in K8s → expect `CLUSTER FORGET`),
   `Network Partitions`, and the per-master topology tree with replica link status.

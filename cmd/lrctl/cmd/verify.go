@@ -6,6 +6,7 @@ import (
 	"os"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/kubernetes"
@@ -63,22 +64,42 @@ var verifyCmd = &cobra.Command{
 				continue
 			}
 
+			// Read the CR once, for the two surfaces that live on it rather than in
+			// live Redis: the legacy→per-shard migration banner (ADR-013) and the
+			// declared heavy operation (ADR-020). Read-only, best-effort — an
+			// --unmanaged target has no CR, and a fetch error is non-fatal, because
+			// verify's job is live health and these are reporting.
+			var lr *littleredv1alpha1.LittleRed
+			if !unmanaged {
+				fetched := &littleredv1alpha1.LittleRed{}
+				if err := k8sClient.Get(ctx, key, fetched); err == nil {
+					lr = fetched
+				}
+			}
+			opView := operationViewOf(lr)
+			opJSON := operationJSONOf(opView)
+
 			if jsonOutput {
+				var result verifyJSONResult
 				switch cCtx.Mode {
 				case modeSentinel:
-					jsonResults = append(jsonResults,
-						verifySentinelJSON(ctx, coreClient, config, cCtx, key.Name, key.Namespace))
+					r := verifySentinelJSON(ctx, coreClient, config, cCtx, key.Name, key.Namespace)
+					result = &r
 				case modeCluster:
-					jsonResults = append(jsonResults,
-						verifyClusterJSON(ctx, coreClient, config, cCtx, key.Name, key.Namespace))
+					r := verifyClusterJSON(ctx, coreClient, config, cCtx, key.Name, key.Namespace)
+					result = &r
 				case modeFailover:
-					jsonResults = append(jsonResults,
-						verifyFailoverJSON(ctx, coreClient, config, cCtx, key.Name, key.Namespace))
+					r := verifyFailoverJSON(ctx, coreClient, config, cCtx, key.Name, key.Namespace)
+					result = &r
 				default:
 					fmt.Fprintf(os.Stderr,
 						"error: %s/%s: JSON output for mode %q not yet implemented\n",
 						key.Namespace, key.Name, cCtx.Mode)
 					errCount++
+				}
+				if result != nil {
+					result.applyOperation(opJSON)
+					jsonResults = append(jsonResults, result)
 				}
 				continue
 			}
@@ -88,17 +109,17 @@ var verifyCmd = &cobra.Command{
 			}
 			fmt.Printf("Verifying Cluster: %s/%s (Mode: %s)\n", cCtx.Namespace, cCtx.Name, cCtx.Mode)
 
-			// Surface an in-progress in-place legacy→per-shard cluster migration
-			// (ADR-013). Read-only, best-effort: the migration phase lives on the CR
-			// status, which --unmanaged targets don't have. A fetch error is non-fatal
-			// (verify's job is live health, not migration reporting).
-			if !unmanaged {
-				lr := &littleredv1alpha1.LittleRed{}
-				if err := k8sClient.Get(ctx, key, lr); err == nil {
-					if banner := migrationBanner(clusterMigration(lr)); banner != "" {
-						fmt.Println(banner)
-					}
-				}
+			if banner := migrationBanner(clusterMigration(lr)); banner != "" {
+				fmt.Println(banner)
+			}
+
+			// The declared operation is printed BEFORE the live-state gather, so the
+			// first thing an owner reads is whether the operator is healing this
+			// instance at all. Absent when nothing is in flight, so output for every
+			// non-operating instance is unchanged.
+			opLines, opFail := renderOperationVerify(opView, time.Now())
+			for _, l := range opLines {
+				fmt.Println(l)
 			}
 
 			var verifyErr error
@@ -112,8 +133,13 @@ var verifyCmd = &cobra.Command{
 			default:
 				fmt.Printf("Verification for mode %q not yet fully implemented\n", cCtx.Mode)
 			}
-			if verifyErr != nil {
-				errCount++ // [FAIL] details already printed by verifySentinel / verifyCluster
+			// A Blocked or Stalled operation reaches the exit code, because ADR-020
+			// guarantees neither ever auto-resolves: a human has to act, and a script
+			// that read exit 0 here would be told the opposite of the truth. Counted
+			// once — an instance can be both unhealthy and blocked, and that is one
+			// failing resource, not two.
+			if verifyErr != nil || opFail {
+				errCount++ // [FAIL] details already printed above / by verifySentinel / verifyCluster
 			}
 		}
 
