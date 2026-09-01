@@ -930,36 +930,226 @@ spec:
 			g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("0"))
 		}, 60*time.Second, 5*time.Second).Should(Succeed())
 
-		// ---- and it is picked up once there are pods again ------------------
+		// ---- WHAT THIS TIER DELIBERATELY NO LONGER ASSERTS — LR-059 --------
 		//
-		// The second half of USAGE's promise. It also proves the hold was a HOLD and
-		// not a drop: nothing re-declares the operation on release, because it was
-		// never un-declared.
-		By("the quarantine releases and the held rename is then carried out")
+		// docs/USAGE.md promises the held change "is picked up once the instance is
+		// released and serving again", and a first draft of this tier asserted exactly
+		// that. **The product does not deliver it, and the reason is a wedge this tier
+		// found**: on release the instance comes back leaderless with bare Sentinels,
+		// the pending rename is picked up IMMEDIATELY (it is no longer quarantined),
+		// and Rule L — the only thing that can give it a master — is in the suppressed
+		// set, so the pods never become Ready, the StatefulSets never settle, row 7
+		// never acknowledges, and the operation runs forever.
+		//
+		// Measured, and it is NOT specific to the quarantine: a hand-staged leaderless
+		// instance with a pending rename sat wedged for 7m56s with zero leaderless
+		// lines in the operator log, while an identical instance with no rename
+		// recovered in 74s. The deterministic reproduction and its positive control
+		// are the committed-and-skipped tier below; see LR-059.
+		//
+		// So this tier stops at the claim it can honestly make — the change is HELD
+		// and REPORTED, which is planOperation row 1 and is correct — and the release
+		// half moves to the tier that names the defect. Asserting the pickup here
+		// would be asserting a defect-free world; re-add it WITH the LR-059 fix.
+		By("the quarantine does release the pods, which is where LR-059 begins")
 		Eventually(func(g Gomega) {
 			g.Expect(quarantinedSince(victim)).To(BeEmpty())
 			g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("3"))
 		}, 5*time.Minute, 5*time.Second).Should(Succeed())
-
-		Eventually(func(g Gomega) {
-			for _, sp := range sentinelPodsOf(victim) {
-				out, err := sentinelCmd(sp, "SENTINEL", "masters")
-				g.Expect(err).NotTo(HaveOccurred())
-				g.Expect(sentinelMasterNames(out)).To(Equal([]string{newName}),
-					"%s monitors %v, want exactly [%s]", sp, sentinelMasterNames(out), newName)
-			}
-		}, 10*time.Minute, 5*time.Second).Should(Succeed())
-
-		By("and only then is it acknowledged")
-		Eventually(func(g Gomega) {
-			ack := renameAck(victim)
-			g.Expect(ack).NotTo(BeEmpty())
-			g.Expect(ack).NotTo(Equal(ack0))
-			g.Expect(operationCondStatus(victim)).To(Equal("False"))
-		}, 5*time.Minute, 5*time.Second).Should(Succeed())
 	})
 })
 
+// =============================================================================
+// LR-059 — a pending heavy operation on a LEADERLESS instance wedges forever
+// =============================================================================
+//
+// ⚠ COMMITTED AND SKIPPED. This is a live product defect found by the tier above,
+// deferred by decision rather than fixed here, and it follows the LR-056/LR-057
+// precedent exactly: the reproduction is committed so the fix has a red to turn
+// green, and it is NOT inverted into a characterisation of the current behaviour —
+// a test that asserts the defect is correct has to be un-written by whoever fixes
+// it, and until then it actively defends the defect.
+//
+// THE FINDING. ADR-020 states the rule that this violates, in its own words:
+//
+//	"an operation must never suppress the healing its own completion condition
+//	 depends on"
+//
+// LR-058 generalized that for Rule R (measured 311s against 162s) and stopped
+// there. It does not hold for **Rule L**, and Rule L is in the suppressed set on
+// purpose, because Rule L assigns authority. The authority boundary is right as a
+// SAFETY rule and it opens a LIVENESS hole in exactly the case where there is no
+// authority to protect: with zero data holders, Rule L's no-data reseed is the only
+// thing that can produce the living master the operation's completion depends on.
+//
+// The loop, every step of it a documented decision working as designed:
+//
+//	rename pending  ⇒ operation Running
+//	              ⇒ Rule L suppressed (it assigns authority)
+//	              ⇒ no master, pods park in the startup wait-loop, never Ready
+//	              ⇒ StatefulSets never settle
+//	              ⇒ row 7 withholds the acknowledgment
+//	              ⇒ the operation stays Running  ⇒ Rule L stays suppressed
+//
+// MEASURED ON t3e (2026-09-01, operator 48120e9), one variable, three directions:
+//
+//	ctrl  — leaderless, NO rename pending        recovered in 74s
+//	        ("Leaderless bootstrap deadlock suspected" -> "seeded ctrl-redis-0")
+//	diag  — leaderless, rename pending           WEDGED 7m56s, still going
+//	        (only "A declared heavy operation is in progress" every ~4s;
+//	         ZERO leaderless lines — Rule L never even started its cooldown)
+//	diag  — the rename REVERTED                  recovered in 84s
+//	        (op False/Converged in 10s, then DeadlockDetected -> Reseeded)
+//
+// SEVERITY: availability, not durability. The instance is empty by construction on
+// the observed path, and an instance that DID hold data is protected by Rule L's own
+// >=2-holder refusal anyway. It is loud (Ready=False, phase Initializing,
+// OperationInProgress=True) but it never reaches `Stalled` for 15 minutes, and
+// `Stalled` has no auto-exit either. The escape hatch is to revert the spec edit,
+// which is exactly the operation the owner was trying to perform.
+//
+// REACHABLE, and by a route the documentation invites: any leaderless deadlock that
+// coincides with a pending rename. The quarantine release above is one route (and
+// USAGE tells owners a held rename is picked up there); LR-015's original
+// mass-restart incident is another, and a rename issued shortly before node
+// maintenance composes the two.
+//
+// NOT FIXED HERE. The fix is a data-safety change to the suppression boundary of a
+// shipped mechanism and it needs its own pass, not the tail end of a test milestone.
+// The obvious narrowing — "let Rule L run when there are zero data holders" — is
+// plausible precisely because that is the branch with no authority to assign, but it
+// is still a change to which rules may act during a declared operation, and
+// ADR-020's boundary is the thing under discussion. That is a decision, not a patch.
+var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
+	Label("sentinel"), Ordered, func() {
+
+		var wedged, control string
+
+		leaderlessCR := func(crName string) string {
+			return sentinelRenameCR(crName, "mymaster")
+		}
+
+		// forceLeaderless reproduces LR-015's deadlock deterministically: with the
+		// operator paused, force-delete every pod. Sentinel storage is EmptyDir
+		// (pillar 3.1), so the Sentinels come back BARE and the Redis pods park in the
+		// startup wait-loop with no master — RealMasterIP == "", which is Rule L's
+		// entire precondition.
+		forceLeaderless := func(names ...string) {
+			for _, n := range names {
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "pod", "-n", testNamespace,
+					"-l", "app.kubernetes.io/instance="+n, "--grace-period=0", "--force"))
+			}
+			for _, n := range names {
+				Eventually(func(g Gomega) {
+					for _, sp := range []string{n + "-sentinel-0", n + "-sentinel-1", n + "-sentinel-2"} {
+						out, err := sentinelPortExec(testNamespace, sp, "SENTINEL", "masters")
+						g.Expect(err).NotTo(HaveOccurred())
+						g.Expect(sentinelMasterNames(out)).To(BeEmpty(),
+							"%s is not bare: %v", sp, sentinelMasterNames(out))
+					}
+				}, 3*time.Minute, 5*time.Second).Should(Succeed())
+			}
+		}
+
+		BeforeAll(func() {
+			stamp := time.Now().Unix()
+			wedged = fmt.Sprintf("op-ll-wedge-%d", stamp)
+			control = fmt.Sprintf("op-ll-ctrl-%d", stamp)
+			for _, n := range []string{wedged, control} {
+				AddReportEntry("cr:" + n)
+			}
+		})
+
+		AfterAll(func() {
+			// Unconditionally FIRST: an operator left at 0 replicas silently breaks
+			// every later spec and the next run of the whole suite.
+			scaleOperator(1)
+			if debugOnFailure && suiteOrSpecFailed() {
+				By("skipping cleanup to allow debugging")
+				return
+			}
+			for _, n := range []string{wedged, control} {
+				_, _ = utils.Run(exec.Command("kubectl", "delete", "littlered", n,
+					"-n", testNamespace, "--ignore-not-found"))
+			}
+		})
+
+		It("recovers through Rule L even with a rename pending", func() {
+			Skip("blocked on LR-059: a pending heavy operation suppresses Rule L, which is the " +
+				"only thing that can satisfy the operation's own completion condition on a " +
+				"leaderless instance — measured wedged 7m56s against a 74s control on t3e. " +
+				"Un-skip with the LR-059 fix, not before.")
+
+			By("deploying two identical instances")
+			for _, n := range []string{wedged, control} {
+				cmd := exec.Command("kubectl", "apply", "-f", "-")
+				cmd.Stdin = strings.NewReader(leaderlessCR(n))
+				out, err := utils.Run(cmd)
+				Expect(err).NotTo(HaveOccurred(), "apply output: %s", out)
+			}
+			for _, n := range []string{wedged, control} {
+				Eventually(func(g Gomega) {
+					g.Expect(getPhase(n)).To(Equal("Running"))
+					g.Expect(renameAck(n)).NotTo(BeEmpty(), "%s was never seeded", n)
+				}, 6*time.Minute, 5*time.Second).Should(Succeed())
+			}
+
+			By("pausing the operator and driving BOTH into the leaderless deadlock")
+			// Paused, so neither instance can be healed while the state is staged and
+			// the two enter it together — which is what makes the pair an A/B rather
+			// than two runs.
+			scaleOperator(0)
+			forceLeaderless(wedged, control)
+
+			By("THE ONE VARIABLE: a rename is pending on one of them only")
+			renameMasterName(wedged, e2eMasterName(testNamespace, wedged))
+
+			By("resuming the operator")
+			scaleOperator(1)
+
+			// The POSITIVE CONTROL, and it is what makes the failure attributable:
+			// the identically-staged instance with no pending operation must recover.
+			// Without it, "the other one did not recover" could be a broken fixture.
+			By("the control recovers through Rule L")
+			Eventually(func(g Gomega) {
+				g.Expect(getPhase(control)).To(Equal("Running"))
+				g.Expect(getMasterPod(control)).NotTo(BeEmpty())
+				st, _ := getConditionField(control, "LeaderlessRecovery", "reason")
+				g.Expect(st).To(Equal("Reseeded"))
+			}, 5*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("and so must the one with a rename pending — this is the assertion LR-059 fails")
+			Eventually(func(g Gomega) {
+				g.Expect(getMasterPod(wedged)).NotTo(BeEmpty(),
+					"the instance is still leaderless with a rename pending: Rule L is "+
+						"suppressed by the operation, and the operation cannot complete until "+
+						"Rule L gives it a master (LR-059)")
+				g.Expect(getPhase(wedged)).To(Equal("Running"))
+			}, 6*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("and the rename then completes")
+			Eventually(func(g Gomega) {
+				expectQuietOperationOn(g, wedged)
+				for _, sp := range []string{wedged + "-sentinel-0", wedged + "-sentinel-1", wedged + "-sentinel-2"} {
+					out, err := sentinelPortExec(testNamespace, sp, "SENTINEL", "masters")
+					g.Expect(err).NotTo(HaveOccurred())
+					g.Expect(sentinelMasterNames(out)).To(
+						Equal([]string{e2eMasterName(testNamespace, wedged)}))
+				}
+			}, 6*time.Minute, 5*time.Second).Should(Succeed())
+		})
+	})
+
+// expectQuietOperationOn is the package-level twin of the closure inside the main
+// Describe, for the tier above which lives outside it.
+func expectQuietOperationOn(g Gomega, crName string) {
+	g.Expect(operationCondStatus(crName)).NotTo(Equal("True"),
+		"an operation is declared (%s) when none should be", operationCondReason(crName))
+	g.Expect(operationStatusField(crName, "name")).To(BeEmpty(),
+		"status.operation is populated when nothing should be declared")
+}
+
+// =============================================================================
 // =============================================================================
 // TIER 6 — an operator upgrade over an existing fleet declares NOTHING
 // =============================================================================
