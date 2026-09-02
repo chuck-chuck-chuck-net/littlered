@@ -210,8 +210,12 @@ endif
 # interrupts and writes its report (cleanup nodes still run) instead of go panicking the
 # process first.
 #   make test-e2e E2E_ALL=true E2E_TIMEOUT=4h
-E2E_TIMEOUT ?= 2h
-E2E_GO_TIMEOUT ?= 3h
+# Raised from 2h/3h on 2026-09-02: a full `test-e2e-all` run measured 8654s (2h24m) on t3e,
+# so the old default GUARANTEED a timeout on the healthy path — which reports as a failure
+# and trains readers to pass a bigger number without reading why. These bound a HUNG suite,
+# not a slow one; raise them again rather than letting a real run race the clock.
+E2E_TIMEOUT ?= 4h
+E2E_GO_TIMEOUT ?= 5h
 
 # DEBUG_ON_FAILURE=true ginkgo --fail-fast ./test/e2e/...
 ifeq ($(DEBUG_ON_FAILURE),true)

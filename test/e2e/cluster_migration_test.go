@@ -357,13 +357,19 @@ var _ = Describe("Cluster Legacy→Per-Shard In-Place Migration (ADR-013)", Labe
 
 // enforceDedicatedClusterGuards is the WS2 refuse-to-run safety net. The migration tier
 // deploys/upgrades operators on its own (pre-split image → migration image over the SAME CR),
-// so it MUST own a dedicated cluster. Two hard guards, both fail-fast BEFORE any migration
-// deploy, both target-agnostic (they gate Kind/k3s/VM/prod alike — nothing here is Kind-specific):
+// so it MUST own a dedicated cluster. Two guards, both BEFORE any migration deploy, both
+// target-agnostic (they gate Kind/k3s/VM/prod alike — nothing here is Kind-specific).
 //
-//  1. SKIP_OPERATOR_DEPLOY must NOT be set. That flag means "reuse an already-installed
-//     operator" — the exact opposite of what this tier needs. This tier IS the operator
-//     lifecycle: it deploys the pre-split operator, upgrades to the migration operator, and
-//     restores it. Reusing a foreign operator would either mis-run or silently no-op.
+// They deliberately behave DIFFERENTLY, because they detect different things:
+//
+//  1. SKIP_OPERATOR_DEPLOY must NOT be set — and this one SKIPS. That flag means "reuse an
+//     already-installed operator", the exact opposite of what this tier needs: this tier IS the
+//     operator lifecycle (pre-split operator → migration operator → restore). But the caller
+//     ASKED for that flag, so the tier is *unrunnable here*, not *failing* — which is what Skip
+//     means. It also makes this precondition consistent with the tier's other environmental one:
+//     an unset LEGACY_OPERATOR_IMAGE already skips (preSplitOperatorImage). Failing on one
+//     environmental precondition and skipping on the other was incoherent, and a red on a
+//     legitimate configuration teaches readers to scroll past reds.
 //
 //  2. No OTHER littlered operator may already be installed anywhere in the target cluster.
 //     We scan ALL namespaces for a littlered controller Deployment (matched by the operator's
@@ -375,14 +381,17 @@ var _ = Describe("Cluster Legacy→Per-Shard In-Place Migration (ADR-013)", Labe
 // thus before bootstrapLegacyCluster's first deploy). The suite's own operator is deployed by
 // BeforeSuite ahead of this and is explicitly excluded from guard 2.
 func enforceDedicatedClusterGuards() {
-	By("WS2 guard: refusing to run if SKIP_OPERATOR_DEPLOY is set (this tier owns operator deployment)")
+	By("WS2 guard: SKIP_OPERATOR_DEPLOY is set, so this tier cannot own operator deployment")
 	if v := os.Getenv("SKIP_OPERATOR_DEPLOY"); v == "true" || v == "1" || v == "yes" {
-		Fail("refusing to run the ADR-013 migration e2e with SKIP_OPERATOR_DEPLOY=" + v +
-			": this tier MUST own operator deployment (it deploys the pre-split operator, upgrades " +
-			"to the migration operator, and restores it). Unset SKIP_OPERATOR_DEPLOY and run against " +
-			"a dedicated cluster.")
+		Skip("SKIP_OPERATOR_DEPLOY=" + v + " — the ADR-013 migration e2e cannot run here: this tier " +
+			"MUST own operator deployment (it deploys the pre-split operator, upgrades to the " +
+			"migration operator, and restores it), and that flag asks for the opposite. Unset " +
+			"SKIP_OPERATOR_DEPLOY and run against a dedicated cluster to exercise this tier.")
 	}
 
+	// Guard 2 stays a hard FAIL, deliberately. Unlike guard 1 this is not something the caller
+	// asked for — it detects a condition they probably do not know about, and proceeding would
+	// trample a foreign operator on a shared cluster. Skipping would hide a hazard; failing names it.
 	By("WS2 guard: refusing to run if a foreign littlered operator is already installed in the cluster")
 	out, err := utils.Run(exec.Command("kubectl", "get", "deployments", "--all-namespaces",
 		"-l", "app.kubernetes.io/name=littlered,control-plane=controller-manager",
