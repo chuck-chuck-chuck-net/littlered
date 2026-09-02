@@ -345,11 +345,22 @@ var _ = Describe("Sentinel Declared Operations", Label("sentinel"), func() {
 				if !ackChanged && ack != "" && ack != ack0 {
 					ackChanged = true
 					ackAt = time.Since(start).Truncate(time.Second)
-					settledAtAck = settled
-					// Nothing rolls after the acknowledgment, so this single sample is a
-					// sound reading of "were the StatefulSets settled when it landed".
-					// The dangerous direction would be a stale-settled read, and this one
-					// comes from the API server rather than from an informer.
+					// RE-READ, deliberately: `settled` above was read SEVERAL kubectl
+					// round-trips before `ack`, so the two are not simultaneous and pairing
+					// them is a read skew. A soak run caught exactly that — the StatefulSet
+					// was mid-roll when `settled` was read, settled a few hundred ms later,
+					// and the operator acked before `renameAck` ran, producing
+					// settledAtAck=false on a perfectly correct rename.
+					//
+					// Re-reading AFTER the ack is sound in the direction that matters, and
+					// this is what the original comment claimed but did not do. Nothing
+					// rolls once the operation completes, so a post-ack read can show
+					// settled only if it genuinely settled; and a product that acked EARLY
+					// would still be mid-roll here, so the real red is preserved. The
+					// asymmetry is the point: the old code was safe against a stale-SETTLED
+					// read (which would hide a defect) and open to a stale-UNSETTLED one
+					// (which invents one).
+					settledAtAck = instanceSettled(crName)
 					break
 				}
 				time.Sleep(2 * time.Second)
