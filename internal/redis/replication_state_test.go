@@ -206,7 +206,7 @@ func TestDataHoldersAndBestDataHolder(t *testing.T) {
 		if got := s.DataHolders(); len(got) != 0 {
 			t.Errorf("DataHolders() = %d holders, want 0 (empty pod + unreachable pod)", len(got))
 		}
-		best, diverged := s.BestDataHolder()
+		best, diverged, _ := s.BestDataHolder()
 		if best != nil || diverged {
 			t.Errorf("BestDataHolder() = (%v, %v), want (nil, false)", best, diverged)
 		}
@@ -225,7 +225,7 @@ func TestDataHoldersAndBestDataHolder(t *testing.T) {
 		if len(holders) != 1 {
 			t.Fatalf("DataHolders() = %d, want 1 (sole reachable data holder)", len(holders))
 		}
-		best, diverged := s.BestDataHolder()
+		best, diverged, _ := s.BestDataHolder()
 		if best == nil || best.IP != masterIP || diverged {
 			t.Errorf("BestDataHolder() = (%v, diverged=%v), want (10.0.0.1, false)", best, diverged)
 		}
@@ -238,7 +238,7 @@ func TestDataHoldersAndBestDataHolder(t *testing.T) {
 		if got := s.DataHolders(); len(got) != 2 {
 			t.Fatalf("DataHolders() = %d, want 2", len(got))
 		}
-		best, diverged := s.BestDataHolder()
+		best, diverged, _ := s.BestDataHolder()
 		if best == nil || best.IP != replicaIP {
 			t.Errorf("BestDataHolder() picked %v, want 10.0.0.2 (higher offset despite fewer keys)", best)
 		}
@@ -251,7 +251,7 @@ func TestDataHoldersAndBestDataHolder(t *testing.T) {
 		s := NewReplicationState()
 		s.RedisNodes[ipPod2] = &RedisNodeState{IP: ipPod2, Reachable: true, Keys: 50, Offset: 100, Replid: "A"}
 		s.RedisNodes[masterIP] = &RedisNodeState{IP: masterIP, Reachable: true, Keys: 50, Offset: 100, Replid: "A"}
-		best, _ := s.BestDataHolder()
+		best, _, _ := s.BestDataHolder()
 		if best == nil || best.IP != masterIP {
 			t.Errorf("BestDataHolder() picked %v, want 10.0.0.1 (equal offset+keys, lowest IP)", best)
 		}
@@ -261,7 +261,7 @@ func TestDataHoldersAndBestDataHolder(t *testing.T) {
 		s := NewReplicationState()
 		s.RedisNodes[masterIP] = &RedisNodeState{IP: masterIP, Reachable: true, Keys: 10, Offset: 100, Replid: "A"}
 		s.RedisNodes[replicaIP] = &RedisNodeState{IP: replicaIP, Reachable: true, Keys: 10, Offset: 200, Replid: "B"}
-		best, diverged := s.BestDataHolder()
+		best, diverged, _ := s.BestDataHolder()
 		if best == nil || best.IP != replicaIP {
 			t.Errorf("BestDataHolder() picked %v, want 10.0.0.2", best)
 		}

@@ -435,10 +435,50 @@ func (s *ReplicationState) DataHolders() []*RedisNodeState {
 // a promotion chain as divergent and wrongly refuse a safe election.
 //
 // Returns (nil, false) when no node holds data.
-func (s *ReplicationState) BestDataHolder() (best *RedisNodeState, diverged bool) {
+// holdersForked reports whether MORE THAN ONE holder has been independently
+// writable — the discriminator holdersDiverged structurally cannot supply (LR-057).
+//
+// A promotion rotates master_replid and shifts the old value into master_replid2,
+// so the union-find over {replid, replid2} connects a promotion CHAIN and a
+// promotion FORK identically:
+//
+//	chain  D -> A -> B      A={A,D}  B={B,A}    one component
+//	fork   D -> A, D -> B   A={A,D}  B={B,D}    one component
+//
+// LR-024 introduced replid2 to stop the chain reading as divergent, which was
+// right; the fork was never distinguished, and only the chain is safe. In a chain
+// every node received ONE stream, so offsets are positions in it and the highest is
+// a superset. In a fork each node has appended to its OWN stream since parting, so
+// the offsets are coordinates on two branches that share only an origin — and
+// BestDataHolder's comparison, which selects master_repl_offset for a master and
+// slave_repl_offset for a replica (client.go), is then comparing two different
+// units. Electing the higher discards the other's acknowledged writes.
+//
+// The test is "how many holders have been WRITABLE", not "how many lineages are
+// there", because writability is what the offset comparison actually assumes.
+//
+// It cannot be tripped by the empty-master transient LR-004/LR-014 describe, and
+// that is why a role-based test is safe HERE where it would not be elsewhere:
+// DataHolders is `Reachable && Keys > 0`, storage is EmptyDir, so a restarted pod
+// returns with zero keys and never enters the holder set at all. Pinned by
+// TestAnEmptyRestartedMasterIsNeverAHolder, because the whole fix turns on it.
+func holdersForked(holders []*RedisNodeState) bool {
+	writable := 0
+	for _, h := range holders {
+		if h != nil && h.Role == roleMaster {
+			writable++
+			if writable > 1 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func (s *ReplicationState) BestDataHolder() (best *RedisNodeState, diverged, forked bool) {
 	holders := s.DataHolders()
 	if len(holders) == 0 {
-		return nil, false
+		return nil, false, false
 	}
 	best = holders[0]
 	for _, h := range holders {
@@ -455,7 +495,7 @@ func (s *ReplicationState) BestDataHolder() (best *RedisNodeState, diverged bool
 			best = h
 		}
 	}
-	return best, holdersDiverged(holders)
+	return best, holdersDiverged(holders), holdersForked(holders)
 }
 
 // isZeroReplid reports whether a replid is empty or the all-zero sentinel Redis reports

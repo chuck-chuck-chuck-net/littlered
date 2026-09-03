@@ -310,26 +310,18 @@ func podNameAt(i int) string {
 // Rule L refuses (holder count), failover mode elects (lineage). Only the shape of
 // the gate differs.
 func TestTwoLiveMastersAreNeverResolvedByElectingOneOfThem(t *testing.T) {
-	// ⚠ BLOCKED ON LR-057 — SKIPPED DELIBERATELY, DO NOT "FIX" BY INVERTING.
+	// UN-SKIPPED 2026-09-03 with the LR-057 fix. It was committed skipped because it
+	// asserts what the operator SHOULD do, and inverting it would have pinned an
+	// election that discards acknowledged writes with no opt-in.
 	//
-	// As above: this is the assertion the operator should satisfy, not a description
-	// of what it does. Inverting it would pin an election that discards acknowledged
-	// writes with no opt-in.
-	//
-	// It is deferred rather than fixed for a reason that is NOT "it is small". This
-	// planner exists to break a wedge — a Sentinel quorum pinned to a dead address
-	// with no promotable replica, which never self-heals — and the obvious narrowing
-	// (refuse when two holders both report role:master) may re-create exactly that
-	// wedge for a state the planner is supposed to resolve. Which of the two failures
-	// is worse, and whether a narrower discriminator exists that separates "two write
-	// endpoints" from "two survivors of one master", is the open question the
-	// investigation must answer before any gate here is narrowed. See LR-057.
-	//
-	// UN-SKIP AS PART OF THE LR-057 FIX, not before.
-	t.Skip("blocked on LR-057: the ghost-master recovery's lineage gate assumes the holders " +
-		"are replicas of one dead master, so two live masters sharing a lineage are " +
-		"resolved by electing one and discarding the other's writes; un-skip with the " +
-		"LR-057 fix")
+	// The reason it was deferred rather than fixed turned out to be WRONG, and that
+	// is worth keeping: the fear was that "refuse when two holders both report
+	// role:master" could re-create the very wedge this planner exists to break,
+	// because "a restarted pod returns as an empty master by default" (LR-004,
+	// LR-014). It cannot. DataHolders is `Reachable && Keys > 0` and storage is
+	// EmptyDir, so a restarted pod returns with ZERO keys and is never a holder at
+	// all — the transient cannot enter the set the refusal ranges over. Pinned
+	// separately by TestAnEmptyRestartedMasterIsNeverAHolder.
 
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	stuck := now.Add(-2 * ghostMasterRecoveryCooldown)
@@ -364,7 +356,7 @@ func TestTwoLiveMastersAreNeverResolvedByElectingOneOfThem(t *testing.T) {
 	if n := len(s.DataHolders()); n != 2 {
 		t.Fatalf("precondition: want 2 data holders, got %d", n)
 	}
-	if _, diverged := s.BestDataHolder(); diverged {
+	if _, diverged, _ := s.BestDataHolder(); diverged {
 		t.Fatalf("precondition: the two masters must read as ONE lineage, which is the point")
 	}
 
@@ -623,7 +615,7 @@ func TestAPromotionChainIsOneLineageAndNeedsNoOptIn(t *testing.T) {
 	}
 
 	s := chain()
-	if _, diverged := s.BestDataHolder(); diverged {
+	if _, diverged, _ := s.BestDataHolder(); diverged {
 		// Errorf, not Fatalf: when this precondition breaks, the verdicts below are
 		// the interesting part of the failure.
 		t.Errorf("precondition: a promotion chain must read as ONE lineage")

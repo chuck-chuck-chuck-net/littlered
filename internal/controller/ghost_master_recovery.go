@@ -105,18 +105,33 @@ func planGhostMasterRecovery(
 		return leaderlessPlan{action: recoverySeedNoData, masterIP: bootstrapMasterIP}
 	}
 
-	best, diverged := state.BestDataHolder()
+	best, diverged, forked := state.BestDataHolder()
 	if best == nil { // defensive; holders is non-empty so this cannot happen
 		return leaderlessPlan{action: recoveryWait, holders: len(holders)}
 	}
 	// Safety gate: replication LINEAGE, not holder count. Same-master survivors (one replid)
 	// are safe to elect from — the losers re-sync from the elected master with no divergent
 	// writes lost — so no opt-in. Only genuinely diverged lineages need the unsafe opt-in.
-	if diverged {
+	//
+	// LR-057: lineage alone is NOT sufficient, and forked is the missing half. A promotion
+	// rotates the replid into replid2, so the union-find connects a promotion CHAIN and a
+	// promotion FORK identically — and only the chain carries LR-024's premise that "the
+	// survivors are replicas of the same dead master". Two holders that have each been
+	// writable have appended to their own streams, so BestDataHolder's offset comparison is
+	// across two units and electing the higher discards the other's acknowledged writes.
+	// Refusing LOUDLY into the opt-in that already exists for exactly this decision is
+	// LR-047's asymmetry (a loud stall beats silent destruction); it is not LR-043's
+	// permanent-stall hazard, because the knob is a documented way out and the state cannot
+	// be produced by the empty-master transient (an empty pod is never a DataHolder).
+	if diverged || forked {
 		if !allowUnsafe {
-			return leaderlessPlan{action: recoveryRefuse, holders: len(holders)}
+			// diverged is deliberately NOT set here: the pre-existing decision-table
+			// rows pin it false on a refusal, and reusing it to carry the REASON
+			// would edit their contract (LR-048's K2b). forked is a new field, so it
+			// can carry the distinction the message needs without touching them.
+			return leaderlessPlan{action: recoveryRefuse, forked: forked, holders: len(holders)}
 		}
-		return leaderlessPlan{action: recoveryUnsafeElect, masterIP: best.IP, diverged: true, holders: len(holders)}
+		return leaderlessPlan{action: recoveryUnsafeElect, masterIP: best.IP, diverged: diverged, forked: forked, holders: len(holders)}
 	}
 	return leaderlessPlan{action: recoveryPromoteSurvivor, masterIP: best.IP, holders: len(holders)}
 }
@@ -189,6 +204,19 @@ func (r *LittleRedReconciler) recoverGhostMasterDeadlock(
 		msg := fmt.Sprintf("Ghost-master deadlock: %d survivors hold data across divergent replication lineages. "+
 			"Refusing to elect (would discard independent writes). Set sentinel.allowUnsafeRebootstrapOnDeadlock=true "+
 			"to authorize, or intervene manually.", plan.holders)
+		if plan.forked {
+			// LR-057. Different situation, different sentence: these two SHARE a
+			// history — the union-find sees one lineage — but each has been writable
+			// since they parted, so their replication offsets are not comparable and
+			// the higher one is not a superset. Telling the owner "divergent
+			// lineages" here would point them at the wrong diagnosis.
+			msg = fmt.Sprintf("Ghost-master deadlock: %d survivors hold data and MORE THAN ONE of them "+
+				"is a master, so each has accepted writes independently since they parted. Their "+
+				"replication offsets are not comparable, so electing the highest would silently "+
+				"discard the other's acknowledged writes. Refusing to elect. Identify which pod "+
+				"holds the writes you need, or set sentinel.allowUnsafeRebootstrapOnDeadlock=true "+
+				"to authorize discarding the rest.", plan.holders)
+		}
 		log.Info(msg)
 		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataPresent, msg)
 		return r.setGhostMasterCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataPresent, msg)

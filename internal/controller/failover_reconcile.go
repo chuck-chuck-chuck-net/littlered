@@ -649,6 +649,17 @@ func (r *LittleRedReconciler) executeFailoverPlan(
 		msg := fmt.Sprintf("No live master and %d pods hold data across divergent replication lineages. "+
 			"Refusing to elect (would discard independent writes). Set failover.allowUnsafeRebootstrapOnDeadlock=true "+
 			"to authorize, or intervene manually.", plan.holders)
+		if plan.forked {
+			// LR-057, the twin of the sentinel message. Same fact, same reason for
+			// wording it differently: these SHARE a history, so "divergent lineages"
+			// would send the owner after the wrong diagnosis.
+			msg = fmt.Sprintf("No live master, %d pods hold data, and MORE THAN ONE of them is a "+
+				"master, so each has accepted writes independently since they parted. Their "+
+				"replication offsets are not comparable, so electing the highest would silently "+
+				"discard the other's acknowledged writes. Refusing to elect. Identify which pod "+
+				"holds the writes you need, or set failover.allowUnsafeRebootstrapOnDeadlock=true "+
+				"to authorize discarding the rest.", plan.holders)
+		}
 		log.Info(msg)
 		r.event(lr, corev1.EventTypeWarning, reasonRefusedDataPresent, msg)
 		return r.setFailoverRecoveryCondition(ctx, lr, metav1.ConditionTrue, reasonRefusedDataPresent, msg)

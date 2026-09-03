@@ -185,7 +185,12 @@ type failoverPlan struct {
 	action   failoverAction
 	masterIP string // pod to elect (seed/promote/unsafe actions only)
 	diverged bool   // unsafe action: holders span multiple replication lineages
-	holders  int    // number of reachable data holders (for messaging)
+	// forked: MORE THAN ONE holder has been independently writable (LR-057). See the
+	// note on leaderlessPlan.forked — same fact, same reason for reporting it apart
+	// from diverged. This mode reaches the identical branch, which is why the fix
+	// lands in both (CLAUDE.md §7 rule 11).
+	forked  bool
+	holders int // number of reachable data holders (for messaging)
 	// unverified: pods that refused the operator's credential, so their keyspace is
 	// unknown (failoverRefuseUnverified only). Carried for the message.
 	unverified []*redisclient.RedisNodeState
@@ -206,11 +211,12 @@ type failoverPlan struct {
 //     cascading flips) -> wait. A nil marker means no prior transition; an elapsed
 //     marker does not block.
 //  4. No live master, 0 data holders -> seed the bootstrap candidate ("" -> wait).
-//  5. >=1 holders, all ONE lineage (holdersDiverged over {replid, replid2} is
-//     false) -> promote BestDataHolder. NO opt-in: same-lineage losers resync from
-//     the winner with no independent writes lost.
-//  6. Holders in >=2 lineages -> refuse unless allowUnsafe; then elect
-//     BestDataHolder and flag the divergence.
+//  5. >=1 holders, all ONE lineage AND at most one of them writable -> promote
+//     BestDataHolder. NO opt-in: the losers resync from the winner with no
+//     independent writes lost.
+//  6. Holders in >=2 lineages, OR more than one holder that has been independently
+//     writable (LR-057) -> refuse unless allowUnsafe; then elect BestDataHolder and
+//     flag which of the two it was.
 //
 // Deliberate contrast with sentinel-mode Rule A (§6): there is NO terminating-pods
 // gate — a crash failover is exactly the moment the dead master pod is
@@ -266,15 +272,21 @@ func planFailover(
 	// 5-6. Data present: the safety gate is replication LINEAGE (union-find over
 	// {replid, replid2}), not holder count — a post-failover promotion chain is one
 	// lineage and elects with no opt-in (LR-024 lesson).
-	best, diverged := state.BestDataHolder()
+	best, diverged, forked := state.BestDataHolder()
 	if best == nil { // defensive; holders is non-empty so this cannot happen
 		return failoverPlan{action: failoverWait, holders: len(holders)}
 	}
-	if diverged {
+	// LR-057: lineage is necessary and not sufficient — a promotion rotates the replid
+	// into replid2, so the union-find cannot tell a promotion CHAIN from a promotion
+	// FORK, and only the chain carries the premise that the losers resync losing
+	// nothing. Two holders that have each been writable have appended to their own
+	// streams, so the offsets BestDataHolder compares are in different units.
+	if diverged || forked {
 		if !allowUnsafe {
-			return failoverPlan{action: failoverRefuse, holders: len(holders)}
+			// diverged deliberately unset — see the note in planGhostMasterRecovery.
+			return failoverPlan{action: failoverRefuse, forked: forked, holders: len(holders)}
 		}
-		return failoverPlan{action: failoverUnsafeElect, masterIP: best.IP, diverged: true, holders: len(holders)}
+		return failoverPlan{action: failoverUnsafeElect, masterIP: best.IP, diverged: diverged, forked: forked, holders: len(holders)}
 	}
 	return failoverPlan{action: failoverPromote, masterIP: best.IP, holders: len(holders)}
 }

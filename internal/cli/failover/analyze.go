@@ -273,7 +273,7 @@ func (a *Analysis) checkLineage(state *redisclient.ReplicationState) {
 	if len(holders) < 2 {
 		return
 	}
-	if _, diverged := state.BestDataHolder(); diverged {
+	if _, diverged, _ := state.BestDataHolder(); diverged {
 		names := make([]string, 0, len(holders))
 		for _, h := range holders {
 			names = append(names, h.PodName)

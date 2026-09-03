@@ -60,7 +60,13 @@ type leaderlessPlan struct {
 	action   recoveryAction
 	masterIP string // pod to elect (seed/promote/unsafe actions only)
 	diverged bool   // unsafe action: holders span multiple replication lineages
-	holders  int    // number of reachable data holders (for messaging)
+	// forked: MORE THAN ONE holder has been independently writable (LR-057). Distinct
+	// from diverged, and reported separately, because they are different situations
+	// and the human reading the message is deciding whether to set the unsafe opt-in:
+	// diverged means "these histories never met", forked means "these two both took
+	// writes after they parted, so their offsets are not comparable".
+	forked  bool
+	holders int // number of reachable data holders (for messaging)
 	// unverified: pods that refused the operator's credential, so their keyspace is
 	// unknown (recoveryRefuseUnverified only). Carried for the message — naming the
 	// pods and what the server said is what turns this from "stuck" into "fix the
@@ -148,11 +154,16 @@ func planLeaderlessRecovery(
 		if !allowUnsafe {
 			return leaderlessPlan{action: recoveryRefuse, holders: len(holders)}
 		}
-		best, diverged := state.BestDataHolder()
+		best, diverged, forked := state.BestDataHolder()
 		if best == nil { // defensive; holders is non-empty so this cannot happen
 			return leaderlessPlan{action: recoveryWait, holders: len(holders)}
 		}
-		return leaderlessPlan{action: recoveryUnsafeElect, masterIP: best.IP, diverged: diverged, holders: len(holders)}
+		// Rule L's own gate is holder COUNT, so reaching here already required the
+		// human's opt-in; forked is threaded for the message rather than to change
+		// the decision. It still matters: they authorized discarding data, not
+		// discarding the LARGER dataset, and a forked set makes the winner's offset
+		// an unreliable choice (LR-057).
+		return leaderlessPlan{action: recoveryUnsafeElect, masterIP: best.IP, diverged: diverged, forked: forked, holders: len(holders)}
 	}
 }
 
