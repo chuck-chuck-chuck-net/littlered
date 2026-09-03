@@ -225,12 +225,12 @@ func TestDetermineRealMasterFailoverActive(t *testing.T) {
 			state.AddLiveTopologyIP("10.0.0.1")
 			state.DetermineRealMaster()
 
-			if state.FailoverActive != tc.want {
-				t.Fatalf("FailoverActive = %v, want %v\n"+
+			if state.FailoverReported != tc.want {
+				t.Fatalf("FailoverReported = %v, want %v\n"+
 					"  gathered sentinel state: %+v\n"+
 					"  the operator must read Sentinel's own `failover-state` key (and the "+
 					"`failover_in_progress` flag), not the never-emitted `failover-status` (LR-052)",
-					state.FailoverActive, tc.want, sn)
+					state.FailoverReported, tc.want, sn)
 			}
 		})
 	}
@@ -280,8 +280,8 @@ func TestFailoverActiveSuppressesTheRedisOnlyFallback(t *testing.T) {
 
 	t.Run("split with a failover in flight: no fallback, no master named", func(t *testing.T) {
 		state := build(t, true)
-		if !state.FailoverActive {
-			t.Fatalf("precondition: FailoverActive = false, want true (the split must be mid-failover)")
+		if !state.FailoverReported {
+			t.Fatalf("precondition: FailoverReported = false, want true (the split must be mid-failover)")
 		}
 		if state.RealMasterIP != "" {
 			t.Fatalf("RealMasterIP = %q, want \"\": while Sentinel is mid-decision the operator "+
@@ -294,8 +294,8 @@ func TestFailoverActiveSuppressesTheRedisOnlyFallback(t *testing.T) {
 		// suppresses the fallback — which would strand every legitimately split
 		// instance at RealMasterIP == "".
 		state := build(t, false)
-		if state.FailoverActive {
-			t.Fatalf("precondition: FailoverActive = true, want false")
+		if state.FailoverReported {
+			t.Fatalf("precondition: FailoverReported = true, want false")
 		}
 		if state.RealMasterIP != podA {
 			t.Fatalf("RealMasterIP = %q, want %q: an ordinary Sentinel split must still "+

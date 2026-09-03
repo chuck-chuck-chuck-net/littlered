@@ -77,6 +77,23 @@ const (
 	// failoverStateNone is Sentinel's own name for "no failover in progress"
 	// (sentinelFailoverStateStr, SENTINEL_FAILOVER_STATE_NONE).
 	failoverStateNone = "none"
+
+	// failoverStateReconfSlaves is the ONLY failover state that can latch.
+	//
+	// Every earlier state has its own abort timer (sentinelFailoverWaitStart's
+	// election timeout, sentinelFailoverWaitPromotion's failover_timeout, both
+	// reaching sentinelAbortFailover), and UPDATE_CONFIG has no case in
+	// sentinelFailoverStateMachine at all — it is switched on the same tick and
+	// sentinelResetMaster clears the flag. RECONF_SLAVES exits only through
+	// sentinelFailoverDetectEnd, whose FIRST statement returns when the promoted
+	// replica is NULL or SRI_S_DOWN — BEFORE its own elapsed > failover_timeout
+	// force-end. Source-confirmed at redis/redis 8.0 src/sentinel.c:5185 (the early
+	// return), :5201 (the force-end it skips) and :5342 (the abort assert that
+	// rules out the other exit), and at valkey-io/valkey 8.1 :4989, :5004, :5129.
+	//
+	// Valkey renamed the enum to SENTINEL_FAILOVER_STATE_RECONF_REPLICAS but kept
+	// the legacy WIRE string (sentinel.c:3256), so one constant covers both.
+	failoverStateReconfSlaves = "reconf_slaves"
 )
 
 // newBoundedClient builds a go-redis Sentinel client for ONE single-shot command

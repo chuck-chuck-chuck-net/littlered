@@ -294,7 +294,7 @@ func planStaleMasterNames(
 	// stale ones included: a failover under the stale name is still a real state machine
 	// reconfiguring our pods.
 	//
-	// state.FailoverActive is no longer along for the ride. It was permanently false
+	// state.FailoverReported is no longer along for the ride. It was permanently false
 	// when this was written (a dead wire key, LR-052) and the comment here said so; it
 	// is now live, and it genuinely fires where the per-entry test cannot: failoverUnder
 	// is collected from MonitoredMasters, which degrades to an EMPTY list on a read
@@ -305,7 +305,7 @@ func planStaleMasterNames(
 	//
 	// That case is also why the message is built rather than formatted straight: with
 	// failoverUnder empty it rendered `under master name(s) []`, naming nothing.
-	if len(failoverUnder) > 0 || state.FailoverActive {
+	if len(failoverUnder) > 0 || state.FailoverReported {
 		return deferStaleNames("G3", failoverInFlightMessage(dedupSorted(failoverUnder)), staleList)
 	}
 
@@ -362,7 +362,7 @@ func describeStaleEntries(entries []staleEntry) string {
 // failoverInFlightMessage renders G3's refusal.
 //
 // It exists because the name list can legitimately be EMPTY: G3 also refuses on
-// state.FailoverActive, which comes from the desired name's own probe, and that case
+// state.FailoverReported, which comes from the desired name's own probe, and that case
 // is reachable exactly when `SENTINEL MASTERS` could not be read at all — so there
 // are no per-entry names to quote (LR-052 found this rendering, LR-053 fixes it).
 // `a failover is in flight under master name(s) []` names nothing and reads like a

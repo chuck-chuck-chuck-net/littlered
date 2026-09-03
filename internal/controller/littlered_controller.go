@@ -119,6 +119,68 @@ type LittleRedReconciler struct {
 	monitors         map[types.NamespacedName]func()
 	failoverMonitors map[types.NamespacedName]func()
 	monitorsMu       sync.Mutex
+
+	// stalledFailover remembers which instances have already been reported as
+	// carrying a stalled Sentinel failover (LR-060), so the operator says it once
+	// per transition rather than on all ~84 passes of the window — LR-042's lesson.
+	//
+	// In memory, deliberately: this is a report, nothing reads it back, and it
+	// gates no decision, so it fails safe in the only direction it can (an operator
+	// restart mid-stall costs one repeated line). Persisting it would be a status
+	// field for a once-in-a-lifetime event, which LR-050 established is a cost.
+	stalledFailover   map[types.NamespacedName]bool
+	stalledFailoverMu sync.Mutex
+}
+
+// noteStalledFailover reports, once per transition, that a Sentinel is reporting a
+// failover that can never progress, and that the operator is therefore no longer
+// standing down for it.
+//
+// This is a genuine Sentinel-side fault rather than a transient: the wedged
+// Sentinel is stuck in RECONF_SLAVES with no timer, and sentinelStartFailoverIfNeeded
+// refuses to begin another failover for a master that still carries
+// SRI_FAILOVER_IN_PROGRESS — so it is also out of action as a failover initiator
+// until something RESETs it. The documented remedy is a `SENTINEL RESET`.
+func (r *LittleRedReconciler) noteStalledFailover(
+	ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState,
+) {
+	key := types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}
+
+	var stalled []string
+	for _, sn := range state.SentinelNodes {
+		if sn.FailoverStalled() {
+			stalled = append(stalled, sn.PodName)
+		}
+	}
+	sort.Strings(stalled)
+
+	r.stalledFailoverMu.Lock()
+	already := r.stalledFailover[key]
+	if r.stalledFailover == nil {
+		r.stalledFailover = map[types.NamespacedName]bool{}
+	}
+	r.stalledFailover[key] = true
+	r.stalledFailoverMu.Unlock()
+	if already {
+		return
+	}
+
+	msg := fmt.Sprintf("Sentinel(s) %v report a failover stuck in %q with the promoted replica down. "+
+		"It cannot end on its own and that Sentinel cannot start another failover for this master. "+
+		"The operator is NOT standing down for this report; healing continues. "+
+		"Clear it with `SENTINEL RESET <master-name>` against the named pod(s).",
+		stalled, "reconf_slaves")
+	r.getLogger(ctx, lr, LogCategoryState).Info("Sentinel failover is stalled; ignoring the report",
+		"sentinels", stalled)
+	r.event(lr, corev1.EventTypeWarning, "SentinelFailoverStalled", msg)
+}
+
+// clearStalledFailover forgets the report so a later stall is announced again.
+func (r *LittleRedReconciler) clearStalledFailover(lr *littleredv1alpha1.LittleRed) {
+	key := types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}
+	r.stalledFailoverMu.Lock()
+	delete(r.stalledFailover, key)
+	r.stalledFailoverMu.Unlock()
 }
 
 // event emits a Kubernetes Event for lr, tolerating a nil Recorder (e.g. in unit
@@ -1213,12 +1275,51 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// Rule A: Guardrails
 	// We skip ALL healing if:
 	// 1. Any pod is terminating (K8s is already working).
-	// 2. Sentinel reports an active failover (Sentinel is already working).
-	if anyTerminating || state.FailoverActive {
+	// 2. Sentinel reports a failover that can still PROGRESS (Sentinel is already
+	//    working). NOT merely "a failover is reported" — LR-060. A Sentinel latched
+	//    in RECONF_SLAVES reports one that can never end, and honouring that report
+	//    means standing down forever; FailoverProgressing is false there so the
+	//    operator resumes. See FailoverStalled for the predicate and its concessions.
+	//
+	// Note what this guard does NOT stop any more: Rule R. It is below this line and
+	// therefore still governed by clause 1, but clause 2 no longer reaches it — the
+	// narrowing is at the Rule R site itself (planReplicaRescue), because Rule R
+	// issues the same command at the same target Sentinel's own reconf_slaves is
+	// issuing and is therefore incapable of fighting it. ADR-003's amendment of
+	// 2026-09-03 carries the argument.
+	if anyTerminating || state.FailoverProgressing {
+		// ...EXCEPT Rule R, when a reported failover is the only reason to stand
+		// down (LR-060). Rule R issues the same command at the same target that
+		// Sentinel's own reconf_slaves is issuing, so it cannot fight the failover
+		// — and a failover held open by an un-reconfigured replica is one only Rule
+		// R can discharge, which is why suppressing it cost a measured 179s of an
+		// entirely unmanaged instance. It has to be invoked HERE rather than left in
+		// its usual position, because that position is below this return.
+		//
+		// anyTerminating still suppresses it, unchanged: that clause is about
+		// Kubernetes churn, and Rule R's argument says nothing about it.
+		if !anyTerminating {
+			r.applyReplicaRescue(ctx, littleRed, state, password)
+		}
 		log.Info("Cluster transition in progress. Skipping healing.",
 			"anyTerminating", anyTerminating,
-			"failoverActive", state.FailoverActive)
+			"failoverProgressing", state.FailoverProgressing,
+			"ruleRStillRuns", !anyTerminating)
 		return nil
+	}
+
+	// LR-060: a reported-but-stalled failover is a real Sentinel-side fault — that
+	// Sentinel is wedged in RECONF_SLAVES and, per sentinelStartFailoverIfNeeded,
+	// can never start another failover for this master until something RESETs it.
+	// The operator now declines to honour the report, so say so ONCE per transition
+	// (LR-042's lesson) rather than every pass. Deliberately a log line and an event
+	// and NOT a new condition: this is a rare, self-describing state, and LR-050
+	// established that status-surface inflation for a once-in-a-lifetime event is a
+	// cost rather than a feature.
+	if state.FailoverReported && !state.FailoverProgressing {
+		r.noteStalledFailover(ctx, littleRed, state)
+	} else {
+		r.clearStalledFailover(littleRed)
 	}
 
 	// Note: state.RealMasterIP == "" (leaderless) used to be a hard early return here.
@@ -1410,7 +1511,7 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// measured 145s regression. Gated, an ordinary rename settled in ~308s against a
 	// ~166s baseline: the early ghost prune (measured at +47s on the pre-M3.1 control) is
 	// what stops Sentinel's failover state machine wedging in RECONF_SLAVES, and once it
-	// wedges, state.FailoverActive pins Rule A above — so every rule below that line,
+	// wedges, state.FailoverProgressing pins Rule A above — so every rule below that line,
 	// including this one, is unreachable until Sentinel's own timers clear it ~178s
 	// later. Rule D cannot BREAK that latch (it sits after Rule A); it prevents it from
 	// forming. See LR-055.
@@ -1448,23 +1549,29 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 	// this rule on the operation closes that loop with no exit but Sentinel's own timers
 	// (measured: +180s on the first-replaced pod). Rule A's guards above still apply to
 	// it exactly as they always have.
-	for ip, rn := range state.RedisNodes {
-		if !rn.Reachable || ip == state.RealMasterIP {
-			continue
-		}
-		// If the pod thinks it's a master, or is following the wrong master.
-		// We DON'T trigger on LinkStatus == "down" alone, because that could be a
-		// transient state during a handshake, and re-issuing SLAVEOF would interrupt it.
-		if rn.Role == RoleMaster || rn.MasterHost != state.RealMasterIP {
-			auditLog.Info("Redis pod is not following the consensus master, issuing SLAVEOF",
-				"pod", rn.PodName, "current_role", rn.Role, "target_master", state.RealMasterIP)
-			if err := redisclient.SlaveOf(ctx, fmt.Sprintf("%s:%d", ip, littleredv1alpha1.RedisPort), password, state.RealMasterIP, fmt.Sprintf("%d", littleredv1alpha1.RedisPort), littleRed.Spec.TLS.Enabled); err != nil {
-				auditLog.Error(err, "Failed to rescue replica", "pod", rn.PodName)
-			}
-		}
-	}
+	r.applyReplicaRescue(ctx, littleRed, state, password)
 
 	return nil
+}
+
+// applyReplicaRescue executes Rule R: point every pod that is not following the
+// consensus master at it.
+//
+// The decision is the pure planReplicaRescue (LR-060). The trigger it carries is
+// LR-010's, unchanged — a definitively wrong Role or MasterHost, never LinkStatus
+// alone, so a replica mid-sync from the correct master is left alone.
+func (r *LittleRedReconciler) applyReplicaRescue(
+	ctx context.Context, littleRed *littleredv1alpha1.LittleRed,
+	state *redisclient.ReplicationState, password string,
+) {
+	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
+	for _, rn := range planReplicaRescue(state) {
+		auditLog.Info("Redis pod is not following the consensus master, issuing SLAVEOF",
+			"pod", rn.PodName, "current_role", rn.Role, "target_master", state.RealMasterIP)
+		if err := redisclient.SlaveOf(ctx, fmt.Sprintf("%s:%d", rn.IP, littleredv1alpha1.RedisPort), password, state.RealMasterIP, fmt.Sprintf("%d", littleredv1alpha1.RedisPort), littleRed.Spec.TLS.Enabled); err != nil {
+			auditLog.Error(err, "Failed to rescue replica", "pod", rn.PodName)
+		}
+	}
 }
 
 // getSentinelAddresses returns a list of Sentinel addresses to try (Service FQDN and pod IPs)

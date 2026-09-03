@@ -345,12 +345,13 @@ func TestReportCrossInstanceSkipsTheCheckWithoutACR(t *testing.T) {
 // (`lrctl verify demo --kubeconfig /nonexistent` → exit 1).
 func TestSentinelVerifyFailureMatchesThePrintedVerdict(t *testing.T) {
 	cases := []struct {
-		name         string
-		realMasterIP string
-		healActions  int
-		staleNames   bool
-		wantErr      bool
-		wantMentions string
+		name            string
+		realMasterIP    string
+		healActions     int
+		staleNames      bool
+		stalledFailover bool
+		wantErr         bool
+		wantMentions    string
 	}{
 		{
 			name: "healthy and converged", realMasterIP: ipMaster,
@@ -374,12 +375,27 @@ func TestSentinelVerifyFailureMatchesThePrintedVerdict(t *testing.T) {
 			name: "stale name AND unhealthy still fails", realMasterIP: "", staleNames: true,
 			wantErr: true, wantMentions: msgUnhealthy,
 		},
+		{
+			// LR-060: a Sentinel wedged in reconf_slaves reports a failover forever.
+			// Otherwise healthy, and it must still fail.
+			name:         "otherwise healthy but a Sentinel failover is stalled",
+			realMasterIP: ipMaster, stalledFailover: true,
+			wantErr: true, wantMentions: "failover that cannot complete",
+		},
+		{
+			// It is named FIRST on purpose: the fault is one Sentinel's state
+			// machine, and "not healthy or consistent" would send the reader after a
+			// topology problem that does not exist.
+			name: "a stalled failover is named ahead of the generic unhealthy verdict", realMasterIP: "",
+			stalledFailover: true,
+			wantErr:         true, wantMentions: "failover that cannot complete",
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := sentinelVerifyFailure("ns", "inst", nameDesired,
-				tc.realMasterIP, tc.healActions, tc.staleNames)
+				tc.realMasterIP, tc.healActions, tc.staleNames, tc.stalledFailover)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("sentinelVerifyFailure() = %v, want error: %v", err, tc.wantErr)
 			}
@@ -397,7 +413,7 @@ func TestSentinelVerifyFailureMatchesThePrintedVerdict(t *testing.T) {
 func TestStaleNamesAlwaysFail(t *testing.T) {
 	for _, ip := range []string{"", ipMaster} {
 		for _, actions := range []int{0, 1} {
-			if err := sentinelVerifyFailure("ns", "inst", nameDesired, ip, actions, true); err == nil {
+			if err := sentinelVerifyFailure("ns", "inst", nameDesired, ip, actions, true, false); err == nil {
 				t.Errorf("stale names with realMasterIP=%q healActions=%d returned nil; "+
 					"a printed [FAIL] would exit 0", ip, actions)
 			}

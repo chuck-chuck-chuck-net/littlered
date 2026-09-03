@@ -141,6 +141,61 @@ type SentinelNodeState struct {
 // `failover-state` — through the one shared predicate, so this path and Rule N's
 // MonitoredMaster path cannot drift about what "in progress" means (the
 // IsLinkUpReplicaOf precedent).
+// FailoverStalled reports whether the failover this Sentinel is reporting can
+// never progress, so that honouring the report means honouring it forever.
+//
+// It is not a proxy for the latch — it reconstructs the upstream condition from
+// flags already on the wire. Sentinel ends a failover only through
+// sentinelFailoverDetectEnd, and in RECONF_SLAVES that function returns at its
+// FIRST statement when `promoted_slave == NULL || promoted_slave->flags &
+// SRI_S_DOWN`, before the elapsed > failover_timeout force-end, and
+// sentinelAbortFailover is unreachable from that state. So the same bit that
+// causes the early return is the bit read here: the `s_down` flag on the entry
+// Sentinel marks `promoted` in its own replica list.
+//
+// TWO DELIBERATE CONCESSIONS, both falling to "not stalled" so the guard holds:
+//
+//  1. The `promoted_slave == NULL` half is NOT implemented. An absent `promoted`
+//     entry is indistinguishable from a failed `SENTINEL replicas` read — the
+//     gather drops that error and leaves Replicas nil (LR-041's class) — and a
+//     replica configured `replica-announced no` is omitted from the reply
+//     outright (addReplyDictOfRedisInstances). Reading absence as evidence would
+//     lift Rule A's guard on no evidence at all.
+//  2. Only RECONF_SLAVES qualifies. Any other state, including an unrecognised or
+//     future one, is bounded by Sentinel's own timers and reads as not stalled.
+//
+// The result is one-way conservative: it can only ever say "this report is not
+// worth honouring", never "keep standing back".
+func (sn *SentinelNodeState) FailoverStalled() bool {
+	if sn == nil || !sn.Reachable || !sn.Monitoring {
+		return false
+	}
+	if !sn.MasterFailoverInProgress() {
+		return false
+	}
+	if strings.TrimSpace(sn.MasterFailoverState) != failoverStateReconfSlaves {
+		return false
+	}
+	for _, r := range sn.Replicas {
+		if hasFlag(r.Flags, "promoted") {
+			return flaggedDown(r.Flags)
+		}
+	}
+	return false
+}
+
+// hasFlag matches one comma-separated token of a Sentinel `flags` field exactly,
+// rather than as a substring, so a future flag that merely contains another one
+// cannot silently change a verdict.
+func hasFlag(flags, want string) bool {
+	for f := range strings.SplitSeq(flags, ",") {
+		if strings.TrimSpace(f) == want {
+			return true
+		}
+	}
+	return false
+}
+
 func (sn *SentinelNodeState) MasterFailoverInProgress() bool {
 	return sn != nil && failoverInProgress(sn.MasterFlags, sn.MasterFailoverState)
 }
@@ -180,8 +235,26 @@ type ReplicationState struct {
 	OwnedIPs        map[string]bool
 
 	// Derived Truth
-	RealMasterIP   string
-	FailoverActive bool
+	RealMasterIP string
+
+	// FailoverReported / FailoverProgressing are the two questions one
+	// `FailoverActive` field used to answer (LR-060; concept R5).
+	//
+	// FailoverReported — "does some Sentinel say a failover state machine is
+	// running?" Correct as it stands, and what lrctl, DetermineRealMaster's
+	// step-4 fallback suppression and Rule N's G3 read.
+	//
+	// FailoverProgressing — "is mastership actually in motion, so the operator
+	// must stand back?" This is what Rule A needs, and it is the one the old
+	// field got wrong: a Sentinel latched in RECONF_SLAVES reports a failover
+	// that can never end, so the report is true forever while nothing is moving.
+	//
+	// Both are an OR over reachable monitoring Sentinels, and the OR is required
+	// rather than merely conservative: only the election LEADER ever carries
+	// SRI_FAILOVER_IN_PROGRESS (LR-052 measured 1 of 3), so a majority test would
+	// make both permanently false again.
+	FailoverReported    bool
+	FailoverProgressing bool
 }
 
 // NewReplicationState initializes an empty ReplicationState
@@ -225,8 +298,10 @@ func (s *ReplicationState) DetermineRealMaster() {
 	// Sentinel that says yes.
 	for _, sn := range s.SentinelNodes {
 		if sn.Reachable && sn.Monitoring && sn.MasterFailoverInProgress() {
-			s.FailoverActive = true
-			break
+			s.FailoverReported = true
+			if !sn.FailoverStalled() {
+				s.FailoverProgressing = true
+			}
 		}
 	}
 
@@ -262,7 +337,7 @@ func (s *ReplicationState) DetermineRealMaster() {
 	// and subsequent failover. Falling back here would cause us to identify
 	// a "stale" or "default" master (like a restarting pod) and potentially
 	// issue RESETs that wipe Sentinel's failover state.
-	if !s.FailoverActive && ghostMasterCount < (reachableSentinels/2)+1 {
+	if !s.FailoverReported && ghostMasterCount < (reachableSentinels/2)+1 {
 		for _, rn := range s.RedisNodes {
 			if rn.Reachable && rn.Role == roleMaster {
 				s.RealMasterIP = rn.IP
@@ -596,4 +671,26 @@ func (s *ReplicationState) GetHealActions(masterName string) []string {
 	}
 
 	return actions
+}
+
+// PromotedIPs is the set of addresses a reachable, monitoring Sentinel currently
+// flags `promoted` — the replica it has selected and told REPLICAOF NO ONE, i.e.
+// the intended new master of a failover in flight.
+//
+// SRI_PROMOTED is set only during a failover and cleared by sentinelResetMaster
+// when one ends, so outside a failover this set is empty by construction and no
+// caller needs to ask whether one is running.
+func (s *ReplicationState) PromotedIPs() map[string]bool {
+	out := map[string]bool{}
+	for _, sn := range s.SentinelNodes {
+		if sn == nil || !sn.Reachable || !sn.Monitoring {
+			continue
+		}
+		for _, r := range sn.Replicas {
+			if r.IP != "" && hasFlag(r.Flags, "promoted") {
+				out[r.IP] = true
+			}
+		}
+	}
+	return out
 }

@@ -353,8 +353,29 @@ func verifySentinel(
 		fmt.Printf("  [FAIL] Authority Master: NONE (Split Brain or Cluster not initialized)\n")
 	}
 
-	if state.FailoverActive {
-		fmt.Printf("  [!] Sentinel reports failover in progress!\n")
+	stalledFailover := false
+	if state.FailoverReported {
+		if state.FailoverProgressing {
+			fmt.Printf("  [!] Sentinel reports failover in progress!\n")
+		} else {
+			// LR-060. A failover reported by a Sentinel that is wedged in
+			// RECONF_SLAVES with its promoted replica down will never end, and that
+			// Sentinel can start no further failover for this master until it is
+			// RESET. The operator deliberately ignores such a report; say so here,
+			// because "failover in progress" for hours is exactly the observation
+			// somebody would otherwise chase in the wrong direction.
+			var stalled []string
+			for _, sn := range state.SentinelNodes {
+				if sn.FailoverStalled() {
+					stalled = append(stalled, sn.PodName)
+				}
+			}
+			sort.Strings(stalled)
+			fmt.Printf("  [FAIL] Sentinel failover STALLED on %v: stuck in reconf_slaves with the promoted\n", stalled)
+			fmt.Printf("         replica down. It cannot end by itself and blocks further failovers on that\n")
+			fmt.Printf("         Sentinel. Clear with: SENTINEL RESET <master-name>\n")
+			stalledFailover = true
+		}
 	}
 
 	// A Sentinel monitoring a name other than the CR's fails verification. This is
@@ -375,7 +396,7 @@ func verifySentinel(
 	}
 
 	return sentinelVerifyFailure(cCtx.Namespace, cCtx.Name, masterNameOf(cCtx),
-		state.RealMasterIP, len(actions), staleNames)
+		state.RealMasterIP, len(actions), staleNames, stalledFailover)
 }
 
 // sentinelVerifyFailure turns the three sentinel-mode findings into the error verify
@@ -389,9 +410,17 @@ func verifySentinel(
 // driven by the same booleans that drove the printing, makes that a unit-testable
 // property instead of a reviewer's promise.
 func sentinelVerifyFailure(namespace, name, masterName, realMasterIP string,
-	healActions int, staleNames bool,
+	healActions int, staleNames, stalledFailover bool,
 ) error {
 	switch {
+	case stalledFailover:
+		// Named first and separately (LR-060): a Sentinel wedged in reconf_slaves
+		// reports a failover forever, so an instance can look "mid-failover" for
+		// hours while nothing is moving. "Not healthy or consistent" would send the
+		// reader looking for a topology problem that does not exist; the fault is in
+		// one Sentinel's state machine and the remedy is a RESET against that pod.
+		return fmt.Errorf("cluster %s/%s has a Sentinel stuck in a failover that cannot complete",
+			namespace, name)
 	case realMasterIP == "" || healActions > 0:
 		return fmt.Errorf("cluster %s/%s is not healthy or consistent", namespace, name)
 	case staleNames:

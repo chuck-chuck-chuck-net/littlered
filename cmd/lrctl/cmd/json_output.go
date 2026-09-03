@@ -323,7 +323,7 @@ func buildSentinelVerifyJSON(
 		Namespace:      namespace,
 		Mode:           modeSentinel,
 		RealMasterIP:   state.RealMasterIP,
-		FailoverActive: state.FailoverActive,
+		FailoverActive: state.FailoverReported,
 		HealActions:    actions,
 		MasterName:     sentinelMasterName,
 		Sentinels:      []sentinelNodeVerifyJSON{},
@@ -399,7 +399,7 @@ func buildSentinelVerifyJSON(
 	// true, so it is part of the health verdict and not only of the text output —
 	// the JSON consumer must not be able to read "healthy" off a two-name instance.
 	result.Healthy = state.RealMasterIP != "" && len(result.HealActions) == 0 &&
-		!state.FailoverActive && scope.Converged()
+		!state.FailoverReported && scope.Converged()
 	return result
 }
 

@@ -464,7 +464,7 @@ func TestNoRecoveryActsWhileAMonitoringSentinelRemains(t *testing.T) {
 // comes from the desired name's own probe and covers the case where the full
 // monitored-master list could not be read at all.
 //
-// Green from birth. Mutation applied: dropping `|| state.FailoverActive` from G3
+// Green from birth. Mutation applied: dropping `|| state.FailoverReported` from G3
 // makes the second sub-case fail with
 //
 //	instance-level: Reason/Gate = "Pruning"/"", want Deferred/G3: removing stale
@@ -499,7 +499,7 @@ func TestASentinelReportingAFailoverSuspendsNameScopeReconciliation(t *testing.T
 	// (b) the instance-level signal, which is the only one left when the full
 	// monitored-master list could not be read.
 	instanceLevel := base()
-	instanceLevel.FailoverActive = true
+	instanceLevel.FailoverReported = true
 	if got := planStaleMasterNames(instanceLevel, asDesiredName, 2, false, false); got.Reason != staleNamesDeferred || got.Gate != "G3" {
 		t.Errorf("instance-level: Reason/Gate = %q/%q, want Deferred/G3: %s", got.Reason, got.Gate, got.Message)
 	} else if len(got.Prune) != 0 {
