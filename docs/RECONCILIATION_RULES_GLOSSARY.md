@@ -101,25 +101,30 @@ forsaken", but the call site passes `forsakenPlan.Captured` and the loop doc/cha
 | **Lives** | `littlered_controller.go:reconcileSentinelCluster` (`// Rule A: Guardrails` banner) |
 | **Mode** | sentinel |
 
-**Condition**: `anyTerminating || state.FailoverActive`.
+**Condition**: `anyTerminating || state.FailoverProgressing`.
 
-> **⚠ Rule A's guard is INESCAPABLE, and that is a property of the evaluation order documented in
-> §6 rather than of the rule itself (LR-055).** Rule A returns at `littlered_controller.go:1217`;
-> everything that could clear a stuck `FailoverActive` sits *below* it — Rule D's `SENTINEL RESET`
-> at `:1416` above all. So a Sentinel whose failover state persists blocks **all** healing, on every
-> pass, with no operator path out. Before LR-052 the field was permanently false and the guard never
-> fired at all; LR-052 made it real — correctly — and it is unbounded. Measured 2026-08-30:
-> `failoverActive` true for 84-86 consecutive passes, ~178s, during an ordinary rename of a healthy
-> instance, against LR-052's estimated ~1.84s window. Rule D's *early* prune is the only lever, and
-> only as prevention: once the state exists, Rule D can no longer run. **Recorded, not fixed.**
+> **⚠ LR-055's "INESCAPABLE" note is superseded by LR-060 — read them together, because LR-055's
+> framing of its own measurement was wrong.** The measured 84-86 passes / ~178s were **not** an
+> unbounded latch: that is one `failoverTimeout` (default 180000), it self-cleared, and it was held
+> open by a replica stuck on the reconf ladder's un-timed `RECONF_INPROG` rung — while Rule R, the
+> rule that would have repointed exactly that replica, sat below the guard reading the report its
+> own action would discharge. LR-060 partitions the guard: **Rule R is no longer covered by clause
+> 2** (the narrowing lives at `planReplicaRescue`, which skips the pod Sentinel flags `promoted`),
+> and clause 2 now reads `FailoverProgressing`, so a *genuinely* latched report — the unbounded case
+> LR-052 derived from the source and nobody has yet observed — stops suppressing anything.
+> `SENTINEL RESET` and `REMOVE`+`MONITOR` keep the guard, which is where LR-011/LR-013's incidents
+> actually are.
 
 - `anyTerminating` — any Redis or Sentinel pod carries a `DeletionTimestamp` (ADR-003 Decision 5's
   reasoning, generalised).
-- `state.FailoverActive` — **had never fired in the product's history until LR-052**: it was parsed
+- `state.FailoverProgressing` — **had never fired in the product's history until LR-052**: it was parsed
   from a `failover-status` key neither Redis nor Valkey emits, so it was permanently `false`. LR-052
   repointed every reader at `failoverInProgress(flags, failover-state)`. It is an **OR** over
   Sentinels (only the failover *leader* carries the flag), which is required, not merely
-  conservative.
+  conservative. LR-060 split it in two: `FailoverReported` keeps that meaning for `lrctl`,
+  `DetermineRealMaster` step 4 and Rule N G3, while `FailoverProgressing` — the one Rule A reads —
+  additionally requires that the reported failover *can still progress*
+  (`SentinelNodeState.FailoverStalled()`).
 - LR-001/LR-007 originally extended Rule A to also skip healing when `RealMasterIP == ""`. That is
   **no longer** the shape: the leaderless branch now hosts Rule L and the LR-024 recovery, and the
   code says so at the `// Note: state.RealMasterIP == "" (leaderless) used to be a hard blocker`
@@ -217,7 +222,14 @@ LR-041 · LR-042.
 - fires only on a definitively wrong `Role == master` **or** `MasterHost != RealMasterIP` —
   **never on `LinkStatus == "down"` alone** (LR-010: re-issuing `SLAVEOF` would interrupt a
   legitimate handshake).
-- after Rule A; requires `RealMasterIP != ""`.
+- after Rule A; requires `RealMasterIP != ""`. **Rule A's failover clause no longer reaches it**
+  (LR-060): Rule R issues the same command at the same target Sentinel's own `reconf_slaves` is
+  issuing, so it cannot fight a failover — it is what lets one held open by an un-reconfigured
+  replica finish. `anyTerminating` still applies.
+- **never targets a pod a reachable Sentinel flags `promoted`** (LR-060). In the ~2s before the
+  quorum's majority catches up with a promotion, that pod reports `role:master` while `RealMasterIP`
+  is still the outgoing one, so the trigger above fires on it and Rule R would undo the failover.
+  It needs no "only during a failover" qualifier: `SRI_PROMOTED` exists only while one is running.
 - **not** gated on a declared operation (ADR-020). Gating it cost a measured **+180 s** on the
   first-replaced pod during a rename: a replaced pod returns following the old master with
   `link:down`, sentinel readiness needs `role:master` or `link:up`, so the pod stays unready, the
@@ -226,7 +238,8 @@ LR-041 · LR-042.
 
 **Sources**: LR-009 (introduced) · LR-010 (narrowed) · LR-016 (Rule R took over zombie redirect from
 the liveness probe, which was wiping survivors) · ADR-003 Decision 1 (partially superseded) · LR-040 /
-LR-049 (bounding) · ADR-020 (classification).
+LR-049 (bounding) · ADR-020 (classification) · LR-060 (un-suppressed during a reported failover; the
+`promoted` skip).
 
 ### Rule L — leaderless bootstrap-deadlock recovery
 

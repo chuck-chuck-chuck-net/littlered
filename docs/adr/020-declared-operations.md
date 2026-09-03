@@ -261,6 +261,17 @@ The short list of what still runs, enumerated deliberately rather than discovere
 Suppressed: **Rule L and the LR-024 recovery** — the two sentinel-mode rules that assign authority,
 a strict subset of Rule A's set.
 
+> **Cross-reference (2026-09-03, LR-060): this ADR's vocabulary is now applied to Rule A itself.**
+> The classification above — *assigns authority* vs *propagates one* vs *cleans up debris* — was
+> written to scope an **operation's** suppression, and it turns out to be the missing partition in
+> the pre-existing guard too. Rule A's `FailoverActive` half suppresses **Rule R**, whose action
+> (`SLAVEOF <RealMasterIP>`) is the same command at the same target Sentinel's own `reconf_slaves`
+> is issuing, and which is therefore what would let the reported failover *finish*. That is
+> LR-058's rule — *an operation must never suppress the healing its own completion condition
+> depends on* — with **Rule A** in the operation's place, and it is the third instance of the
+> family after LR-058's own Rule R finding and LR-059. The partition lands as an amendment to
+> **ADR-003**, which owns Rule A; nothing in this ADR changes. Measured record: **LR-060**.
+
 **Suppressing Rule L and LR-024 is a HOLD, not a skip — stated precisely, because the first draft
 overclaimed it.** A clock that has *already started* is **never reset** by the suppression (LR-038:
 *the timer never resets on a veto*), so the instant the operation completes, a recovery whose

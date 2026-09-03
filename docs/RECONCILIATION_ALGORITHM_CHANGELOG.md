@@ -2474,7 +2474,12 @@ not cover a slow FORGET/MEET/REPLICATE. Recorded, not tuned.
 
 - **⚠ NEW RESIDUAL, found by this work and not closed here: a Sentinel can latch
   `SRI_FAILOVER_IN_PROGRESS` indefinitely, and Rule A would then suspend sentinel healing for as
-  long.** Read first-hand at both versions. `sentinelAbortFailover` (redis 8.0 `:5340`, valkey 8.1
+  long.** **⚠ Split by LR-060 into two defects that must not be conflated: the *bounded* case —
+  a failover held open for a full `failover_timeout` by a replica stuck on the reconf ladder's
+  un-timed `RECONF_INPROG` rung — is measured, is what LR-055 actually observed, and is fixed
+  there by partitioning Rule A. The *unbounded* case below (the early return at `:5185` bypassing
+  the force-end when the promoted replica is `s_down`) remains source-confirmed and **never
+  observed**, and keeps its own pass.** Read first-hand at both versions. `sentinelAbortFailover` (redis 8.0 `:5340`, valkey 8.1
   `:5127`) clears the flag *and* resets `failover_state`, and it is reachable from four call sites —
   but it `serverAssert`s `failover_state <= WAIT_PROMOTION`, so it **cannot** be reached from
   `RECONF_SLAVES`. The only exit from `RECONF_SLAVES` is `sentinelFailoverDetectEnd` (`:5177`),
@@ -3000,6 +3005,15 @@ refutation of a second, very close LR-051 near-miss.
   defect with a delay) and no narrowing is proposed here — the right answer needs its own
   design pass. What landed is the measurement, the ordering that makes it inescapable, and
   the identification of the one thing that prevents it in practice.
+- **⚠ Corrected by LR-060, on two counts, and the design pass this entry declined is discharged
+  there.** (1) The 178s measured below is **not** the unbounded `RECONF_SLAVES` latch this entry
+  attributes it to: it is **one `failover_timeout`** (`spec.sentinel.failoverTimeout` defaults to
+  180000, matching upstream), it self-cleared, and LR-058 says so in words — *"Sentinel's own
+  timers broke it after ~180s"*. The unbounded latch is a **separate, still-unobserved** defect.
+  (2) "No escape" therefore overstates it: the escape is Sentinel's own force-end, and the defect
+  is that the operator suspends **all** healing for its duration — including Rule R, whose action
+  is what would let the failover finish. LR-060 reproduces the whole chain deterministically in
+  four minutes (84 passes, the same count measured here) and partitions Rule A accordingly.
 - **Not an ADR-020 defect.** It is a Phase 0 consequence, found by ADR-020's M3.1 live work
   because that milestone happened to remove the mitigation for a while.
 
@@ -3665,3 +3679,322 @@ suppression is vacuous there and could be lifted on that fact — an invariant, 
 trigger), `docs/USAGE.md` (corrected here), LR-058 (the rule it generalized is incomplete).
 **Regresses:** nothing — the wedge requires a pending heavy operation, so it is unreachable before
 ADR-020.
+
+---
+
+## [LR-060] Rule A Suppressed Rule R For a Full `failover_timeout` — the Guard Read a Report the Suppressed Rule Was There to Discharge
+- **Date:** 2026-09-03
+- **Commit:** (pending)
+- **ID note:** the highest ID visible on **any** branch, local or remote, was LR-059. Allocated
+  with the LR-039 cross-branch loop over every branch, not by reading the tip of one line.
+- **Status: IMPLEMENTED, red-first, unit + envtest green, lint clean against a 0-issue baseline.
+  NOT YET e2e-verified** — the deterministic fixture below is the tier-3 red that is still owed.
+- **Scope:** the design pass **LR-055 declined to pre-empt**, and the closure of the residual
+  **LR-052** recorded. Not an ADR-020 defect: the mechanism predates it and is reachable with no
+  operation in flight.
+
+- **⚠ THIS CORRECTS LR-055's OWN FRAMING, and the correction is the useful part.** LR-055 is
+  titled *"Rule A Has No Escape From a Persistent `FailoverActive`"* and attributes its measured
+  178s to the unbounded `RECONF_SLAVES` latch LR-052 derived from the source. **The measurement is
+  not that latch.** It is bounded, it self-cleared, and it is *one `failover_timeout`*:
+  `sentinel_default_failover_timeout = 60*3*1000` upstream and `spec.sentinel.failoverTimeout`
+  defaults to `180000`, against LR-055's measured **~178s** which *"cleared"* at +308s. LR-058
+  in fact says so in words — *"Sentinel's own timers broke it after ~180s"* — and both entries
+  read past it. **Two distinct defects have to be kept apart from here on:**
+
+  | | **D1 — this entry, measured** | **D2 — LR-052's residual, unobserved** |
+  |---|---|---|
+  | Mechanism | `not_reconfigured > 0` holds `reconf_slaves` open until the `failover_timeout` force-end | `sentinelFailoverDetectEnd`'s early return bypasses that force-end when the promoted replica is `s_down`/NULL |
+  | Bounded | **yes** — `failoverTimeout`, self-clears | **no** — never clears, and that Sentinel can never start another failover (`:4952`/`:4957`) |
+  | Evidence | reproduced deterministically below; LR-055's 178s is an instance of it | read at redis 8.0 `:5185` / valkey 8.1 `:4989`; **never observed** |
+  | Fix | this entry | its own pass; the discriminator is `promoted` + `s_down` in the replica list |
+
+  D2 is real and is the worse of the two when it happens. It is **not** what a rename hits, and
+  designing for it does not fix D1 — which is the mistake this entry exists to avoid repeating.
+
+- **Root cause — the reconf ladder has exactly one rung with no timeout, and our own guard turns
+  that into an instance-wide healing outage.** Read first-hand at both versions.
+  During `reconf_slaves` the leader walks its replica list and climbs each entry:
+
+  | rung | set when | timeout |
+  |---|---|---|
+  | `RECONF_SENT` | the leader sent `SLAVEOF <promoted>` (redis `:5281-5285`) | **10s** — `sentinel_slave_reconf_timeout` (`:72`) force-marks it `RECONF_DONE`, *"consider it reconfigured even if it is not"* (`:5266-5275`) |
+  | `RECONF_INPROG` | the replica's own INFO reports `master_host/port` == the promoted replica (`:2725-2734`) | **NONE** |
+  | `RECONF_DONE` | the replica's INFO reports `master_link_status: up` (`:2737-2743`) | — |
+
+  `sentinelFailoverDetectEnd` counts a replica in `not_reconfigured` unless it is `PROMOTED`,
+  `RECONF_DONE` or `S_DOWN`. So **a replica that accepted the `SLAVEOF` but whose replication link
+  never comes up** is not `DONE` (link down), not `S_DOWN` (it answers Sentinel's PING perfectly —
+  it is alive, merely unsynced), and **outside the 10s escape**, which is guarded on
+  `SRI_RECONF_SENT` alone. It holds the count above zero until the whole-failover force-end at
+  `:5201`. With the product default `parallelSyncs: 1` it is worse than one stuck replica: the send
+  loop is `while (in_progress < master->parallel_syncs)` where `in_progress` counts
+  `SENT|INPROG` (`:5249`), so **the stuck entry also blocks the leader from ever reconfiguring the
+  others** — head-of-line blocking inside Sentinel's own machine.
+
+  On our side the report is then load-bearing in the wrong direction, and the loop closes:
+
+      replica INPROG, link down → not_reconfigured ≥ 1 → failover reported in progress → Rule A returns
+              ↑                                                                                 ↓
+      link stays down  ←  Rule R never issues SLAVEOF  ←  Rule R sits below :1217  ←────────────┘
+
+  **Rule A suppresses the one rule whose action would discharge the report it is reading.** That is
+  LR-058's rule — *"an operation must never suppress the healing its own completion condition
+  depends on"* — arriving at the guard that predates it, and it is the third member of that family
+  after LR-058's own Rule R finding and LR-059. `master_link_status` is additionally the predicate
+  our sentinel readiness probe uses (LR-016), so the same stuck replica is not-Ready, which makes
+  the StatefulSet unsettled, which makes ADR-020's row 7 withhold the acknowledgment.
+
+- **Reproduced deterministically — the fixture, exactly, so it is repeatable without this
+  transcript** (t3e, 2026-09-03, operator `47154d7`, the soak build; throwaway instance in a
+  throwaway namespace, deleted and deletion confirmed). Product defaults throughout:
+  `downAfterMilliseconds: 30000`, `failoverTimeout: 180000`, `parallelSyncs: 1`, auth off.
+    1. Healthy 3-pod sentinel instance, 3 keys seeded.
+    2. `CONFIG SET replica-priority 200` on the victim and `100` on the intended target, so
+       `compareSlavesForPromotion` (`:5014-5020`, which sorts on `slave_priority` **first**) keeps
+       the victim out of the promotion. Wait one `sentinel_info_period` (10s) for Sentinel to read
+       the new priorities.
+    3. `CONFIG SET masterauth <wrong>` on the victim. Against a password-less master the handshake
+       fails forever with `ERR Client sent AUTH, but no password is set` (LR-054's mechanism), so
+       `master_host` stays correct while the link can never come up — i.e. `RECONF_INPROG`, exactly.
+    4. `SENTINEL failover <name>` on one Sentinel. Deliberately **not** a pod delete: no churn, no
+       ghosts, no rollout — the reconf mechanism in isolation.
+    5. In-pod sampling at 1s of `SENTINEL master` + `SENTINEL replicas` on all three Sentinels and
+       `INFO replication` on all three Redis pods (LR-052's instrument).
+
+  | observation | measured |
+  |---|---|
+  | **control** (run 1, healthy failover, same rig) | `failover-state reconf_slaves` in **1 sample of 1s** |
+  | victim's rung | **`reconf_inprog` × 178**, `reconf_sent` × 1 |
+  | leader's `reconf_slaves` | **179 samples** ≈ `failoverTimeout` |
+  | promoted replica's flags | `slave,promoted` — **clean, never `s_down`** |
+  | **Rule A** | **84 passes, `12:00:58Z → 12:03:57Z` = 179s**, every one logging `anyTerminating:false failoverActive:true` |
+  | victim's kubelet readiness | `redis=false` |
+
+  **84 passes is the same count LR-055 measured through a rename**, so this is that defect,
+  reproducible in four minutes with no rename, no suppressed build and no code change. The
+  promoted replica never being `s_down` is what independently separates D1 from D2 above.
+
+- **It needs no exotic cause, and that is the production finding.** A wrong password is merely a
+  convenient way to hold a link down forever. **A full sync that takes longer than
+  `failoverTimeout` does the same thing**, so on a large dataset *every* failover suspends all
+  sentinel healing for the duration of the sync. Nothing in the rename is special; the rename is
+  just where it was first noticed.
+  **State the defect without the word "rename", because that is what it is:** *on a sizeable
+  dataset, every Sentinel failover suspends all sentinel healing for as long as the slowest
+  replica's resync, up to `failoverTimeout`* — in the mode this project recommends for HA. The
+  reproduction above contains no rename, no rollout and no pod deletion. That matters for scoping:
+  the fix is two conditions and pays off on every failover for the instance's whole life, whereas
+  the rename-shaped *preventions* below pay off once, and are declined.
+
+- **Fix — THREE parts, all reading data already gathered. No timer, no persisted state, no new
+  round trip, no new RBAC. Parts 1-2 close D1; part 3 closes D2, folded in by owner decision
+  2026-09-03 rather than deferred.**
+    1. **`FailoverActive` no longer suppresses Rule R.** Rule D's `SENTINEL RESET` and the
+       LR-005/LR-008 `REMOVE`+`MONITOR` correction keep the guard; Rule R does not. See the
+       partition table below — it is the partition **ADR-003 already draws in its own text**.
+    3. **`SentinelNodeState.FailoverStalled()` — D2, closed in the same change.** The single
+       derived `FailoverActive` is split into `FailoverReported` (Q1: a Sentinel says a failover is
+       running — kept by `lrctl`, `DetermineRealMaster` step 4 and Rule N G3, all unchanged) and
+       `FailoverProgressing` (Q2: it can still progress — the only thing **Rule A** reads). They
+       differ exactly on the latch. `FailoverStalled` is positive-evidence-only and one-way
+       conservative: `reconf_slaves` **and** a positively-read `promoted` entry flagged `s_down`.
+       The `promoted_slave == NULL` half is conceded — an absent entry is indistinguishable from a
+       failed `SENTINEL replicas` read (the gather drops that error; LR-041's class) and from a
+       replica configured `replica-announced no`, which `addReplyDictOfRedisInstances` omits
+       outright. Any other state, including an unrecognised or future one, is bounded by Sentinel's
+       own timers and reads as not stalled. So the predicate can only ever say *"this report is not
+       worth honouring"*, never *"keep standing back"*.
+       A stalled report is announced **once per transition** — an audit line plus a
+       `SentinelFailoverStalled` Warning naming the pods and the `SENTINEL RESET` remedy — and
+       `lrctl verify` reports it and exits non-zero, named ahead of the generic unhealthy verdict
+       because the fault is one Sentinel's state machine, not the topology. Deliberately **no new
+       condition**: LR-050 established that status-surface inflation for a once-in-a-lifetime event
+       is a cost, and the transition marker is in-memory precisely because nothing reads it back
+       (an operator restart mid-stall costs one repeated line, which is the only direction it can
+       fail).
+    2. **Rule R never issues `SLAVEOF` to a pod any reachable Sentinel flags `promoted`.** This
+       closes the one genuine residual (below): a ~2s window at promotion in which the quorum's
+       majority still names the outgoing master, where an ungated Rule R would demote the pod
+       Sentinel had just promoted. The flag is on the wire already
+       (`addReplySentinelRedisInstance` emits `promoted`, redis `:3413` / valkey `:3295`) and
+       `sn.Replicas[].Flags` is already gathered per Sentinel and already scanned by Rule D's ghost
+       loop. Same input D2's discriminator will want, so the two share it.
+
+- **Why the partition is not symmetric — and it is ADR-003's own, not a new judgement:**
+
+  | rule | during a reported failover | why |
+  |---|---|---|
+  | **Rule R** (`SLAVEOF <RealMasterIP>`) | **runs** | it issues the *identical command at the identical target* that `sentinelFailoverReconfNextSlave` is issuing (`sentinelSendSlaveOf(slave, master->promoted_slave->addr)`). It cannot fight Sentinel; it does Sentinel's work for it. **ADR-003 Decision 1 already says Rule R *"never races Sentinel's own reconfiguration"*** — so suppressing it *because* Sentinel is reconfiguring was incoherent with the ADR that owns it |
+  | **Rule D** (`SENTINEL RESET`) | **suppressed** | wipes the replica list (LR-011/LR-013) *and* clears the leader's `promoted_slave`, destroying the in-flight failover. ADR-003's 2026-02-20 amendment asks for exactly this gate, by name |
+  | **LR-005/LR-008** (`REMOVE`+`MONITOR`) | **suppressed** | recreates the entry at `config_epoch = 0` and discards the failover state — LR-039's unwinnable-reclaim shape, self-inflicted |
+  | Rule L / LR-024 recovery | already suppressed | authority assignment (ADR-020), and both require `RealMasterIP == ""` regardless |
+
+- **Why this is safe, in descending order of evidentiary strength. The first leg is the case; the
+  third is corroboration and is explicitly NOT load-bearing.**
+
+  **(1) Mechanical — the set of pods Rule R can harm during a failover is enumerable and has one
+  member.** Rule R's trigger is `rn.Role == RoleMaster || rn.MasterHost != state.RealMasterIP`
+  (`littlered_controller.go:1458`); **LR-010 removed `link:down` as a trigger** precisely so a
+  re-issued `SLAVEOF` cannot interrupt a handshake. Enumerating every pod state reachable during a
+  reported failover:
+
+  | pod | state mid-failover | Rule R fires? |
+  |---|---|---|
+  | a replica mid-sync from the **correct** master | `role:slave`, `MasterHost == RealMasterIP` | **no** — Rule R cannot restart an in-progress sync, the interference that would matter most |
+  | a replica not yet reconfigured, majority still naming the outgoing master | `MasterHost == RealMasterIP` (both the outgoing one) | **no** |
+  | the **promoted** pod, while the majority still names the outgoing master | `role:master` != `RealMasterIP` | **yes — and this is the entire hazard** |
+
+  So the unsafe set is `{the promoted pod}`, and part 2 skips exactly that pod by exactly the flag
+  Sentinel uses to mark it. **Closed by construction rather than by argument.**
+
+  **(2) Measured — the exposure of that one target is ~2s.** Reconstructed per second from all three
+  Sentinels' own `SENTINEL master` replies:
+
+      trigger 12:00:56      outgoing .23 (redis-2)      promoted .132 (redis-1)
+        sentinel-1 → promoted at 12:00:58   }  the two followers converge in 2s
+        sentinel-2 → promoted at 12:00:58   }
+        sentinel-0 → promoted at 12:03:58      the LEADER only at UPDATE_CONFIG
+
+      majority named the OUTGOING master:  2 samples (12:00:56, 12:00:57)
+      majority named the PROMOTED master:  176 of the remaining 177
+
+  The leader reports its master entry's **old** address for the whole window, because `ri->addr`
+  changes only at `UPDATE_CONFIG` (`addReplySentinelRedisInstance` emits `ri->addr`, `:3391`; it is
+  `sentinelGetCurrentMasterAddress` at `:1647` that advertises the promoted address, and only in
+  hellos and `get-master-addr-by-name`). The two followers adopt the new config in 2s. So the
+  **majority — which is what `DetermineRealMaster` step 3 reads — is correct for 176 of 177
+  samples**, and Rule R would have been aimed at the right target on 82 of the 84 suppressed passes.
+
+  **(3) Historical mileage — corroboration only, and its limits are stated because the first draft
+  of this entry leaned on it as the decisive argument, which it is not.** Until **LR-052** landed
+  (2026-08-29) `FailoverActive` was permanently false, so
+  Rule A's only trigger was `anyTerminating` — and a `SENTINEL failover` terminates no pod. **Rule
+  R therefore ran unprotected through every Sentinel failover for the entire history of the
+  product**, and every incident in that family — LR-001, LR-007, LR-011, LR-013 — is about
+  **`SENTINEL RESET`**, not about Rule R. Part 1 returns Rule R to its long-shipped behaviour while
+  keeping LR-052's genuinely new protection precisely where the incidents are.
+  **What that does NOT establish, on this file's own standards.** *"No recorded incident"* is not
+  *"no harm"*: this ledger is largely defects that hid for releases because nothing errored (LR-041
+  and LR-052 are both *"a plausible-looking lie"*), and Rule R fighting a failover would present as
+  slow convergence or a replica flap — a symptom nobody would have attributed to it. And the
+  surrounding code moved underneath the claim: **LR-049 (2026-08-26) bounded `SlaveOf`**, so Rule R
+  now *completes* where against a blackholing address it previously burned `5 x ProbeTimeout` and
+  may not have. Today's Rule R is more effective than the one that ran for most of that history,
+  hence more able to interfere. Read leg 3 as mileage, and leg 1 as the reason.
+  **Corollary for the tests:** part 2 is the piece with **no** historical mileage at all, so it
+  carries the mutation with real teeth — drop the skip and the promoted pod must be observed being
+  demoted.
+
+- **Deliberately NOT proposed, each for a recorded reason.**
+    - **A `failoverTimeout`-derived bound on Rule A** — LR-050's rejected margin against a
+      user-settable, unbounded field, in a new place; ADR-017's *"a timer is the defect with a
+      delay"*. Declined already by LR-055 and not revisited.
+    - **Hoisting Rule D above Rule A** — re-opens exactly the RESET-into-a-running-failover hazard
+      LR-011/LR-013 added the guard for. Declined already by LR-055.
+    - **A stalled-vs-progressing discriminator on `FailoverActive`** (the R5 split: `FailoverReported`
+      vs `FailoverProgressing`, keyed on `reconf_slaves` + a `promoted`/`s_down` replica). Designed,
+      and it is **the right fix for D2 and the wrong fix for D1** — the report here is *genuinely
+      true* for the whole 179s, so no discriminator shortens it. Held for D2's own pass.
+    - **Cross-checking the report against the topology** (*"the quorum agrees on a live reachable
+      master of ours, so mastership is not in motion"*). Refuted by this project's own measurement
+      before it was built: LR-052 recorded that `RealMasterIP` is already resolvable during a
+      genuine `reconf_slaves`, and the capture above reproduces that exactly (176/177 samples). The
+      predicate would call every real failover settled and re-open LR-011/LR-013 on the ordinary path.
+
+- **Regresses:** Rule R runs during a reported failover, which is what it did for the product's
+  whole history until nine days ago; the `promoted`-skip is strictly additive and strictly a
+  refusal. Nothing else changes: Rule D, the LR-005/LR-008 correction, Rule 0, Rule N, Rule L, the
+  LR-024 recovery, `updateMasterLabel` (upstream of Rule A), the requeue cadences (LR-045),
+  `DetermineRealMaster`, every planner table and every gather field are untouched. No status field,
+  no annotation, no persistence (ADR-006 clean), no new RBAC, no new Redis round trip. Cross-mode
+  parity (§7 rule 11): failover mode has no Sentinels so `SentinelNodes` is empty and
+  `FailoverActive` is false by construction; cluster and standalone never reach the path — the same
+  table LR-052 established.
+
+- **What this does NOT close, stated plainly.**
+    - **D2** — the genuinely unbounded early-return latch. Its own pass; the discriminator above is
+      what it should be built from.
+    - **The 179s itself, in the general case.** Rule R can only discharge a link that is *fixable*
+      by a `SLAVEOF`; in this fixture it provably cannot (no `SLAVEOF` repairs a wrong password), so
+      the window stays 179s and the gain is that **the rest of the instance stays managed** during
+      it. Where the cause *is* fixable, LR-058 measured Rule R shrinking the straggler window from
+      **188s to ~10s**.
+    - **`DetermineRealMaster` step 4 and Rule N's G3** also read `state.FailoverActive` and also
+      ask the "is mastership in motion" question. Both are strictly-more-conservative refusals and
+      neither is touched here; both are candidates for D2's pass, and leaving them is a deliberate
+      scope choice rather than an oversight.
+    - **Two adjacent preventions were surfaced by the measurement and are DECLINED — owner decision
+      2026-09-03, recorded with reasons so they are not re-proposed.**
+      **(a) Raising `parallelSyncs` from 1.** At 1 the send loop
+      (`while (in_progress < master->parallel_syncs)`, `:5249`) lets one stuck replica block the
+      leader from even *telling* the others. But raising it **does not shorten the window**:
+      `not_reconfigured` counts every replica that is not `PROMOTED`/`DONE`/`S_DOWN`, so one stuck
+      entry keeps the count above zero at any `parallel_syncs` — the measured tally was 2 at 1 and
+      would be 1 at 2; both non-zero, both a full `failoverTimeout`. Its only benefit is that healthy
+      replicas are reconfigured promptly instead of queueing behind the stuck one, which **Rule R
+      does anyway once part 1 lands**. Against that, N concurrent full syncs off a fresh master is an
+      unmeasured CPU/memory/bandwidth spike on a pure in-memory instance (pillar 3.3). Declined on
+      the stated bar: *the threshold for running non-default upstream configuration is non-zero, and
+      trading a measured nothing for an unmeasured load spike does not clear it.*
+      **(b) `replica-priority` by pod ordinal.** The *mechanism* is verified live here
+      (`compareSlavesForPromotion` sorts on `slave_priority` first, `:5014-5020`; the pod at 100 was
+      promoted over the pod at 200 on the first attempt) and it would converge mastership onto
+      `redis-0`, the pod a rollout replaces **last**, which is the benign shape for a rename. Its
+      *purpose* was never measured — no run compared a rename with the master at `redis-0` against a
+      high ordinal — and it is declined on grounds that do not depend on that measurement. It is
+      effectively a **preferred-master** policy, against a standing preference of *stay where you
+      failed over to unless there is a good reason*; a master-name rename, which an instance performs
+      roughly once in its life, is not one. For the record the usual objection to preferred-master is
+      **not** mechanically right here: Sentinel never preempts, so priority bites only at the next
+      election and a returning `redis-0` stays a replica — there are no fail-backs. The decline rests
+      on the rest. The **one-shot variant** — *on detecting rename intent, arrange for `redis-0` to be
+      master, with an extra failover if needed* — is declined on effort against payoff: it is a **new
+      authority-assigning action inside an operation**, inverting the boundary ADR-020 just shipped;
+      it needs an ordered phase, i.e. the cursor in status ADR-018 refused outright (*"no 'from' name,
+      no phase, no cursor"*); it would grow its own gate chain (not while degraded, not while
+      captured, not if a failover is already in flight), which is the N x M re-verification surface
+      the runlevels concept exists to escape; its payoff is capped by what Rule R already delivers
+      (LR-058: 188s -> ~10s); and it **does not generalise**, since the same cycle is reachable from a
+      crash, a drain or an image bump, none of which carry a declared intent to hook onto — so it
+      would fix only the path that already has a fix. Independently, `replica-priority` lives in the
+      pod template, so shipping it at all triggers one rolling update of every sentinel instance
+      (ADR-017 Decision 4's hazard), and it would introduce a second promotion authority beside
+      `BestDataHolder`/`electMaster`, which key on offset and keys and would ignore it.
+    - **No e2e yet.** The fixture above is the deterministic tier-3 reproduction and is what the
+      red must be observed against.
+
+- **Tests, red-first at every tier, with the red observed BEHAVIOURALLY rather than as an undefined
+  symbol (the plumbing landed first with the semantics unchanged — LR-050's precedent).**
+    - `TestFailoverStalled` (8 rows) + `TestDetermineRealMasterFailoverProgressing` (4 rows),
+      authored against a `return false` stub and observed **RED on exactly the two load-bearing
+      rows** — `FailoverStalled() = false, want true` and `FailoverProgressing = true, want false`.
+      The other ten passed against the stub, which is what makes the two reds attributable: they pin
+      behaviour the stub already had right, including **the measured control from run 2** (a
+      `reconf_slaves` whose promoted replica is healthy — held 179s by `not_reconfigured`, and which
+      must NOT read as stalled) and both concessions. Mutation-checked in the other direction with
+      *"every reported failover is stalled"*, which fails exactly the five guard rows.
+    - `TestPlanReplicaRescue` (6 rows). Rule R's decision was first extracted to the pure
+      `planReplicaRescue` **behaviour-preservingly**, so the only red is the new clause: observed
+      **RED on 2 of 6**, and the failure output is the defect itself —
+      `planReplicaRescue = [redis-1], want []`, i.e. Rule R demoting the pod Sentinel had just
+      promoted. The four LR-009/LR-010 rows passed throughout, which is what shows the extraction
+      changed nothing. Carries a **positive control**: in the same mid-failover window a genuinely
+      wrong-mastered pod must still be rescued, so the clause cannot pass as a blanket refusal.
+    - `lrctl`: two rows added to `TestSentinelVerifyFailureMatchesThePrintedVerdict`, mutation-checked
+      by disabling the new `case`, which fails both.
+    - **Stop condition (LR-048's K2b) verified:** no existing decision-table row's inputs or expected
+      verdict was edited. The only test edits are the mechanical rename of `state.FailoverActive` to
+      `state.FailoverReported` at 17 sites and one added `false` argument to `sentinelVerifyFailure`
+      — LR-053's precedent for adapting a renamed symbol. Full suite green (envtest included); lint
+      **0 issues against a 0-issue baseline**, verified by stashing the change and re-running.
+
+- **Impacts:** **ADR-003** (amended 2026-09-03 — Rule A's second half is partitioned; the amendment
+  is the review artefact beside this entry); **ADR-020** (its authority-classification vocabulary is
+  what makes the partition statable, and LR-058's rule gains its third instance); **LR-055** (its
+  framing is corrected and its declined design pass is discharged); **LR-052** (its `⚠ NEW RESIDUAL`
+  is now split into D1, fixed here, and D2, still open); **LR-058** / **LR-059** (same family: a
+  guard suppressing the healing its own exit depends on); **LR-009** / **LR-010** (Rule R's original
+  justification, arriving at Rule A); **LR-011** / **LR-013** (whose hazard is RESET, which keeps the
+  guard); **LR-016** (readiness keys on the same `master_link_status` that holds the ladder);
+  `docs/RECONCILIATION_LOOP_SENTINEL.md` (Rule A's scope), `docs/RECONCILIATION_RULES_GLOSSARY.md`.

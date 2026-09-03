@@ -129,11 +129,22 @@ an **empty list**, never to `Reachable: false` (LR-041), so emptiness is not evi
 
 `MasterFailoverState` is the monitored master's own `failover-state` field, and the name matters:
 it was `FailoverStatus`, populated from a `failover-status` key **neither Redis nor Valkey has ever
-emitted**, so `FailoverActive` was permanently false and Rule A's second half had never fired in the
+emitted**, so the flag was permanently false and Rule A's second half had never fired in the
 product's history (LR-052). The old name is what made the wrong wire key look plausible. Sentinel
-omits the field entirely unless a failover is running, so absence means idle — and `FailoverActive`
+omits the field entirely unless a failover is running, so absence means idle — and the derivation
 is an **OR** over Sentinels rather than a majority, because only the election *leader* carries the
 flag (1 of 3, measured).
+
+**Two derived flags, not one (LR-060).** `FailoverReported` answers *"does some Sentinel say a
+failover is running?"* — read by `lrctl`, `DetermineRealMaster`'s step-4 fallback suppression and
+Rule N's G3. `FailoverProgressing` answers *"is mastership actually in motion?"* — the question
+**Rule A** needs, and the one the single old flag got wrong. They differ only for a Sentinel wedged
+in `reconf_slaves` whose promoted replica is down: `sentinelFailoverDetectEnd` returns at its first
+statement there, *before* its own `failover_timeout` force-end, and `sentinelAbortFailover` is
+unreachable from that state — so the report is true forever while nothing moves.
+`SentinelNodeState.FailoverStalled()` reconstructs exactly that condition from the `promoted` and
+`s_down` flags already gathered, and concedes the `promoted_slave == NULL` half deliberately,
+because an absent entry is indistinguishable from a failed `SENTINEL replicas` read.
 
 ### DetermineRealMaster Algorithm
 
@@ -289,11 +300,28 @@ LR-050 is about. See pillar 3.16 and LR-058.
 
 ### Rule A: Guardrails
 
-**Trigger**: Any pod has `DeletionTimestamp != nil` OR `FailoverActive == true`.
+**Trigger**: Any pod has `DeletionTimestamp != nil` OR `FailoverProgressing == true`.
 
 **Action**: Skip all healing rules. Return immediately.
 
 **Rationale**: Kubernetes (pod termination) or Sentinel (failover election) is already performing a transition. Operator interference during transitions causes race conditions and timer resets.
+
+**Two narrowings, both LR-060, and both about the same measurement — 84 consecutive passes (179s) of
+suppressed healing on one ordinary failover:**
+
+1. **It gates on `FailoverProgressing`, not on `FailoverReported`.** A *stalled* report is not a
+   transition, and honouring it means standing down until somebody intervenes by hand. When one is
+   seen the operator says so once per transition (a Warning event, `SentinelFailoverStalled`) and
+   carries on; `lrctl verify` reports it and exits non-zero.
+2. **Rule R is no longer covered by clause 2 at all** — the narrowing lives at the Rule R site
+   (`planReplicaRescue`) rather than here. Rule R issues the *same command at the same target* that
+   Sentinel's own `reconf_slaves` is issuing, so it cannot fight the failover; it is in fact what
+   lets a failover held open by an un-reconfigured replica finish. The one pod it must not touch in
+   that window — the pod Sentinel has just `promoted`, which reports `role:master` while the quorum
+   still names the outgoing one — is skipped by name. Clause 1 (`anyTerminating`) still applies to
+   Rule R unchanged. See ADR-003's 2026-09-03 amendment for the full argument, including why the
+   other rules keep the guard: `SENTINEL RESET` wipes the replica list *and* the leader's
+   `promoted_slave`, and `REMOVE` + `MONITOR` recreates the entry at `config_epoch 0`.
 
 ### Ghost Master Correction (LR-005, LR-008)
 
