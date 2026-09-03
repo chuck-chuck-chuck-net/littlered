@@ -3223,10 +3223,10 @@ refutation of a second, very close LR-051 near-miss.
 - **Commit:** (pending)
 - **ID note:** allocated with the LR-039 cross-branch loop; LR-056 is this milestone's
   sibling finding, directly above.
-- **Status: FOUND AND RECORDED, NOT FIXED — and this one needs its OWN INVESTIGATION, not
-  just its own pass.** See "Why this is deferred rather than fixed" below: the naive fix may
-  re-create the deadlock this planner was built to break, and that has to be worked through
-  before a gate whose purpose is to break wedges is narrowed.
+- **Status: FIXED 2026-09-03** (unit + envtest green, lint clean; **no e2e** — see below).
+  The investigation this entry asked for was done and it produced three results, two of them
+  corrections to this entry itself. **Read the resolution block at the end before the analysis
+  below it**, because the reason recorded here for deferring the fix turned out to be wrong.
 - **Scope:** the second finding of the ADR-020 Phase 4 / M4.1 arbitrary-state tier. Not an
   ADR-020 defect; the mechanism is unchanged since LR-024.
 
@@ -3327,9 +3327,112 @@ refutation of a second, very close LR-051 near-miss.
 - **Regresses:** nothing — no production code changed in this entry.
 - **Impacts:** **LR-024** (its lineage gate's stated premise, and the reason it chose lineage
   over Rule L's holder count); **LR-015** (Rule L's holder-count gate is the contrast that
-  exposes it); **LR-004 / LR-014** (the empty-master transient that makes the naive fix
-  dangerous); prospective **ADR-010**, which already owns Rule D's fate and is where the
+  exposes it); **LR-004 / LR-014** (the empty-master transient that was thought to make the naive
+  fix dangerous — REFUTED, see the resolution); prospective **ADR-010**, which already owns Rule D's fate and is where the
   emptied-replica-list precondition of this state belongs; `BACKLOG.md`.
+
+### Resolution (2026-09-03) — the union-find cannot tell a CHAIN from a FORK
+
+- **The root cause, stated more precisely than above.** *"Nothing on that path reads `Role`"* is
+  true but is not the mechanism. `client.go:619` reads `Role` **one line above** the comparison,
+  to choose which offset field to take — `master_repl_offset` for a master,
+  `slave_repl_offset` for a replica — so `RedisNodeState.Offset` is a **role-dependent
+  quantity**, and `BestDataHolder` then compares those numbers across nodes as if they were
+  commensurable. The defect is not an unread field; it is **a quantity whose meaning depends on
+  `Role`, compared without regard to `Role`.**
+  Underneath that: a promotion rotates `master_replid` and shifts the old value into
+  `master_replid2`, so the union-find connects a promotion **chain** and a promotion **fork**
+  identically —
+
+      chain  D -> A -> B      A={A,D}  B={B,A}    one component
+      fork   D -> A, D -> B   A={A,D}  B={B,D}    one component
+
+  — and only the chain carries LR-024's premise. In a chain every node received ONE stream, so
+  offsets are positions in it and the highest is a superset. In a fork each node has appended to
+  its own stream since parting, so the offsets are coordinates on two branches sharing only an
+  origin. **Shared lineage is NECESSARY for comparable offsets and was used as if it were
+  SUFFICIENT.** LR-024's own generalisation ("lineage checks must use `replid2`, not `replid`
+  alone") is correct and incomplete: `replid2` is exactly what makes a fork look like a chain.
+
+- **⚠ THE REASON THIS ENTRY GAVE FOR DEFERRING IS REFUTED, and it is the finding that unblocked
+  the fix.** The entry declines the role-based discriminator because *"a restarted pod returns as
+  an empty master by default (LR-004, LR-014), so 'two holders report `role:master`' may be an
+  ordinary transient of the very scenario the rule rescues"*. It cannot be. `DataHolders()` is
+  `Reachable && Keys > 0`, and storage is EmptyDir (pillar 3.1), so a restarted pod returns with
+  **zero keys and is never a holder at all** — the transient cannot enter the set the refusal
+  ranges over. Pinned by `TestAnEmptyRestartedMasterIsNeverAHolder`, because the whole fix turns
+  on it. The open question ("is there a discriminator?") therefore had a simpler answer than the
+  entry expected, and the wedge it feared is not reachable.
+
+- **The other half of the open question — persistence — is now SOURCE-CONFIRMED rather than
+  argued, and the answer is that nothing resolves it.** The entry asks whether the state can
+  persist past the 30s cooldown *"without Rule R or the LR-008 correction resolving it first"*:
+    - Both are gated on `state.RealMasterIP != ""`, and in a majority-ghost state
+      `DetermineRealMaster` returns `""` (step 3 finds no live majority; step 4's fallback is
+      suppressed by `ghostMasterCount >= quorum`, LR-004). **The precondition of this planner's
+      whole branch is their disqualification.** Neither can run, by construction.
+    - **Sentinel will not fix it either.** Its corrective path for a replica that turned into a
+      master is `+convert-to-slave` (`sentinel.c:2682-2697`), gated on
+      `sentinelMasterLooksSane(ri->master)`, which requires `(flags & (SRI_S_DOWN|SRI_O_DOWN)) == 0`
+      (`:2482-2488`). In a ghost-master deadlock the monitored master is a dead address and IS
+      `s_down`, so the conversion is **disabled exactly in this state**. Read first-hand at redis
+      8.0 and valkey 8.1; the two agree.
+  So once formed the state persists indefinitely. **How it ARISES remains argued, not observed**
+  — the constructible path is a blackhole split-brain (LR-017's hazard): a master alive and
+  serving clients but unreachable to the operator, the operator elects a survivor, clients follow
+  the label and write, and the original returns to reachability holding its own writes.
+
+- **Fix — one pure predicate, and the refusal it feeds, in BOTH modes.**
+  `holdersForked(holders)` (`internal/redis/replication_state.go`) reports whether MORE THAN ONE
+  holder has been independently **writable**, which is what the offset comparison actually
+  assumes and what lineage structurally cannot establish. `BestDataHolder` returns it as a third
+  value, so the compiler asked every call site. Both election branches now refuse on
+  `diverged || forked`, into the **existing** `allowUnsafeRebootstrapOnDeadlock` — the knob that
+  exists for exactly this decision — rather than stalling silently. That is LR-047's asymmetry (a
+  loud stall beats silent destruction) and **not** LR-043's permanent-stall hazard, because the
+  knob is a documented way out and the refusal cannot be triggered by a legitimate own state (see
+  the refutation above).
+  **Cross-mode (§7 rule 11), and this entry missed it:** `planFailover` step 5 is structurally
+  identical — *">=1 holders, one lineage -> promote `BestDataHolder`, **NO opt-in**"* — so
+  **failover mode had the same defect** and is fixed in the same change. `planLeaderlessRecovery`
+  is the third consumer and is deliberately NOT changed: Rule L gates on holder COUNT, so
+  `BestDataHolder` is reached only behind the opt-in the human has already given. `forked` is
+  threaded there for the message only — the residual being that they authorised discarding *some*
+  data, not the *larger* dataset.
+  **The refusal reason is carried on `forked`, never on `diverged`**, and that is deliberate: the
+  pre-existing decision-table rows pin `diverged == false` on a refusal, so reusing it would have
+  edited their contract (LR-048's K2b). The two get different messages, because they are different
+  situations — *"divergent lineages"* would send an owner whose pods SHARE a history after the
+  wrong diagnosis.
+
+- **Tests, red-first.** `TestHoldersForked` (6 rows) + `TestBestDataHolderReportsForkSeparately
+  FromDivergence` observed **RED on exactly 3 of 9** against an always-false stub, with the four
+  must-stay-safe rows (LR-024's premise, one-master-and-replicas, single holder, none) passing
+  throughout — and the third red *proves the defect*, since it asserts `diverged == false` on a
+  genuine fork. `TestGhostMasterRecoveryRefusesTwoLiveMasters` and
+  `TestPlanFailoverRefusesTwoLiveMasters` were **RED in both modes**, and the output is the defect
+  itself: both elected `10.0.0.2`, which holds **fewer keys** (400 v 500) and only a larger offset
+  number — the unit error in one line. Both carry a **positive control** requiring the rule to
+  still break the wedge it exists for. **This entry's own committed-skipped repro,
+  `TestTwoLiveMastersAreNeverResolvedByElectingOneOfThem`, is UN-SKIPPED and is the headline red**:
+  against pre-fix behaviour it reports `planGhostMasterRecovery = 4 (electing 10.0.0.10 of 2
+  holders, diverged=false) with no opt-in`. Mutation-checked by forcing `holdersForked` false,
+  which fails all four assertions. Every pre-existing decision-table row passes unedited.
+
+- **Regresses:** nothing on any path where at most one holder is writable — the ordinary
+  ghost-master deadlock the rule was built for (survivors of one dead master, all replicas) takes
+  the branch it took before, which the positive controls pin. The one behaviour change is the
+  intended one: two or more data-holding masters now refuse into the opt-in instead of electing
+  silently. No gate, cadence, requeue interval or status field changed; no new round trip, no new
+  RBAC, nothing persisted.
+
+- **NOT covered:** no e2e. Staging a genuine two-live-masters ghost-master deadlock needs a
+  blackhole split-brain (traffic shaping this suite does not have — the same capability
+  `HoldDataUnknown` is waiting on, `feat/e2e-harness`), and the arising path is argued rather than
+  observed. The decision is pinned deterministically at the pure-seam tier, which is where it is
+  decidable. Also unchanged and still open: `planLeaderlessRecovery`'s winner selection under the
+  opt-in, for the reason given above.
+
 
 ### Method note, for both entries — mutation-checking by inspection does not work
 
