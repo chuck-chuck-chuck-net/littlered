@@ -792,4 +792,205 @@ spec:
 			}
 		})
 	})
+
+	// --- One Sentinel's word (LR-056) ---------------------------------------
+	//
+	// The other three tiers all stage a capture the verdict SHOULD act on. This one
+	// stages the state it must REFUSE, and it is the only tier that exercises clause
+	// 1's evidentiary floor at all.
+	//
+	// THE DEFECT IT GUARDS. planForsaken's clause 2 is documented as unanimity, and
+	// this file's own `capture` helper injects into all three Sentinels because of it
+	// ("a 1-of-3 injection reads as a transition, not a verdict" — LR-044 M4a). But
+	// clause 1 asked only `monitoring != 0`, and BOTH of forsakenSignature's
+	// `continue`s — unreachable, and monitoring nothing — dropped a Sentinel from the
+	// DENOMINATOR rather than from the vote. So with its peers silent, ONE Sentinel's
+	// word armed a verdict that takes both StatefulSets to zero on EmptyDir storage.
+	// Fixed by forsakenMonitoringFloor: a majority of the Sentinels we DEPLOY.
+	//
+	// WHY THE STAGING IS THIS SHAPE — each step is load-bearing:
+	//
+	//   - The operator is PAUSED across the injection. With it running, a 1-of-3
+	//     injection is corrected by LR-008's REMOVE+MONITOR in the same second
+	//     (LR-041 observed exactly that, sub-second, in the isolation tier), so the
+	//     state under test would never exist. Restored unconditionally in AfterAll.
+	//   - The two peers are made bare by DELETING their pods: Sentinel storage is
+	//     EmptyDir (pillar 3.7), so a replaced Sentinel comes back monitoring nothing
+	//     and only Rule 0 can re-register it. This is not a synthetic state; it is
+	//     what a Sentinel StatefulSet rollout produces.
+	//   - The victim's Redis pods must follow the foreign master BEFORE the peers are
+	//     deleted. That is planForsaken clause 4 (no reachable pod of ours is a
+	//     master), and it is also what keeps the fixture STABLE once the operator
+	//     returns: with one Sentinel on a stranger and two bare, DetermineRealMaster
+	//     finds no majority (step 3) and its Redis-only fallback (step 4) finds no
+	//     master of ours, so RealMasterIP stays "" — and Rule 0, which would otherwise
+	//     re-register the bare peers within a pass, is gated on it. Nothing repairs
+	//     the fixture out from under the assertion.
+	//
+	// AND THE PRECONDITION THAT KEEPS IT HONEST: the victim's Redis StatefulSet must
+	// be fully Ready. If it is not, LR-050's rollout gate withholds attribution and
+	// the verdict is refused for THAT reason — which is LR-054, a different defect —
+	// and this tier would be green while testing nothing. Asserted, not assumed.
+	Context("A capture reported by ONE Sentinel while its peers are bare", Ordered, func() {
+		var captor, victim, masterName string
+
+		BeforeAll(func() {
+			stamp := time.Now().Unix()
+			captor = fmt.Sprintf("q-floor-captor-%d", stamp)
+			victim = fmt.Sprintf("q-floor-victim-%d", stamp)
+			// Not "mymaster": this tier asserts that NOTHING is armed, and the legacy
+			// name would additionally make the instance quarantineConfigDangerous,
+			// confusing which refusal is under test if it ever goes red.
+			masterName = fmt.Sprintf("q.floor.%d", stamp)
+			deploy(captor, masterName)
+			deploy(victim, masterName)
+		})
+
+		AfterAll(func() {
+			// Unconditionally, and BEFORE cleanup — which may be skipped for
+			// debugging. A suite that leaves the operator at 0 breaks every later spec.
+			scaleOperator(1)
+			cleanup(captor, victim)
+		})
+
+		It("does not arm a verdict, and does not take the instance away", func() {
+			By("pausing the operator so a one-Sentinel capture is not corrected before it lands")
+			// LR-008's divergent-master correction repoints a lone captured Sentinel
+			// within a second. That correction is CORRECT — it is what makes a partial
+			// capture self-healing — and it is exactly why this state has to be staged
+			// with the operator down.
+			scaleOperator(0)
+
+			By("reading the captor's live master address")
+			captorMasters, err := sentinelCmd(captor+"-sentinel-0", "SENTINEL", "masters")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sentinelField(captorMasters, "name")).To(Equal(masterName))
+			foreign := sentinelField(captorMasters, "ip")
+			Expect(foreign).NotTo(BeEmpty())
+			AddReportEntry("foreign master (captor's)", foreign)
+
+			By("checking no Sentinel of the victim already monitors that address")
+			for _, sp := range sentinelPods(victim) {
+				out, cerr := sentinelCmd(sp, "SENTINEL", "masters")
+				Expect(cerr).NotTo(HaveOccurred())
+				Expect(sentinelField(out, "ip")).NotTo(Equal(foreign),
+					"%s already monitors the foreign master before any injection", sp)
+			}
+
+			By("injecting the hello into sentinel-0 ONLY")
+			victimSentinel0 := victim + "-sentinel-0"
+			before, err := sentinelCmd(victimSentinel0, "SENTINEL", "masters")
+			Expect(err).NotTo(HaveOccurred())
+			epoch := nextEpoch(before)
+			hello := fmt.Sprintf("%s,26379,%s,%d,%s,%s,6379,%d",
+				podIP(captor+"-sentinel-0"),
+				"ca7e0000000000000000000000000000deadbee2",
+				epoch, masterName, foreign, epoch)
+			out, err := sentinelCmd(victimSentinel0, "PUBLISH", "__sentinel__:hello", hello)
+			Expect(err).NotTo(HaveOccurred(), "PUBLISH output: %s", out)
+			// redis-cli exits 0 on a Redis error reply, so the reply itself is the
+			// positive control: sentinelPublishCommand answers 1, and anything else
+			// means the payload never reached the processor — after which this tier
+			// would assert a non-event about a state it never created.
+			Expect(strings.TrimSpace(out)).To(Equal("1"),
+				"%s refused the injected hello", victimSentinel0)
+
+			By("sentinel-0 now serves the foreign master, and the victim's pods follow it")
+			Eventually(func(g Gomega) {
+				o, e := sentinelCmd(victimSentinel0, "SENTINEL", "masters")
+				g.Expect(e).NotTo(HaveOccurred())
+				g.Expect(sentinelField(o, "ip")).To(Equal(foreign))
+			}, 60*time.Second, 2*time.Second).Should(Succeed())
+			// One captured Sentinel is enough to repoint the victim's pods: the hello
+			// moves its master entry to the foreign address and its known replicas are
+			// reconfigured onto it. No quorum is involved — quorum is a failover
+			// mechanism and this is config-fixing. If this step ever times out, the
+			// staging assumption is what broke, not the floor.
+			Eventually(func(g Gomega) {
+				for _, rp := range redisPods(victim) {
+					o, e := redisExec(testNamespace, rp, "INFO", "replication")
+					g.Expect(e).NotTo(HaveOccurred())
+					g.Expect(o).To(ContainSubstring("role:slave"), "%s is not a replica", rp)
+					g.Expect(o).To(ContainSubstring("master_host:"+foreign),
+						"%s does not follow the foreign master", rp)
+				}
+			}, 2*time.Minute, 3*time.Second).Should(Succeed())
+
+			By("making the two peers bare by replacing their pods (EmptyDir)")
+			for _, sp := range []string{victim + "-sentinel-1", victim + "-sentinel-2"} {
+				_, derr := utils.Run(exec.Command("kubectl", "delete", "pod", sp,
+					"-n", testNamespace, "--wait=false"))
+				Expect(derr).NotTo(HaveOccurred())
+			}
+			Eventually(func(g Gomega) {
+				for _, sp := range []string{victim + "-sentinel-1", victim + "-sentinel-2"} {
+					o, e := sentinelCmd(sp, "SENTINEL", "masters")
+					g.Expect(e).NotTo(HaveOccurred())
+					g.Expect(strings.TrimSpace(o)).To(BeEmpty(),
+						"%s is monitoring something; it must come back bare", sp)
+				}
+			}, 3*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("restoring the operator")
+			scaleOperator(1)
+
+			By("the LR-056 signature is genuinely present — asserted, not assumed")
+			// Deliberately taken ONCE, immediately, and not inside an Eventually. The
+			// whole state was staged while the operator was down, so it is already true
+			// here — and against a build without the floor the operator arms the verdict
+			// within forsakenCooldown and DELETES these pods, at which point an
+			// Eventually would spend its budget failing to exec into a pod that no
+			// longer exists and report that instead of the verdict. The red has to name
+			// the defect, so the fixture is checked here and the behaviour below.
+			sig, err := sentinelCmd(victimSentinel0, "SENTINEL", "masters")
+			Expect(err).NotTo(HaveOccurred())
+			Expect(sentinelField(sig, "ip")).To(Equal(foreign),
+				"sentinel-0 no longer names the stranger, so there is no signature to refuse")
+			for _, sp := range []string{victim + "-sentinel-1", victim + "-sentinel-2"} {
+				po, pe := sentinelCmd(sp, "SENTINEL", "masters")
+				Expect(pe).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(po)).To(BeEmpty(), "%s is no longer bare", sp)
+			}
+			for _, rp := range redisPods(victim) {
+				ro, re := redisExec(testNamespace, rp, "INFO", "replication")
+				Expect(re).NotTo(HaveOccurred())
+				Expect(ro).To(ContainSubstring("role:slave"),
+					"%s is a master of ours, so clause 4 refuses and the floor is untested", rp)
+			}
+			// The LR-054 discriminator, and the reason this tier is not silently
+			// green for somebody else's defect: a not-Ready Redis StatefulSet means
+			// LR-050's rollout gate is what withholds the verdict, not the floor.
+			rr, rerr := utils.Run(exec.Command("kubectl", "get", "statefulset",
+				victim+"-redis", "-n", testNamespace,
+				"-o", "jsonpath={.status.readyReplicas}"))
+			Expect(rerr).NotTo(HaveOccurred())
+			Expect(strings.TrimSpace(rr)).To(Equal("3"),
+				"the victim's Redis StatefulSet is not fully Ready, so LR-050's rollout "+
+					"gate withholds attribution and this tier tests nothing (LR-054)")
+
+			By("and the operator refuses: no verdict, no marker, no pods taken away")
+			// The window has to outlast forsakenCooldown (30s) plus the steady requeue
+			// interval (30s, LR-045) with margin, or "nothing happened" would only mean
+			// "not yet". Against the pre-fix build the verdict arms at the cooldown and
+			// both StatefulSets are at 0 one pass later.
+			Consistently(func(g Gomega) {
+				st, _ := getConditionField(victim, "Forsaken", "status")
+				g.Expect(st).NotTo(Equal("True"),
+					"a capture verdict was armed on ONE Sentinel's word (reason %q)",
+					forsakenReason(victim))
+				g.Expect(quarantinedSince(victim)).To(BeEmpty(),
+					"the quarantine was armed; on EmptyDir storage that deletes the instance")
+				g.Expect(quarantineAttempts(victim)).To(BeElementOf("", "0"))
+				g.Expect(stsSpecReplicas(victim + "-redis")).To(Equal("3"))
+				g.Expect(stsSpecReplicas(victim + "-sentinel")).To(Equal("3"))
+			}, 120*time.Second, 5*time.Second).Should(Succeed())
+
+			By("the captor was never touched either")
+			for _, rp := range redisPods(captor) {
+				o, e := redisExec(testNamespace, rp, "PING")
+				Expect(e).NotTo(HaveOccurred())
+				Expect(strings.TrimSpace(o)).To(Equal("PONG"))
+			}
+		})
+	})
 })
