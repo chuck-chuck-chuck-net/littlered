@@ -39,6 +39,8 @@ const (
 
 	flagsFailingOver = "master,failover_in_progress"
 	respEmptyArray   = "*0\r\n"
+	// verbMasters is the SENTINEL MASTERS subcommand, spelled once for the fakes.
+	verbMasters = "masters"
 )
 
 // failoverSentinel is a scripted fake Sentinel that answers
@@ -104,7 +106,7 @@ func failoverSentinel(t *testing.T, host, name string, fields []string) {
 						strings.EqualFold(args[1], "replicas"):
 						reply = respEmptyArray
 					case len(args) >= 2 && strings.EqualFold(args[0], "sentinel") &&
-						strings.EqualFold(args[1], "masters"):
+						strings.EqualFold(args[1], verbMasters):
 						reply = "*1\r\n" + record(fields)
 					}
 					if _, err := c.Write([]byte(reply)); err != nil {

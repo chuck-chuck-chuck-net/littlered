@@ -1442,25 +1442,50 @@ func (r *LittleRedReconciler) reconcileSentinelCluster(ctx context.Context, litt
 		// the ghost-master failover deadlock (Sentinels pinned to a dead master, no
 		// promotable replica). Each no-ops when it is not its case.
 		//
-		// CLASSIFICATION: both ASSIGN AUTHORITY (ADR-020), and they are sentinel mode's
-		// only two rules that do. Neither propagates a decision that already exists; each
-		// creates a new fact about who holds the data — Rule L seeds redis-0 or promotes
-		// a survivor, and the LR-024 recovery force-elects one via REMOVE + MONITOR +
-		// REPLICAOF NO ONE. Running either while a declared change is mid-flight means
-		// electing a master on evidence the operation is still changing. LR-048 already
-		// records renaming a DEGRADED instance as out of scope, with Rule L as the safety
-		// net and the wedge; standing it down for the duration of the operation is that
-		// scope stated in code.
+		// CLASSIFICATION: both ASSIGN AUTHORITY (ADR-020) — Rule L seeds redis-0 or
+		// promotes a survivor, the LR-024 recovery force-elects one via REMOVE + MONITOR
+		// + REPLICAOF NO ONE. That classification is correct and is NOT why they used to
+		// be suppressed during a declared operation; the suppression was removed in
+		// LR-059 because the boundary was testing the wrong property.
+		//
+		// A DECLARED OPERATION NO LONGER STANDS THESE DOWN, and the reason generalises
+		// LR-058's rule. Suppression has no auto-exit by design (rows 7, 9 and 10 all
+		// keep the operation Running, and a Stalled operation is deliberately not
+		// auto-exited — ADR-017: a timer is the defect with a delay). So the boundary has
+		// to be closed under "forever":
+		//
+		//	a rule may be stood down by an operation only if the instance can still
+		//	reach a SETTLED state with that rule permanently absent.
+		//
+		// Rule L fails that test on exactly this branch, and the cycle is closed: no
+		// master seeded ⇒ the pods park in the startup wait-loop ⇒ never Ready ⇒
+		// ReadyReplicas != Replicas ⇒ the StatefulSets never settle ⇒ row 7 withholds
+		// the acknowledgment ⇒ the operation stays Running ⇒ Rule L stays suppressed.
+		// Measured on t3e: 74s to recover with no rename pending, WEDGED 7m56s with one,
+		// 84s once it was reverted (LR-059).
+		//
+		// Two things make removing it the whole fix rather than a relaxation. The gate
+		// lived HERE, inside `RealMasterIP == ""`, and both rules require that state — so
+		// its entire domain of effect was the leaderless state, where there is no
+		// authority to withhold, only one to establish. And a capture cannot widen that
+		// domain: planForsaken's clauses 3 and 4 imply `RealMasterIP == ""` (the agreed
+		// address is not ours, so DetermineRealMaster's step 3 cannot match it, and no
+		// reachable pod of ours is a master, so step 4's fallback finds nothing), while a
+		// settled Forsaken verdict and an armed quarantine both return well above this
+		// line. In the one capture state that does reach here — Captured inside its
+		// cooldown — both rules already veto themselves (Rule L needs AllSentinelsBare,
+		// false while the Sentinels monitor the captor; the LR-024 recovery needs
+		// !HasHealthyKnownReplica, and our own live pods sit in the captor's replica
+		// list). So the refusal moves from the operation gate to each rule's own gates,
+		// which are the ones designed for it.
 		//
 		// The return stays unconditional: with no consensus master nothing below can run
 		// anyway (Rule R would issue SLAVEOF at an empty address).
-		if !operationRunning {
-			if err := r.recoverLeaderlessDeadlock(ctx, littleRed, state, redisMap, password); err != nil {
-				stateLog.Error(err, "leaderless deadlock recovery failed")
-			}
-			if err := r.recoverGhostMasterDeadlock(ctx, littleRed, state, redisMap, password); err != nil {
-				stateLog.Error(err, "ghost-master deadlock recovery failed")
-			}
+		if err := r.recoverLeaderlessDeadlock(ctx, littleRed, state, redisMap, password); err != nil {
+			stateLog.Error(err, "leaderless deadlock recovery failed")
+		}
+		if err := r.recoverGhostMasterDeadlock(ctx, littleRed, state, redisMap, password); err != nil {
+			stateLog.Error(err, "ghost-master deadlock recovery failed")
 		}
 		return nil
 	}

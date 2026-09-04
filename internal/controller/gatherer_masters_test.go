@@ -90,9 +90,9 @@ func twoNameSentinel(t *testing.T, knownName, otherName string) {
 						}
 					case len(args) >= 3 && strings.EqualFold(args[0], "sentinel") &&
 						strings.EqualFold(args[1], "replicas"):
-						reply = "*0\r\n"
+						reply = respEmptyArray
 					case len(args) >= 2 && strings.EqualFold(args[0], "sentinel") &&
-						strings.EqualFold(args[1], "masters"):
+						strings.EqualFold(args[1], verbMasters):
 						reply = "*2\r\n" +
 							masterRecord(knownName, "10.0.0.1", "master") +
 							masterRecord(otherName, "10.0.0.9", "s_down,master")

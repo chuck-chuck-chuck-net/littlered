@@ -124,7 +124,7 @@ func (f *scriptedSentinel) reply(args []string) string {
 	}
 	ip, known := f.masters[name]
 	switch verb {
-	case "masters":
+	case verbMasters:
 		var b strings.Builder
 		fmt.Fprintf(&b, "*%d\r\n", len(f.order))
 		for _, n := range f.order {
@@ -142,7 +142,7 @@ func (f *scriptedSentinel) reply(args []string) string {
 		}
 		return fmt.Sprintf("*2\r\n$%d\r\n%s\r\n$4\r\n6379\r\n", len(ip), ip)
 	case "replicas", "slaves":
-		return "*0\r\n"
+		return respEmptyArray
 	case "remove":
 		if !known {
 			return respNoSuchName

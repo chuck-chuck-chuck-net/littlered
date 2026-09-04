@@ -22,6 +22,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
@@ -298,6 +299,12 @@ type opRecordingSentinel struct {
 	masterIP string
 	replicas [][2]string // ip, flags
 	commands [][]string
+	// bare makes this Sentinel monitor NOTHING: every name reads as a miss and
+	// `SENTINEL masters` answers an empty array. That is what a replaced Sentinel pod
+	// comes back as (EmptyDir, pillar 3.7), and it is `AllSentinelsBare`'s precondition,
+	// i.e. Rule L's. A flag on this fake rather than a second fake, so there stays one
+	// place where "what a Sentinel answers" lives.
+	bare bool
 }
 
 func newOpRecordingSentinel(
@@ -348,9 +355,12 @@ func (f *opRecordingSentinel) reply(args []string) string {
 	if len(args) >= 3 {
 		name = args[2]
 	}
-	known := name == f.name
+	known := name == f.name && !f.bare
+	if f.bare && verb == verbMasters {
+		return respEmptyArray
+	}
 	switch verb {
-	case "masters":
+	case verbMasters:
 		return "*1\r\n" + sentinelMasterRecord(f.name, f.masterIP)
 	case RoleMaster:
 		if !known {
@@ -386,6 +396,22 @@ func (f *opRecordingSentinel) sawReset() bool {
 	defer f.mu.Unlock()
 	for _, c := range f.commands {
 		if len(c) >= 2 && strings.EqualFold(c[1], "reset") {
+			return true
+		}
+	}
+	return false
+}
+
+// sawMonitorOf reports whether this Sentinel was told to MONITOR the given address —
+// which is how Rule L's seed is observed. On a leaderless instance it is unambiguous:
+// Rule 0's re-registration issues the same command but is gated on
+// `RealMasterIP != ""`, so it cannot run in this fixture.
+func (f *opRecordingSentinel) sawMonitorOf(ip string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, c := range f.commands {
+		// SENTINEL MONITOR <name> <ip> <port> <quorum>
+		if len(c) >= 4 && strings.EqualFold(c[1], "monitor") && c[3] == ip {
 			return true
 		}
 	}
@@ -639,5 +665,197 @@ var _ = Describe("ADR-020 an operation suppresses authority assignment, nothing 
 			"the fixture control: Rule D must reach its RESET on this topology with no operation "+
 				"in play, so the spec above is asserting that an operation does not CHANGE that, "+
 				"rather than asserting over a fixture that never reaches Rule D at all")
+	})
+})
+
+// ---- LR-059: an operation must not suppress the rule that ESTABLISHES authority ----
+//
+// The Describe above pins the two rules that must keep running because they PROPAGATE a
+// decision or CLEAN UP DEBRIS. This one is the other half of the boundary, and it is the
+// half ADR-020 got wrong: Rule L and the LR-024 recovery were suppressed for ASSIGNING
+// authority, and on a leaderless instance that closes a cycle.
+//
+//	operation pending -> Rule L suppressed -> no master is seeded -> pods park in the
+//	startup wait-loop -> never Ready -> ReadyReplicas != Replicas -> the StatefulSets
+//	never settle -> row 7 withholds the acknowledgment -> the operation stays Running
+//	-> Rule L stays suppressed
+//
+// Measured on t3e: 74s to recover with no rename pending, WEDGED 7m56s and still going
+// with one, 84s once the rename was reverted. There is no exit at any horizon — rows 7,
+// 9 and 10 all keep `Run` set, so Blocked and Stalled suppress exactly as Running does,
+// and `Stalled` is deliberately not auto-exited.
+//
+// THE CRITERION THIS PINS, which is the general form of LR-058's rule: because
+// suppression has no auto-exit, the boundary must be closed under "forever" — a rule may
+// be stood down by an operation only if the instance can still reach a settled state
+// with that rule PERMANENTLY absent. Rule L fails it, which is why sentinel mode's
+// suppressed set is now empty. Note the taxonomy was not wrong about Rule L: seeding a
+// master genuinely does assign authority. It is the wrong test.
+var _ = Describe("ADR-020 an operation never suppresses the rule that establishes authority", func() {
+	const (
+		llDesired  = "ops-ll.cache"
+		llRedis0   = "127.0.0.41"
+		llRedis1   = "127.0.0.42"
+		llRedis2   = "127.0.0.43"
+		llSentinel = "127.0.0.44"
+		llSentinl1 = "127.0.0.45"
+		llSentinl2 = "127.0.0.46"
+	)
+	var (
+		reconciler *LittleRedReconciler
+		lr         *littleredv1alpha1.LittleRed
+		sentinels  []*opRecordingSentinel
+	)
+
+	BeforeEach(func() {
+		reconciler = &LittleRedReconciler{
+			Client:   k8sClient,
+			Scheme:   k8sClient.Scheme(),
+			Recorder: events.NewFakeRecorder(64),
+		}
+		lr = &littleredv1alpha1.LittleRed{
+			ObjectMeta: metav1.ObjectMeta{GenerateName: "opll-", Namespace: testNamespaceDefault},
+			Spec: littleredv1alpha1.LittleRedSpec{
+				Mode:     ModeSentinel,
+				Sentinel: &littleredv1alpha1.SentinelSpec{Quorum: 2, MasterName: llDesired},
+			},
+		}
+		Expect(k8sClient.Create(ctx, lr)).To(Succeed())
+		// Initializing, not Running: a leaderless instance is not serving. The
+		// leaderless marker is pre-set past leaderlessRecoveryCooldown so the seed is
+		// decidable in ONE pass — otherwise the first pass only starts the cooldown and
+		// the spec would assert over a state that has not been reached yet.
+		lr.Status.Phase = littleredv1alpha1.PhaseInitializing
+		lr.Status.LeaderlessSince = &metav1.Time{Time: time.Now().Add(-2 * leaderlessRecoveryCooldown)}
+		Expect(k8sClient.Status().Update(ctx, lr)).To(Succeed())
+
+		makePod := func(name, ip string, labels map[string]string) {
+			pod := &corev1.Pod{
+				ObjectMeta: metav1.ObjectMeta{Name: lr.Name + "-" + name, Namespace: lr.Namespace, Labels: labels},
+				Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: ComponentRedis, Image: opTestImage}}},
+			}
+			Expect(k8sClient.Create(ctx, pod)).To(Succeed())
+			pod.Status.PodIP = ip
+			pod.Status.Phase = corev1.PodRunning
+			pod.Status.ContainerStatuses = []corev1.ContainerStatus{{Name: ComponentRedis, Ready: true}}
+			// PodReady is load-bearing, exactly as in the Describe above:
+			// getSentinelAddresses skips a Sentinel pod without it, so the seed would
+			// reach no fake and the assertion would pass having tested nothing.
+			pod.Status.Conditions = []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			}
+			Expect(k8sClient.Status().Update(ctx, pod)).To(Succeed())
+		}
+		makePod("redis-0", llRedis0, redisSelectorLabels(lr))
+		makePod("redis-1", llRedis1, redisSelectorLabels(lr))
+		makePod("redis-2", llRedis2, redisSelectorLabels(lr))
+		for i, ip := range []string{llSentinel, llSentinl1, llSentinl2} {
+			makePod(fmt.Sprintf("sentinel-%d", i), ip, sentinelSelectorLabels(lr))
+		}
+
+		// Every Redis pod is a replica following an address nobody holds, with NO
+		// keyspace section — so DataHolders() is empty and Rule L takes its no-data
+		// reseed branch, which needs no opt-in (LR-015). None reports role:master, which
+		// is what keeps DetermineRealMaster's step-4 fallback from finding one and is
+		// therefore what makes the instance leaderless at all.
+		for _, ip := range []string{llRedis0, llRedis1, llRedis2} {
+			newOpRecordingRedis(GinkgoT(), ip,
+				"# Replication\r\nrole:slave\r\nmaster_host:10.99.99.98\r\nmaster_link_status:down\r\n"+
+					"master_replid:abc\r\nslave_repl_offset:0\r\n")
+		}
+
+		// All three Sentinels BARE — the mass-restart signature Rule L exists for, and
+		// the state ADR-016's quarantine release hands back (empty and leaderless, which
+		// is how this wedge is reached without anybody doing anything unusual).
+		sentinels = make([]*opRecordingSentinel, 0, 3)
+		for _, ip := range []string{llSentinel, llSentinl1, llSentinl2} {
+			s := newOpRecordingSentinel(GinkgoT(), ip, llDesired, "", nil)
+			s.bare = true
+			sentinels = append(sentinels, s)
+		}
+
+		for _, n := range []struct {
+			name   string
+			labels map[string]string
+		}{{statefulSetName(lr), redisSelectorLabels(lr)}, {sentinelStatefulSetName(lr), sentinelSelectorLabels(lr)}} {
+			replicas := int32(3)
+			sts := &appsv1.StatefulSet{
+				ObjectMeta: metav1.ObjectMeta{Name: n.name, Namespace: lr.Namespace},
+				Spec: appsv1.StatefulSetSpec{
+					Replicas: &replicas,
+					Selector: &metav1.LabelSelector{MatchLabels: n.labels},
+					Template: corev1.PodTemplateSpec{
+						ObjectMeta: metav1.ObjectMeta{Labels: n.labels},
+						Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: ComponentRedis, Image: opTestImage}}},
+					},
+					ServiceName: n.name,
+				},
+			}
+			Expect(k8sClient.Create(ctx, sts)).To(Succeed())
+			// UNSETTLED, and not as scenery: this is the wedge's own mechanism. The pods
+			// are parked because there is no master, so ReadyReplicas can never reach
+			// Replicas until Rule L runs — which is the condition the operation waits on.
+			sts.Status = appsv1.StatefulSetStatus{
+				ObservedGeneration: sts.Generation,
+				Replicas:           3, ReadyReplicas: 0, UpdatedReplicas: 3,
+				CurrentRevision: opTestRevision, UpdateRevision: opTestRevision,
+			}
+			Expect(k8sClient.Status().Update(ctx, sts)).To(Succeed())
+		}
+	})
+
+	setAck := func(value string) {
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		latest.Status.AcknowledgedOperations = []littleredv1alpha1.OperationAck{{
+			Name:           opRename,
+			Fingerprint:    littleredv1alpha1.OperationFingerprint(latest.UID, opRename, value),
+			AcknowledgedAt: metav1.Now(),
+		}}
+		Expect(k8sClient.Status().Update(ctx, latest)).To(Succeed())
+		lr.Status.AcknowledgedOperations = latest.Status.AcknowledgedOperations
+	}
+
+	seeded := func() bool {
+		for _, s := range sentinels {
+			if s.sawMonitorOf(llRedis0) {
+				return true
+			}
+		}
+		return false
+	}
+
+	It("seeds a master through Rule L even while a rename is pending", func() {
+		setAck("the-previous-name") // fingerprint differs => the rename is pending
+
+		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
+
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		Expect(latest.Status.Operation).NotTo(BeNil(), "precondition: an operation must be in progress")
+		Expect(latest.Status.Operation.Reason).To(Equal(operationReasonRunning),
+			"precondition: the operation must be RUNNING, which is what suppressed Rule L")
+
+		Expect(seeded()).To(BeTrue(),
+			"Rule L never seeded a master while an operation was pending, which is the LR-059 "+
+				"wedge: the seed is the only thing that can make these pods Ready, Ready is the "+
+				"only thing that settles the StatefulSets, and settling is the only thing that "+
+				"completes the operation that is suppressing the seed. Nothing exits this at any "+
+				"horizon — Blocked and Stalled keep Run set too")
+	})
+
+	It("seeds a master with no operation pending (the control)", func() {
+		setAck(llDesired) // fingerprint matches => converged, no operation
+
+		Expect(reconciler.reconcileSentinelCluster(ctx, lr)).To(Succeed())
+
+		latest := &littleredv1alpha1.LittleRed{}
+		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: lr.Name, Namespace: lr.Namespace}, latest)).To(Succeed())
+		Expect(latest.Status.Operation).To(BeNil(), "precondition: no operation may be in progress")
+
+		Expect(seeded()).To(BeTrue(),
+			"the fixture control: Rule L must reach its seed on this topology with no operation "+
+				"in play, so the spec above asserts that an operation does not CHANGE that, "+
+				"rather than asserting over a fixture that never reaches Rule L at all")
 	})
 })
