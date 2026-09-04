@@ -1078,16 +1078,25 @@ spec:
 // mass-restart incident is another, and a rename issued shortly before node
 // maintenance composes the two.
 //
-// NOT FIXED HERE. The fix is a data-safety change to the suppression boundary of a
-// shipped mechanism and it needs its own pass, not the tail end of a test milestone.
-// The obvious narrowing — "let Rule L run when there are zero data holders" — is
-// plausible precisely because that is the branch with no authority to assign, but it
-// is still a change to which rules may act during a declared operation, and
-// ADR-020's boundary is the thing under discussion. That is a decision, not a patch.
+// FIXED 2026-09-04 (LR-059), and NOT by the narrowing this header proposed. The fix is
+// the criterion under ADR-020's boundary: because a suppression has no auto-exit, a rule
+// may be stood down by an operation only if the instance can still reach a SETTLED state
+// with that rule permanently absent. Rule L fails that here, and since both
+// authority-assigning rules require `RealMasterIP == ""`, the gate's whole domain of
+// effect was this branch — so sentinel mode's suppressed set is now empty.
+//
+// TWO TIERS, because the run against the fixed operator found a SECOND cycle underneath
+// this one (**LR-061**): pods left on the OLD pod template ask Sentinel for the OLD
+// master name, which Rule N has correctly pruned, so they never start, never become
+// Ready, and the rolling update that would re-bake them cannot advance. The first tier
+// below therefore asserts exactly what LR-059 delivers (a master, from Rule L's reseed,
+// named in the CR) and stops; the second stages the IN-SCOPE ordering — rename first, so
+// the pods return on the current template, which is what ADR-016's quarantine release
+// produces — and asserts full recovery plus the rename completing.
 var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
 	Label("sentinel"), Ordered, func() {
 
-		var wedged, control string
+		var wedged, control, inScope string
 
 		leaderlessCR := func(crName string) string {
 			return sentinelRenameCR(crName, "mymaster")
@@ -1119,7 +1128,8 @@ var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
 			stamp := time.Now().Unix()
 			wedged = fmt.Sprintf("op-ll-wedge-%d", stamp)
 			control = fmt.Sprintf("op-ll-ctrl-%d", stamp)
-			for _, n := range []string{wedged, control} {
+			inScope = fmt.Sprintf("op-ll-inscope-%d", stamp)
+			for _, n := range []string{wedged, control, inScope} {
 				AddReportEntry("cr:" + n)
 			}
 		})
@@ -1132,17 +1142,56 @@ var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
 				By("skipping cleanup to allow debugging")
 				return
 			}
-			for _, n := range []string{wedged, control} {
+			for _, n := range []string{wedged, control, inScope} {
 				_, _ = utils.Run(exec.Command("kubectl", "delete", "littlered", n,
 					"-n", testNamespace, "--ignore-not-found"))
 			}
 		})
 
 		It("recovers through Rule L even with a rename pending", func() {
-			Skip("blocked on LR-059: a pending heavy operation suppresses Rule L, which is the " +
-				"only thing that can satisfy the operation's own completion condition on a " +
-				"leaderless instance — measured wedged 7m56s against a 74s control on t3e. " +
-				"Un-skip with the LR-059 fix, not before.")
+			// UN-SKIPPED with the LR-059 fix. It was committed skipped because it
+			// asserts what the operator SHOULD do, and inverting it into a
+			// characterisation would have pinned the wedge as correct.
+			//
+			// The fix is not the narrowing this header proposed ("let Rule L run when
+			// there are zero data holders"). It is the criterion underneath: because a
+			// suppression has no auto-exit, a rule may be stood down by an operation
+			// only if the instance can still reach a SETTLED state with that rule
+			// permanently absent. Rule L fails that on the leaderless branch, and since
+			// both suppressed rules require `RealMasterIP == ""`, the gate's entire
+			// domain of effect was that branch — so sentinel mode's suppressed set is
+			// now empty and each rule's own gates carry the refusals. ADR-020, LR-059.
+			//
+			// ⚠ SPLIT 2026-09-04, AND THE REASON IS THE INTERESTING PART. Run against
+			// the fixed operator, this tier still failed — at `phase == Running`, NOT at
+			// the master assertion, which passed. Rule L had seeded
+			// (`LeaderlessRecovery=False/Reseeded`) and Rule N had converged
+			// (`StaleMasterName=False/Converged`); what remained was a SECOND, unrelated
+			// cycle, now recorded as **LR-061**:
+			//
+			//	the Sentinels monitor only the NEW name (Rule N pruned mymaster, which
+			//	is ADR-018's R3 working) -> redis-0 and redis-1 are still on the OLD
+			//	pod template and their wait-loop asks `get-master-addr-by-name
+			//	mymaster` -> they never start ("Sentinel has no master info. Waiting...",
+			//	redis-cli refused) -> never Ready -> the rolling update cannot advance
+			//	past the one pod it already replaced -> they are never re-baked with the
+			//	new name. Measured: sts `ready=0 updated=1`, currentRevision !=
+			//	updateRevision, and the operation reaching Stalled without auto-exiting.
+			//
+			// THIS TIER'S STAGING IS STRONGER THAN LR-059'S CLAIM, which is why the two
+			// separate cleanly: it force-deletes the pods BEFORE patching the name, so
+			// they return on the OLD template — i.e. it stages "rename a degraded
+			// instance", which LR-048 explicitly scopes out ("Rule L is the safety net
+			// AND the wedge"). LR-059's own documented route, ADR-016's quarantine
+			// release, hands the pods back from the CURRENT template, so they speak the
+			// new name and the seed wakes them; that route is covered by the sibling
+			// tier below, which is the in-scope variant.
+			//
+			// So what stays asserted here is exactly what LR-059's fix delivers and what
+			// went red→green: a master is assigned and the reseed is named in the CR.
+			// Everything downstream of a pod being able to START belongs to LR-061 and
+			// is asserted in the sibling tier instead — asserting it here would pin
+			// behaviour that does not hold, which is what the skip existed to avoid.
 
 			By("deploying two identical instances")
 			for _, n := range []string{wedged, control} {
@@ -1182,23 +1231,88 @@ var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
 				g.Expect(st).To(Equal("Reseeded"))
 			}, 5*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("and so must the one with a rename pending — this is the assertion LR-059 fails")
+			By("and so must the one with a rename pending — the LR-059 assertion")
+			// THE LR-059 GUARD, and deliberately no more than this. Pre-fix these two
+			// were unreachable: Rule L was suppressed for the whole window and the
+			// operator logged only "A declared heavy operation is in progress" (LR-059
+			// measured ZERO leaderless lines). Post-fix both hold, and the CR NAMES the
+			// mechanism rather than leaving it to be inferred.
 			Eventually(func(g Gomega) {
 				g.Expect(getMasterPod(wedged)).NotTo(BeEmpty(),
-					"the instance is still leaderless with a rename pending: Rule L is "+
+					"the instance is still leaderless with a rename pending: Rule L was "+
 						"suppressed by the operation, and the operation cannot complete until "+
 						"Rule L gives it a master (LR-059)")
-				g.Expect(getPhase(wedged)).To(Equal("Running"))
+				reason, _ := getConditionField(wedged, "LeaderlessRecovery", "reason")
+				g.Expect(reason).To(Equal("Reseeded"),
+					"the master must come from Rule L's no-data reseed, not from some other "+
+						"path — naming it is what makes this a guard for LR-059 rather than "+
+						"for 'something eventually assigned a master'")
 			}, 6*time.Minute, 5*time.Second).Should(Succeed())
 
-			By("and the rename then completes")
+			// ⚠ DELIBERATELY NOT ASSERTED HERE — BLOCKED ON LR-061, and do NOT
+			// re-add it without that fix. On this staging (pods force-deleted BEFORE
+			// the name patch, so they return on the OLD template) the instance cannot
+			// reach `Running` or finish the rename however long it is given: the two
+			// old-template pods ask Sentinel for `mymaster`, which Rule N has correctly
+			// pruned, so they never start, never become Ready, and the rolling update
+			// that would re-bake them cannot advance. Measured on t3e 2026-09-04 against
+			// the fixed operator: `ready=0 updated=1`, currentRevision != updateRevision,
+			// operation Stalled with no auto-exit. The in-scope route — a rename already
+			// in the template when the pods return, which is what ADR-016's quarantine
+			// release produces — is the sibling tier below, and it asserts full recovery.
+		})
+
+		// The IN-SCOPE variant of the tier above, and the one that exercises LR-059's
+		// documented reachability path end to end.
+		//
+		// The difference is one line of ordering: the rename is patched BEFORE the pods
+		// are forced out, so they come back from the CURRENT pod template and speak the
+		// name the operator will seed. That is exactly what ADR-016's quarantine release
+		// hands back (empty, leaderless, current template), which is the route LR-059
+		// names as reachable "by a path docs/USAGE.md was actively inviting".
+		//
+		// So this tier asserts what the fix is FOR: with a heavy operation pending and no
+		// master anywhere, the instance recovers on Rule L's ordinary path AND the
+		// operation then completes. It carries no LR-061 exposure, because no pod is left
+		// on a superseded template.
+		It("recovers and completes the rename when the pods return on the new template", func() {
+			By("deploying one instance")
+			cmd := exec.Command("kubectl", "apply", "-f", "-")
+			cmd.Stdin = strings.NewReader(leaderlessCR(inScope))
+			out, err := utils.Run(cmd)
+			Expect(err).NotTo(HaveOccurred(), "apply output: %s", out)
 			Eventually(func(g Gomega) {
-				expectQuietOperationOn(g, wedged)
-				for _, sp := range []string{wedged + "-sentinel-0", wedged + "-sentinel-1", wedged + "-sentinel-2"} {
-					out, err := sentinelPortExec(testNamespace, sp, "SENTINEL", "masters")
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(sentinelMasterNames(out)).To(
-						Equal([]string{e2eMasterName(testNamespace, wedged)}))
+				g.Expect(getPhase(inScope)).To(Equal("Running"))
+				g.Expect(renameAck(inScope)).NotTo(BeEmpty(), "%s was never seeded", inScope)
+			}, 6*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("renaming FIRST, so the new name is in the pod template")
+			renameMasterName(inScope, e2eMasterName(testNamespace, inScope))
+
+			By("then pausing the operator and driving it leaderless")
+			// The operation is pending across the whole window: the rename is patched
+			// but unacknowledged, so `OperationInProgress` is True throughout, which is
+			// the precondition this tier exists to test against.
+			scaleOperator(0)
+			forceLeaderless(inScope)
+			scaleOperator(1)
+
+			By("Rule L recovers it despite the pending operation")
+			Eventually(func(g Gomega) {
+				g.Expect(getMasterPod(inScope)).NotTo(BeEmpty())
+				reason, _ := getConditionField(inScope, "LeaderlessRecovery", "reason")
+				g.Expect(reason).To(Equal("Reseeded"))
+				g.Expect(getPhase(inScope)).To(Equal("Running"))
+			}, 8*time.Minute, 5*time.Second).Should(Succeed())
+
+			By("and the rename then completes and goes quiet")
+			Eventually(func(g Gomega) {
+				expectQuietOperationOn(g, inScope)
+				for _, sp := range []string{inScope + "-sentinel-0", inScope + "-sentinel-1", inScope + "-sentinel-2"} {
+					so, serr := sentinelPortExec(testNamespace, sp, "SENTINEL", "masters")
+					g.Expect(serr).NotTo(HaveOccurred())
+					g.Expect(sentinelMasterNames(so)).To(
+						Equal([]string{e2eMasterName(testNamespace, inScope)}))
 				}
 			}, 6*time.Minute, 5*time.Second).Should(Succeed())
 		})
