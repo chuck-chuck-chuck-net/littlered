@@ -74,7 +74,18 @@ Default-on, with no opt-out knob: the instance is provably empty and unrecoverab
 damaging a neighbour, and an opt-in nobody sets protects nobody.
 
 The decision is the pure `planQuarantine` (`internal/controller/quarantine_plan.go`), gated on
-LR-042's existing `Forsaken` verdict (`planForsaken`, unchanged).
+LR-042's `Forsaken` verdict (`planForsaken`).
+
+6. **The verdict carries an evidentiary floor** (added by LR-056, 2026-09-04): a **majority of
+   the Sentinels this instance deploys** must be monitoring and must agree. Clause 2 is
+   documented as unanimity and this ADR's own verification relied on it — the M4a injection had
+   to hit all three of the victim's Sentinels — but clause 1 asked only *"at least one Sentinel
+   monitors something"*, and a Sentinel that is unreachable or bare left the **denominator**
+   rather than the vote. With two peers silent, one Sentinel's word armed a verdict that takes
+   both StatefulSets to zero on EmptyDir. The floor is keyed on the deployed count
+   (`sentinelProcessReplicas`, fixed at three), which is LR-013's wholeness gate reused, and
+   deliberately **not** on `spec.sentinel.quorum` — that field has no `Minimum`, so `quorum: 1`
+   would make the floor vacuous.
 
 ## Rationale
 
@@ -226,6 +237,16 @@ design, so the reorder buys nothing that is needed and risks something that is.
   alternative leaves a healthy neighbour permanently poisoned; the settling period shrinks the
   window (the captor prunes those addresses before the pods return); and the N=2 latch bounds the
   number of dice-rolls.
+- **The floor's cost, and why it does not blunt this ADR** (LR-056). Making the verdict harder to
+  reach trades a false-positive deletion against leaving a genuine captor poisoned for longer,
+  which is the trade this whole document is about — but the trade is measured, not open. Every
+  capture on record is unanimous across all three of the victim's Sentinels: the field incident
+  (LR-039), M4a twice, and the e2e helper, which asserts exactly that before any spec proceeds.
+  And a capture the floor refuses is **still diagnosed**: `lrctl verify`'s `DetectCrossInstance`
+  has no floor and must keep none, since LR-039 built it to fire on a *partial* capture. **A
+  floorless diagnostic and a floored verdict, because only one of them deletes pods.** The
+  failure direction is LR-047's — withholding is bounded and non-destructive, while a false
+  verdict is unrecoverable by the sole-authority invariant above.
 - A quarantined instance can never report `Running`, because `allReady` requires `Redis.Ready > 0`
   — so the quarantine cannot reset the counter that is counting it, and the latch still bites.
 - The release lands up to ~150s after arming rather than 120s, since a forsaken instance is polled
@@ -274,7 +295,14 @@ Timings, cycle 1 → cycle 2:
 
 **What is not covered, stated plainly.**
 
-- The three committed e2e tiers (`Sentinel Forsaken-Gated Quarantine` — full cycle,
+- **A fourth tier was added by LR-056 and it is the only one here with an honest red**
+  (`> A capture reported by ONE Sentinel while its peers are bare`): observed RED on t3e against
+  the pre-fix operator — *"a capture verdict was armed on ONE Sentinel's word"*, 39.4s in, i.e.
+  one `forsakenCooldown` plus a pass — and green after, with the whole Describe re-run green on
+  the fixed build (4 of 4) as the over-suppression check. It also carries the LR-054
+  discriminator (the victim's Redis StatefulSet must be 3/3 Ready), without which a refusal
+  could be credited to LR-050's rollout gate rather than to the floor.
+- The three original e2e tiers (`Sentinel Forsaken-Gated Quarantine` — full cycle,
   `HoldDataPresent` refusal, `Latched`) are **green from birth**. They assert behaviour that
   already shipped and was already verified by hand in M4a, and the honest red was not obtainable:
   building the pre-LR-042 operator and deploying it to watch tier 1 fail was attempted and blocked

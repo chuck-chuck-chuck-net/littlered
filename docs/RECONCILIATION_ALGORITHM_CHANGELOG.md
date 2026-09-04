@@ -3099,11 +3099,13 @@ refutation of a second, very close LR-051 near-miss.
 - **Commit:** (pending)
 - **ID note:** the highest ID visible on any branch was LR-055; allocated with the LR-039
   cross-branch loop over **every** branch, not by reading the tip of one line.
-- **Status: FOUND AND RECORDED, NOT FIXED — by owner decision.** The defect is
-  pre-existing (ADR-016 / LR-042, and it predates the work that found it), and the fix is a
-  data-safety change to a shipped planner that gates a scale-to-zero on EmptyDir storage. It
-  gets its own pass rather than a tail-end of a test milestone. What landed here is the
-  diagnosis, a committed reproduction, and the skip that keeps the suite honest.
+- **Status: FIXED 2026-09-04** (unit + envtest green, lint 0 issues, **and e2e-verified on t3e
+  red-then-green against the pre-fix image** — see the resolution). It was first recorded as FOUND AND NOT FIXED by owner decision:
+  the defect is pre-existing (ADR-016 / LR-042, and it predates the work that found it) and
+  the fix is a data-safety change to a shipped planner that gates a scale-to-zero on EmptyDir
+  storage, so it got its own pass rather than a tail-end of a test milestone. **Read the
+  resolution block at the end before the analysis below it** — it corrects this entry on two
+  counts, and one of them is which states can reach the defect.
 - **Scope:** found by the post-operation arbitrary-state tier (ADR-020 Phase 4, M4.1), whose
   entire premise is that the regular loop must be safe against states it did not produce.
   This is that tier's headline finding. It is **not** an ADR-020 defect: the mechanism is
@@ -3203,20 +3205,188 @@ refutation of a second, very close LR-051 near-miss.
   planner: it makes the verdict strictly harder to reach, which trades a false-positive
   deletion against leaving a **genuine** captor poisoned for longer — the trade LR-044's
   whole design is about — and ADR-016's conservatism argument runs in the opposite direction
-  from LR-042's. That is a decision, not a patch.
+  from LR-042's. That is a decision, not a patch. **Taken 2026-09-04, and the trade turned out
+  to be measured rather than open — see the resolution.**
 
-- **Tests.** `TestACaptureVerdictIsNeverCarriedByASingleSentinel` is committed and
+- **Tests.** `TestACaptureVerdictIsNeverCarriedByASingleSentinel` was committed and
   **skipped**, naming this entry and the un-skip condition inline (the
-  `test/e2e/sentinel_master_name_test.go` / LR-054 precedent). It is deliberately **not**
+  `test/e2e/sentinel_master_name_test.go` / LR-054 precedent). It was deliberately **not**
   inverted into a characterisation of the current verdict: a test that asserts the defect is
   correct has to be un-written by whoever fixes it, and until then it actively defends the
   defect. It carries a positive control (all three Sentinels naming the stranger must
   **still** reach the verdict) so it cannot be satisfied by a predicate that never arms.
-- **Regresses:** nothing — no production code changed in this entry.
+  **Un-skipped with the fix, and it is the headline red.**
+- **Regresses:** nothing — no production code changed in this entry. (The fix's own regression
+  note is in the resolution.)
 - **Impacts:** **LR-042** (its clause 2 is weaker than its own text says); **LR-044** (M4a's
   "a 1-of-3 injection reads as a transition" is conditional and does not say so); **ADR-016**
   (the quarantine's trigger); `BACKLOG.md`. Found by ADR-020 Phase 4 / M4.1, which is the
   first thing in this project to feed the planners states with no story attached.
+
+### Resolution (2026-09-04) — the denominator must come from what we DEPLOYED, not from what answered
+
+- **Two corrections to the entry above, both found by reading the code rather than by running
+  anything, and the second changes what the fix has to cover.**
+    1. **The trigger set is wider than bare Sentinels.** The entry frames the collapse on
+       clause 1's `continue` at `:183` (no observations). `forsakenSignature` has a **second**
+       `continue` one line earlier, at `:179` (`!sn.Reachable`), and `GetSentinelState`
+       (`gatherer.go:78-90`) maps every probe error other than a genuine name-miss to
+       `Reachable:false`. So two **blackholing or timing-out** Sentinels collapse the
+       denominator exactly as two bare ones do — LR-017's measured shape, and LR-040's and
+       LR-046's. The argued reachability path is therefore not only "the Sentinel StatefulSet
+       was replaced": **the denominator is composed of precisely the failure modes this
+       ledger is made of.** One floor closes both, because monitoring ⊆ reachable.
+    2. **The predicate was NON-MONOTONE in evidence, which is what makes it indefensible
+       rather than merely unlucky.** Two peers still naming a master of **ours** REFUSE the
+       verdict (clause 3 — `IsOurs`). The same two peers saying **nothing** — strictly less
+       evidence, same instance, same stranger — ARMED it. The partial capture the design
+       explicitly refuses (*"partial capture: one Sentinel still on a master of ours"*, a row
+       that has been in `TestPlanForsakenIsNameAgnostic` all along) is the **stronger**
+       evidential state of the two. Asserted side by side as rows 1-3 of the new table, so
+       the property is executable rather than argued.
+
+- **The fix: one clause and one constant.** Clause 1 asks `monitoring >= forsakenMonitoringFloor`
+  instead of `monitoring != 0`, where `forsakenMonitoringFloor = int(sentinelProcessReplicas)/2 + 1`
+  — a majority of the Sentinels the operator **deploys**. That is **LR-013's gate arriving
+  here**: Rule D's wholeness clause is `reachableRedis == SentinelRedisReplicas`, i.e. it
+  already keys its denominator on the expected pod count rather than on the gather. `planForsaken`
+  never got that, and it is the one verdict in the tree whose consequence is destructive.
+- **Why NOT `spec.sentinel.quorum`, although the three siblings use it.** The field carries no
+  `Minimum` (`littlered_types.go:444-447`), so `quorum: 1` is representable and would make the
+  floor vacuous — **a guard defeated by a user setting, which is LR-050's rejected shape one
+  field over**. `sentinelProcessReplicas` is fixed at three (sentinel HA is not horizontally
+  scalable), so the majority is config-independent, and at every default the two coincide at 2.
+  The field is deliberately left alone: tightening a shipped API surface is its own decision and
+  the floor does not read it.
+- **Why a CONSTANT and not a parameter, deliberately against LR-041.** That rule — *put
+  mandatory values in the signature, because a required value held as construction state has no
+  enforcement* — guards against a **call site forgetting one**. Here the forgotten value's zero
+  **is the defect**, and there is no per-instance value to thread; a constant cannot be
+  zero-valued by omission. The tests vary the number of monitoring Sentinels in the fixture,
+  which is the input that should be varying anyway.
+- **Why a CLAUSE and not an arming-only gate like LR-050's `rolling`.** That gate names a fact
+  about our own churn, and it is arming-only because the call site's `default` branch calls
+  `clearForsaken`, so a naive "no verdict while rolling" retracts a real capture. A floor names
+  something different — **how much evidence we have** — and LR-044's whole lifecycle rests on
+  the verdict self-clearing once the evidence is gone. So when a monitoring majority is no
+  longer visible the operator stops asserting, exactly as every other clause does. The one
+  consequence to accept: a verdict held at `HoldDataPresent`/`HoldDataUnknown` whose Sentinels
+  drop below the floor now clears. An **armed quarantine is untouched** — `planQuarantine`'s
+  armed branch is decided from `status.quarantinedSince` alone and the call-site switch takes
+  `ScaleToZero` first.
+- **The failure direction is LR-047's, not LR-043's, and the diagnosis is not lost.**
+  Withholding a verdict from a genuine capture costs the **captor** its automated cleanup and
+  leaves the victim loudly `Ready=False` — bounded and non-destructive — and the capture is
+  **still reported**, because `lrctl verify`'s `DetectCrossInstance` has **no floor and must
+  keep none**: LR-039 built it to fire on a *partial* capture, before a full takeover, and it
+  only reports. That is the principle worth carrying: **a floorless diagnostic and a floored
+  verdict, because only one of them deletes pods.** Admitting a false verdict is unrecoverable
+  by construction — pillar 3.15's invariant is that `status.quarantinedSince` is the sole
+  authority on scale-to-zero from the moment it is set, so the arming pass is the only moment
+  any evidence is ever weighed.
+- **The cost side was measured before this fix existed, which is what makes the trade decidable
+  without a new run.** Every capture on record is unanimous across all three of the victim's
+  Sentinels: the field incident (LR-039, *"in the field all three Sentinels were captured via
+  epoch gossip"*), LR-044's M4a twice, and the e2e helper, which **asserts exactly that** as a
+  precondition before any spec proceeds (`test/e2e/sentinel_quarantine_test.go:335-344`). So a
+  refusal that bites only below two monitoring Sentinels has no observed true positive to lose.
+  The *benefit* side needs no experiment at all: it is a refusal.
+- **E2E: a new tier, and it has an HONEST RED — which the three tiers ADR-016 shipped do not.**
+  Before it, nothing in `test/e2e` exercised this decision: only two tiers arm a verdict at all
+  (`Sentinel Forsaken-Gated Quarantine > Full cycle` and `> Latched after the attempt budget is
+  spent`; `> A victim pod holding data the captor does not have` was re-scoped by LR-054 to
+  assert that no verdict arms, and `Sentinel Master Name Rename Under Capture` is **skipped**,
+  also on LR-054) — and both stage all three Sentinels, so they would pass against a **unanimity**
+  floor too, i.e. against the one mutant with a real cost. They are positive controls against an
+  absurd floor, not coverage of this decision.
+  New tier `> A capture reported by ONE Sentinel while its peers are bare`
+  (`test/e2e/sentinel_quarantine_test.go`), and the staging is the interesting part because each
+  step is forced: **the operator is paused across the injection** (with it running, LR-008's
+  divergent-master correction repoints a lone captured Sentinel sub-second — LR-041 observed
+  exactly that, so the state under test would never exist); **the two peers are made bare by
+  deleting their pods**, which is what a Sentinel StatefulSet rollout does on EmptyDir (pillar
+  3.7) rather than a synthetic state; and the **victim's Redis pods must follow the foreign
+  master first**, which is clause 4 and is *also* what makes the fixture stable once the operator
+  returns — with one Sentinel on a stranger and two bare, `DetermineRealMaster` finds no majority
+  and its Redis-only fallback finds no master of ours, so `RealMasterIP` stays `""` and **Rule 0,
+  which would otherwise re-register the bare peers within a pass, is gated on it**. The tier also
+  asserts the victim's Redis StatefulSet is 3/3 Ready, which is the **LR-054 discriminator**:
+  without it a not-Ready victim would have the verdict withheld by LR-050's rollout gate and the
+  tier would be green for somebody else's defect.
+- **Live verification (t3e, 2026-09-04).** **RED against the deployed pre-fix operator
+  `112989f`** — every staging step passed and the failure landed on the intended assertion at
+  **39.4s** of the `Consistently` (one `forsakenCooldown` plus a pass):
+
+      a capture verdict was armed on ONE Sentinel's word (reason "Quarantined")
+
+  **GREEN against the fixed image** (`1 Passed | 0 Failed`, 235s), and then the whole Describe on
+  the fixed build — **`Ran 4 of 136 Specs in 995.5s … 4 Passed | 0 Failed`** — which is the
+  over-suppression check the pure seams cannot make: the full cycle still arms, quarantines, lets
+  the captor heal and re-bootstraps the victim; `Latched` still latches; the data-present refusal
+  still refuses.
+- **This materially strengthens the entry's own "ARGUED, NOT OBSERVED".** The state is not merely
+  constructible in a fixture — it was **built on a live cluster out of ordinary primitives** (one
+  injected hello plus two Sentinel pod deletions), it **held stable** rather than being repaired
+  by the loop, for the structural reason above, and the shipped operator **armed a destructive
+  verdict on it in under 40 seconds**. What is still not observed is a *spontaneous* arrival of
+  the state — i.e. how a not-ours, not-flagged-down address comes to be monitored by the
+  surviving Sentinel without an injection. That gap is unchanged, and it does not gate a refusal.
+- **Alternatives rejected.** **Treating a bare peer as disagreement (a veto)** — more
+  conservative and wrong: an ordinary Sentinel roll would suppress a *real* capture verdict,
+  and every observed capture is unanimous, so it costs the mechanism its trigger for nothing.
+  **A majority of *reachable* Sentinels** (`SentinelsMonitorGhostMaster`'s shape) — defeated by
+  the same unreachability that creates the defect: two pods blackholing leaves that majority at
+  one. **Lengthening `forsakenCooldown`, or requiring the majority to persist** — a timer, and a
+  margin against `downAfterMilliseconds`; rejected already by LR-050 and ADR-017. **Widening
+  LR-050's rollout gate to watch the Sentinel StatefulSet too** — ADR-020's trap 1 restated: it
+  names a cause (a Sentinel roll) rather than the fact (we cannot see a majority), and closes
+  none of the probe-failure paths in correction 1.
+- **Tests, red-first.** The entry's own committed-skipped repro is **un-skipped and is the
+  headline red**: `planForsaken.Forsaken = true (foreign_master=10.9.9.9) on the word of ONE
+  Sentinel while its two peers are bare`, followed in the same run by
+  `planQuarantine.ScaleToZero = true (phase "Quarantined")`, so the red names the blast radius
+  as well as the verdict. New table `TestACaptureVerdictNeedsAMonitoringMajority` (5 rows) was
+  observed **RED on exactly 2 of 5** — bare peers, and unreachable peers — with the other three
+  green from birth and **disclosed as such**: the monotonicity contrast (row 1, pinned by
+  clause 3, whose own teeth are LR-053's tables) and the two positive controls. Mutation-checked
+  in both directions, **by running them**: an unreachably-high floor (a blanket refusal) fails
+  **15 arming rows across five pre-existing tables** including both new positive controls, and a
+  floor at **unanimity** over the deployed count fails **exactly one row** — *"a MAJORITY naming
+  the stranger, one peer bare: still a verdict"* — which is the row written to pin the floor's
+  value from below, i.e. that one restarted Sentinel must not cost a genuine capture its
+  verdict.
+- **Stop condition (LR-048's K2b) verified: not one existing decision-table row was edited, and
+  not even a call line changed** — the floor is a constant, so `planForsaken`'s signature is
+  untouched. Checked rather than assumed: every arming fixture in `forsaken_plan_test.go` (both
+  tables), `rollout_attribution_gate_test.go` (`k9Shape`) and `owned_ips_test.go` (LR-054's
+  characterisation) already uses three monitoring Sentinels.
+- **Regresses:** nothing on any instance whose Sentinels answer. `forsakenSignature` is private
+  with a single caller, so the blast radius is one function. No gate, cadence, requeue interval,
+  status field, condition, event, RBAC or Redis round trip changed; LR-050's `rolling` gate, the
+  four clauses' content and order, the data clauses, the quarantine lifecycle and marker
+  semantics, `forsakenCooldown`, Rule N (whose G4 already floors on quorum), and Rules 0/D/R/L
+  and the LR-024 recovery are all untouched. Cluster, failover and standalone modes never set
+  `Forsaken` and are not reached.
+- **Sequencing finding, recorded rather than acted on: this adds a second refusal to the same
+  edge as LR-054**, which is open and also blocks arming (for a data-holding victim, via
+  LR-050's readiness-keyed gate). The two are independent — a denominator floor is orthogonal
+  to whatever replaces the readiness clause — but if LR-054 is ever closed by relaxing that
+  gate, **this floor becomes the remaining protection on that path**, and it should be read
+  that way rather than as redundant.
+- **NOT closed:** the **spontaneous** arrival of this state is still unobserved — the live run
+  above staged it deliberately, and what remains unestablished is how a not-ours,
+  not-flagged-down address comes to be monitored by the surviving Sentinel for a full
+  `forsakenCooldown` without an injection. Unchanged by the fix and it does not gate it: the fix
+  is a refusal, and a refusal does not need its trigger to have arrived by itself. The cheap
+  check, if anyone wants that window sized, is a `kubectl rollout restart
+  statefulset/<name>-sentinel` on t3e sampling how long a mixed monitoring/bare quorum persists.
+- **Impacts:** **LR-042** (clause 1 now says what clause 2's text always assumed); **LR-044**
+  (M4a's *"a 1-of-3 injection reads as a transition, not a verdict"* is now unconditionally
+  true); **ADR-016** and `CLAUDE.md` pillar 3.15 (the verdict's evidentiary floor, stated beside
+  the sole-authority invariant that makes a false one unrecoverable); **LR-013** (its
+  deployed-count denominator is the precedent, reused); **LR-050** (its "never a margin against
+  a user-settable value" is why the floor is not keyed on `spec.sentinel.quorum`); **LR-039**
+  (`DetectCrossInstance` stays floorless, deliberately); `BACKLOG.md` (item struck).
 
 ## [LR-057] The Ghost-Master Recovery's Lineage Gate Assumes the Holders Are REPLICAS — Two Live Masters Are Resolved by Discarding One
 - **Date:** 2026-09-01
