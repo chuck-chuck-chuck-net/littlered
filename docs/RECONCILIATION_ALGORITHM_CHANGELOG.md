@@ -4064,9 +4064,21 @@ ADR-020.
   the operator seeds. The tier is therefore **split**: it now asserts exactly what this fix
   delivers (a master, from Rule L's reseed, named in the CR) and a **new sibling tier** stages the
   in-scope ordering — rename first, then force leaderless — and asserts full recovery plus the
-  rename completing. **That sibling has not been run yet**, and it is what would show the half
-  still argued rather than measured: that Rule L acting mid-rename converges the rename rather
-  than fighting it (LR-048's *"the rename completes even out of the wreckage"*).
+  rename completing. It is what would show the half still argued rather than measured: that Rule L
+  acting mid-rename converges the rename rather than fighting it (LR-048's *"the rename completes
+  even out of the wreckage"*).
+  **First run of that sibling FAILED, on a test-staging error worth recording as a lesson rather
+  than as a product finding (t3e, 2026-09-04):** it patched the CR and paused the operator **106 ms
+  later**, so it failed at `phase == Running` exactly like the tier it was written to contrast
+  with. **Patching the CR is not the same as the pod template being updated — the OPERATOR is what
+  applies the StatefulSet**, so pausing it immediately after a patch stages the *old* template and
+  reproduces LR-061 rather than avoiding it. The tier now waits until the Redis StatefulSet's pod
+  template actually carries the new name, and asserts the operation is still pending at that
+  moment, before pausing. That window exists because the acknowledgment waits for both StatefulSets
+  to settle (row 7) and the roll has not finished. **Re-run owed.**
+  It also sharpens why ADR-016's quarantine release is genuinely in scope, which this entry claims:
+  there the operator is *running* throughout, so it applies the renamed template while the instance
+  sits at zero replicas, and the pods come back speaking the new name.
 - **Regresses:** the two authority-assigning rules now run during a declared operation, which is
   what they did before ADR-020 existed — and during the roll itself Rule A's `anyTerminating` still
   suppresses them, so the change is confined to the window *after* the roll with the instance

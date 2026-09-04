@@ -1289,10 +1289,32 @@ var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
 			By("renaming FIRST, so the new name is in the pod template")
 			renameMasterName(inScope, e2eMasterName(testNamespace, inScope))
 
+			// ⚠ AND WAITING FOR THE OPERATOR TO APPLY IT, which is the whole point of
+			// this tier and is where its first version went wrong (2026-09-04):
+			// **patching the CR is not the same as the pod template being updated** —
+			// the OPERATOR is what applies the StatefulSet. That run paused the operator
+			// 106 ms after the patch, so it never reconciled the new name into the
+			// template, the pods came back on the OLD one, and the tier staged exactly
+			// the LR-061 state it exists to avoid (it failed at `phase == Running`,
+			// identically to the sibling tier). Wait for the template, then pause.
+			By("waiting until the operator has baked the new name into the pod template")
+			Eventually(func(g Gomega) {
+				tmpl, terr := utils.Run(exec.Command("kubectl", "get", "statefulset",
+					inScope+"-redis", "-n", testNamespace, "-o", "jsonpath={.spec.template}"))
+				g.Expect(terr).NotTo(HaveOccurred())
+				g.Expect(tmpl).To(ContainSubstring(e2eMasterName(testNamespace, inScope)),
+					"the StatefulSet still carries the previous master name, so pods "+
+						"recreated now would return on the superseded template (LR-061)")
+			}, 3*time.Minute, 2*time.Second).Should(Succeed())
+
+			// The window this tier needs is exactly here: the name is baked, and the
+			// operation is still PENDING because the acknowledgment waits for both
+			// StatefulSets to settle (row 7) and the roll has not finished. Asserted, so
+			// the tier cannot pass by having quietly completed the rename first.
+			Expect(operationCondStatus(inScope)).To(Equal("True"),
+				"the rename must still be pending here, or this tier tests nothing")
+
 			By("then pausing the operator and driving it leaderless")
-			// The operation is pending across the whole window: the rename is patched
-			// but unacknowledged, so `OperationInProgress` is True throughout, which is
-			// the precondition this tier exists to test against.
 			scaleOperator(0)
 			forceLeaderless(inScope)
 			scaleOperator(1)
