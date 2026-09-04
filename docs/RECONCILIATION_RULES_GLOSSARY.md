@@ -253,7 +253,9 @@ LR-049 (bounding) · ADR-020 (classification) · LR-060 (un-suppressed during a 
 
 **Guards**
 
-- `RealMasterIP == ""` — Rule L and the LR-024 recovery are the only rules that run here.
+- `RealMasterIP == ""` — Rule L and the LR-024 recovery are the only rules that run here, and since
+  LR-059 a declared heavy operation does not stand them down: the gate lived on this branch, so its
+  whole domain of effect was the state where they are the only path back to a settled instance.
 - `AllSentinelsBare()` — the discriminator from a *recent master death*, where Sentinels still
   monitor the dead master and can fail over on their own (LR-015).
 - a reachable Sentinel **quorum**.

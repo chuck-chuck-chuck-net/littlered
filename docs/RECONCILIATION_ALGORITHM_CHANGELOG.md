@@ -3736,7 +3736,16 @@ each test.
   AUTHORITY**. It may **propagate** an authority decision already made, and it may **clean up
   debris**. Everything else runs under its normal guards.* In sentinel mode authority is which pod
   the quorum monitors as master, so the suppressed set is exactly **Rule L and the LR-024
-  recovery** — a strict subset of Rule A's. **Rule D is not authority assignment, and that is a
+  recovery** — a strict subset of Rule A's.
+  **⚠ Corrected by LR-059: that set is now EMPTY, and the rule stated here needed a second half.**
+  Because a suppression has no auto-exit (rows 7/9/10 all keep the operation `Running`), the
+  boundary must be **closed under "forever"**: a rule may be stood down only if the instance can
+  still reach a *settled* state with it permanently absent. Rule L fails that — settlement requires
+  a master, and on the leaderless branch Rule L is the only thing that produces one — so
+  suppressing it wedged the instance unboundedly (measured 7m56s). The rule generalized in this
+  entry is therefore the special case of the criterion, not the criterion; and since both
+  suppressed rules require `RealMasterIP == ""`, the gate's whole domain of effect was the state
+  where it wedged. See LR-059. **Rule D is not authority assignment, and that is a
   ledger fact rather than a judgement:** **LR-007 established by incident that `SENTINEL RESET`
   does not change the monitored master IP**, which is precisely why LR-008 had to introduce
   `REMOVE` + `MONITOR`. Rule D is *structurally incapable* of assigning authority.
@@ -3852,7 +3861,8 @@ each test.
   what "unset" means — or they disagree in exactly the population that predates the field.**
 
 - **Regresses:** **Two healing rules now stand down during a declared heavy operation** — Rule L
-  and the LR-024 recovery — which is the one behavioural change this entry can be blamed for, and
+  and the LR-024 recovery (**⚠ reverted by LR-059: nothing is stood down any more**) — which is the
+  one behavioural change this entry can be blamed for, and
   it is close to a no-op against today's behaviour: during a rename a pod is terminating from the
   moment of the edit, so Rule A already returns before both of them, and the suppressed set is a
   strict subset of Rule A's. It is a **hold**, not a skip (above). Nothing else changed: LR-050's
@@ -3892,9 +3902,11 @@ each test.
 
 ## [LR-059] A Pending Heavy Operation on a Leaderless Instance Wedges Forever
 
-**Status: FOUND AND RECORDED, NOT FIXED.** Found by ADR-020's own Phase 6 e2e (T4's release half),
-2026-09-01. Availability, not durability — but unbounded, and reachable by a route `docs/USAGE.md`
-was actively inviting.
+**Status: FIXED 2026-09-04** (unit + envtest green, lint 0 issues; the committed-skipped e2e repro
+is un-skipped, and **not yet run** — see the resolution). Found by ADR-020's own Phase 6 e2e (T4's
+release half), 2026-09-01. Availability, not durability — but unbounded, and reachable by a route
+`docs/USAGE.md` was actively inviting. **Read the resolution block at the end first:** the fix is
+not the narrowing this entry proposed, and the reason is a criterion this entry did not have.
 
 **The loop.** ADR-020 suppresses only the rules that **assign authority**; in sentinel mode that is
 Rule L and the LR-024 recovery. That boundary is correct as a *safety* rule — electing a master on
@@ -3952,6 +3964,123 @@ suppression is vacuous there and could be lifted on that fact — an invariant, 
 trigger), `docs/USAGE.md` (corrected here), LR-058 (the rule it generalized is incomplete).
 **Regresses:** nothing — the wedge requires a pending heavy operation, so it is unreachable before
 ADR-020.
+
+### Resolution (2026-09-04) — the boundary has to be closed under "forever"
+
+- **The criterion, which is the whole fix and is more general than this entry's own framing.**
+  A suppression here has **no auto-exit by design** — rows 7, 9 and 10 of `planOperation` all keep
+  the operation `Running` (`operation_plan.go:300-330`), and a `Stalled` operation is deliberately
+  not auto-exited (ADR-017: a timer is the defect with a delay). So *whatever an operation stands
+  down, it may stand down forever*, and therefore:
+
+      a rule may be stood down by an operation only if the instance can still reach a SETTLED
+      state with that rule PERMANENTLY absent.
+
+  Rule L fails that on the leaderless branch, and the cycle closes on the operation's own
+  completion condition: `instanceStatefulSetsSettled` → `statefulSetRolloutSettled` →
+  **`ReadyReplicas == Replicas`**, while sentinel-mode readiness requires `role:master` or
+  `link:up` (LR-016). No master ⇒ no pod Ready ⇒ never settled ⇒ row 7 withholds the ack ⇒ `Run`
+  stays set ⇒ Rule L stays suppressed.
+  **It is the general form of LR-058's rule**, which was derived from Rule R and stopped at the
+  rules that do not assign authority. Rule L assigns authority *and* is what settlement depends on,
+  so LR-058's rule read as satisfied while an unbounded wedge existed. Three findings, one
+  criterion: LR-058 (Rule R), LR-059 (Rule L), LR-060 (Rule A suppressing Rule R). The taxonomy was
+  never wrong about Rule L — seeding a master genuinely does assign authority. It is the wrong
+  **test**.
+- **The fix is a deletion: the `!operationRunning` gate at `littlered_controller.go:1457` is gone**,
+  so ADR-020's sentinel-mode suppressed set is **empty** and registry v1 suppresses nothing at all.
+  Two facts make that the whole fix rather than a relaxation, and both were checked rather than
+  assumed:
+    1. **The gate's entire domain of effect was the leaderless state.** It was the only consumer of
+       `operationRunning` (grep, one hit) and it sat *inside* `if state.RealMasterIP == ""`, and
+       both suppressed rules require that state by construction. So every pass on which it had any
+       effect was a pass where there was no authority to withhold — only one to establish.
+    2. **A capture cannot widen that domain.** `planForsaken`'s clause 3 (the agreed address is not
+       ours) and clause 4 (no reachable pod of ours is a master) together imply
+       `RealMasterIP == ""`: step 3 of `DetermineRealMaster` requires the agreed address to be in
+       `LiveTopologyIPs`, which is a subset of `OwnedIPs` (LR-053), and step 4's Redis-only
+       fallback requires a reachable `role:master` of ours. A **settled** `Forsaken` verdict and an
+       **armed** quarantine both return above the operation branch. In the one capture state that
+       does reach the gate — `Captured` inside its cooldown — both rules veto themselves anyway
+       (Rule L needs `AllSentinelsBare`, false while the Sentinels monitor the captor; the LR-024
+       recovery needs `!HasHealthyKnownReplica`, and our own live pods sit in the captor's replica
+       list, which is LR-039's own recorded observation). So the refusals move from the operation
+       gate to each rule's own gate chain, which is where they were designed.
+- **What the suppression was reasoned to prevent does not arise for registry v1.** The comment said
+  *"electing a master on evidence the operation is still changing"* — but `masterName` does not
+  decide **which pod** is master, so Rule L has no decision to pre-empt, and `electMaster` /
+  `seedSentinelsWithMaster` issue `MONITOR` under the **desired (new)** name, so Rule L *advances*
+  the rename. LR-048 already recorded exactly that: *"the rename completes even out of the
+  wreckage"*. For auth, the next registry member, the analogous hazard is covered by an
+  **invariant** — LR-051's `unprovablyEmptyVeto` — which is pillar 3.16's own division of labour:
+  operations manage interference, invariants make actions safe.
+- **⚠ The criterion rules on ADR-020's two unwired rows, and one of them fails.** **Failover mode's
+  proposed row fails it**: `planFailover`'s seed/promote is what produces a master, and failover
+  readiness delegates to the sentinel builders (pillar 3.14), so no master ⇒ nothing Ready ⇒ never
+  settles ⇒ the ack is withheld — LR-059 reproduced in a second mode. **Do not wire that row as
+  written.** **Cluster mode's row survives**: cluster readiness is a local `PING`
+  (`buildClusterReadinessProbe`), so pods are Ready without slots and settledness does not depend
+  on Step 0/1/3. That asymmetry is the first thing the criterion bought that the taxonomy could not
+  express.
+- **Alternatives rejected.** *Narrow to "let Rule L run when there are zero data holders"* (this
+  entry's own proposal) — leaves the wedge for the **single-survivor** case, which is the instance
+  holding the only copy and whose promotion is Rule L's no-opt-in safe branch. *Loosen row 7 so the
+  ack does not wait for Ready pods* — trades a measured property (148s of deliberate withholding,
+  observed in M3.1) and hands the exit edge back into LR-050's churn window. *Let `Stalled` lift
+  the suppression* — a timer, after 15m of unbounded wedge. *Condition the declaration on instance
+  health* — derives intent from the world rather than the spec, the LR-050 conflation D1 exists to
+  prevent. *A predicate reading `operationRunning && hasLiveAuthority(state)`* — expresses the rule
+  but is **structurally dead** inside a branch that already implies `!hasLiveAuthority`, which is
+  the smell LR-048 caught in Rule N's G0 and refused to ship.
+- **Tests, red-first.** New envtest pair in `operation_wiring_test.go`
+  (*"ADR-020 an operation never suppresses the rule that establishes authority"*), the sibling of
+  the Describe that pins Rule R and Rule D: three **bare** Sentinels, three parked replicas with no
+  keyspace, `leaderlessSince` pre-set past the cooldown, and both StatefulSets unsettled at
+  `ReadyReplicas: 0` — which is not scenery but the wedge's own mechanism. Observed **RED** on the
+  defect spec with the operation confirmed `Running` as a precondition, and the **control green in
+  the same run** (same fixture, ack matching, no operation), which is what makes the red
+  attributable to the gate rather than to a fixture that never reaches Rule L. Mutation-checked by
+  restoring the gate: it fails **exactly that one spec and nothing else** across the eight ADR-020
+  wiring specs. The fake Sentinel gained a `bare` flag rather than a second fake, and `sawMonitorOf`
+  is unambiguous here because Rule 0's `MONITOR` is gated on `RealMasterIP != ""`.
+- **e2e (t3e, 2026-09-04): the fix is confirmed, and the run found a SECOND cycle underneath it
+  — now LR-061.** The committed-skipped repro was un-skipped and run against the fixed operator.
+  It **still failed**, and where it failed is the finding: on `phase == Running`, *not* on the
+  master assertion, which passed. The CR named both halves of the fix working —
+  `LeaderlessRecovery=False/Reseeded: seeded …-redis-0 as master` and
+  `StaleMasterName=False/Converged` — while the identically-staged control recovered in ~13s. So
+  Rule L ran, which pre-fix it never did (LR-059 measured *zero* leaderless lines).
+  What blocked recovery is unrelated to the suppression: the two Redis pods still on the **old**
+  pod template ask Sentinel for the **old** master name, which Rule N has correctly pruned, so
+  they park forever (`[Startup] Sentinel has no master info. Waiting...`, `redis-cli` refused),
+  never become Ready, and the rolling update that would re-bake them cannot advance
+  (`ready=0 updated=1`, `currentRevision != updateRevision`). The operation reached `Stalled` and,
+  as designed, did not auto-exit. Full record: **LR-061**.
+  **The tier's staging was stronger than this entry's own claim**, which is why the two separate
+  cleanly: it force-deletes the pods *before* patching the name, so they return on the old
+  template — i.e. it stages "rename a degraded instance", which **LR-048 explicitly scopes out**
+  (*"Rule L is the safety net AND the wedge"*). This entry's own documented route, ADR-016's
+  quarantine release, hands the pods back from the **current** template, so they speak the name
+  the operator seeds. The tier is therefore **split**: it now asserts exactly what this fix
+  delivers (a master, from Rule L's reseed, named in the CR) and a **new sibling tier** stages the
+  in-scope ordering — rename first, then force leaderless — and asserts full recovery plus the
+  rename completing. **That sibling has not been run yet**, and it is what would show the half
+  still argued rather than measured: that Rule L acting mid-rename converges the rename rather
+  than fighting it (LR-048's *"the rename completes even out of the wreckage"*).
+- **Regresses:** the two authority-assigning rules now run during a declared operation, which is
+  what they did before ADR-020 existed — and during the roll itself Rule A's `anyTerminating` still
+  suppresses them, so the change is confined to the window *after* the roll with the instance
+  leaderless, which is exactly the wedge. Nothing else: one `if` removed, no planner touched (no
+  existing decision-table row edited, ADR-020's trap 2 intact), no status field, condition, event,
+  cadence, RBAC or Redis round trip changed, and the quarantine/`Forsaken` branches still return
+  above it. M3.1's 311s-vs-162s measurement is untouched — that was the *blanket* return over Rule
+  D and Rule R, and Rule L never featured in it.
+- **Impacts:** **ADR-020** (the boundary gains the closure criterion as its primary test; the
+  sentinel suppressed set becomes empty and the failover row is marked as failing the criterion);
+  `CLAUDE.md` pillar 3.16 and §4; `docs/RECONCILIATION_LOOP_SENTINEL.md` (the branch no longer
+  suppresses); `docs/RECONCILIATION_RULES_GLOSSARY.md`; `docs/USAGE.md` (the quarantine-release
+  warning becomes a statement that it works); **LR-058** (its rule now has a general form);
+  **LR-060** (same family, same criterion); **ADR-016** (the release path that reaches this state).
 
 ---
 
@@ -4271,3 +4400,98 @@ ADR-020.
   justification, arriving at Rule A); **LR-011** / **LR-013** (whose hazard is RESET, which keeps the
   guard); **LR-016** (readiness keys on the same `master_link_status` that holds the ladder);
   `docs/RECONCILIATION_LOOP_SENTINEL.md` (Rule A's scope), `docs/RECONCILIATION_RULES_GLOSSARY.md`.
+
+---
+
+## [LR-061] A Pod on the Pre-Rename Template Waits for a Name Rule N Has Pruned — and the Roll That Would Re-Bake It Cannot Advance
+- **Date:** 2026-09-04
+- **Commit:** (pending)
+- **ID note:** the highest ID visible on **any** branch, local or remote, was LR-060. Allocated
+  with the LR-039 cross-branch loop over every branch, not by reading the tip of one line.
+- **Status: FOUND AND RECORDED, NOT FIXED.** Found by the LR-059 fix's own e2e run, which failed
+  for this reason after LR-059's mechanism was confirmed working. The reproduction is committed as
+  the deliberately-narrowed assertion in that tier plus a comment naming this entry; nothing is
+  skipped, because the tier still has a real red-turned-green guard of its own (see LR-059).
+- **Scope:** sentinel mode, and it is **reachable only on a rename of an instance whose Redis pods
+  cannot become Ready** — which LR-048 already declares out of scope, with a sentence that reads
+  differently now: *"renaming a degraded instance … Rule L is the safety net **and the wedge**"*.
+  This entry is what that wedge actually is.
+
+- **The finding, in one sentence: a Redis pod still on the pre-rename pod template asks Sentinel
+  for the OLD master name, Rule N has correctly pruned that name, so the pod can never start — and
+  because it can never become Ready, the rolling update that would re-bake it with the new name can
+  never advance past it.**
+
+- **Measured on t3e (2026-09-04, operator `lr059-fix`), and every step is a documented decision
+  working as designed:**
+
+      LeaderlessRecovery=False/Reseeded: seeded op-ll-wedge-…-redis-0 as master
+      StaleMasterName=False/Converged: every reachable Sentinel monitors exactly
+        "littlered-e2e.op-ll-wedge-…"
+      Ready=False/PodsNotReady: Redis: 0/3, Sentinels: 3/3, Sentinel-known replicas: 0/2
+      OperationInProgress=True/Stalled: … it is not auto-exited
+
+  | pod | name baked in its spec | state |
+  |---|---|---|
+  | `redis-0` | `get-master-addr-by-name mymaster` | `[Startup] Sentinel has no master info. Waiting...`, `redis-cli ping` → connection refused |
+  | `redis-1` | `get-master-addr-by-name mymaster` | identical |
+  | `redis-2` (replaced after the patch) | `get-master-addr-by-name littlered-e2e.op-ll-wedge-…` | started, told `redis-0` is master, `Error condition on socket for SYNC: Connection refused` |
+
+  StatefulSet: `replicas=3 ready=0 updated=1`, `currentRevision != updateRevision` — the roll
+  replaced the highest ordinal and stopped, because a rolling update advances only as pods become
+  Ready. The identically-staged control instance, with no rename pending, recovered in **~13s**.
+
+- **Mechanism, and note that no component is misbehaving.** Rule N prunes every name that is not
+  the desired one, which is ADR-018's R3 (*"no leftover entry, ever"*) and is exactly what LR-048
+  built. The startup script asks Sentinel for **the name in its own pod spec**, which is right: a
+  pod cannot know a name it was not given, and LR-016 forbids it inferring one. Rule L seeds the
+  **desired** name, which is right too. The rolling update waits for readiness, which is the
+  StatefulSet contract. The defect is in the *composition*: after the prune, a pod on the old
+  template is asking a question nothing will answer, and the only thing that would give it the new
+  question is a roll that its own un-readiness blocks.
+
+- **This is LR-048's own lesson, third instance:** *"a fix that removes a broken mechanism also
+  removes whatever that mechanism was accidentally providing."* Pre-LR-048 the stale `mymaster`
+  entry stayed monitored forever — which is the defect LR-048 exists to fix, and which was
+  *accidentally* what let an old-template pod boot during a rename. LR-048 → LR-050 was the first
+  pair (the stale entry was also what made the outgoing master hand over instantly); this is the
+  same removal biting a second dependent. The pattern is worth stating as a habit: **when a fix
+  deletes a piece of state, enumerate who was reading it, including readers that are not part of
+  the mechanism being fixed** — here, a pod's own startup script.
+
+- **Why the ordinary rename does not hit it, which is also the bound on severity.** On a healthy
+  instance every pod is Ready, so the roll advances one ordinal at a time and each replacement
+  carries the new name; the two-name window LR-048 measured is exactly that roll. The wedge needs a
+  pod that is **both** not-Ready **and** on the superseded revision, i.e. a rename issued against
+  an instance that is already degraded — LR-048's out-of-scope case. It is **availability, not
+  durability**: on the observed path the instance is empty by construction (Rule L's no-data
+  reseed), and an instance that *did* hold data is protected by Rule L's own ≥2-holder refusal.
+- **It is loud, and it still needs a human.** `Ready=False/PodsNotReady`, and the operation reaches
+  `OperationInProgress=True/Stalled` — correctly, since ADR-017 forbids the auto-exit timer. The
+  manual escape is one command: **delete the parked pods**, and the StatefulSet re-creates them from
+  the *current* template, with the new name, at which point Rule L's seed is visible to them.
+
+- **Candidate fix, NOT proposed here, and the precedent is exact.** That manual escape is
+  LR-023's shape: recycle a pod that is **not-Ready per the kubelet** *and* on a **superseded
+  revision**, after a cooldown, so its StatefulSet re-creates it from the current template. The
+  data-safety argument is already made in this repo — a not-Ready redis in a pure in-memory
+  instance holds no data, and the kubelet's readiness is the blackhole-proof signal (LR-023, not
+  the operator's dial, LR-017). What still needs deciding, and why this is not a patch: whether the
+  discriminator is "old revision + not Ready" or something narrower (a pod whose *baked master
+  name* differs from the desired one is the most direct statement of the fault, and the operator
+  can read that from the pod spec without inferring anything); whether it belongs to Rule N, to a
+  new rule, or to the rollout gate; and how it interacts with ADR-017's cluster-mode partition
+  discipline, which deliberately never releases a pod on a timer. Recorded as a decision.
+- **Also worth ruling on separately:** whether `redis-2`'s shape — a *new*-template pod told to
+  replicate from a pod that will never start — should instead have started **bare** under ADR-002's
+  bounded-ping rule (pillar 3.8: after ~18s unreachable, start with no `--replicaof` so Sentinel
+  discovers a live replica). It did not, and if it had, the instance would have had a serving pod
+  under the new name. That may be correct as-is (it was told a *specific* master by Sentinel rather
+  than by its own guess) or it may be the cheaper half of the fix; it was not investigated.
+
+- **Regresses:** nothing — no production code changed in this entry.
+- **Impacts:** **LR-048** (its out-of-scope sentence now has a named mechanism, and its lesson gets
+  a third instance); **LR-059** (found by its e2e; the tier is split rather than left asserting a
+  state that cannot be reached); **ADR-018** (Rule N's prune is the removal this composes with);
+  **ADR-016** (the quarantine release is *not* affected — it returns pods on the current template);
+  **LR-023** (the precedent for the candidate fix); `BACKLOG.md`.

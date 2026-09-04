@@ -542,15 +542,15 @@ at zero Redis and zero Sentinel pods while the capture is resolved. With no pods
 to perform a heavy change on, so a pending rename is **recorded and held**, not run — the operator
 reports it rather than silently dropping it.
 
-> **⚠ It is NOT reliably picked up when the quarantine releases — LR-059.** The release hands the
-> pods back **empty and leaderless**, and recovering from that is Rule L's job — which a pending
-> operation stands down, because Rule L assigns authority. The pods then park in the wait-loop, never
-> become Ready, the StatefulSets never settle, and the acknowledgment that would end the operation
-> never lands. **Measured: wedged 7m56s and still going, against 74s to recover with no rename
-> pending, and 84s once the rename was reverted.** It is loud (`OperationInProgress` stays `Running`)
-> but it does not reach `Stalled` for 15 minutes, and `Stalled` has no auto-exit either. **If you hit
-> this, revert the `masterName` edit** — that clears the pending operation and lets Rule L recover
-> the instance; re-apply the rename once it is serving. Recorded, not yet fixed.
+> **It IS picked up when the quarantine releases (fixed in LR-059).** The release hands the pods
+> back **empty and leaderless**, and recovering from that is Rule L's job. Until LR-059, a pending
+> operation stood Rule L down for assigning authority, and that wedged the instance: the pods parked
+> in the wait-loop, never became Ready, the StatefulSets never settled, and the acknowledgment that
+> would end the operation never landed — **measured wedged 7m56s and still going**, against 74s to
+> recover with no rename pending. A declared operation now stands **no** rule down, so the release
+> recovers on Rule L's ordinary path and the rename is acknowledged once the instance settles. If you
+> are running an older build, the workaround is to **revert the `masterName` edit**, let Rule L
+> recover, then re-apply it.
 
 Do not try to rename your way out of a capture; the remedy order is
 **capture → let the quarantine finish → then rename**.

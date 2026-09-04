@@ -197,17 +197,51 @@ Exclusivity runs both ways, and the boundary is:
 > **During a heavy operation the operator does not ASSIGN AUTHORITY.** It may *propagate* an
 > authority decision already made, and it may *clean up debris*. Everything else runs under its
 > normal guards.
+>
+> **And the boundary is closed under "forever" (LR-059):** a rule may be stood down by an
+> operation only if the instance can still reach a **settled** state with that rule
+> **permanently absent**.
+
+**The second clause is the test; the first is the taxonomy that explains it per mode.** That
+ordering is a correction, and it is the whole of LR-059. A suppression here has **no auto-exit by
+design** — rows 7, 9 and 10 all keep the operation `Running`, and a `Stalled` operation is
+deliberately not auto-exited (ADR-017: a timer is the defect with a delay) — so *whatever an
+operation stands down, it may stand down forever*. A rule whose absence blocks settlement therefore
+blocks its own release. The taxonomy cannot see that property: it asks what a rule *does*, and this
+asks what the instance can still **reach** without it.
+
+It is also the general form of LR-058's rule (*"an operation must never suppress the healing its own
+completion condition depends on"*), which was derived from Rule R and stopped at the rules that do
+not assign authority. Rule L assigns authority **and** is what settlement depends on when there is
+no master, so the earlier rule read as satisfied while the wedge existed. Three findings, one
+criterion: LR-058 (Rule R), LR-059 (Rule L), LR-060 (Rule A suppressing Rule R).
 
 **Assigning authority** means creating a new fact about who holds data — which pod is master, or
 which node owns a slot range. **Propagating** means making reality match a decision that already
 exists. What "authority" is differs per mode, and naming it per mode is what makes the rule usable:
 
-| mode | authority is | suppressed — assigns it | still runs — propagates or cleans |
-|---|---|---|---|
-| **standalone** | nothing: one pod, no authority exists | *(empty by construction)* | — |
-| **sentinel** | which pod the quorum monitors as master | **Rule L** (seed / promote / force-elect), **the LR-024 recovery** (elect a survivor) | Rule 0, Rule D, Rule R, the LR-005/LR-008 correction |
-| **failover** | which pod the operator stamps as master | `planFailover`'s seed / promote / unsafe-elect | the straggler repoint, the outgoing-master fence |
-| **cluster** | which node owns a slot range | Step 0/1 `CLUSTER FAILOVER TAKEOVER`, Step 3 missing-slot assignment, Step 3b's destination choice | `MEET`, `FORGET`, `REPLICATE`, the shard-aware reattach |
+| mode | authority is | assigns it | suppressed, i.e. also closed under "forever" | still runs |
+|---|---|---|---|---|
+| **standalone** | nothing: one pod, no authority exists | *(empty by construction)* | *(empty)* | — |
+| **sentinel** | which pod the quorum monitors as master | **Rule L** (seed / promote / force-elect), **the LR-024 recovery** (elect a survivor) | **NOTHING — empty, LR-059.** Both assigning rules require `RealMasterIP == ""`, so suppressing them can only ever bite where the instance has no master to protect and cannot settle without them | Rule 0, Rule D, Rule R, the LR-005/LR-008 correction, **and both assigning rules under their own gates** |
+| **failover** | which pod the operator stamps as master | `planFailover`'s seed / promote / unsafe-elect | **FAILS the criterion — do not wire as written.** Readiness delegates to the sentinel builders (pillar 3.14), so with no master nothing is Ready, nothing settles, and the ack is withheld: LR-059 in a second mode | the straggler repoint, the outgoing-master fence |
+| **cluster** | which node owns a slot range | Step 0/1 `CLUSTER FAILOVER TAKEOVER`, Step 3 missing-slot assignment, Step 3b's destination choice | **survives the criterion** — cluster readiness is a local `PING`, so pods are Ready without slots and settledness does not depend on these | `MEET`, `FORGET`, `REPLICATE`, the shard-aware reattach |
+
+**Read the two suppression columns as a pair.** *Assigns authority* is necessary and is not
+sufficient: the third column is the taxonomy, the fourth is what may actually be stood down. In
+sentinel mode — the only mode wired — the fourth column is **empty**, so registry v1 suppresses
+nothing at all, and the refusals it was reaching for live where they belong: in each rule's own
+gate chain (Rule L's holder count and `AllSentinelsBare`, the LR-024 recovery's
+`!HasHealthyKnownReplica` and lineage/fork gates, LR-051's `unprovablyEmptyVeto`, LR-057's
+`holdersForked`). The mechanism's other three halves — declaration, serialization at admission, and
+acknowledgment on completion — are untouched by that and are where its value was anyway.
+
+**A capture cannot widen the sentinel domain, checked rather than assumed:** `planForsaken`'s
+clauses 3 and 4 imply `RealMasterIP == ""` (the agreed address is not ours, so `DetermineRealMaster`
+step 3 cannot match it since `LiveTopologyIPs ⊆ OwnedIPs`; and no reachable pod of ours is a master,
+so step 4's fallback finds nothing), a settled `Forsaken` verdict and an armed quarantine both
+return above the operation branch, and in the one capture state that does reach it — `Captured`
+inside its cooldown — both rules veto themselves anyway.
 
 > **⚠ D6 originally said "regular healing does not run during a heavy operation", and measurement
 > proved that wrong. Corrected 2026-08-30.** The first build suppressed everything Rule A skips, on
@@ -258,8 +292,10 @@ The short list of what still runs, enumerated deliberately rather than discovere
   suppression is deliberate and hoisting them earlier is not: those guards exist for their own
   reasons, and moving the rules ahead of Rule A would change behaviour far beyond this feature.
 
-Suppressed: **Rule L and the LR-024 recovery** — the two sentinel-mode rules that assign authority,
-a strict subset of Rule A's set.
+Suppressed, as shipped: **nothing** (LR-059). Rule L and the LR-024 recovery are the two
+sentinel-mode rules that assign authority, and they were suppressed for it until the closure
+criterion above showed the gate could only ever bite where it wedged the instance. They now run
+under their own gates, which is where the refusals belong.
 
 > **Cross-reference (2026-09-03, LR-060): this ADR's vocabulary is now applied to Rule A itself.**
 > The classification above — *assigns authority* vs *propagates one* vs *cleans up debris* — was
@@ -271,6 +307,10 @@ a strict subset of Rule A's set.
 > depends on* — with **Rule A** in the operation's place, and it is the third instance of the
 > family after LR-058's own Rule R finding and LR-059. The partition lands as an amendment to
 > **ADR-003**, which owns Rule A; nothing in this ADR changes. Measured record: **LR-060**.
+
+**⚠ The HOLD-not-skip paragraph below is now MOOT for registry v1 and is kept because it is the
+contract any future suppression inherits** (and because its marker reasoning is what makes a
+suppression survivable at all). With the sentinel set empty, no clock is held by an operation today.
 
 **Suppressing Rule L and LR-024 is a HOLD, not a skip — stated precisely, because the first draft
 overclaimed it.** A clock that has *already started* is **never reset** by the suppression (LR-038:

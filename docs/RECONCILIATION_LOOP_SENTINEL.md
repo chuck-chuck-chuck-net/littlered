@@ -76,9 +76,9 @@ graph TD
         RuleN --> Operation
 
         Operation{"Declared heavy operation running?<br/><i>planOperation — ADR-020</i>"}
-        Operation -- Yes --> SuppressAuthority["Report it; the two AUTHORITY-ASSIGNING rules<br/>stand down: Rule L and the LR-024 recovery<br/><i>HELD, not skipped — their cooldowns keep<br/>their elapsed time</i>"]
+        Operation -- Yes --> ReportOperation["Report it — and stand NO rule down<br/><i>ADR-020's suppressed set is empty since LR-059:</i><br/><i>a rule may be suppressed only if the instance can<br/>still SETTLE without it, and the two<br/>authority-assigning rules are what settle<br/>a leaderless one</i>"]
         Operation -- No --> RuleA
-        SuppressAuthority --> RuleA
+        ReportOperation --> RuleA
 
         RuleA{"Rule A: Guardrails<br/>Any terminating pods?<br/>Failover active?"}
         RuleA -- Yes --> SkipAll["Skip all healing<br/><i>Let Sentinel/K8s finish</i>"]
