@@ -195,23 +195,16 @@ func asReplicaKnown(s *redisclient.ReplicationState, sentinelIP string, replicas
 // StatefulSet, so a Sentinel-side replacement leaves it off. That is the shape this
 // fixture is: Redis settled, Sentinels part-way back.
 func TestACaptureVerdictIsNeverCarriedByASingleSentinel(t *testing.T) {
-	// ⚠ BLOCKED ON LR-056 — SKIPPED DELIBERATELY, DO NOT "FIX" BY INVERTING.
+	// UN-SKIPPED with the LR-056 fix. It was committed skipped because it asserts what
+	// the operator SHOULD do, and inverting it into a characterisation would have
+	// pinned a verdict that deletes an instance on one Sentinel's word.
 	//
-	// Everything below is written as the assertion the operator SHOULD satisfy, and
-	// it fails against this build. Do not rewrite it into a characterisation of the
-	// current verdict: that would assert the defect is correct and would have to be
-	// un-written again by whoever fixes it, which is how a defect acquires a test
-	// defending it. The failure is real, reproducible from the fixture in this
-	// function alone, and recorded in full in LR-056.
-	//
-	// The fix is a data-safety change to a shipped planner (`planForsaken` gates
-	// ADR-016's scale-to-zero) and it predates the work this file was written for, so
-	// it gets its own pass rather than a tail-end of a test milestone.
-	//
-	// UN-SKIP AS PART OF THE LR-056 FIX, not before.
-	t.Skip("blocked on LR-056: planForsaken has no quorum floor, so with its peers bare " +
-		"a single Sentinel's word arms a capture verdict that deletes the instance; " +
-		"un-skip with the LR-056 fix")
+	// The floor the fix adds is derived from the DEPLOYED Sentinel count
+	// (sentinelProcessReplicas, fixed at three) rather than from spec.sentinel.quorum,
+	// which carries no Minimum and could be set to 1 — LR-050's "never a margin
+	// against a user-settable value", applied to a denominator rather than to a timer.
+	// The floor's own table, including what it must NOT suppress, is
+	// TestACaptureVerdictNeedsAMonitoringMajority.
 
 	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
 	armed := metav1.NewTime(now.Add(-2 * forsakenCooldown))
@@ -277,6 +270,123 @@ func TestACaptureVerdictIsNeverCarriedByASingleSentinel(t *testing.T) {
 
 func podNameAt(i int) string {
 	return []string{authVetoRedis0, authVetoRedis1, authVetoRedis2}[i]
+}
+
+// TestACaptureVerdictNeedsAMonitoringMajority is the LR-056 floor's own table, and it
+// exists to pin the fix from BOTH sides: what it must suppress, and what it must not.
+//
+// THE DEFECT, stated as a property rather than as one fixture. Clause 1 asked
+// `monitoring != 0` and both of the loop's `continue`s — unreachable at the top,
+// no-observations below it — drop a Sentinel from the DENOMINATOR rather than merely
+// from the vote. A unanimity test whose denominator shrinks with the number of
+// speakers degrades into an existence test.
+//
+// THE SHARPEST WAY TO SEE IT is that the predicate was NON-MONOTONE in evidence, which
+// rows 1-3 assert side by side on one address. Two peers that still name a master of
+// OURS refuse the verdict (clause 3). The same two peers saying NOTHING — strictly less
+// evidence, from the same instance, about the same stranger — armed it. More evidence
+// refused; less evidence deleted the instance.
+//
+// AND THE TRIGGER SET IS WIDER THAN LR-056'S OWN WRITE-UP, which frames it on bare
+// Sentinels (the state a Sentinel-StatefulSet replacement leaves, since Sentinel storage
+// is EmptyDir). Row 3 is the other half: GetSentinelState maps any probe error other
+// than a genuine name-miss to Reachable:false, so two blackholing or timing-out
+// Sentinels — LR-017's measured shape, and LR-040/LR-046's — collapse the denominator
+// exactly as bareness does. One floor closes both, because monitoring ⊆ reachable.
+//
+// WHAT THE FLOOR MUST NOT DO is suppress the capture this mechanism exists for. Every
+// capture on record is unanimous across all three of the victim's Sentinels — the field
+// incident (LR-039), LR-044's M4a twice, and the e2e helper, which asserts exactly that
+// as a precondition before any spec proceeds — so rows 4 and 5 are the positive controls
+// and row 5 additionally pins the floor's VALUE from below: a majority is two, so one
+// restarted Sentinel must not cost a real capture its verdict.
+func TestACaptureVerdictNeedsAMonitoringMajority(t *testing.T) {
+	now := time.Date(2026, 8, 31, 12, 0, 0, 0, time.UTC)
+	armed := metav1.NewTime(now.Add(-2 * forsakenCooldown))
+
+	// Every fixture below is the same instance in the same predicament: no pod of ours
+	// is a master any more, and sentinel-0 names a stranger that is answering. The ONLY
+	// thing that varies is what its two peers have to say.
+	fleet := func(peers func(s *redisclient.ReplicationState)) *redisclient.ReplicationState {
+		s := asFleet()
+		asMonitoring(s, asSent0, asStranger)
+		peers(s)
+		for i, ip := range []string{asRedis0, asRedis1, asRedis2} {
+			asRedisNode(s, ip, podNameAt(i), asNode{role: roleSlave, reachable: true})
+		}
+		return s
+	}
+
+	cases := []struct {
+		name         string
+		peers        func(s *redisclient.ReplicationState)
+		wantForsaken bool
+	}{
+		{
+			// The monotonicity contrast, and the row that makes rows 2 and 3
+			// indefensible rather than merely unfortunate. Green from birth: clause 3
+			// already refuses here, because the agreed address would be one of ours.
+			name: "peers still naming a master of OURS: refused, on MORE evidence",
+			peers: func(s *redisclient.ReplicationState) {
+				asMonitoring(s, asSent1, asRedis0)
+				asMonitoring(s, asSent2, asRedis0)
+			},
+			wantForsaken: false,
+		},
+		{
+			// THE DEFECT. Strictly less evidence than row 1, same stranger.
+			name: "peers BARE: strictly LESS evidence, and it must not become a verdict",
+			peers: func(s *redisclient.ReplicationState) {
+				asBare(s, asSent1)
+				asBare(s, asSent2)
+			},
+			wantForsaken: false,
+		},
+		{
+			// The same collapse through the other `continue`. Not in LR-056's write-up.
+			name: "peers UNREACHABLE: a probe failure must not carry a verdict either",
+			peers: func(s *redisclient.ReplicationState) {
+				withSentinel(s, asSent1, false, false, "", "")
+				withSentinel(s, asSent2, false, false, "", "")
+			},
+			wantForsaken: false,
+		},
+		{
+			// Positive control: the observed capture shape must still arm, or the floor
+			// is a blanket refusal and this whole table passes vacuously.
+			name: "all three naming the stranger: the capture every incident recorded",
+			peers: func(s *redisclient.ReplicationState) {
+				asMonitoring(s, asSent1, asStranger)
+				asMonitoring(s, asSent2, asStranger)
+			},
+			wantForsaken: true,
+		},
+		{
+			// The floor's value, pinned from below. A majority of three is two, so one
+			// Sentinel that has just restarted bare must not cost a genuine capture its
+			// verdict — the quarantine is what heals the CAPTOR, and a floor set at
+			// unanimity would withhold it for the duration of any Sentinel roll.
+			// Green from birth; the mutation is to demand all three.
+			name: "a MAJORITY naming the stranger, one peer bare: still a verdict",
+			peers: func(s *redisclient.ReplicationState) {
+				asMonitoring(s, asSent1, asStranger)
+				asBare(s, asSent2)
+			},
+			wantForsaken: true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := planForsaken(fleet(tc.peers), &armed, now, false)
+			if got.Forsaken != tc.wantForsaken {
+				t.Errorf("planForsaken.Forsaken = %v (captured=%v foreign_master=%q), want %v: "+
+					"the verdict deletes the instance, so it must rest on a majority of the "+
+					"Sentinels we DEPLOYED, not on however many of them happened to answer",
+					got.Forsaken, got.Captured, got.ForeignMaster, tc.wantForsaken)
+			}
+		})
+	}
 }
 
 // ---------------------------------------------------------------------------

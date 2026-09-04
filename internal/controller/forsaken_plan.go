@@ -31,6 +31,52 @@ import (
 // never produce the signature below. What it covers is a bad read.
 const forsakenCooldown = 30 * time.Second
 
+// forsakenMonitoringFloor is the minimum number of reachable, MONITORING Sentinels
+// whose agreement may carry a capture verdict (LR-056).
+//
+// Clause 2 is documented as unanimity, and LR-044's live procedure states the
+// consequence it relied on: an injection had to hit ALL THREE of the victim's
+// Sentinels, because "a 1-of-3 injection reads as a transition, not a verdict". That
+// is true only while all three are monitoring, and nothing checked it. Both of
+// forsakenSignature's `continue`s — unreachable, and no observations — drop a Sentinel
+// from the DENOMINATOR rather than from the vote alone, so "everyone who spoke agrees"
+// degrades to "someone spoke" as the speakers fall silent. With two peers bare, one
+// Sentinel's word armed a verdict that takes both StatefulSets to zero on EmptyDir.
+//
+// The predicate was thereby NON-MONOTONE in evidence, which is what makes it
+// indefensible rather than merely unlucky: two peers still naming a master of ours
+// REFUSE the verdict (clause 3), while the same two peers saying nothing — strictly
+// less evidence, same stranger — armed it.
+//
+// The denominator has to come from what we DEPLOYED rather than from what answered,
+// which is LR-013's gate for Rule D arriving here: `reachableRedis ==
+// SentinelRedisReplicas`. Hence sentinelProcessReplicas, which is fixed at three
+// (sentinel HA is not horizontally scalable), and NOT spec.sentinel.quorum:
+//
+//   - `quorum` carries no Minimum, so `quorum: 1` is representable and would make this
+//     floor vacuous — a guard defeated by a user setting, which is LR-050's rejected
+//     shape one field over. At every default the two coincide at 2.
+//   - It is a constant rather than a parameter, deliberately against LR-041's "put
+//     mandatory values in the signature". That rule guards against a call site
+//     forgetting one — and here the forgotten value's zero IS the defect, while there
+//     is no per-instance value to thread. A constant cannot be zero-valued by omission.
+//
+// The floor is a CLAUSE, not an arming-only gate like LR-050's `rolling`. That gate
+// names a fact about our own churn; this names how much evidence we have, and LR-044's
+// lifecycle rests on the verdict self-clearing once the evidence is gone. So when a
+// monitoring majority is no longer visible the operator stops asserting, exactly as
+// every other clause does.
+//
+// The failure direction is chosen and it is LR-047's, not LR-043's. Withholding a
+// verdict from a genuine capture costs the CAPTOR its automated cleanup and leaves the
+// victim loudly `Ready=False` — bounded, non-destructive, and still diagnosed, because
+// `lrctl verify`'s DetectCrossInstance deliberately has no floor (LR-039 built it to
+// fire on a PARTIAL capture). Admitting a false one deletes six pods on EmptyDir, and
+// pillar 3.15 makes that unrecoverable: `status.quarantinedSince` is the sole authority
+// on scale-to-zero from the moment it is set, so the arming pass is the only moment any
+// evidence is ever weighed.
+const forsakenMonitoringFloor = int(sentinelProcessReplicas)/2 + 1
+
 // forsakenPlan is the verdict on whether this instance has been captured by another
 // Sentinel deployment sharing its master name.
 type forsakenPlan struct {
@@ -204,7 +250,11 @@ func forsakenSignature(state *redisclient.ReplicationState) (bool, string) {
 			}
 		}
 	}
-	if monitoring == 0 { // clause 1
+	// Clause 1, with the LR-056 floor: not "somebody spoke" but "a majority of the
+	// Sentinels we deployed spoke, and agreed". A Sentinel that is unreachable or bare
+	// contributed no observation and is correctly not counted as DISAGREEMENT above —
+	// the defect was letting it also not count as EXISTING.
+	if monitoring < forsakenMonitoringFloor {
 		return false, ""
 	}
 
