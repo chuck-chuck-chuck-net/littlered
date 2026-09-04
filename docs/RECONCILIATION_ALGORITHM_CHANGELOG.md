@@ -4091,6 +4091,12 @@ ADR-020.
   release, which is this entry's documented route. **That path is argued, not verified** — see the
   unverified note in LR-061 — so the honest status of LR-059 is: the suppression defect is fixed
   and proven, and the scenario it was found in needs LR-061 as well.
+- **The guard tier is GREEN inside a full suite (t3e, 2026-09-04): `131 Passed | 0 Failed |
+  6 Skipped` in 2h29m** on operator `d4d7d6c`, so the fix is e2e-verified rather than only
+  envtest-verified: with a rename pending and no master anywhere, Rule L seeds and the CR names it
+  (`LeaderlessRecovery=Reseeded`). The same run is the regression evidence for this change and for
+  LR-056's floor across every mode — one more spec ran than the pre-change soak (130 → 131), which
+  is this entry's repro un-skipped, and nothing that previously passed stopped passing.
 - **Regresses:** the two authority-assigning rules now run during a declared operation, which is
   what they did before ADR-020 existed — and during the roll itself Rule A's `anyTerminating` still
   suppresses them, so the change is confined to the window *after* the roll with the instance
