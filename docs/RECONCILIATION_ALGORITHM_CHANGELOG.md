@@ -4075,10 +4075,22 @@ ADR-020.
   reproduces LR-061 rather than avoiding it. The tier now waits until the Redis StatefulSet's pod
   template actually carries the new name, and asserts the operation is still pending at that
   moment, before pausing. That window exists because the acknowledgment waits for both StatefulSets
-  to settle (row 7) and the roll has not finished. **Re-run owed.**
-  It also sharpens why ADR-016's quarantine release is genuinely in scope, which this entry claims:
-  there the operator is *running* throughout, so it applies the renamed template while the instance
-  sits at zero replicas, and the pods come back speaking the new name.
+  to settle (row 7) and the roll has not finished.
+  **Re-run of the corrected tier ALSO failed, and that one is a product finding, not a staging
+  error (t3e, 2026-09-04).** It cleared both new gates — the template genuinely carried the new
+  name and the operation was still pending — and still never reached `Running`. The revision
+  labels named the reason: `redis-0` on `currentRevision` with the OLD name, `redis-1`/`redis-2` on
+  `updateRevision`. **A rolling update re-bakes ordinal 0 LAST, and Rule L always seeds `redis-0`**,
+  so the recovery target and the last-updated pod are the same pod by construction. **The tier is
+  therefore not stageable as written and is committed SKIPPED naming LR-061** — no ordering
+  available to a test avoids the interlock while a rename is still pending, which it must be.
+  **What this costs THIS entry's fix, stated plainly:** Rule L now runs, which is what LR-059 is
+  about and is measured (`LeaderlessRecovery=Reseeded` in the CR) — and it then seeds a pod that
+  cannot start, so on this path the instance still does not recover. The fix's practical value
+  narrows to paths where the pods are *created* rather than *updated*, i.e. ADR-016's quarantine
+  release, which is this entry's documented route. **That path is argued, not verified** — see the
+  unverified note in LR-061 — so the honest status of LR-059 is: the suppression defect is fixed
+  and proven, and the scenario it was found in needs LR-061 as well.
 - **Regresses:** the two authority-assigning rules now run during a declared operation, which is
   what they did before ADR-020 existed — and during the roll itself Rule A's `anyTerminating` still
   suppresses them, so the change is confined to the window *after* the roll with the instance
@@ -4415,7 +4427,7 @@ ADR-020.
 
 ---
 
-## [LR-061] A Pod on the Pre-Rename Template Waits for a Name Rule N Has Pruned — and the Roll That Would Re-Bake It Cannot Advance
+## [LR-061] Rule L Seeds `redis-0`; a Rolling Update Re-Bakes `redis-0` LAST — so a Leaderless Instance With a Pending Rename Cannot Self-Recover
 - **Date:** 2026-09-04
 - **Commit:** (pending)
 - **ID note:** the highest ID visible on **any** branch, local or remote, was LR-060. Allocated
@@ -4471,13 +4483,36 @@ ADR-020.
   deletes a piece of state, enumerate who was reading it, including readers that are not part of
   the mechanism being fixed** — here, a pod's own startup script.
 
-- **Why the ordinary rename does not hit it, which is also the bound on severity.** On a healthy
-  instance every pod is Ready, so the roll advances one ordinal at a time and each replacement
-  carries the new name; the two-name window LR-048 measured is exactly that roll. The wedge needs a
-  pod that is **both** not-Ready **and** on the superseded revision, i.e. a rename issued against
-  an instance that is already degraded — LR-048's out-of-scope case. It is **availability, not
-  durability**: on the observed path the instance is empty by construction (Rule L's no-data
-  reseed), and an instance that *did* hold data is protected by Rule L's own ≥2-holder refusal.
+- **⚠ THE BOUND FIRST WRITTEN HERE WAS TOO NARROW, and the corrected version is the whole point
+  of this entry (measured t3e, 2026-09-04, second run).** It was framed as needing a pod that
+  happened to be **both** not-Ready **and** on the superseded revision. The revision labels say it
+  is not a coincidence but an **interlock**:
+
+      redis-0  currentRevision   <- still baked with the OLD name
+      redis-1  updateRevision
+      redis-2  updateRevision    (sts: ready=0 updated=2)
+
+  A StatefulSet rolling update re-bakes **ordinal 0 LAST** — it will not update `redis-0` until
+  `redis-1` and `redis-2` are Ready, and they never can be, because they are replicas of
+  `redis-0`. Rule L, meanwhile, **always seeds `redis-0`** (`pickBootstrapMasterIP`). So the
+  recovery target and the last pod to be re-baked are **the same pod, by construction**: the seed
+  lands on the stalest pod every time. The honest statement is therefore
+  **a sentinel instance that goes leaderless while a rename is pending cannot self-recover**, not
+  "a stale pod may be left behind".
+- **Why the ordinary rename does not hit it, which is what is left of the severity bound.** On a
+  healthy instance every pod is Ready, so the roll advances one ordinal at a time and each
+  replacement carries the new name; the two-name window LR-048 measured is exactly that roll. The
+  wedge needs the instance to go **leaderless during the roll** — LR-048's out-of-scope "rename a
+  degraded instance", now with a named mechanism. It is **availability, not durability**: on the
+  observed path the instance is empty by construction (Rule L's no-data reseed), and an instance
+  that *did* hold data is protected by Rule L's own ≥2-holder refusal.
+- **The one path that should escape it, stated as UNVERIFIED because this entry has already been
+  wrong once about StatefulSet revision semantics.** ADR-016's quarantine release scales the
+  instance to zero and back, so every pod is *created* rather than *updated*, and `redis-0` should
+  come back on the update revision with the new name. That is LR-059's documented route and the
+  reason its fix still delivers there. It is cheaply checkable — scale a StatefulSet to 0 and back
+  with a pending template change and read the `controller-revision-hash` labels — and it has not
+  been checked.
 - **It is loud, and it still needs a human.** `Ready=False/PodsNotReady`, and the operation reaches
   `OperationInProgress=True/Stalled` — correctly, since ADR-017 forbids the auto-exit timer. The
   manual escape is one command: **delete the parked pods**, and the StatefulSet re-creates them from
@@ -4494,6 +4529,14 @@ ADR-020.
   can read that from the pod spec without inferring anything); whether it belongs to Rule N, to a
   new rule, or to the rollout gate; and how it interacts with ADR-017's cluster-mode partition
   discipline, which deliberately never releases a pod on a timer. Recorded as a decision.
+  **A second candidate falls straight out of the interlock and may be cheaper: let Rule L SEED A
+  POD THAT CAN ACTUALLY START.** `pickBootstrapMasterIP` hardcodes `redis-0`, which is exactly the
+  pod a rolling update re-bakes last. Preferring a pod whose baked master name matches the desired
+  one — information the operator already has, in the pod spec, with no inference — would make the
+  seed land on `redis-2` in this state and the instance recover on its own. It needs its own
+  ruling: `redis-0` is load-bearing elsewhere (it is the bootstrap master and the no-data reseed
+  target across ADR-005), and changing which pod is seeded is an authority decision, so it is not
+  a patch.
 - **Also worth ruling on separately:** whether `redis-2`'s shape — a *new*-template pod told to
   replicate from a pod that will never start — should instead have started **bare** under ADR-002's
   bounded-ping rule (pillar 3.8: after ~18s unreachable, start with no `--replicaof` so Sentinel

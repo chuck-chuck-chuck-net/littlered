@@ -1276,6 +1276,34 @@ var _ = Describe("Sentinel Declared Operations On A Leaderless Instance",
 		// operation then completes. It carries no LR-061 exposure, because no pod is left
 		// on a superseded template.
 		It("recovers and completes the rename when the pods return on the new template", func() {
+			// ⚠ SKIPPED — BLOCKED ON LR-061, and the reason is why this tier cannot be
+			// staged as written at all. It was added believing the in-scope path was an
+			// ORDERING the test controls: rename first, let the operator bake the new
+			// name into the template, then force leaderless. Two runs on t3e falsified
+			// that, and the second one showed the mechanism (revision labels, 19:32):
+			//
+			//	redis-0  currentRevision  <- still baked with the OLD name
+			//	redis-1  updateRevision
+			//	redis-2  updateRevision
+			//
+			// A StatefulSet rolling update re-bakes ordinal 0 LAST: it will not update
+			// redis-0 until redis-1 and redis-2 are Ready, and they can never be,
+			// because they are replicas of redis-0. Rule L, meanwhile, always seeds
+			// redis-0 (pickBootstrapMasterIP). So the recovery target and the last pod
+			// to be re-baked are THE SAME POD, by construction — the seed lands on the
+			// stalest pod every time, and no ordering available to a test avoids it
+			// while a rename is still pending (which it must be, or this tier tests
+			// nothing).
+			//
+			// The path that does avoid it is the one LR-059 documents and this tier was
+			// standing in for: ADR-016's quarantine release, where the instance goes to
+			// zero replicas and every pod is created fresh. That is a heavier fixture
+			// (it needs a captor) and it belongs with the quarantine tiers rather than
+			// here. UN-SKIP ONLY as part of LR-061, or replace it there.
+			Skip("blocked on LR-061: Rule L seeds redis-0 and a rolling update re-bakes " +
+				"redis-0 last, so a leaderless instance with a pending rename cannot " +
+				"self-recover — no test ordering avoids it; see LR-061")
+
 			By("deploying one instance")
 			cmd := exec.Command("kubectl", "apply", "-f", "-")
 			cmd.Stdin = strings.NewReader(leaderlessCR(inScope))
