@@ -18,8 +18,6 @@ package cmd
 
 import (
 	"encoding/json"
-	"os"
-	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -40,9 +38,6 @@ const (
 
 	// phaseRunning is the CR phase, unrelated to the operation reason of the same value.
 	phaseRunning = "Running"
-
-	// controllerPlanSource is the file the drift guard reads the reason vocabulary from.
-	controllerPlanSource = "../../../internal/controller/operation_plan.go"
 )
 
 func opStatus(reason string, ago time.Duration, pending ...string) *littleredv1alpha1.OperationStatus {
@@ -241,45 +236,13 @@ func TestOperationViewOf(t *testing.T) {
 	}
 }
 
-// TestOperationReasonsMatchController is the drift guard for the one thing lrctl
-// re-implements: the reason vocabulary. The controller's constants are unexported and
-// in a package the CLI does not import, so the shipped binary stays decoupled and the
-// TEST reads the source of truth instead. If a reason is ever renamed there, `verify`
-// would silently stop failing on it — which is precisely the failure this catches.
-//
-// Reported separately: the vocabulary would be better as exported constants on
-// api/v1alpha1 beside ConditionOperationInProgress, which would delete this test.
-func TestOperationReasonsMatchController(t *testing.T) {
-	const src = controllerPlanSource
-	b, err := os.ReadFile(src)
-	if err != nil {
-		t.Fatalf("read %s: %v (has the controller's plan file moved?)", src, err)
-	}
-	re := regexp.MustCompile(`operationReason(\w+)\s*=\s*"([^"]+)"`)
-	found := map[string]string{}
-	for _, m := range re.FindAllStringSubmatch(string(b), -1) {
-		found[m[1]] = m[2]
-	}
-	// Keyed by the controller's identifier SUFFIX, which happens to equal its value for
-	// every reason. If that ever stops being true the length check below still catches a
-	// reason added or removed, and the value check still catches one renamed.
-	want := map[string]string{
-		opReasonConverged:   opReasonConverged,
-		opReasonRunning:     opReasonRunning,
-		opReasonBlocked:     opReasonBlocked,
-		opReasonStalled:     opReasonStalled,
-		opReasonQuarantined: opReasonQuarantined,
-		opReasonSeeded:      opReasonSeeded,
-	}
-	if len(found) != len(want) {
-		t.Errorf("controller declares %d reasons, lrctl mirrors %d: %v", len(found), len(want), found)
-	}
-	for k, v := range want {
-		if found[k] != v {
-			t.Errorf("operationReason%s = %q in the controller, %q in lrctl", k, found[k], v)
-		}
-	}
-}
+// The drift guard that used to live here — TestOperationReasonsMatchController, which
+// READ THE CONTROLLER'S SOURCE with a regexp and asserted the two vocabularies agreed —
+// is deleted, and its own note said why it should be: the vocabulary belongs on
+// api/v1alpha1 beside ConditionOperationInProgress, which both packages already import.
+// It does now, so lrctl no longer mirrors anything and there is nothing left to drift.
+// A test that greps source is a workaround for a design; deleting the workaround by
+// fixing the design is strictly better than keeping the guard honest.
 
 // sentinelLR is a plain, healthy sentinel instance with nothing in flight.
 func sentinelLR() *littleredv1alpha1.LittleRed {

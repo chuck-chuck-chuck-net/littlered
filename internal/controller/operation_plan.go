@@ -31,23 +31,17 @@ import (
 // the other four each name a state in which a declared change exists and is either
 // being carried out or deliberately held.
 const (
-	// operationReasonConverged: every candidate's fingerprint equals its ack. There is
-	// no unfinished work from any spec change.
-	operationReasonConverged = "Converged"
-	// operationReasonRunning: a heavy operation is being carried out this pass.
-	operationReasonRunning = "Running"
-	// operationReasonBlocked: work is pending but cannot proceed — the driver said so,
-	// or a Requires edge holds it. Never auto-skipped (ADR-017).
-	operationReasonBlocked = "Blocked"
-	// operationReasonStalled: the running operation has outlived its StallAfter budget.
-	// This changes what the operator SAYS, never what it does — there is no auto-exit.
-	operationReasonStalled = "Stalled"
-	// operationReasonQuarantined: a change is pending but the instance has no pods to
-	// carry it out. Reported precisely so the hold is not silent (LR-054).
-	operationReasonQuarantined = "Quarantined"
-	// operationReasonSeeded: an ack was written without anything being run, because the
-	// instance is already in the state its spec asks for.
-	operationReasonSeeded = "Seeded"
+	// The controller spells the vocabulary through the exported API constants rather
+	// than keeping a second copy: they are status.operation.reason's documented values,
+	// and cmd/lrctl needs them too without importing this package. Keeping the short
+	// unexported names is deliberate — every call site and decision-table row reads the
+	// same as before, so this is a plumbing change with no behavioural surface.
+	operationReasonConverged   = littleredv1alpha1.OperationReasonConverged
+	operationReasonRunning     = littleredv1alpha1.OperationReasonRunning
+	operationReasonBlocked     = littleredv1alpha1.OperationReasonBlocked
+	operationReasonStalled     = littleredv1alpha1.OperationReasonStalled
+	operationReasonQuarantined = littleredv1alpha1.OperationReasonQuarantined
+	operationReasonSeeded      = littleredv1alpha1.OperationReasonSeeded
 )
 
 // operationCandidate is one registered heavy operation, already filtered to this

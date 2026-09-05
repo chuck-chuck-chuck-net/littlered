@@ -40,18 +40,15 @@ import (
 // controller's source and asserts the two agree, so the shipped binary stays decoupled
 // while a rename cannot pass silently.
 const (
-	opReasonRunning     = "Running"
-	opReasonBlocked     = "Blocked"
-	opReasonStalled     = "Stalled"
-	opReasonQuarantined = "Quarantined"
-
-	// Converged and Seeded never reach status.operation — the planner leaves the field
-	// absent for them — so nothing here renders them. They are mirrored anyway so the
-	// drift guard covers the whole vocabulary rather than the half this file happens to
-	// use: a reason silently added to the controller is exactly what would slip past a
-	// partial mirror.
-	opReasonConverged = "Converged"
-	opReasonSeeded    = "Seeded"
+	// Imported from the API package rather than mirrored (ADR-020's vocabulary is an API
+	// surface). The previous copy here was kept honest by a test that parsed the
+	// controller's source — a workaround, not a design, and importing deletes it.
+	opReasonRunning     = littleredv1alpha1.OperationReasonRunning
+	opReasonBlocked     = littleredv1alpha1.OperationReasonBlocked
+	opReasonStalled     = littleredv1alpha1.OperationReasonStalled
+	opReasonQuarantined = littleredv1alpha1.OperationReasonQuarantined
+	opReasonConverged   = littleredv1alpha1.OperationReasonConverged
+	opReasonSeeded      = littleredv1alpha1.OperationReasonSeeded
 )
 
 // operationView is everything `lrctl` reports about a declared heavy operation: the
