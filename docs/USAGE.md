@@ -347,7 +347,16 @@ healthy, with a unanimous and self-consistent Sentinel view, while serving someo
 keyspace. This has happened in production; the analysis is in
 `SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md`.
 
-**2. Enable authentication.**
+**2. Enable authentication.** It is **off by default and stays off by default** — a deliberate
+decision, not an oversight, and the reasoning is worth knowing because the counter-argument is
+good. Auth is the only thing closing the address-adoption path a unique master name leaves open,
+so a boundary you can lose by leaving a default alone is arguably not a boundary. Against that:
+defaulting it on is not an additive change. On the next write to an existing instance the API
+server would set the field, the pods would begin demanding a password their clients do not have,
+and every unauthenticated deployment would take an outage on operator upgrade. That is a
+different category of change from anything else in a minor release, so it waits for a version
+where a breaking change is expected. **Treat "enabled: false" as a choice you are making, not a
+default you are accepting.**
 
 ```yaml
 spec:
@@ -554,6 +563,17 @@ reports it rather than silently dropping it.
 
 Do not try to rename your way out of a capture; the remedy order is
 **capture → let the quarantine finish → then rename**.
+
+**`status.quarantineAttempts` is the signal to act on, and its budget is PER EPISODE.** The
+counter resets once the instance reaches `Running` again, so an instance that is quarantined,
+re-bootstrapped, serving, and *then* captured a second time gets a fresh budget rather than
+latching. That is deliberate: reaching `Running` is evidence the re-bootstrap genuinely worked, so
+a later capture is fresh bad luck rather than proven misconfiguration — and a lifetime cap would
+latch an instance that may have been healthy for months, needing a human to release it. The
+consequence you should watch for is the other side: **an instance that quarantines repeatedly is
+telling you its configuration is the problem, not its luck.** Give it a `masterName` unique on the
+pod network and enable auth; the operator will not do that for you, and it will keep re-rolling
+the dice as long as the captures keep resolving.
 
 **4. Two heavy fields cannot be changed in one `kubectl apply`.** The CRD refuses an update that
 changes more than one registered heavy field at a time, at admission — so the error lands on your
@@ -1676,6 +1696,16 @@ kubectl logs store-sentinel-0
 ```
 
 ### Recovering a sentinel instance captured by another Sentinel deployment
+
+> **⚠ ONE CAPTURE SHAPE IS NOT DIAGNOSED, and it is the one where your data is at stake
+> (LR-054).** If a victim pod's replication from the captor's master FAILS, that pod keeps the
+> victim's **own** keys — and a failed sync means `link:down`, which means the pod is not Ready,
+> which means the operator withholds address attribution while its StatefulSet is unsettled. The
+> capture verdict therefore never arms: **no `Forsaken`, no quarantine, and no condition at all**,
+> while the neighbouring captor stays polluted. Nothing is deleted — the direction is safe, and
+> the victim's data is untouched — but the operator will be silent. Diagnose it with
+> `lrctl verify`, which reports foreign Sentinel contact regardless, and use the manual runbook
+> below. Accepted for this release; the fix needs a design pass on a predicate four rules share.
 
 **Symptoms.** The instance sits at `Ready=False` / `phase: Initializing` with an empty
 `status.master`, and the operator names the state outright — condition **`Forsaken=True`**:

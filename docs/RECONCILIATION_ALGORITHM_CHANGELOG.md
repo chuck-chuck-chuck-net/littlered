@@ -2830,7 +2830,17 @@ refutation of a second, very close LR-051 near-miss.
   master-name-rename branch's; LR-051, LR-052 and LR-053 are this branch's three commits
   beneath. Allocated with the LR-039 cross-branch loop over **every** branch, not by reading
   the tip of one line — the highest ID visible anywhere was LR-053.
-- **Status: FOUND AND RECORDED, NOT FIXED.** The fix needs a design decision, not a patch
+- **Status: FOUND AND RECORDED, NOT FIXED. RULED 2026-09-05 — ACCEPTED for this release.**
+  It is a **diagnosis** gap, not data loss: no verdict means no quarantine, so nothing is deleted
+  and the victim's own keys — the thing at stake — are untouched. What is lost is that the operator
+  says nothing while a neighbouring captor stays polluted, and `lrctl verify` still reports the
+  foreign contact regardless. Today's behaviour is pinned by the two re-scoped e2e tiers, and
+  `docs/USAGE.md`'s capture runbook now warns that this shape produces **no condition at all**, so
+  an owner is not left inferring it. Revisit with the **R5 split** of
+  `statefulSetRolloutSettled` — one predicate answering both *"is a rollout of ours in flight?"*
+  and *"is every pod of ours healthy?"*, shared by four rules (LR-021, LR-047, LR-050 and
+  ADR-020's row 7), each depending on it for its own reason — which is a design pass rather than a
+  patch. The fix needs a design decision, not a patch
   (see "Why the obvious narrowing is wrong"). What landed here is the diagnosis, a
   planner-level pin, a correction to the reasoning on which the residual was accepted, and
   the two e2e tiers re-scoped to assert what the product actually does.
