@@ -107,7 +107,7 @@ func buildRedisConfigFailover(lr *littleredv1alpha1.LittleRed) string {
 	// Timeout settings
 	sb.WriteString("\n# Connection settings\n")
 	fmt.Fprintf(&sb, "timeout %d\n", lr.Spec.Config.Timeout)
-	fmt.Fprintf(&sb, "tcp-keepalive %d\n", lr.Spec.Config.TCPKeepalive)
+	fmt.Fprintf(&sb, "tcp-keepalive %d\n", lr.Spec.Config.TCPKeepaliveOrDefault())
 
 	// Replication settings - allow replicas to serve stale data during sync
 	sb.WriteString("\n# Replication settings\n")

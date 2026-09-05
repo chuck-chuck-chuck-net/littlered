@@ -157,7 +157,12 @@ spec:
                     type: string
                   tcpKeepalive:
                     default: 300
-                    description: TCPKeepalive interval in seconds
+                    description: |-
+                      TCPKeepalive interval in seconds. Zero DISABLES keepalive, which is a real Redis
+                      semantic and a legitimate choice — hence a pointer: nil means "unset, take the
+                      default", 0 means the user asked for 0. As a plain int with a non-zero default it
+                      was indistinguishable from unset at every layer, so an explicit 0 was silently
+                      overwritten with 300 (the LR-033 shape; MinReplicasToWrite is the precedent).
                     type: integer
                   timeout:
                     default: 0

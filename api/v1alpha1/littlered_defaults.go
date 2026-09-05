@@ -238,9 +238,21 @@ func (c *ConfigSpec) SetDefaults() {
 	if c.MaxmemoryPolicy == "" {
 		c.MaxmemoryPolicy = DefaultMaxmemoryPolicy
 	}
-	if c.TCPKeepalive == 0 {
-		c.TCPKeepalive = DefaultTCPKeepalive
+	if c.TCPKeepalive == nil {
+		v := DefaultTCPKeepalive
+		c.TCPKeepalive = &v
 	}
+}
+
+// TCPKeepaliveOrDefault is the effective tcp-keepalive, and it is the ONLY thing that
+// should be rendered into redis.conf. It exists so the nil-vs-zero distinction lives in
+// one place rather than at each of the four render sites (LR-041's shape: put the
+// guarantee in the primitive, not in every caller).
+func (c *ConfigSpec) TCPKeepaliveOrDefault() int {
+	if c.TCPKeepalive == nil {
+		return DefaultTCPKeepalive
+	}
+	return *c.TCPKeepalive
 }
 
 // SetDefaults applies default values to MetricsSpec

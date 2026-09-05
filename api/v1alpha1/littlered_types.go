@@ -202,10 +202,14 @@ type ConfigSpec struct {
 	// +optional
 	Timeout int `json:"timeout,omitempty"`
 
-	// TCPKeepalive interval in seconds
+	// TCPKeepalive interval in seconds. Zero DISABLES keepalive, which is a real Redis
+	// semantic and a legitimate choice — hence a pointer: nil means "unset, take the
+	// default", 0 means the user asked for 0. As a plain int with a non-zero default it
+	// was indistinguishable from unset at every layer, so an explicit 0 was silently
+	// overwritten with 300 (the LR-033 shape; MinReplicasToWrite is the precedent).
 	// +kubebuilder:default=300
 	// +optional
-	TCPKeepalive int `json:"tcpKeepalive,omitempty"`
+	TCPKeepalive *int `json:"tcpKeepalive,omitempty"`
 
 	// Raw is raw redis.conf content (expert mode)
 	// +optional
@@ -803,6 +807,38 @@ const (
 	// It never affects Ready. An instance mid-rename is not an unhealthy instance, and
 	// conflating the two trains an operator to ignore the signal that matters.
 	ConditionOperationInProgress = "OperationInProgress"
+)
+
+// The declared-operation reason vocabulary (ADR-020). These are an API SURFACE: they are
+// the values of status.operation.reason and of the OperationInProgress condition, they
+// are enumerated in that field's own documentation, and TWO packages depend on the exact
+// strings — the controller and cmd/lrctl, which does not import internal/controller.
+//
+// They live here so both can import them. Before, each kept its own copy and agreement
+// rested on a test that parsed the controller's SOURCE — a workaround rather than a
+// design, and one that a rename could only be caught by rather than prevented from.
+//
+// Converged and Seeded mean nothing is pending, so status.operation is absent for them;
+// the other four each name a state in which a declared change exists and is either being
+// carried out or deliberately held.
+const (
+	// OperationReasonConverged: every candidate's fingerprint equals its ack. There is
+	// no unfinished work from any spec change.
+	OperationReasonConverged = "Converged"
+	// OperationReasonRunning: a heavy operation is being carried out this pass.
+	OperationReasonRunning = "Running"
+	// OperationReasonBlocked: work is pending but cannot proceed — the driver said so,
+	// or a Requires edge holds it. Never auto-skipped (ADR-017).
+	OperationReasonBlocked = "Blocked"
+	// OperationReasonStalled: the running operation has outlived its StallAfter budget.
+	// This changes what the operator SAYS, never what it does — there is no auto-exit.
+	OperationReasonStalled = "Stalled"
+	// OperationReasonQuarantined: a change is pending but the instance has no pods to
+	// carry it out. Reported precisely so the hold is not silent (LR-054).
+	OperationReasonQuarantined = "Quarantined"
+	// OperationReasonSeeded: an ack was written without anything being run, because the
+	// instance is already in the state its spec asks for.
+	OperationReasonSeeded = "Seeded"
 )
 
 // LittleRedStatus defines the observed state of LittleRed
