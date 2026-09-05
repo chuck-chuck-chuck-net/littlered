@@ -333,6 +333,35 @@ spec:
 			// Over the 120 s chaos window, write availability should remain above 40%.
 			Expect(metrics.DataCorruptions).To(Equal(int64(0)), "Data corruption detected!")
 			Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.40))
+
+			// DURABILITY. `VerifyAll` has always computed FinalMissing for this tier and
+			// this tier has always PRINTED IT AND DISCARDED IT — which is exactly the
+			// shape LR-038 started from: a number computed, reported, never asserted,
+			// while 202 of 1171 acknowledged writes vanished under assertions that all
+			// passed. DataCorruptions cannot catch it, because the keys are GONE rather
+			// than wrong, and WriteAvailability cannot either, because the writes were
+			// ACKed.
+			//
+			// The bound is the one the failover tier derives, and it is a design claim
+			// rather than a fitted number: a kill-9'd master loses only what was ACKed
+			// inside the replication lag of the kill — ~1 per failover at 10 writes/s,
+			// so ~2 for this spec. 5 is generous against that and tight against any real
+			// regression, which loses tens to hundreds.
+			//
+			// Evidence it is achievable HERE, rather than borrowed from the other mode:
+			// LR-038's six-cell matrix ran this disruption shape 10 consecutive times
+			// and measured 0 MISSING in every block (sentinel kill-9, 43-74% write
+			// availability — the availability is poor and the durability is perfect,
+			// which is precisely why the availability bar cannot stand in for this one).
+			Expect(metrics.FinalChecked).To(BeNumerically(">", 500),
+				"final verification sweep did not check a meaningful number of keys, so a "+
+					"FinalMissing of 0 would be vacuous")
+			Expect(metrics.FinalUnreadable).To(BeNumerically("<", metrics.FinalChecked/10),
+				"too many keys unreadable at sweep time to trust the durability verdict")
+			Expect(metrics.FinalMissing).To(BeNumerically("<=", 5),
+				"acknowledged writes were LOST: %d of %d. The kill-9 guard exists to make "+
+					"this 0 — see LR-038's start-gate, where a kill-9 of a PROMOTED master "+
+					"destroyed 352 of 1145.", metrics.FinalMissing, metrics.FinalChecked)
 		})
 	})
 
