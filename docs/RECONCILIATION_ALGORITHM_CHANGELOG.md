@@ -4088,9 +4088,10 @@ ADR-020.
   about and is measured (`LeaderlessRecovery=Reseeded` in the CR) — and it then seeds a pod that
   cannot start, so on this path the instance still does not recover. The fix's practical value
   narrows to paths where the pods are *created* rather than *updated*, i.e. ADR-016's quarantine
-  release, which is this entry's documented route. **That path is argued, not verified** — see the
-  unverified note in LR-061 — so the honest status of LR-059 is: the suppression defect is fixed
-  and proven, and the scenario it was found in needs LR-061 as well.
+  release, which is this entry's documented route. **That path is now MEASURED SAFE** (t3e,
+  2026-09-05: with a template change pending, a StatefulSet scaled 0 → 3 brings every pod back at
+  `updateRevision`), so the fix delivers where this entry said it was needed. See LR-061's probe
+  table.
 - **The guard tier is GREEN inside a full suite (t3e, 2026-09-04): `131 Passed | 0 Failed |
   6 Skipped` in 2h29m** on operator `d4d7d6c`, so the fix is e2e-verified rather than only
   envtest-verified: with a rename pending and no master anywhere, Rule L seeds and the CR names it
@@ -4512,13 +4513,40 @@ ADR-020.
   degraded instance", now with a named mechanism. It is **availability, not durability**: on the
   observed path the instance is empty by construction (Rule L's no-data reseed), and an instance
   that *did* hold data is protected by Rule L's own ≥2-holder refusal.
-- **The one path that should escape it, stated as UNVERIFIED because this entry has already been
-  wrong once about StatefulSet revision semantics.** ADR-016's quarantine release scales the
-  instance to zero and back, so every pod is *created* rather than *updated*, and `redis-0` should
-  come back on the update revision with the new name. That is LR-059's documented route and the
-  reason its fix still delivers there. It is cheaply checkable — scale a StatefulSet to 0 and back
-  with a pending template change and read the `controller-revision-hash` labels — and it has not
-  been checked.
+- **⚠ AND THE "BY CONSTRUCTION" CLAIM ABOVE IS ALSO TOO STRONG — MEASURED 2026-09-05.** That is
+  twice this entry has had its bound wrong, in opposite directions, which is itself the finding
+  worth carrying: the first version was too narrow (a coincidence of two states), the second too
+  broad (a deterministic interlock). A controlled probe on t3e — a 3-replica StatefulSet with the
+  product's `PodManagementPolicy: Parallel`, a readiness probe held false to stall the roll —
+  answered three questions:
+
+  | # | question | result |
+  |---|---|---|
+  | (a) | template change pending, scale 0 → 3 (**ADR-016's release**) | **all pods at `updateRevision`**, `currentRevision` advances — the release path is SAFE |
+  | (b) | delete ordinal 0 during a stalled roll (**the recycle candidate**) | comes back at `updateRevision` — the recycle **works** (also confirmed under `OrderedReady`) |
+  | (c) | template change, then force-delete ALL pods (**the observed shape**) | **all pods at `updateRevision` — the wedge did NOT reproduce** |
+
+  So the wedge is **not** a construction. It was observed twice on real instances, with revision
+  labels, and it does not reproduce from the same operation in a controlled fixture.
+  **Hypothesis that fits both**, offered as such and NOT source-confirmed: a *missing* pod's
+  revision depends on `Status.CurrentReplicas` at the instant the controller syncs (`ordinal <
+  CurrentReplicas` ⇒ `currentRevision`), so the outcome turns on the **order in which deletes land
+  relative to controller syncs**. If ordinal 0 is re-created while 1 and 2 are still present at the
+  old revision it inherits that revision; if all are gone, every pod gets the new one. The real run
+  deleted **six** pods (Redis *and* Sentinel) with syncs interleaved; the probe deleted three in one
+  command. Confirming this means reading `newVersionedStatefulSetPod` at the cluster's 1.36.3 —
+  **not done**.
+- **What that does to severity, which is the practical point.** The path LR-059 documents —
+  ADR-016's quarantine release — is **measured safe** (row (a)), so the LR-059 fix delivers there.
+  What remains is: renaming an instance that goes leaderless during the roll *and* loses its pods
+  in an order that leaves `redis-0` stale. That is a **race inside an already out-of-scope
+  operation** (LR-048: renaming a degraded instance), it is loud, and the manual escape is one
+  `kubectl delete pod` — which row (b) confirms actually works. It is a documented limitation
+  rather than a release blocker.
+- **Both candidate fixes are viable, and (b) corrects an earlier claim in this entry.** The
+  LR-023-shaped recycle was written up as *"probably ineffective, because the roll cannot advance"*
+  — that is wrong: a deleted pod is re-created at the update revision even while the roll is
+  stalled. The seed-choice candidate is unaffected either way.
 - **It is loud, and it still needs a human.** `Ready=False/PodsNotReady`, and the operation reaches
   `OperationInProgress=True/Stalled` — correctly, since ADR-017 forbids the auto-exit timer. The
   manual escape is one command: **delete the parked pods**, and the StatefulSet re-creates them from
