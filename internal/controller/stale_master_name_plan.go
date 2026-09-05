@@ -100,7 +100,7 @@ type StaleMasterNamePlan struct {
 // Nearly all of the value is in the refusals. REMOVE is destructive and the only thing
 // aiming it is this predicate:
 //
-//   - G0 forsaken: a capture verdict stands the whole rule down. Passed IN, never
+//   - G0 captured: a capture verdict stands the whole rule down. Passed IN, never
 //     re-derived — it is computed once per pass, before Rule N.
 //   - G1 the desired name is non-empty (LR-041: a required string's zero value is a
 //     plausible input, not an obvious error — and with desired == "" EVERY name reads as
@@ -117,7 +117,12 @@ func planStaleMasterNames(
 	state *redisclient.ReplicationState,
 	desired string,
 	quorum int,
-	forsaken bool,
+	// captured is planForsaken's Captured — the SIGNATURE seen this pass — and never its
+	// settled Forsaken verdict. The distinction is load-bearing and the old parameter name
+	// (`forsaken`) misled about exactly it: a settled Forsaken returns from the caller's
+	// switch ~90 lines above this rule, so gating on it would be structurally dead code,
+	// while Captured is the strictly more conservative reading.
+	captured bool,
 	rolling bool,
 ) StaleMasterNamePlan {
 	// `rolling` — our own Redis StatefulSet is not settled (LR-050). G5's discriminator
@@ -145,7 +150,7 @@ func planStaleMasterNames(
 	// is blind to a captor whose master is transiently s_down — at that moment every
 	// per-entry test passes, the prune fires, and the capture becomes both undiagnosed
 	// and unrecoverable. Only a verdict that does not depend on the name closes that.
-	if forsaken {
+	if captured {
 		return StaleMasterNamePlan{
 			Reason: staleNamesForeign,
 			Message: "the instance is Forsaken (captured by another Sentinel deployment): " +

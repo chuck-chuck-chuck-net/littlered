@@ -2684,6 +2684,14 @@ func (r *LittleRedReconciler) clearForsaken(
 			Reason:  reasonNotCaptured,
 			Message: "This instance's Sentinels are serving its own topology.",
 		})
+		// Say so. A state transition that emits nothing is one somebody has to
+		// re-derive later: the first full-suite run of the quarantine tier had to infer
+		// WHICH pass reset the counter from a reconcile timestamp plus the CR's final
+		// state, because this function was silent (LR-044). One line per actual clear —
+		// the early return above means a converged instance logs nothing at all.
+		r.getLogger(ctx, lr, LogCategoryAudit).Info(
+			"Capture verdict cleared; the instance is being managed again.",
+			"quarantineReleased", q.Clear, "attemptsReset", clearAttempts)
 		if err := r.Status().Update(ctx, latest); err != nil {
 			return err
 		}
@@ -2759,9 +2767,11 @@ func planStaleMasterNameReport(plan StaleMasterNamePlan) staleNameReport {
 // gained.
 func (r *LittleRedReconciler) reconcileStaleMasterNames(
 	ctx context.Context, lr *littleredv1alpha1.LittleRed, state *redisclient.ReplicationState,
-	desired string, quorum int, password string, forsaken, rolling bool,
+	desired string, quorum int, password string, captured, rolling bool,
 ) (StaleMasterNamePlan, error) {
-	plan := planStaleMasterNames(state, desired, quorum, forsaken, rolling)
+	// `captured` is planForsaken's Captured, never its settled Forsaken verdict — see
+	// G0's comment on planStaleMasterNames for why the distinction is load-bearing.
+	plan := planStaleMasterNames(state, desired, quorum, captured, rolling)
 	audit := r.getLogger(ctx, lr, LogCategoryAudit)
 
 	skippedAtReconfirm := r.executeStaleMasterNamePrune(ctx, lr, plan, desired, password, audit)
