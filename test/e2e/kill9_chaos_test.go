@@ -332,7 +332,14 @@ spec:
 			// Downtime window: SDOWN detection (~5 s) + failover (~5–10 s) + replica startup.
 			// Over the 120 s chaos window, write availability should remain above 40%.
 			Expect(metrics.DataCorruptions).To(Equal(int64(0)), "Data corruption detected!")
-			Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.40))
+			// The same cell as the mode-comparison tier's sentinel/kill-9, so the same
+			// bar and the same derivation: 0.40 sits ~3pp under a measured minimum of
+			// 43.32% over ten passes, the cell is bimodal rather than noisy, and the
+			// number is low by DESIGN — the restart guard suppresses Redis and waits for
+			// SDOWN, which costs availability and buys zero data loss. See
+			// chaosWriteAvailabilityFloor for the distribution.
+			Expect(metrics.WriteAvailability()).To(
+				BeNumerically(">", chaosWriteAvailabilityFloor("sentinel", "kill-9")))
 
 			// DURABILITY. `VerifyAll` has always computed FinalMissing for this tier and
 			// this tier has always PRINTED IT AND DISCARDED IT — which is exactly the

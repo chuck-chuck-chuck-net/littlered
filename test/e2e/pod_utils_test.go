@@ -327,6 +327,47 @@ var chaosDisruptions = []chaosDisruption{
 	},
 }
 
+// chaosWriteAvailabilityFloor is the per-cell regression bar for the mode-comparison
+// chaos tiers, and it is DERIVED from a measured distribution rather than fitted to a
+// run: LR-038's addendum 5 ran both modes x three shapes ten consecutive times (60 chaos
+// runs, t3e, operator 803eb26), and each bar sits a few points below that cell's measured
+// MINIMUM, rounded to a round number.
+//
+//	cell                     min / median / max        bar
+//	failover graceful        95.83 / 96.42 / 96.91     0.90
+//	failover force-delete    94.66 / 98.46 / 98.92     0.90
+//	failover kill-9          85.13 / 92.19 / 95.73     0.80
+//	sentinel graceful        94.75 / 95.29 / 96.50     0.90
+//	sentinel force-delete    96.83 / 97.58 / 98.33     0.90
+//	sentinel kill-9          43.32 / 54.92 / 73.89     0.40
+//
+// WHY A SINGLE BAR WAS WRONG IN BOTH DIRECTIONS. Every cell used to assert `> 0.40`.
+// For the five cells measuring 85-99% that is uselessly loose — a mode could lose a
+// third of its write availability and still pass. For sentinel kill-9 it is nearly
+// TIGHT: 0.40 sits ~3pp under a measured minimum of 43.32, so a real regression there
+// would read as a flaky test rather than as what it is.
+//
+// SENTINEL KILL-9 KEEPS 0.40 DELIBERATELY, and its number is the one to read carefully.
+// It is low because the mode's restart guard suppresses Redis on the killed master and
+// waits for Sentinel to reach SDOWN, elect and be observed — a design cost, not a defect,
+// and it buys zero data loss (that column measured 0 MISSING in all ten passes). The cell
+// is also BIMODAL rather than noisy (~314 vs ~600+ failed writes), so a single sample of
+// it means nothing. If this bar ever trips, read it as "the yield's cost grew", not as
+// flakiness — and check the durability assertion first, because that is the property that
+// matters.
+//
+// These are regression detectors, not SLOs. A cell that drifts below its bar has changed
+// behaviour; what "acceptable availability" is for a deployment is the deployment's call.
+func chaosWriteAvailabilityFloor(mode, shape string) float64 {
+	if mode == "sentinel" && shape == "kill-9" {
+		return 0.40
+	}
+	if shape == "kill-9" {
+		return 0.80
+	}
+	return 0.90
+}
+
 // deletePod deletes a pod in the given namespace.
 // If NON_GRACEFUL_RESTART environment variable is set to "true", it performs a
 // non-graceful deletion (--grace-period=0 --force). Otherwise graceful.

@@ -176,7 +176,13 @@ spec:
 				GinkgoWriter.Printf("Sentinel Rapid-Double-Failover Metrics (%s):\n%s\n", d.Name, metrics.String())
 
 				Expect(metrics.DataCorruptions).To(Equal(int64(0)), "Data corruption detected!")
-				Expect(metrics.WriteAvailability()).To(BeNumerically(">", 0.40))
+				// Per-cell, derived from LR-038's 10-pass matrix — see
+				// chaosWriteAvailabilityFloor for the distribution each bar sits under.
+				floor := chaosWriteAvailabilityFloor("sentinel", d.Name)
+				Expect(metrics.WriteAvailability()).To(BeNumerically(">", floor),
+					"write availability %.2f%% is below the %s/%s bar of %.0f%%: read this as a "+
+						"behaviour change in that cell, not as flakiness",
+					metrics.WriteAvailability()*100, "sentinel", d.Name, floor*100)
 
 				// The sweep must actually have run, or FinalMissing == 0 is vacuous.
 				Expect(metrics.FinalChecked).To(BeNumerically(">", 500),
