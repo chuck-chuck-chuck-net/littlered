@@ -41,10 +41,47 @@ import (
 // them actually matches. That, and that a custom spec.appName produces a workload which
 // reconciles to Running rather than one whose StatefulSet the API server rejects for a
 // selector/template mismatch.
-// Mode labels: the tiers below are standalone-mode instances (the round trip is
-// mode-independent at the API-server level and standalone is the cheapest carrier).
-// Per-mode inheritance is covered at the builder level by TestBuildersCarryInheritedMetadata.
-var _ = Describe("LittleRed metadata inheritance", Label("metadata"), Label("standalone"), func() {
+//
+// The round trip runs in ALL FOUR modes, following security_test.go's pattern. That is
+// not redundancy with the builder-level table: every mode has its own StatefulSet builder
+// and its own pod template, and failover mode's went unwired for exactly as long as the
+// coverage was "one mode stands in for the rest" (see the ADR-021 addendum). The appName
+// tiers below stay single-mode — they exercise API-server behaviour, which is mode-neutral.
+
+// metadataModeCR returns a CR in the given mode carrying the inherited metadata, plus
+// the name of a StatefulSet that mode is expected to produce.
+func metadataModeCR(mode, name string, labels, annotations map[string]string) (*littleredv1alpha1.LittleRed, string) {
+	cr := &littleredv1alpha1.LittleRed{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        name,
+			Namespace:   testNamespace,
+			Labels:      labels,
+			Annotations: annotations,
+		},
+		Spec: littleredv1alpha1.LittleRedSpec{Mode: mode},
+	}
+	// The Redis StatefulSet is "<name>-redis" in every mode but cluster, which has one
+	// per shard.
+	sts := name + "-redis"
+	switch mode {
+	case "cluster":
+		replicas := clusterReplicasPerShard
+		cr.Spec.Cluster = &littleredv1alpha1.ClusterSpec{ReplicasPerShard: &replicas}
+		sts = name + "-shard-0"
+	case "sentinel":
+		// masterName is required and must be unique per pod network (pillar 3.7,
+		// LR-039); without it the instance never leaves Initializing.
+		cr.Spec.Sentinel = &littleredv1alpha1.SentinelSpec{
+			MasterName:            e2eMasterName(testNamespace, name),
+			Quorum:                2,
+			DownAfterMilliseconds: 5000,
+			FailoverTimeout:       10000,
+		}
+	}
+	return cr, sts
+}
+
+var _ = Describe("LittleRed metadata inheritance", Label("metadata"), func() {
 	var k8sClient client.Client
 	ctx := context.Background()
 
@@ -63,94 +100,114 @@ var _ = Describe("LittleRed metadata inheritance", Label("metadata"), Label("sta
 		}, timeout, 5*time.Second).Should(Succeed())
 	}
 
-	It("propagates CR labels and annotations to the pods and the StatefulSet", func() {
-		cr := &littleredv1alpha1.LittleRed{
-			ObjectMeta: metav1.ObjectMeta{
-				Name:        "meta-inherit",
-				Namespace:   testNamespace,
-				Labels:      map[string]string{"team": "payments", "environment": "e2e"},
-				Annotations: map[string]string{"owner": "team-payments@example.com"},
-			},
-			Spec: littleredv1alpha1.LittleRedSpec{Mode: "standalone"},
-		}
-		Expect(k8sClient.Create(ctx, cr)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
+	for _, mode := range []string{"standalone", "sentinel", "failover", "cluster"} {
+		mode := mode // capture range variable
 
-		waitForRunning(cr.Name, 3*time.Minute)
+		Context("in "+mode+" mode", modeLabel(mode), func() {
+			It("propagates CR labels and annotations to the pods and the StatefulSet", func() {
+				labels := map[string]string{"team": "payments", "environment": "e2e"}
+				annotations := map[string]string{"owner": "team-payments@example.com"}
+				cr, stsName := metadataModeCR(mode, "meta-inherit-"+mode, labels, annotations)
 
-		By("finding the pods by an inherited label alone")
-		pods := &corev1.PodList{}
-		Eventually(func(g Gomega) {
-			g.Expect(k8sClient.List(ctx, pods,
-				client.InNamespace(testNamespace),
-				client.MatchingLabels{"team": "payments", "app.kubernetes.io/instance": cr.Name},
-			)).To(Succeed())
-			g.Expect(pods.Items).NotTo(BeEmpty())
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+				Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+				DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
 
-		for _, pod := range pods.Items {
-			Expect(pod.Labels).To(HaveKeyWithValue("environment", "e2e"))
-			Expect(pod.Annotations).To(HaveKeyWithValue("owner", "team-payments@example.com"))
-			// The operator's own labels must have survived the merge intact, or the
-			// StatefulSet could not have adopted this pod at all.
-			Expect(pod.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", littleredv1alpha1.DefaultAppName))
-		}
+				waitForRunning(cr.Name, 5*time.Minute)
 
-		By("checking the StatefulSet's own metadata")
-		sts := &appsv1.StatefulSet{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: testNamespace}, sts)).To(Succeed())
-		Expect(sts.Labels).To(HaveKeyWithValue("team", "payments"))
-		Expect(sts.Annotations).To(HaveKeyWithValue("owner", "team-payments@example.com"))
-	})
+				By("finding the pods by an inherited label alone")
+				pods := &corev1.PodList{}
+				Eventually(func(g Gomega) {
+					g.Expect(k8sClient.List(ctx, pods,
+						client.InNamespace(testNamespace),
+						client.MatchingLabels{"team": "payments", "app.kubernetes.io/instance": cr.Name},
+					)).To(Succeed())
+					g.Expect(pods.Items).NotTo(BeEmpty())
+				}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
-	It("brings up an instance with a custom spec.appName", func() {
-		const customAppName = "valkey-store"
-		cr := &littleredv1alpha1.LittleRed{
-			ObjectMeta: metav1.ObjectMeta{Name: "meta-appname", Namespace: testNamespace},
-			Spec: littleredv1alpha1.LittleRedSpec{
-				Mode:    "standalone",
-				AppName: customAppName,
-			},
-		}
-		Expect(k8sClient.Create(ctx, cr)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
+				// Sentinel mode must return the sentinel pods here too, not just the
+				// Redis ones: buildSentinelStatefulSet was historically the builder that
+				// applied no pod-template metadata at all.
+				if mode == "sentinel" {
+					var sentinels int
+					for _, pod := range pods.Items {
+						if pod.Labels["app.kubernetes.io/component"] == "sentinel" {
+							sentinels++
+						}
+					}
+					Expect(sentinels).To(BeNumerically(">", 0),
+						"no sentinel pod carried the inherited label")
+				}
 
-		// Reaching Running is the assertion that matters: a StatefulSet whose pod
-		// template disagreed with its selector would have been rejected outright.
-		waitForRunning(cr.Name, 3*time.Minute)
+				for _, pod := range pods.Items {
+					Expect(pod.Labels).To(HaveKeyWithValue("environment", "e2e"))
+					Expect(pod.Annotations).To(HaveKeyWithValue("owner", "team-payments@example.com"))
+					// The operator's own labels must have survived the merge intact, or
+					// the StatefulSet could not have adopted this pod at all.
+					Expect(pod.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", littleredv1alpha1.DefaultAppName))
+				}
 
-		sts := &appsv1.StatefulSet{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: testNamespace}, sts)).To(Succeed())
-		Expect(sts.Spec.Selector.MatchLabels).To(HaveKeyWithValue("app.kubernetes.io/name", customAppName))
-		Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", customAppName))
+				By("checking the StatefulSet's own metadata")
+				sts := &appsv1.StatefulSet{}
+				Expect(k8sClient.Get(ctx, types.NamespacedName{Name: stsName, Namespace: testNamespace}, sts)).To(Succeed())
+				Expect(sts.Labels).To(HaveKeyWithValue("team", "payments"))
+				Expect(sts.Annotations).To(HaveKeyWithValue("owner", "team-payments@example.com"))
+			})
+		})
+	}
 
-		By("checking the Service selector moved with it, so clients still resolve")
-		svc := &corev1.Service{}
-		Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: testNamespace}, svc)).To(Succeed())
-		Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/name", customAppName))
+	// The appName tiers exercise API-server behaviour (selector agreement, the CEL
+	// immutability rule), which is mode-neutral; standalone is the cheapest carrier.
+	Context("spec.appName", modeLabel("standalone"), func() {
+		It("brings up an instance with a custom spec.appName", func() {
+			const customAppName = "valkey-store"
+			cr := &littleredv1alpha1.LittleRed{
+				ObjectMeta: metav1.ObjectMeta{Name: "meta-appname", Namespace: testNamespace},
+				Spec: littleredv1alpha1.LittleRedSpec{
+					Mode:    "standalone",
+					AppName: customAppName,
+				},
+			}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
 
-		Eventually(func(g Gomega) {
-			endpoints := &corev1.Endpoints{}
-			g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: testNamespace}, endpoints)).To(Succeed())
-			g.Expect(endpoints.Subsets).NotTo(BeEmpty())
-			g.Expect(endpoints.Subsets[0].Addresses).NotTo(BeEmpty())
-		}, 2*time.Minute, 5*time.Second).Should(Succeed())
-	})
+			// Reaching Running is the assertion that matters: a StatefulSet whose pod
+			// template disagreed with its selector would have been rejected outright.
+			waitForRunning(cr.Name, 3*time.Minute)
 
-	It("rejects a change to spec.appName", func() {
-		cr := &littleredv1alpha1.LittleRed{
-			ObjectMeta: metav1.ObjectMeta{Name: "meta-appname-immutable", Namespace: testNamespace},
-			Spec: littleredv1alpha1.LittleRedSpec{
-				Mode:    "standalone",
-				AppName: "before",
-			},
-		}
-		Expect(k8sClient.Create(ctx, cr)).To(Succeed())
-		DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
+			// The Redis StatefulSet is "<name>-redis"; the Service is "<name>".
+			sts := &appsv1.StatefulSet{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name + "-redis", Namespace: testNamespace}, sts)).To(Succeed())
+			Expect(sts.Spec.Selector.MatchLabels).To(HaveKeyWithValue("app.kubernetes.io/name", customAppName))
+			Expect(sts.Spec.Template.Labels).To(HaveKeyWithValue("app.kubernetes.io/name", customAppName))
 
-		cr.Spec.AppName = "after"
-		err := k8sClient.Update(ctx, cr)
-		Expect(err).To(HaveOccurred())
-		Expect(err.Error()).To(ContainSubstring("immutable"))
+			By("checking the Service selector moved with it, so clients still resolve")
+			svc := &corev1.Service{}
+			Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: testNamespace}, svc)).To(Succeed())
+			Expect(svc.Spec.Selector).To(HaveKeyWithValue("app.kubernetes.io/name", customAppName))
+
+			Eventually(func(g Gomega) {
+				endpoints := &corev1.Endpoints{}
+				g.Expect(k8sClient.Get(ctx, types.NamespacedName{Name: cr.Name, Namespace: testNamespace}, endpoints)).To(Succeed())
+				g.Expect(endpoints.Subsets).NotTo(BeEmpty())
+				g.Expect(endpoints.Subsets[0].Addresses).NotTo(BeEmpty())
+			}, 2*time.Minute, 5*time.Second).Should(Succeed())
+		})
+
+		It("rejects a change to spec.appName", func() {
+			cr := &littleredv1alpha1.LittleRed{
+				ObjectMeta: metav1.ObjectMeta{Name: "meta-appname-immutable", Namespace: testNamespace},
+				Spec: littleredv1alpha1.LittleRedSpec{
+					Mode:    "standalone",
+					AppName: "before",
+				},
+			}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
+
+			cr.Spec.AppName = "after"
+			err := k8sClient.Update(ctx, cr)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("immutable"))
+		})
 	})
 })

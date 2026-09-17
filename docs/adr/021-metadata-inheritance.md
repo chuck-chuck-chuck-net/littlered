@@ -172,10 +172,22 @@ discussion. Rejected: Argo CD tracking metadata on children is actively harmful,
   **every object-producing builder in every mode**, not one builder per kind. The
   per-kind sampling it replaced is what let failover mode ship uncovered — see the
   addendum below.
-- `test/e2e/metadata_test.go` (label `metadata`) asserts the round trip on a live cluster:
-  pods findable by an inherited label alone, and a custom `spec.appName` instance reaching
-  `Running` with matching Service endpoints. **Not yet executed** — it compiles
-  (`go vet -tags e2e`) but the run needs a cluster and an image registry; see the PR notes.
+- `test/e2e/metadata_test.go` (label `metadata`) asserts the round trip on a live cluster,
+  **in all four modes**: pods findable by an inherited label alone, and a custom
+  `spec.appName` instance reaching `Running` with matching Service endpoints.
+  **Executed on t3e, 2026-09-17: `6 Passed | 0 Failed`** in 108s.
+
+  The failover tier banked an honest RED first, against the pre-fix build deployed to the
+  same cluster: the instance reached `Running` and then **no pod was findable by the
+  inherited label** for the full 120s window (`[]v1.Pod | len:0 ... not to be empty`),
+  which is issue #96's own symptom. Green on the fixed build.
+
+  Two defects in the e2e itself were found by running it for the first time, both in
+  never-executed code: it looked the Redis StatefulSet up as `<name>` where the builder
+  names it `<name>-redis`, and its sentinel-mode CR carried no `sentinel.masterName`, which
+  is required per pillar 3.7 — that instance sat at an empty phase until the 5-minute
+  timeout. Worth stating plainly: a test that has never run is not coverage, and these two
+  would have failed on any cluster, at any time, for reasons unrelated to the feature.
 
 ## Addendum (2026-09-17): failover mode, and why the per-kind test missed it
 
