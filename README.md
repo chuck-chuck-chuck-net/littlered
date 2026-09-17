@@ -10,7 +10,9 @@ LittleRed is built for workloads where persistence is explicitly disabled and ne
 
 We had reports of *Sentinel collisions*: pod restarts on recycled IPs led two unrelated Sentinel instances to merge into one, losing both. A unique `masterName` — use `<namespace>.<name>` — closes most of those cases. Authentication closes the rest, which is why we now **strongly recommend authentication in sentinel mode**; see [Isolating Sentinel instances](docs/USAGE.md#isolating-sentinel-instances) for which cases need which, and `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` for the full analysis.
 
-**Existing instances keep running.** The requirement is enforced on new instances; an existing one is only forced to state a value on its next change to `spec.sentinel`, and reports a `SentinelMasterNameUnscoped` warning until then.
+**Existing instances keep running.** An existing instance is only forced to state a value on its next change to `spec.sentinel`, and reports a `SentinelMasterNameUnscoped` warning condition (and a Warning event) until then.
+
+**The requirement is not a hard gate, and it is worth knowing where the gap is.** `masterName` is required *within* `spec.sentinel`, but that block is itself optional — so a CR that omits it entirely is accepted even in sentinel mode, and falls back to the legacy shared name `mymaster`. That is the same warning path as a pre-upgrade instance, deliberately, because the two are the same situation: nobody has decided a name. **Set one explicitly.** An instance left on `mymaster` with authentication off is the configuration most exposed to the collision described above — and the one the operator treats as least recoverable if it happens.
 
 Note that `masterName` is part of the configuration of Sentinel-aware clients. If you give an instance a new, unique master name — and enable authentication — you must reconfigure those clients in the same maintenance window. Clients that reach the master through the `{name}` Service are unaffected.
 
