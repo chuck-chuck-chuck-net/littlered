@@ -5,7 +5,7 @@ GIT_TAG := $(shell if [ -n "$$(git describe --tags --exact-match 2>/dev/null)" ]
                    git rev-parse --short HEAD; \
                fi)
 
-LITTLERED_REGISTRY ?= ghcr.io/littlered-operator
+LITTLERED_REGISTRY ?= ghcr.io/chuck-chuck-chuck-net
 
 IMAGES ?= littlered littlered-chaos-client
 

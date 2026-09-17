@@ -10,13 +10,13 @@ Helm chart for deploying the LittleRed operator to Kubernetes.
 ## Installation
 
 ```bash
-helm install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   --version <version> \
   -n littlered-system \
   --create-namespace
 ```
 
-Find available versions on the [releases page](https://github.com/littlered-operator/littlered-operator/releases).
+Find available versions on the [releases page](https://github.com/chuck-chuck-chuck-net/littlered/releases).
 
 ## Uninstallation
 
@@ -34,7 +34,7 @@ kubectl delete crd littlereds.chuck-chuck-chuck.net
 
 | Parameter | Description | Default |
 |-----------|-------------|---------|
-| `image.repository` | Operator image repository | `ghcr.io/littlered-operator/littlered` |
+| `image.repository` | Operator image repository | `ghcr.io/chuck-chuck-chuck-net/littlered` |
 | `image.tag` | Operator image tag | `0.1.0` |
 | `image.pullPolicy` | Image pull policy | `IfNotPresent` |
 | `replicas` | Number of operator replicas | `1` |
@@ -60,7 +60,7 @@ kubectl delete crd littlereds.chuck-chuck-chuck.net
 ### Custom image (e.g. private registry)
 
 ```bash
-helm install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   --version <version> \
   -n littlered-system \
   --create-namespace \
@@ -71,7 +71,7 @@ helm install littlered oci://ghcr.io/littlered-operator/charts/littlered \
 ### With Prometheus monitoring
 
 ```bash
-helm install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   --version <version> \
   -n littlered-system \
   --create-namespace \
@@ -82,7 +82,7 @@ helm install littlered oci://ghcr.io/littlered-operator/charts/littlered \
 ### Using a values file
 
 ```bash
-helm install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   --version <version> \
   -n littlered-system \
   --create-namespace \
@@ -107,7 +107,7 @@ See the [main README](../../README.md) for full LittleRed CR documentation.
 ## Upgrading
 
 ```bash
-helm upgrade littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm upgrade littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   --version <new-version> \
   -n littlered-system
 ```

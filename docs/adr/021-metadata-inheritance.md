@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed. Implements [issue #96](https://github.com/littlered-operator/littlered/issues/96)
+Proposed. Implements [issue #96](https://github.com/chuck-chuck-chuck-net/littlered/issues/96)
 ("Configurable `kubernetes.io/name`"). Additive and backwards compatible: `spec.appName`
 defaults to the previous constant, so an existing instance's selectors are byte-identical
 after upgrade.

@@ -96,7 +96,7 @@ no RDB/AOF and no PersistentVolumes.
   PodDisruptionBudgets, the ServiceMonitor and the pods — so `team=payments` or
   `environment=production` set where a user naturally puts it reaches the objects a scrape
   config actually selects on. Resolves
-  [#96](https://github.com/littlered-operator/littlered/issues/96). The operator's own keys
+  [#96](https://github.com/chuck-chuck-chuck-net/littlered/issues/96). The operator's own keys
   always win and are never inherited, and bookkeeping stamped on the CR by Helm, Argo CD,
   Flux or kubectl is not propagated (Argo CD's tracking labels on a child confuse its
   pruning; `last-applied-configuration` would embed a copy of the CR into every child
@@ -132,6 +132,22 @@ no RDB/AOF and no PersistentVolumes.
   operation in flight.
 
 ### Changed
+
+- **The project has moved to `github.com/chuck-chuck-chuck-net/littlered`, and so have the
+  images and the chart.** The old location redirects, but the container registry does not:
+  packages belong to the GitHub organisation, so nothing at
+  `ghcr.io/littlered-operator/...` moves on its own.
+
+  | | Old | New |
+  |---|---|---|
+  | Operator image | `ghcr.io/littlered-operator/littlered` | `ghcr.io/chuck-chuck-chuck-net/littlered` |
+  | Chaos client | `ghcr.io/littlered-operator/littlered-chaos-client` | `ghcr.io/chuck-chuck-chuck-net/littlered-chaos-client` |
+  | Helm chart | `oci://ghcr.io/littlered-operator/charts/littlered` | `oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered` |
+
+  If you installed by chart, `helm upgrade` from the new OCI reference picks up the new image
+  default. If you pin `image.repository` yourself, update it. **The old packages stay
+  published** — an existing deployment keeps pulling and will not break on a node reschedule
+  — but they will not receive new versions.
 
 - **BREAKING — `spec.sentinel.masterName` is required, and you should set it.** A
   Sentinel master name is the *only* isolation Sentinel's gossip protocol has: a

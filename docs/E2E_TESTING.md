@@ -224,8 +224,8 @@ make test-e2e ARGS="-timeout 90m"
 | `TEST_NAMESPACE` | `littlered-e2e` | Namespace for test resources (must not be `default`, and must not already exist) |
 | `DEBUG_ON_FAILURE` | `false` | Skip cleanup on failure (leave resources for inspection); also enables Ginkgo `--fail-fast` |
 | `KIND_CLUSTER` | `littlered-test-e2e` | Kind cluster name |
-| `OPERATOR_IMAGE` | `ghcr.io/littlered-operator/littlered:<git-tag>` | Operator image to deploy |
-| `CHAOS_CLIENT_IMAGE` | `ghcr.io/littlered-operator/littlered-chaos-client:<git-tag>` | Chaos client image |
+| `OPERATOR_IMAGE` | `ghcr.io/chuck-chuck-chuck-net/littlered:<git-tag>` | Operator image to deploy |
+| `CHAOS_CLIENT_IMAGE` | `ghcr.io/chuck-chuck-chuck-net/littlered-chaos-client:<git-tag>` | Chaos client image |
 | `KUBECONTEXT_PINNING` | `false` | Snapshot current kubeconfig so context switches don't break tests |
 | `KUBECONTEXT` | (none) | Pin to a specific named context (implies pinning) |
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |

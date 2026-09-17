@@ -10,7 +10,7 @@ sentinel:
 # Chaos Client configuration
 chaosClient:
   image:
-    repository: ghcr.io/littlered-operator/littlered-chaos-client
+    repository: ghcr.io/chuck-chuck-chuck-net/littlered-chaos-client
     tag: latest
     pullPolicy: Always
   # 0 means unlimited duration

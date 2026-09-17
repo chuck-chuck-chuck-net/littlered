@@ -1,6 +1,6 @@
 # Image configuration for the chaos client
 image:
-  repository: ghcr.io/littlered-operator/littlered-chaos-client
+  repository: ghcr.io/chuck-chuck-chuck-net/littlered-chaos-client
   tag: latest
   pullPolicy: IfNotPresent
 

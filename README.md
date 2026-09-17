@@ -37,11 +37,11 @@ Failover mode is **experimental**. Its e2e coverage is on parity with sentinel m
 ### 1. Install the Operator
 
 ```bash
-helm upgrade --install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   -n littlered-system --create-namespace
 ```
 
-This installs the latest release. For a pinned version, add `--version <version>` — see the [releases page](https://github.com/littlered-operator/littlered-operator/releases).
+This installs the latest release. For a pinned version, add `--version <version>` — see the [releases page](https://github.com/chuck-chuck-chuck-net/littlered/releases).
 
 By default the operator is cluster-scoped (watches all namespaces). To scope it to specific namespaces — for multi-tenancy, least-privilege RBAC, or running two operators side by side — see [Namespace Scoping](docs/USAGE.md#namespace-scoping).
 

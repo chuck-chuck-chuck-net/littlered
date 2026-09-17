@@ -1,5 +1,5 @@
 image:
-  repository: ghcr.io/littlered-operator/littlered
+  repository: ghcr.io/chuck-chuck-chuck-net/littlered
   # tag: ""  # defaults to .Chart.AppVersion
   pullPolicy: IfNotPresent
 

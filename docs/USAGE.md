@@ -16,7 +16,7 @@ This guide shows how to deploy and use Redis instances with the LittleRed operat
 
 ```bash
 # From the published OCI chart (recommended)
-helm upgrade --install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   -n littlered-system --create-namespace
 
 # For a pinned version, add: --version <version>
@@ -25,8 +25,8 @@ helm upgrade --install littlered oci://ghcr.io/littlered-operator/charts/littler
 Or from a source checkout:
 
 ```bash
-git clone https://github.com/littlered-operator/littlered-operator.git
-helm upgrade --install littlered ./littlered-operator/charts/littlered \
+git clone https://github.com/chuck-chuck-chuck-net/littlered.git
+helm upgrade --install littlered ./littlered/charts/littlered \
   -n littlered-system --create-namespace
 ```
 
@@ -50,7 +50,7 @@ Create a `values.yaml` file:
 
 ```yaml
 image:
-  repository: ghcr.io/littlered-operator/littlered
+  repository: ghcr.io/chuck-chuck-chuck-net/littlered
   # tag: ""   # defaults to the chart's appVersion — pin only to override
 
 resources:
@@ -89,7 +89,7 @@ topologySpreadConstraints:
 Install with custom values:
 
 ```bash
-helm upgrade --install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   -n littlered-system --create-namespace \
   -f values.yaml
 ```
@@ -97,7 +97,7 @@ helm upgrade --install littlered oci://ghcr.io/littlered-operator/charts/littler
 #### Upgrade
 
 ```bash
-helm upgrade littlered oci://ghcr.io/littlered-operator/charts/littlered -n littlered-system
+helm upgrade littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered -n littlered-system
 ```
 
 **Important: Upgrading CRDs**
@@ -130,7 +130,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/littlered-operator/littlered-operator.git
+    repoURL: https://github.com/chuck-chuck-chuck-net/littlered.git
     targetRevision: main          # or a release tag, e.g. v0.3.0
     path: charts/littlered
   destination:
@@ -179,7 +179,7 @@ Use it for a single-tenant or per-team operator ("this operator manages only the
 `team-a` namespace"), or to manage a specific set of namespaces:
 
 ```bash
-helm upgrade --install littlered oci://ghcr.io/littlered-operator/charts/littlered \
+helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
   -n littlered-system --create-namespace \
   --set scope.watchNamespaces={team-a,team-b}
 ```
