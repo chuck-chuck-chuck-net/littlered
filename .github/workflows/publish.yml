@@ -124,8 +124,16 @@ jobs:
               capture { print }
             ' CHANGELOG.md
           }
-          # Prefer the section for the exact released version, fall back to [Unreleased].
+          # Prefer the section for the exact released version. For a pre-release tag
+          # (v0.4.0-rc1) fall back to the base version's section (0.4.0), which is what
+          # the release actually contains -- without this an rc publishes empty notes,
+          # because prepare-release.sh leaves [Unreleased] empty once a version is cut.
+          # [Unreleased] stays as the last resort for an untagged-content release.
           notes="$(extract "## [${version}]")"
+          base="${version%%-*}"
+          if ! printf '%s' "$notes" | grep -q '[^[:space:]]' && [ "$base" != "$version" ]; then
+            notes="$(extract "## [${base}]")"
+          fi
           printf '%s' "$notes" | grep -q '[^[:space:]]' || notes="$(extract '## [Unreleased]')"
           : > release-notes.md
           if printf '%s' "$notes" | grep -q '[^[:space:]]'; then
@@ -153,6 +161,9 @@ jobs:
         with:
           files: dist/*
           body_path: release-notes.md
+          # A tag carrying a pre-release suffix (v0.4.0-rc1) must not become the
+          # repository's headline release. Semver's own rule: a hyphen means pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
 
   chart:
     name: Push Helm chart
