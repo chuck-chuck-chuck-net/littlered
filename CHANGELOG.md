@@ -21,7 +21,8 @@ cut a release (`scripts/prepare-release.sh`).
   always win and are never inherited, and bookkeeping stamped on the CR by Helm, Argo CD,
   Flux or kubectl is not propagated (Argo CD's tracking labels on a child confuse its
   pruning; `last-applied-configuration` would embed a copy of the CR into every child
-  object). See ADR-021 and `docs/API_SPEC.md` §5.4.
+  object). See ADR-021 and `docs/API_SPEC.md` §5.4. Designed and implemented by Michael
+  Koch.
 
   **Note:** pod labels live in the pod template, so editing CR metadata triggers a rolling
   update — a failover in sentinel and failover mode, a serialized per-shard roll in cluster

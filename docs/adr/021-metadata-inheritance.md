@@ -7,6 +7,12 @@ Proposed. Implements [issue #96](https://github.com/littlered-operator/littlered
 defaults to the previous constant, so an existing instance's selectors are byte-identical
 after upgrade.
 
+**This ADR, the design it records and the implementation it describes are Michael Koch's**
+(`feat/metadata-inheritance`, commit `fb5882b`, 2026-08-19). The merge, the renumbering, the
+failover-mode wiring and the e2e run are later work on top; the addendum at the end of this
+document marks where that begins. `git blame` on this file and on
+`internal/controller/metadata.go` is the authoritative split.
+
 > ADR number: 021. Authored as 015 on a branch cut before ADR-015 (per-instance Sentinel
 > master name), 016, 017, 018 and 020 landed on the mainline; renumbered on merge. 010
 > (ghost-replica prune), 012 (multi-site) and 019 remain unclaimed.
@@ -190,6 +196,9 @@ discussion. Rejected: Argo CD tracking metadata on children is actively harmful,
   would have failed on any cluster, at any time, for reasons unrelated to the feature.
 
 ## Addendum (2026-09-17): failover mode, and why the per-kind test missed it
+
+*Everything above this line is the ADR as authored. This addendum is later work, added
+when the branch was merged a month after it was written.*
 
 This ADR was authored on a branch cut before `failover` mode existed, so it reasoned about
 three modes and wired three modes' builders. `resources_failover.go` arrived on the
