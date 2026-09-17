@@ -44,3 +44,8 @@ charts/*/values-local.yaml
 debug-*/
 
 dist/
+
+# Local scratch that has been committed by accident before: e2e console dumps carry
+# cluster and pod names and absolute home paths, and this repository is public.
+*.weg
+e2e-fail*.txt
