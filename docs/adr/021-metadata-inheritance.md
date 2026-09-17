@@ -120,8 +120,10 @@ error message; permitting it would cost them their data.
 
 **Editing CR labels or annotations rolls the pods.** Pod labels live in the pod template,
 and Kubernetes has no in-place pod-label update through a StatefulSet — a template change
-is a rolling update. Per mode: cluster rolls shard by shard (serialized, LR-021); sentinel
-fails over; **standalone restarts its single pod, which discards the data** (EmptyDir).
+is a rolling update. Per mode: cluster rolls shard by shard (serialized, LR-021, and
+within a shard one pod at a time on state, LR-047); sentinel fails over; failover mode
+fails over too, with the operator performing the handover itself and fencing the outgoing
+master (LR-038); **standalone restarts its single pod, which discards the data** (EmptyDir).
 Object-level metadata (Services, ConfigMap, PDBs, ServiceMonitor) changes in place with no
 restart. Users who annotate CRs frequently should prefer annotations that they are content
 to see roll the workload, or set them on a wrapper object instead.
@@ -166,9 +168,45 @@ discussion. Rejected: Argo CD tracking metadata on children is actively harmful,
   the immutability spec failed with "Expected an error to have occurred" and the
   structural-key spec with "expected app.kubernetes.io/name to be rejected" — then green
   with the rules restored.
-- Inheritance reaching real objects: `TestBuildersCarryInheritedMetadata` covers one
-  builder per kind.
+- Inheritance reaching real objects: `TestBuildersCarryInheritedMetadata` enumerates
+  **every object-producing builder in every mode**, not one builder per kind. The
+  per-kind sampling it replaced is what let failover mode ship uncovered — see the
+  addendum below.
 - `test/e2e/metadata_test.go` (label `metadata`) asserts the round trip on a live cluster:
   pods findable by an inherited label alone, and a custom `spec.appName` instance reaching
   `Running` with matching Service endpoints. **Not yet executed** — it compiles
   (`go vet -tags e2e`) but the run needs a cluster and an image registry; see the PR notes.
+
+## Addendum (2026-09-17): failover mode, and why the per-kind test missed it
+
+This ADR was authored on a branch cut before `failover` mode existed, so it reasoned about
+three modes and wired three modes' builders. `resources_failover.go` arrived on the
+mainline afterwards, and on merge its three builders (`buildConfigMapFailoverMode`,
+`buildRedisStatefulSetFailover`, `buildFailoverRedisPDB`) were **half-covered by
+accident**: they call `commonLabels`, so object *labels* inherited from day one, while
+object annotations and the entire pod template did not. A failover-mode pod could not be
+found by an inherited label — the exact thing issue #96 asked for.
+
+`buildFailoverRedisPDB` was correct throughout, because it is one line delegating to
+`buildSentinelRedisPDB`. That is the shape worth copying: a mode that *reuses* a builder
+gets the behaviour, a mode that *re-implements* one does not, and re-implementation is
+invisible at review time.
+
+**The test is the finding, not the fix.** `TestBuildersCarryInheritedMetadata` was written
+to cover "one builder per kind", which is a reasonable-sounding sampling rule that is
+structurally unable to see this class: `buildStatefulSet` stood in as *the* StatefulSet, so
+three other StatefulSet builders were never asked the question. It is now exhaustive per
+mode. A builder added to any mode from here fails it until it is wired — which is the only
+version of this check that survives the next mode being added.
+
+Widening the test also surfaced a second, pre-existing gap it had not been looking for:
+`buildReplicasHeadlessService` and `buildSentinelHeadlessService` declared
+`var annotations map[string]string` and populated it only when metrics were enabled, so
+neither inherited CR annotations in either sentinel or failover mode. Both now seed from
+`inheritedAnnotations` and layer the `prometheus.io/*` keys over it, per the precedence
+this ADR already specifies.
+
+Generalizable, and the same shape as LR-041 and LR-052: **a check whose coverage is defined
+by sampling reports green about the thing it never sampled.** The three builders were not
+missed by a wrong decision — nobody ever decided anything about them, because the branch
+predated them and the test could not notice.

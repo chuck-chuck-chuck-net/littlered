@@ -1197,8 +1197,9 @@ resource triggers a rolling update**:
 
 | Mode | Effect |
 |------|--------|
-| `cluster` | Rolls shard by shard (serialized); each shard's master fails over to its replica |
+| `cluster` | Rolls shard by shard (serialized); within a shard, one pod at a time gated on the replacement being a synced replica (ADR-017) |
 | `sentinel` | Rolls the pods; the master fails over |
+| `failover` | Rolls the pods; the operator performs the handover and fences the outgoing master (ADR-011) |
 | `standalone` | Restarts the single pod — **the data is discarded** (EmptyDir, no persistence) |
 
 Object-level metadata (Services, ConfigMap, PDBs, ServiceMonitor) updates in place with no

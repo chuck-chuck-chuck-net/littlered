@@ -24,8 +24,9 @@ cut a release (`scripts/prepare-release.sh`).
   object). See ADR-021 and `docs/API_SPEC.md` §5.4.
 
   **Note:** pod labels live in the pod template, so editing CR metadata triggers a rolling
-  update — a failover in sentinel mode, a serialized per-shard roll in cluster mode, and in
-  standalone mode a restart that **discards the data** (EmptyDir, no persistence).
+  update — a failover in sentinel and failover mode, a serialized per-shard roll in cluster
+  mode, and in standalone mode a restart that **discards the data** (EmptyDir, no
+  persistence).
 
 - **`spec.appName` sets the `app.kubernetes.io/name` value** (default `littlered`, so
   existing instances are unaffected), threaded through every selector so the label and the
@@ -46,6 +47,19 @@ cut a release (`scripts/prepare-release.sh`).
 
 - **Sentinel pods now get `spec.podTemplate.labels`.** `buildSentinelStatefulSet` was the
   one builder that never applied them, unlike standalone, sentinel-mode Redis and cluster.
+
+- **Failover mode inherits CR metadata like every other mode.** Its builders were written
+  after the inheritance work and were never wired, so a failover-mode instance inherited
+  object *labels* (they go through the shared `commonLabels`) but not object annotations
+  and not its pod template — a failover-mode pod could not be found by an inherited label,
+  which is the thing #96 asked for. The builder-level test now enumerates every
+  object-producing builder in every mode rather than one builder per kind, which is what
+  found this; see the ADR-021 addendum.
+
+- **The sentinel and failover headless Services inherit CR annotations.** Both built their
+  annotation map from scratch and populated it only when metrics were enabled, so CR
+  annotations never reached either. The `prometheus.io/*` keys now layer over the inherited
+  ones, per the documented precedence.
 
 ### Changed
 

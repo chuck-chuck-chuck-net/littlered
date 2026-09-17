@@ -19,7 +19,6 @@ package controller
 import (
 	"bytes"
 	"fmt"
-	"maps"
 	"strings"
 	"text/template"
 
@@ -176,9 +175,10 @@ func buildConfigMapFailoverMode(lr *littleredv1alpha1.LittleRed) *corev1.ConfigM
 
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      configMapName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        configMapName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Data: map[string]string{
 			fileRedisConf: buildRedisConfigFailover(lr),
@@ -220,17 +220,13 @@ func buildRedisStatefulSetFailover(lr *littleredv1alpha1.LittleRed) *appsv1.Stat
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentRedis
 
-	podLabels := make(map[string]string)
-	maps.Copy(podLabels, redisSelectorLabels(lr))
-	maps.Copy(podLabels, lr.Spec.PodTemplate.Labels)
+	podLabels := podTemplateLabels(lr, redisSelectorLabels(lr))
 
 	// Compute config hash for pod annotations to trigger rolling update on config change
 	configData := map[string]string{fileRedisConf: buildRedisConfigFailover(lr)}
 	configHash := computeConfigHash(configData)
 
-	podAnnotations := make(map[string]string)
-	maps.Copy(podAnnotations, lr.Spec.PodTemplate.Annotations)
-	podAnnotations[AnnotationConfigHash] = configHash
+	podAnnotations := podTemplateAnnotations(lr, map[string]string{AnnotationConfigHash: configHash})
 
 	failover := failoverSpecOrDefault(lr)
 	replicas := 1 + *failover.Replicas
@@ -254,9 +250,10 @@ func buildRedisStatefulSetFailover(lr *littleredv1alpha1.LittleRed) *appsv1.Stat
 
 	sts := &appsv1.StatefulSet{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      statefulSetName(lr),
-			Namespace: lr.Namespace,
-			Labels:    labels,
+			Name:        statefulSetName(lr),
+			Namespace:   lr.Namespace,
+			Labels:      labels,
+			Annotations: inheritedAnnotations(lr),
 		},
 		Spec: appsv1.StatefulSetSpec{
 			Replicas:        &replicas,

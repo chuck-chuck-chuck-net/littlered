@@ -19,6 +19,8 @@ package controller
 import (
 	"testing"
 
+	appsv1 "k8s.io/api/apps/v1"
+
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
@@ -249,36 +251,125 @@ func TestAppNameDefaultsWhenUnset(t *testing.T) {
 
 // TestBuildersCarryInheritedMetadata is the integration-level check that the
 // propagation reaches the resources a scrape config actually selects on, not just the
-// pure helpers. Covers one builder per kind.
+// pure helpers.
+//
+// It enumerates EVERY object-producing builder in EVERY mode rather than "one builder
+// per kind", because the per-kind sampling is what let failover mode ship uncovered:
+// resources_failover.go was written after the inheritance branch was cut, its builders
+// were never wired, and a test that checked buildStatefulSet as the representative
+// StatefulSet saw nothing. A builder added to a mode from now on fails this test until
+// it is wired, which is the property worth having.
 func TestBuildersCarryInheritedMetadata(t *testing.T) {
-	lr := withCRMetadata(
-		map[string]string{metaTeamKey: metaTeamValue},
-		map[string]string{metaOwnerKey: metaOwnerValue},
-	)
-	enabled := true
-	lr.Spec.Metrics.Enabled = &enabled
-
 	type object struct {
 		name        string
 		labels      map[string]string
 		annotations map[string]string
 	}
-	sts := buildStatefulSet(lr)
-	svc := buildService(lr)
-	cm := buildConfigMap(lr)
-	objects := []object{
-		{"StatefulSet", sts.Labels, sts.Annotations},
-		{"StatefulSet pod template", sts.Spec.Template.Labels, sts.Spec.Template.Annotations},
-		{"Service", svc.Labels, svc.Annotations},
-		{"ConfigMap", cm.Labels, cm.Annotations},
+
+	// withMode returns a defaulted CR in the given mode, carrying one inherited label
+	// and one inherited annotation.
+	withMode := func(mode string) *littleredv1alpha1.LittleRed {
+		lr := withCRMetadata(
+			map[string]string{metaTeamKey: metaTeamValue},
+			map[string]string{metaOwnerKey: metaOwnerValue},
+		)
+		lr.Spec.Mode = mode
+		enabled := true
+		lr.Spec.Metrics.Enabled = &enabled
+		lr.SetDefaults()
+		return lr
 	}
-	for _, o := range objects {
-		if o.labels[metaTeamKey] != metaTeamValue {
-			t.Errorf("%s labels missing inherited team label: %v", o.name, o.labels)
+
+	// podTemplate flattens a StatefulSet into the object pair plus its pod template,
+	// which is the half that actually reaches a running pod.
+	stsObjects := func(what string, sts *appsv1.StatefulSet) []object {
+		return []object{
+			{what, sts.Labels, sts.Annotations},
+			{what + " pod template", sts.Spec.Template.Labels, sts.Spec.Template.Annotations},
 		}
-		if o.annotations[metaOwnerKey] != metaOwnerValue {
-			t.Errorf("%s annotations missing inherited owner annotation: %v", o.name, o.annotations)
-		}
+	}
+
+	modes := []struct {
+		mode    string
+		objects func(lr *littleredv1alpha1.LittleRed) []object
+	}{
+		{
+			mode: ModeStandalone,
+			objects: func(lr *littleredv1alpha1.LittleRed) []object {
+				svc, cm, sm := buildService(lr), buildConfigMap(lr), buildServiceMonitor(lr)
+				objs := stsObjects("StatefulSet", buildStatefulSet(lr))
+				return append(objs,
+					object{"Service", svc.Labels, svc.Annotations},
+					object{"ConfigMap", cm.Labels, cm.Annotations},
+					object{"ServiceMonitor", sm.Labels, sm.Annotations},
+				)
+			},
+		},
+		{
+			mode: ModeSentinel,
+			objects: func(lr *littleredv1alpha1.LittleRed) []object {
+				objs := stsObjects("Redis StatefulSet", buildRedisStatefulSetSentinel(lr, 3))
+				objs = append(objs, stsObjects("Sentinel StatefulSet", buildSentinelStatefulSet(lr, 3))...)
+				redisCM, sentinelCM := buildConfigMapSentinelMode(lr), buildSentinelConfigMap(lr)
+				master, replicas := buildMasterService(lr), buildReplicasHeadlessService(lr)
+				sentinelSvc := buildSentinelHeadlessService(lr)
+				redisPDB, sentinelPDB := buildSentinelRedisPDB(lr), buildSentinelPDB(lr)
+				return append(objs,
+					object{"Redis ConfigMap", redisCM.Labels, redisCM.Annotations},
+					object{"Sentinel ConfigMap", sentinelCM.Labels, sentinelCM.Annotations},
+					object{"master Service", master.Labels, master.Annotations},
+					object{"replicas headless Service", replicas.Labels, replicas.Annotations},
+					object{"sentinel headless Service", sentinelSvc.Labels, sentinelSvc.Annotations},
+					object{"Redis PDB", redisPDB.Labels, redisPDB.Annotations},
+					object{"Sentinel PDB", sentinelPDB.Labels, sentinelPDB.Annotations},
+				)
+			},
+		},
+		{
+			mode: ModeCluster,
+			objects: func(lr *littleredv1alpha1.LittleRed) []object {
+				objs := stsObjects("shard StatefulSet", buildClusterShardStatefulSet(lr, 0, nil))
+				cm := buildClusterConfigMap(lr)
+				headless, client := buildClusterHeadlessService(lr), buildClusterClientService(lr)
+				pdb := buildClusterShardPDB(lr, 0)
+				return append(objs,
+					object{"cluster ConfigMap", cm.Labels, cm.Annotations},
+					object{"cluster headless Service", headless.Labels, headless.Annotations},
+					object{"cluster client Service", client.Labels, client.Annotations},
+					object{"shard PDB", pdb.Labels, pdb.Annotations},
+				)
+			},
+		},
+		{
+			// Failover mode reuses sentinel mode's master/replicas Services (the label
+			// routing is identical, pillar 3.14) and adds three builders of its own.
+			mode: ModeFailover,
+			objects: func(lr *littleredv1alpha1.LittleRed) []object {
+				objs := stsObjects("failover StatefulSet", buildRedisStatefulSetFailover(lr))
+				cm, pdb := buildConfigMapFailoverMode(lr), buildFailoverRedisPDB(lr)
+				master, replicas := buildMasterService(lr), buildReplicasHeadlessService(lr)
+				return append(objs,
+					object{"failover ConfigMap", cm.Labels, cm.Annotations},
+					object{"failover PDB", pdb.Labels, pdb.Annotations},
+					object{"master Service", master.Labels, master.Annotations},
+					object{"replicas headless Service", replicas.Labels, replicas.Annotations},
+				)
+			},
+		},
+	}
+
+	for _, m := range modes {
+		t.Run(m.mode, func(t *testing.T) {
+			lr := withMode(m.mode)
+			for _, o := range m.objects(lr) {
+				if o.labels[metaTeamKey] != metaTeamValue {
+					t.Errorf("%s labels missing inherited team label: %v", o.name, o.labels)
+				}
+				if o.annotations[metaOwnerKey] != metaOwnerValue {
+					t.Errorf("%s annotations missing inherited owner annotation: %v", o.name, o.annotations)
+				}
+			}
+		})
 	}
 }
 

@@ -1725,7 +1725,7 @@ func buildReplicasHeadlessService(lr *littleredv1alpha1.LittleRed) *corev1.Servi
 		},
 	}
 
-	var annotations map[string]string
+	annotations := inheritedAnnotations(lr)
 	// This headless service selects every Redis data pod (master + replicas),
 	// so it is the scrape target for the whole sentinel data plane — the
 	// role-scoped master service deliberately does not expose metrics to avoid
@@ -1737,11 +1737,10 @@ func buildReplicasHeadlessService(lr *littleredv1alpha1.LittleRed) *corev1.Servi
 			TargetPort: intstr.FromString(portNameMetrics),
 			Protocol:   corev1.ProtocolTCP,
 		})
-		annotations = map[string]string{
-			"prometheus.io/scrape": annotationValueTrue,
-			"prometheus.io/port":   fmt.Sprintf("%d", littleredv1alpha1.RedisExporterPort),
-			"prometheus.io/path":   pathMetrics,
-		}
+		// The operator's own keys layer OVER the inherited ones (ADR-021).
+		annotations["prometheus.io/scrape"] = annotationValueTrue
+		annotations["prometheus.io/port"] = fmt.Sprintf("%d", littleredv1alpha1.RedisExporterPort)
+		annotations["prometheus.io/path"] = pathMetrics
 	}
 
 	return &corev1.Service{
@@ -1775,7 +1774,7 @@ func buildSentinelHeadlessService(lr *littleredv1alpha1.LittleRed) *corev1.Servi
 		},
 	}
 
-	var annotations map[string]string
+	annotations := inheritedAnnotations(lr)
 	// Expose the exporter port so the ServiceMonitor (selects on name+instance)
 	// and prometheus.io annotations pick up the Sentinel pods' metrics.
 	if lr.Spec.Metrics.IsEnabled() {
@@ -1785,11 +1784,10 @@ func buildSentinelHeadlessService(lr *littleredv1alpha1.LittleRed) *corev1.Servi
 			TargetPort: intstr.FromString(portNameMetrics),
 			Protocol:   corev1.ProtocolTCP,
 		})
-		annotations = map[string]string{
-			"prometheus.io/scrape": annotationValueTrue,
-			"prometheus.io/port":   fmt.Sprintf("%d", littleredv1alpha1.RedisExporterPort),
-			"prometheus.io/path":   pathMetrics,
-		}
+		// The operator's own keys layer OVER the inherited ones (ADR-021).
+		annotations["prometheus.io/scrape"] = annotationValueTrue
+		annotations["prometheus.io/port"] = fmt.Sprintf("%d", littleredv1alpha1.RedisExporterPort)
+		annotations["prometheus.io/path"] = pathMetrics
 	}
 
 	return &corev1.Service{
