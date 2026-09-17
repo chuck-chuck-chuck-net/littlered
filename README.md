@@ -84,6 +84,7 @@ kubectl lr verify my-store
 - **Burstable QoS by default**: memory limit equals request (preventing OOM surprises); a CPU *request* but no CPU *limit*. Redis's CPU use is bounded by its thread count, so a limit can only throttle it under load — size the request to the thread budget instead. Set an explicit CPU limit only if you need Guaranteed QoS.
 - **`noeviction` by default**: memory exhaustion returns an error rather than silently dropping data. Explicitly configure a different policy if you need eviction semantics.
 - **Per-shard failure-domain isolation (cluster mode)**: `spec.placement.shardAntiAffinity` spreads each shard's master and replica(s) across nodes/zones, so losing a single failure domain can't take out a whole shard.
+- **Metadata inheritance**: labels and annotations on the `LittleRed` resource propagate to every object it owns — StatefulSets, Services, ConfigMap, PDBs, ServiceMonitor and the pods — so a scrape config or cost report can group on your own `team` / `environment` labels. `spec.appName` sets the `app.kubernetes.io/name` value. Note that editing instance metadata rolls the pods.
 - **Security**: password authentication and TLS encryption, both via Kubernetes Secrets.
 - **Observability**: `redis_exporter` sidecar included by default, with optional `ServiceMonitor` for Prometheus.
 - **`lrctl`**: a CLI tool (installable as a `kubectl lr` plugin) for direct state inspection and verification.
@@ -97,8 +98,13 @@ apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
   name: my-store
+  labels:                   # Inherited by every object the operator creates
+    team: payments
+  annotations:
+    owner: payments@example.com
 spec:
   mode: standalone          # standalone | sentinel | cluster | failover (experimental)
+  appName: littlered        # app.kubernetes.io/name on owned resources. IMMUTABLE.
 
   image:
     registry: docker.io

@@ -1255,6 +1255,97 @@ spec:
         release: prometheus  # Match your Prometheus operator selector
 ```
 
+### Labels and annotations on the instance (inherited by everything it owns)
+
+Labels and annotations you put on the `LittleRed` resource propagate to **every** object the
+operator creates for it — StatefulSets, Services, the ConfigMap, PodDisruptionBudgets, the
+ServiceMonitor, and the pods themselves. This is the intended way to attach team, environment
+or ownership metadata that a scrape config, a cost report or a network policy groups on.
+
+```yaml
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: store
+  labels:
+    team: payments
+    environment: production
+  annotations:
+    owner: payments@example.com
+spec:
+  mode: sentinel
+  sentinel:
+    masterName: payments.store
+```
+
+Every pod is then selectable by your own label alone:
+
+```bash
+kubectl get pods -l team=payments
+kubectl get sts,svc,cm,pdb -l environment=production
+```
+
+**What does not propagate**, and why:
+
+| Not inherited | Reason |
+|---------------|--------|
+| `app.kubernetes.io/name`, `/instance`, `/component`, `redis.…/shard`, `/role` | These **are** the Service and StatefulSet selectors. The operator owns them; see `appName` below to set the first one. |
+| `app.kubernetes.io/managed-by`, `app.kubernetes.io/version` | Operator-authored and kept current. Your value would be overwritten, so it is dropped rather than quietly lost. |
+| Anything under `redis.chuck-chuck-chuck.net/` | The operator's own namespace, reserved in full — not just the keys it happens to set today. |
+| `kubectl.kubernetes.io/`, `argocd.argoproj.io/`, `meta.helm.sh/`, `helm.sh/`, `kustomize.toolkit.fluxcd.io/`, `helm.toolkit.fluxcd.io/` | Tool bookkeeping. Argo CD tracking labels on a child confuse its pruning, and `last-applied-configuration` would embed a copy of the whole CR into every child object. |
+
+If you set one of the five structural keys in `spec.podTemplate.labels`, the API server
+rejects the CR up front, rather than letting the operator build a StatefulSet whose pod
+template disagrees with its own selector:
+
+```
+spec.podTemplate.labels may not set the operator's structural labels
+(app.kubernetes.io/name, app.kubernetes.io/instance, app.kubernetes.io/component,
+redis.chuck-chuck-chuck.net/shard, redis.chuck-chuck-chuck.net/role);
+use spec.appName for the app name
+```
+
+#### Setting `app.kubernetes.io/name` with `spec.appName`
+
+The app name defaults to `littlered`. Set `spec.appName` to group the instance under your
+own application name — this is what most monitoring stacks key on:
+
+```yaml
+spec:
+  appName: valkey-store
+```
+
+It is threaded through every selector, so the label and the selectors cannot disagree.
+
+**`appName` is immutable.** It is part of `StatefulSet.spec.selector`, which Kubernetes does
+not permit changing; the only way around that is to delete and recreate the StatefulSet,
+which under EmptyDir (no persistence) **discards the data**. The CRD rejects a change
+outright rather than offering you that trade:
+
+```
+spec.appName is immutable: it is part of the StatefulSet selector, which Kubernetes does not allow to change
+```
+
+Choose it at creation time. To change it, create a new instance and migrate clients.
+
+#### ⚠ Editing instance metadata rolls the pods
+
+Pod labels live in the pod template, and Kubernetes has no in-place pod-label update through
+a StatefulSet — so **adding or changing a label or annotation on the `LittleRed` resource
+triggers a rolling update**:
+
+| Mode | Effect |
+|------|--------|
+| `sentinel` | Rolls the pods; the master fails over |
+| `failover` | Rolls the pods; the operator performs the handover and fences the outgoing master |
+| `cluster` | Rolls shard by shard; within a shard, one pod at a time, gated on the replacement being a synced replica |
+| `standalone` | Restarts the single pod — **the data is discarded** (EmptyDir, no persistence) |
+
+Object-level metadata (Services, ConfigMap, PDBs, ServiceMonitor) updates in place with no
+restart. If you relabel instances routinely — a CI pipeline stamping a build ID, say — put
+that metadata on a wrapper object instead, or accept a roll each time. In standalone mode,
+treat a label edit as equivalent to deleting the data.
+
 ### Production sentinel setup
 
 ```yaml
