@@ -10,7 +10,86 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-17
+
+Everything below has landed since `v0.3.0`. Three headlines, in the order they are
+likely to affect you.
+
+**Sentinel isolation is now enforced, and it is the one breaking change.**
+`spec.sentinel.masterName` is required, because a shared master name is what let two
+unrelated Sentinel deployments on one pod network merge into one and destroy a
+dataset — in production, silently, with both instances reporting healthy. Existing
+instances keep running; see **Changed** for exactly when you are forced to act, and
+where the requirement does *not* bite.
+
+**A new `failover` mode, experimental.** The same job as sentinel mode — one master,
+N replicas, automatic failover — with the operator as the sole failure detector and
+no Sentinel processes. Offered alongside sentinel mode, which stays fully supported.
+
+**Cluster rolling updates now wait for redundancy instead of for a timer**, after a
+routine rolling update destroyed a shard's entire dataset and reported complete
+success. A held rollout stalls loudly and is never released on a timeout.
+
+No change to the persistence posture: LittleRed remains a pure in-memory store with
+no RDB/AOF and no PersistentVolumes.
+
 ### Added
+
+- **`failover` mode (experimental)** — a fourth deployment mode: 1 master +
+  `spec.failover.replicas` replicas (default 2), **no Sentinel processes**. The
+  operator is the failure detector and the failover decider, which removes the "two
+  cooks" problem of running Sentinel underneath an operator that also has opinions
+  about the same state. Writer routing is unchanged — the `{name}` Service still
+  selects on the operator's `role: master` label.
+  - Roles are assigned by annotating the data pods (`assigned-role`,
+    `assigned-master-ip`, `assignment-epoch`); each pod reads its own annotations
+    back through a downward-API volume, so no data pod needs API-server access.
+  - Death is declared on corroborated evidence: the kubelet's own readiness verdict
+    or a pod that is gone, or — for a network failure — the operator being unable to
+    reach the master for `spec.failover.downAfterMilliseconds` **and** every reachable
+    replica agreeing its link is down. The operator's own dial is never sufficient on
+    its own.
+  - `spec.failover.minReplicasToWrite` (default `1`) lets an isolated master fence
+    itself during a partition, the one case operator-side fencing cannot reach. Set it
+    to `0` explicitly at `replicas: 1`.
+  - **Accepted trade-off: HA is coupled to operator liveness.** Sentinel mode's hard
+    failures already were. `sentinel` remains fully supported; `failover` is offered
+    as an option, not a migration you are expected to make.
+  - Experimental: e2e coverage is at parity with sentinel mode, including chaos and
+    durability tiers, but it has not seen real-world usage. See
+    [docs/RECONCILIATION_LOOP_FAILOVER.md](docs/RECONCILIATION_LOOP_FAILOVER.md) and
+    ADR-011.
+
+- **In-place rename of the Sentinel master name** (ADR-018). Edit
+  `spec.sentinel.masterName` on a running instance and the operator re-points its
+  Sentinels to the new name and prunes every other name they carry, **dataset
+  preserved**. Progress shows on a `StaleMasterName` condition. This is the supported
+  way to move an instance off a colliding or legacy name; the runbook, its
+  preconditions and the roughly three-minute window are in
+  [docs/USAGE.md](docs/USAGE.md).
+
+- **Automatic containment when a capture happens anyway** (ADR-016). An instance whose
+  Sentinels have been taken over by another deployment sharing its master name is
+  declared `Forsaken` and **held at zero replicas** until the captor has healed, then
+  re-bootstrapped empty. This is default-on and has no opt-out.
+  - **Read this if you run sentinel mode:** the captured instance's pods are deleted.
+    It is already unrecoverable at that point — its identity and data cannot be
+    salvaged, which ADR-015 established and did not reverse — and the purpose is the
+    *neighbour*: the captor is silently healthy with the victim's pods in its
+    failover-candidate set, so its next master death can promote a foreign pod.
+  - It refuses to act when a reachable pod holds keys the capture does not explain, or
+    when a pod cannot be proven empty. Bounded to two attempts, then it latches and
+    stops.
+
+- **Declared operations** (ADR-020). A change to a *heavy* spec field — one whose
+  change cannot safely proceed alongside ordinary healing — is now declared,
+  carried out and acknowledged on completion. `status.operation` and an
+  `OperationInProgress` condition report it. The registry has exactly one member,
+  the master-name rename above.
+  - A CEL rule refuses an apply that changes more than one heavy field at once, so
+    the ambiguous state cannot be created.
+  - **A `Blocked` or `Stalled` operation never clears itself.** There is no timer; a
+    timer would just be the same defect with a delay.
 
 - **Labels and annotations on a `LittleRed` resource are now inherited by every resource
   the operator creates for it** — StatefulSets, Services, the ConfigMap,
@@ -36,7 +115,147 @@ cut a release (`scripts/prepare-release.sh`).
   recreating the StatefulSet would discard the data. This is the direct request in #96 —
   grouping an instance under the user's own application name for monitoring.
 
+- **`spec.config.tcpKeepalive`** — the Redis `tcp-keepalive` interval in seconds. Zero
+  disables keepalive, which is a real Redis setting and not a "leave it default" value.
+
+- **New conditions**, all surfaced on the CR: `SentinelMasterNameUnscoped` (warning —
+  no master name has been decided), `StaleMasterName`, `Forsaken`, `FailoverRecovery`,
+  `ClusterRolloutBlocked`, `OperationInProgress`, and `OperatorCannotAuthenticate`
+  (the operator's credential was refused by a pod — its keyspace is therefore unknown,
+  not empty, and every data-safety gate treats it that way).
+
+- **`lrctl` reports the new state.** No new verbs — `status`, `verify`, `inspect`,
+  `debug-dump` and `import` are unchanged — but `verify` now covers failover-mode
+  topology, flags a foreign Sentinel contact whether or not the operator has reached a
+  capture verdict (it has no evidentiary floor of its own, deliberately: only the
+  operator's verdict deletes pods), and both `status` and `verify` render any declared
+  operation in flight.
+
+### Changed
+
+- **BREAKING — `spec.sentinel.masterName` is required, and you should set it.** A
+  Sentinel master name is the *only* isolation Sentinel's gossip protocol has: a
+  Sentinel that receives a hello looks the name up, discards it if unknown, and checks
+  nothing else — no instance identity, no namespace. Two instances sharing a name and
+  able to reach each other are, protocol-wise, **one deployment**, and the one with the
+  higher config epoch can reassign the other's master to a foreign Redis pod, whose
+  replicas then flush their datasets to resynchronise from a stranger. This happened in
+  production. Use `<namespace>.<name>`.
+  - **Existing instances keep running.** One is forced to state a value only on its next
+    change to `spec.sentinel`, and reports the `SentinelMasterNameUnscoped` warning
+    condition until then.
+  - **The requirement is not a hard gate.** `masterName` is required *within*
+    `spec.sentinel`, and that block is itself optional — so a CR that omits it entirely
+    is accepted even in sentinel mode and falls back to the legacy shared name
+    `mymaster`, with the same warning. Set one explicitly.
+  - **Authentication is now strongly recommended in sentinel mode.** It is the Sentinel
+    peer-membership credential too, and the only thing closing the narrower path a unique
+    name leaves open. It remains off by default.
+  - `masterName` is part of a Sentinel-aware client's configuration. Changing it means
+    reconfiguring those clients in the same window; clients reaching the master through
+    the `{name}` Service are unaffected.
+
+- **Cluster rolling updates are gated on redundancy, not on a timer** (ADR-017). The
+  operator holds each shard's StatefulSet at a `partition` and releases the next pod only
+  once every pod above it is at the new revision, Ready per the kubelet, **and** a
+  link-`up` replica of its shard's slot owner. The state where a node owns slots with no
+  synced replica no longer exists on this path.
+  - **The cost is time.** The bound moves from `shards x pods x (ready + minReadySeconds)`
+    to `shards x pods x (schedule + rejoin + full sync)`, which for a large dataset is
+    minutes per pod.
+  - **The chosen failure direction is a stall.** A rollout that cannot restore redundancy
+    holds, leaving the old pods serving, and reports `ClusterRolloutBlocked`. It is never
+    released on a timeout — a time-released rollout is the lossy path.
+  - This governs operator-triggered rollouts. A manual `kubectl rollout restart`, a drain
+    or an eviction bypasses the operator; those are covered by a pod-local preStop fence
+    that makes a last-copy master refuse writes rather than acknowledge and lose them.
+
+- Default `redis_exporter` sidecar image is now **v1.89.0** (from v1.88.0). Instances
+  that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
+
+- Dependency updates: prometheus-operator apis 0.93.1 and Ginkgo 2.32.1. CI-only:
+  the lint workflow now uses `azure/setup-helm@v5`.
+
 ### Fixed
+
+Data-loss and data-safety fixes first; each names its entry in
+`docs/RECONCILIATION_ALGORITHM_CHANGELOG.md`.
+
+- **A cluster rolling update could destroy a shard's entire dataset and report success**
+  (LR-047). Nothing gated the handover within a shard on the replacement actually being a
+  copy: a replaced pod returns on a wiped EmptyDir with a new node ID and is a copy of
+  nothing until the operator rejoins it and it full-syncs, so the whole window to restore
+  redundancy was `minReadySeconds` after the replacement answered a local `PING`. Observed:
+  96 seconds with zero copies of a shard's slot range, after which the repair loop
+  *healed the dead shard into a healthy-looking empty one*. Fixed by the state gate above.
+
+- **In failover mode, a graceful master delete lost acknowledged writes** (LR-038).
+  Promoting a replica says who the new master is and nothing about the old one, which on a
+  graceful delete is still alive and still mastering for its whole termination window —
+  and an established client connection is not re-routed by the label flip. **Measured: 202
+  of 1171 acknowledged writes lost, with zero corruptions and 97.66% write availability**,
+  so nothing caught it. The operator now demotes the outgoing master, converting silent
+  loss into visible `-READONLY` write failures. **Verified: 202 of 1171 lost → 0 of 990.**
+
+- **In failover mode, a `kill -9` of a promoted master could return it as an empty master**
+  that the operator believed was healthy, then repoint the replicas holding the only copy
+  onto it. **Measured: 352 of 1145 acknowledged writes destroyed**, fixed to 0. The
+  assignment epoch was being used to answer an identity question ("was this instruction
+  issued for *my* incarnation?"), which it cannot; a master start now additionally requires
+  an authorization the operator stamps only after establishing that no data is at risk.
+
+- **Rotating an auth Secret could make the operator reseed an empty master over live data**
+  (LR-051). This is the most serious fix in the release, it needed no CR edit to trigger, and
+  it shipped in v0.3.0.
+  - The password reaches the pods through an env `secretKeyRef` and appears in no pod
+    template, so changing it restarts nothing: the pods keep the old credential and the
+    instance looks perfectly healthy. The operator picks the new one up and every probe then
+    fails — and because the failure was **discarded rather than classified**, a pod that
+    refused the credential was byte-identical to a pod that did not answer at all. The data
+    holders filter on reachability, so every holder went invisible, which is precisely the
+    "no data, safe to reseed" signature. **The ≥2-holder refusal — the gate whose entire job
+    is to stop the operator discarding data — could never fire**, and the reseed needed no
+    opt-in.
+  - Reaching it required the operator to reach the Sentinels but not the Redis pods, which a
+    *partial* restart creates — including `kubectl rollout restart statefulset/<name>-sentinel`,
+    which this project's own runbook recommended.
+  - The gather now classifies the error. A pod that refused the credential is treated as a
+    live server with an **unknown** keyspace rather than an empty one, it blocks the recovery
+    outright, and the instance reports `OperatorCannotAuthenticate`. The accepted consequence
+    is that a permanent credential mismatch holds recovery open until the Secret is fixed —
+    which destroys nothing.
+
+- **A healthy instance could be quarantined and its pods deleted during an ordinary
+  rename** (LR-050). A pod of ours that had just been replaced was indistinguishable from a
+  foreign captor's master, and a supported rename presented that signature for a measured
+  42.5 seconds. The operator no longer attributes addresses at all while its own StatefulSet
+  is rolling.
+
+- **A blackholing dead pod IP could stall a reconcile for ~117 seconds** (LR-040),
+  starving the recovery it was meant to perform. The Sentinel *write* paths were left
+  unbounded on the premise that a guard upstream would stop them during churn; that guard
+  runs *after* them. Also established that a context deadline alone does not bound these
+  calls — the client's own dial/read/write timeouts must be set too.
+
+- **Every Sentinel read as "reachable but monitoring nothing", silently, forever**
+  (LR-041). The gather asked Sentinel about an empty master name, which Sentinel answers
+  exactly like an unknown one, so ghost-replica pruning, ghost-master correction and the
+  healthy-replica check all went quietly dead while status kept reporting healthy. The name
+  is now a parameter, so the omission cannot compile.
+
+- **A deference guard that had never once fired** (LR-052). The check for "a Sentinel
+  failover is already in progress, stay out of its way" read a reply field neither Redis
+  nor Valkey has ever emitted, so it was permanently false for the product's entire
+  history. Now reads the real field, through a single shared predicate.
+
+- **`CLUSTER MEET` could merge two unrelated clusters** (LR-043). Pod IPs are recycled
+  across instances on a shared pod network, and MEET validates nothing. Every MEET target
+  is now confirmed uncached against the API server before it is introduced.
+
+- **A captured sentinel instance was treated as converging, indefinitely** (LR-042) —
+  roughly 30 reconciles a minute re-deriving a dead end, and during a partial capture
+  actively wiping a Sentinel's replica list every pass. The state is now named and the
+  operator stops managing it.
 
 - **`spec.podTemplate.labels` could break an instance.** It was merged last, so it could
   override the operator's structural labels — making the pod template disagree with its
@@ -51,26 +270,13 @@ cut a release (`scripts/prepare-release.sh`).
 
 - **Failover mode inherits CR metadata like every other mode.** Its builders were written
   after the inheritance work and were never wired, so a failover-mode instance inherited
-  object *labels* (they go through the shared `commonLabels`) but not object annotations
-  and not its pod template — a failover-mode pod could not be found by an inherited label,
-  which is the thing #96 asked for. The builder-level test now enumerates every
-  object-producing builder in every mode rather than one builder per kind, which is what
-  found this; see the ADR-021 addendum.
+  object *labels* but not object annotations and not its pod template — a failover-mode pod
+  could not be found by an inherited label, which is the thing #96 asked for.
 
 - **The sentinel and failover headless Services inherit CR annotations.** Both built their
   annotation map from scratch and populated it only when metrics were enabled, so CR
   annotations never reached either. The `prometheus.io/*` keys now layer over the inherited
   ones, per the documented precedence.
-
-### Changed
-
-- Default `redis_exporter` sidecar image is now **v1.89.0** (from v1.88.0). Instances
-  that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
-
-- Dependency updates: prometheus-operator apis 0.93.1 and Ginkgo 2.32.1. CI-only:
-  the lint workflow now uses `azure/setup-helm@v5`.
-
-### Fixed
 
 - **Both container images were being built by a Go release candidate.** The
   Dependabot `golang` group moved the operator and chaos-client builders from
@@ -96,10 +302,54 @@ cut a release (`scripts/prepare-release.sh`).
   (ADR-014) was integrated with the guard's closing `{{- end }}` left behind in
   both files, closing nothing. `values.yaml` likewise carried a duplicated
   `scope:` block. Charts 0.2.2 and 0.3.0 have been republished with the fix.
+
 - **CI now lints and renders the chart** (`make helm-lint`, run on every push and
   again before the release job pushes to the registry) in the default,
   allow-list and deny-list scoping modes. A chart template error is invisible to
   the Go linter and previously only surfaced on the user's cluster.
+
+### Known issues
+
+None of these is a regression. The rename and capture entries are gaps in functionality that
+ships here for the first time; the authentication entries ship in v0.3.0 today and are
+carried forward knowingly, documented rather than patched a week before a tag.
+
+- **Renaming an instance whose Redis pods cannot become Ready wedges the rename**
+  (LR-061). A pod still on the pre-rename template asks Sentinel for the old name, which
+  the rename has correctly pruned, so it never starts — and the rolling update that would
+  give it the new name advances only as pods become Ready. Renaming a degraded instance is
+  already documented as out of scope; recover the instance first. The operation reports
+  `Stalled` and will not clear itself.
+
+- **Rotating an auth Secret still stops the operator managing the instance, and recovery
+  requires rolling the pods.** With the credential mismatch above now classified rather than
+  silent, the data-loss path is closed and the instance reports
+  `OperatorCannotAuthenticate` — but the operator still cannot read Sentinel, so healing
+  stays suspended until the pods are restarted onto the new credential. The consequence to
+  plan for is that a master failure during that window promotes correctly in Sentinel while
+  the operator cannot move the `role: master` label, so the `{name}` Service keeps selecting
+  the old pod. Roll the pods as part of any rotation.
+
+- **Any failure to read the auth Secret is treated as "auth is disabled".** A transient API
+  error, a deleted or renamed Secret, an RBAC change or a mistyped key all make the operator
+  present no credential to an auth-enabled fleet. The consequences are the two entries above,
+  reached with no user intent at all. Watch for `OperatorCannotAuthenticate`.
+
+- **Enabling authentication on a running sentinel instance can fail over a healthy master.**
+  Turning `spec.auth.enabled` on changes container arguments, so both StatefulSets roll; during
+  the roll an un-rolled Sentinel presenting no credential to an already-enforcing master is
+  told `NOAUTH`, marks it subjectively down, and a quorum of un-rolled Sentinels can agree and
+  fail over a master that is perfectly healthy. Availability only — no data loss — and it is
+  Sentinel behaving correctly on a topology the rollout creates. Enable auth during a window
+  where a failover is acceptable.
+
+- **A capture victim that is holding data and cannot sync produces no verdict at all**
+  (LR-054, ruled and accepted for this release). Such a pod is `link:down`, so the instance
+  never looks settled, so the operator withholds the capture diagnosis entirely. **Nothing
+  is deleted and the victim's own keys are untouched** — what is lost is that the operator
+  stays silent while a neighbouring captor remains polluted. `lrctl verify` still reports
+  the foreign contact, and the capture runbook in `docs/USAGE.md` flags that this shape
+  produces no condition.
 
 ## [0.3.0] - 2026-08-11
 

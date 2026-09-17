@@ -4,7 +4,7 @@ A Kubernetes operator for deploying Redis/Valkey as a pure in-memory data store.
 
 LittleRed is built for workloads where persistence is explicitly disabled and never enabled—not even by accident. It provides a full reconciliation engine to manage node identities and cluster membership across restarts and failures: the class of problem where static Helm charts and startup scripts reach their limits.
 
-## Upgrading to v0.3.1
+## Upgrading to v0.4.0
 
 ### Sentinel mode: `spec.sentinel.masterName` is now required
 
