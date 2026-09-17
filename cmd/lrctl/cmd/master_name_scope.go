@@ -20,7 +20,7 @@ import (
 	"fmt"
 	"strings"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // renderMasterNameScope turns the survey into the lines `verify` prints, and says

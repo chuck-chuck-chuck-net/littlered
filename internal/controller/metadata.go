@@ -21,7 +21,7 @@ import (
 	"slices"
 	"strings"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
 )
 
 // Metadata propagation (ADR-021). Labels and annotations on the LittleRed resource are

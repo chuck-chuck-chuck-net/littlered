@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"testing"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // ipMaster is the master address reused across the fixtures below.

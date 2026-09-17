@@ -22,7 +22,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // The §9.2 guard: a NORMAL rename must not be reported as a possible capture.

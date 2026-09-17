@@ -17,8 +17,8 @@ limitations under the License.
 package cmd
 
 import (
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	"github.com/littlered-operator/littlered-operator/internal/cli/types"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/types"
 )
 
 // masterNameOf resolves the Sentinel master name to use for an instance.

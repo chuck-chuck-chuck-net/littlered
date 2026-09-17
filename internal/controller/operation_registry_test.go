@@ -24,7 +24,7 @@ import (
 	"testing"
 	"time"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/yaml"
 )

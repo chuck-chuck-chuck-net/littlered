@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/littlered-operator/littlered-operator/cmd/lrctl/cmd"
+	"github.com/chuck-chuck-chuck-net/littlered/cmd/lrctl/cmd"
 )
 
 func main() {

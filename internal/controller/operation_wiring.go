@@ -28,7 +28,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/util/retry"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
 )
 
 // The wiring of ADR-020's declared-operation branch into sentinel mode.

@@ -5,7 +5,7 @@ import (
 	"context"
 	"fmt"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"

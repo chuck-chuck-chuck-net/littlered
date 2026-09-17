@@ -24,9 +24,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
-	"github.com/littlered-operator/littlered-operator/internal/cli/types"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/k8s"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/types"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 type cliGatherer struct {

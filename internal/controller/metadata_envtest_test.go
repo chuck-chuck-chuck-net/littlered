@@ -26,7 +26,7 @@ import (
 	utilrand "k8s.io/apimachinery/pkg/util/rand"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
 )
 
 // The two guards protecting the metadata contract (ADR-021) are CRD CEL rules, so the

@@ -41,9 +41,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	"github.com/littlered-operator/littlered-operator/internal/controller"
-	"github.com/littlered-operator/littlered-operator/internal/watchscope"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/controller"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/watchscope"
 	// +kubebuilder:scaffold:imports
 )
 

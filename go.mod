@@ -1,4 +1,4 @@
-module github.com/littlered-operator/littlered-operator
+module github.com/chuck-chuck-chuck-net/littlered
 
 go 1.26.0
 

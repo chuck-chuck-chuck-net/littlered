@@ -25,9 +25,9 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	clifailover "github.com/littlered-operator/littlered-operator/internal/cli/failover"
-	"github.com/littlered-operator/littlered-operator/internal/cli/types"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	clifailover "github.com/chuck-chuck-chuck-net/littlered/internal/cli/failover"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/types"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // failoverPodViews resolves the K8s-side per-pod inputs (assignment

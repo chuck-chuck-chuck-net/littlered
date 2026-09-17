@@ -21,7 +21,7 @@ import (
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // quarantinePhase is the decided state of the forsaken-gated quarantine lifecycle

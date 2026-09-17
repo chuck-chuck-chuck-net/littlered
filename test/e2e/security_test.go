@@ -15,9 +15,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	clik8s "github.com/littlered-operator/littlered-operator/internal/cli/k8s"
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	clik8s "github.com/chuck-chuck-chuck-net/littlered/internal/cli/k8s"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 var _ = Describe("LittleRed Security Features", Label("security"), func() {

@@ -21,7 +21,7 @@ import (
 	"strings"
 	"testing"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // Rule N's pure seam: which stale Sentinel master-name entries may be REMOVEd, and —

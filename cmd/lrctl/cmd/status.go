@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/k8s"
 	"github.com/spf13/cobra"
 	apimeta "k8s.io/apimachinery/pkg/api/meta"
 )

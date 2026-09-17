@@ -9,8 +9,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	"github.com/littlered-operator/littlered-operator/internal/cli/types"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/types"
 )
 
 const (

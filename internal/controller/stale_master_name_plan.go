@@ -21,7 +21,7 @@ import (
 	"sort"
 	"strings"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // The four reasons of the StaleMasterName condition (design §8). Polarity: True is bad,

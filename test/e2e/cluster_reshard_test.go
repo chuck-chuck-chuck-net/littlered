@@ -29,7 +29,7 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 // LR-018: the operator must recover a *consolidated-shard* cluster — one master owning

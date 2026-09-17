@@ -12,11 +12,11 @@ import (
 	"k8s.io/client-go/kubernetes"
 	"k8s.io/client-go/rest"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	"github.com/littlered-operator/littlered-operator/internal/cli/discovery"
-	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
-	"github.com/littlered-operator/littlered-operator/internal/cli/types"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/discovery"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/k8s"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/types"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 var verifyCmd = &cobra.Command{

@@ -20,8 +20,8 @@ import (
 	"strings"
 	"testing"
 
-	controller "github.com/littlered-operator/littlered-operator/internal/controller"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	controller "github.com/chuck-chuck-chuck-net/littlered/internal/controller"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // Shared string constants for the failover analyze tests (role/link/phase/replid

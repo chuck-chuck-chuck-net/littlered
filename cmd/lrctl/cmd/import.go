@@ -6,10 +6,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/littlered-operator/littlered-operator/internal/cli/discovery"
-	"github.com/littlered-operator/littlered-operator/internal/cli/k8s"
-	"github.com/littlered-operator/littlered-operator/internal/cli/types"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/discovery"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/k8s"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/cli/types"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 	"github.com/spf13/cobra"
 	"sigs.k8s.io/yaml"
 )

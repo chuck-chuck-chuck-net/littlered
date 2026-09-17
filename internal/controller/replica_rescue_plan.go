@@ -19,7 +19,7 @@ package controller
 import (
 	"sort"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // planReplicaRescue is Rule R's decision seam (LR-009/LR-010): which reachable

@@ -33,7 +33,7 @@ import (
 	. "github.com/onsi/ginkgo/v2" //nolint:revive // dot-import is the Ginkgo/Gomega convention in tests
 	. "github.com/onsi/gomega"    //nolint:revive // dot-import is the Ginkgo/Gomega convention in tests
 
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 // =============================================================================

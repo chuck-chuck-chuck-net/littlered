@@ -29,9 +29,9 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 // clusterMasterPod returns shard K's master pod name ({crName}-shard-K-0).

@@ -21,8 +21,8 @@ import (
 	"sort"
 	"strconv"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // ClusterPodRef identifies one pod in a per-shard cluster topology: which shard it

@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"testing"
 
-	"github.com/littlered-operator/littlered-operator/internal/watchscope"
+	"github.com/chuck-chuck-chuck-net/littlered/internal/watchscope"
 )
 
 const (

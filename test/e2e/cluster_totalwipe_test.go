@@ -29,8 +29,8 @@ import (
 	. "github.com/onsi/ginkgo/v2"
 	. "github.com/onsi/gomega"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 // Cluster total-wipe re-bootstrap — the cluster analog of the sentinel leaderless

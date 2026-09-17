@@ -29,7 +29,7 @@ import (
 
 	. "github.com/onsi/ginkgo/v2"
 
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 // Per-pod Redis ground truth for the debug artifacts.

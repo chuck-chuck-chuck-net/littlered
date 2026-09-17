@@ -20,7 +20,7 @@ import (
 	"reflect"
 	"testing"
 
-	redisclient "github.com/littlered-operator/littlered-operator/internal/redis"
+	redisclient "github.com/chuck-chuck-chuck-net/littlered/internal/redis"
 )
 
 // --- resolveFailoverIntent (ADR-011 §3: annotations ARE the intent record) ---

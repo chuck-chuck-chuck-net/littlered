@@ -26,7 +26,7 @@ import (
 	"strings"
 	"testing"
 
-	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
+	littleredv1alpha1 "github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1"
 )
 
 // twoNameSentinel is a scripted fake Sentinel that monitors TWO master names —

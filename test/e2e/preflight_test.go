@@ -12,7 +12,7 @@ import (
 	. "github.com/onsi/ginkgo/v2" //nolint:revive
 	. "github.com/onsi/gomega"    //nolint:revive
 
-	"github.com/littlered-operator/littlered-operator/test/utils"
+	"github.com/chuck-chuck-chuck-net/littlered/test/utils"
 )
 
 // defaultRedis is the image used by LittleRed when no image is specified in the CR.
