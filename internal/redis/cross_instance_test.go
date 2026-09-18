@@ -46,8 +46,8 @@ func TestDetectCrossInstance(t *testing.T) {
 			NumOtherSentinels: peers, NumSlaves: slaves, Replicas: reps,
 		}
 	}
-	state := func(nodes ...*SentinelNodeState) *SentinelClusterState {
-		s := &SentinelClusterState{
+	state := func(nodes ...*SentinelNodeState) *ReplicationState {
+		s := &ReplicationState{
 			SentinelNodes: map[string]*SentinelNodeState{},
 			ValidIPs:      ourPods,
 			RedisNodes:    map[string]*RedisNodeState{},

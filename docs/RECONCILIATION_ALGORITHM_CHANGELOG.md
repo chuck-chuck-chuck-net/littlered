@@ -487,10 +487,10 @@ the worst mode clusters at 43-51%, so a margin of ~3pp. If that cell ever fails,
 "the yield's cost grew", not as a flaky test — and note the same `> 0.40` bar is uselessly
 loose for the failover cells, which measured 85-96%.
 ## [LR-039] Cross-Instance Sentinel Capture — the Master Name Was a Shared Constant
-> **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and LR-038 on the
-> failover line (`release/0.3.1`); none are present on this branch, hence the jump from LR-025.
-> IDs are allocated globally across branches so they stay unique through a merge; chronological
-> order within one branch's file is deliberately sacrificed to that.
+> **Numbering note:** LR-026 … LR-037 are allocated on the multi-site line and are not present
+> here, hence the jump from LR-025 to LR-038. IDs are allocated globally across branches so they
+> stay unique through a merge — which is what let LR-038 (failover) and LR-039 (this entry) land
+> side by side on this integration branch with no renumbering.
 >
 > This entry was briefly numbered LR-038 by mistake — the highest ID was checked on the
 > multi-site line only (LR-037) and the failover line had already taken 038. **Check every

@@ -75,7 +75,7 @@ func flaggedDown(flags string) bool {
 //
 // Only reachable, monitoring Sentinels contribute: an unreachable one has no view, and
 // counting it would manufacture evidence out of a gather failure.
-func (s *SentinelClusterState) DetectCrossInstance(expectedSentinels, expectedReplicas int) CrossInstanceEvidence {
+func (s *ReplicationState) DetectCrossInstance(expectedSentinels, expectedReplicas int) CrossInstanceEvidence {
 	var ev CrossInstanceEvidence
 	masters := map[string]bool{}
 	replicas := map[string]bool{}

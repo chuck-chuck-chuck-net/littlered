@@ -33,7 +33,7 @@ import (
 // construction. That is why this lives in `verify`, run by someone already suspicious,
 // rather than in the controller, where silence would be read as an all-clear it cannot
 // give (ADR-015 Alternative E).
-func reportCrossInstance(state *redisclient.SentinelClusterState, cCtx *types.ClusterContext) {
+func reportCrossInstance(state *redisclient.ReplicationState, cCtx *types.ClusterContext) {
 	masterName := masterNameOf(cCtx)
 	expectedSentinels := len(cCtx.SentinelPods)
 	expectedReplicas := max(len(cCtx.RedisPods)-1, 0)
