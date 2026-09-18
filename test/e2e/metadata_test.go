@@ -35,13 +35,16 @@ import (
 	clik8s "github.com/littlered-operator/littlered-operator/internal/cli/k8s"
 )
 
-// Metadata inheritance (ADR-015) is unit-tested at the builder level; what only a live
+// Metadata inheritance (ADR-021) is unit-tested at the builder level; what only a live
 // cluster shows is that the labels survive the full round trip — operator applies, API
 // server stores, kubelet stamps them on running pods — so a scrape config selecting on
 // them actually matches. That, and that a custom spec.appName produces a workload which
 // reconciles to Running rather than one whose StatefulSet the API server rejects for a
 // selector/template mismatch.
-var _ = Describe("LittleRed metadata inheritance", Label("metadata"), func() {
+// Mode labels: the tiers below are standalone-mode instances (the round trip is
+// mode-independent at the API-server level and standalone is the cheapest carrier).
+// Per-mode inheritance is covered at the builder level by TestBuildersCarryInheritedMetadata.
+var _ = Describe("LittleRed metadata inheritance", Label("metadata"), Label("standalone"), func() {
 	var k8sClient client.Client
 	ctx := context.Background()
 

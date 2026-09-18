@@ -1,4 +1,4 @@
-# ADR-015: Label and Annotation Inheritance, and a Configurable App Name
+# ADR-021: Label and Annotation Inheritance, and a Configurable App Name
 
 ## Status
 
@@ -7,8 +7,9 @@ Proposed. Implements [issue #96](https://github.com/littlered-operator/littlered
 defaults to the previous constant, so an existing instance's selectors are byte-identical
 after upgrade.
 
-> ADR number: 015. 010–012 are claimed on sibling branches (010 ghost-replica prune, 011
-> failover, 012 multi-site).
+> ADR number: 021. Authored as 015 on a branch cut before ADR-015 (per-instance Sentinel
+> master name), 016, 017, 018 and 020 landed on the mainline; renumbered on merge. 010
+> (ghost-replica prune), 012 (multi-site) and 019 remain unclaimed.
 
 ## Context
 

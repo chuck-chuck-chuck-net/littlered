@@ -24,7 +24,7 @@ import (
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
-// Metadata propagation (ADR-015). Labels and annotations on the LittleRed resource are
+// Metadata propagation (ADR-021). Labels and annotations on the LittleRed resource are
 // inherited by every resource the operator owns, so an instance can be grouped under a
 // team, environment or application name for monitoring and scraping without the operator
 // needing a knob per use case. Two rules bound it:

@@ -31,7 +31,7 @@ func withCRMetadata(labels, annotations map[string]string) *littleredv1alpha1.Li
 }
 
 // TestInheritedLabels covers the propagation filter: user labels on the CR flow to
-// child resources, operator-owned and tool-injected keys do not (ADR-015).
+// child resources, operator-owned and tool-injected keys do not (ADR-021).
 func TestInheritedLabels(t *testing.T) {
 	tests := []struct {
 		name string
@@ -55,7 +55,7 @@ func TestInheritedLabels(t *testing.T) {
 				labelAppInstance:  metaHijackValue,
 				labelAppComponent: metaHijackValue,
 				LabelShard:        "9",
-				LabelRole:         "master",
+				LabelRole:         RoleMaster,
 				metaKeepKey:       metaKeepValue,
 			},
 			want: map[string]string{metaKeepKey: metaKeepValue},
@@ -177,9 +177,9 @@ func TestObjectLabelsOperatorWins(t *testing.T) {
 // structural keys never overridable, because a pod template that drifts from the
 // StatefulSet selector is rejected by the API server.
 func TestPodLabelsPrecedence(t *testing.T) {
-	lr := withCRMetadata(map[string]string{metaTeamKey: metaTeamValue, "tier": "from-cr"}, nil)
+	lr := withCRMetadata(map[string]string{metaTeamKey: metaTeamValue, metaTierKey: "from-cr"}, nil)
 	lr.Spec.PodTemplate.Labels = map[string]string{
-		"tier":           "from-podtemplate",
+		metaTierKey:      "from-podtemplate",
 		labelAppName:     metaHijackValue,
 		labelAppInstance: metaHijackValue,
 		LabelShard:       "9",
@@ -197,8 +197,8 @@ func TestPodLabelsPrecedence(t *testing.T) {
 	if got[LabelShard] != "" {
 		t.Errorf("%s must not be settable by the user, got %q", LabelShard, got[LabelShard])
 	}
-	if got["tier"] != "from-podtemplate" {
-		t.Errorf("podTemplate.labels should beat inherited CR labels, got %q", got["tier"])
+	if got[metaTierKey] != "from-podtemplate" {
+		t.Errorf("podTemplate.labels should beat inherited CR labels, got %q", got[metaTierKey])
 	}
 	if got[metaTeamKey] != metaTeamValue {
 		t.Errorf("inherited label lost: %v", got)

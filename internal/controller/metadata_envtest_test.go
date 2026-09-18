@@ -29,7 +29,7 @@ import (
 	littleredv1alpha1 "github.com/littlered-operator/littlered-operator/api/v1alpha1"
 )
 
-// The two guards protecting the metadata contract (ADR-015) are CRD CEL rules, so the
+// The two guards protecting the metadata contract (ADR-021) are CRD CEL rules, so the
 // kube-apiserver — not Go code — is what enforces them. Unit tests cannot reach them:
 // they only verify the operator's side of the bargain. This suite verifies the
 // apiserver's side against a real one.

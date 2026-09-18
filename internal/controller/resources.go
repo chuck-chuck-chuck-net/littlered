@@ -206,7 +206,7 @@ func computePodTemplateHash(tmpl *corev1.PodTemplateSpec) string {
 }
 
 // commonLabels returns the standard labels applied to all resources, layered over the
-// labels inherited from the LittleRed resource (ADR-015).
+// labels inherited from the LittleRed resource (ADR-021).
 func commonLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
 	return objectLabels(lr, map[string]string{
 		labelAppName:      appNameFor(lr),
