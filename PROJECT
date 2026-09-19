@@ -7,7 +7,7 @@ domain: chuck-chuck-chuck.net
 layout:
 - go.kubebuilder.io/v4
 projectName: redis-operator
-repo: github.com/littlered-operator/littlered
+repo: github.com/chuck-chuck-chuck-net/littlered
 resources:
 - api:
     crdVersion: v1
@@ -16,6 +16,6 @@ resources:
   domain: chuck-chuck-chuck.net
   group: redis
   kind: LittleRed
-  path: github.com/littlered-operator/littlered/api/v1alpha1
+  path: github.com/chuck-chuck-chuck-net/littlered/api/v1alpha1
   version: v1alpha1
 version: "3"
