@@ -53,7 +53,7 @@ helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/litt
   -n littlered-system --create-namespace
 ```
 
-This installs the latest release. For a pinned version, add `--version <version>` — see the [releases page](https://github.com/chuck-chuck-chuck-net/littlered/releases).
+This installs the latest release. For a pinned version, add `--version <version>` — **without the leading `v`**, e.g. `--version 0.4.0` for the `v0.4.0` release. See the [releases page](https://github.com/chuck-chuck-chuck-net/littlered/releases).
 
 By default the operator is cluster-scoped (watches all namespaces). To scope it to specific namespaces — for multi-tenancy, least-privilege RBAC, or running two operators side by side — see [Namespace Scoping](docs/USAGE.md#namespace-scoping).
 
