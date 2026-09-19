@@ -2,7 +2,7 @@ apiVersion: v2
 name: littlered
 description: A Helm chart for deploying the LittleRed Redis operator
 type: application
-version: 0.4.0
+version: 0.4.0-rc1
 appVersion: "latest"
 home: https://github.com/chuck-chuck-chuck-net/littlered
 sources:
