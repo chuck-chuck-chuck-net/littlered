@@ -404,7 +404,7 @@ helm-package: manifests ## Package the Helm chart into dist/ with the current ve
 	mkdir -p $(HELM_DIST)
 	$(HELM) package charts/littlered \
 		--version $(CHART_VERSION) \
-		--app-version $(GIT_TAG) \
+		--app-version $(CHART_VERSION) \
 		--destination $(HELM_DIST)
 
 .PHONY: run
