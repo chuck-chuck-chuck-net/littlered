@@ -10,7 +10,7 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
-## [0.4.0] - 2026-09-17
+## [0.4.0] - 2026-09-19
 
 Everything below has landed since `v0.3.0`. Three headlines, in the order they are
 likely to affect you.
