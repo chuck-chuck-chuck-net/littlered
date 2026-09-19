@@ -2,7 +2,6 @@ apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
 kind: LittleRed
 metadata:
   labels:
-    app.kubernetes.io/name: littlered-operator
     app.kubernetes.io/managed-by: kustomize
   name: store-failover
 spec:
