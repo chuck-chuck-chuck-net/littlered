@@ -6,6 +6,18 @@ LittleRed is built for workloads where persistence is explicitly disabled and ne
 
 ## Upgrading to v0.4.0
 
+### The project has moved to `chuck-chuck-chuck-net`
+
+**Existing deployments keep working.** Git URLs redirect automatically, and the packages at
+`ghcr.io/littlered-operator/...` stay published — a running cluster keeps pulling and will not
+break on a node reschedule. They simply stop receiving new versions.
+
+The container registry does **not** redirect, because packages belong to the GitHub
+organisation rather than to the repository. So if you pin `image.repository` yourself, or
+install the chart by OCI reference, update it — the old→new table for all three artifacts is in
+[the 0.4.0 changelog](CHANGELOG.md). Installing with the `helm upgrade` command below picks up
+the new image default on its own.
+
 ### Sentinel mode: `spec.sentinel.masterName` is now required
 
 We had reports of *Sentinel collisions*: pod restarts on recycled IPs led two unrelated Sentinel instances to merge into one, losing both. A unique `masterName` — use `<namespace>.<name>` — closes most of those cases. Authentication closes the rest, which is why we now **strongly recommend authentication in sentinel mode**; see [Isolating Sentinel instances](docs/USAGE.md#isolating-sentinel-instances) for which cases need which, and `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` for the full analysis.
