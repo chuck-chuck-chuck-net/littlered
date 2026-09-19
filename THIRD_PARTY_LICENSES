@@ -12,7 +12,7 @@ reproduced in NOTICE (Apache-2.0 §4(d)); littlered's own license is in LICENSE.
 Module:  cel.dev/expr
 Version: v0.25.2
 License: Apache-2.0
-URL:     https://github.com/google/cel-spec/blob/v0.25.2/LICENSE
+URL:     https://github.com/cel-expr/cel-spec/blob/v0.25.2/LICENSE
 ================================================================================
 
 
@@ -557,9 +557,9 @@ SOFTWARE.
 
 ================================================================================
 Module:  github.com/go-logr/logr
-Version: v1.4.3
+Version: v1.4.4
 License: Apache-2.0
-URL:     https://github.com/go-logr/logr/blob/v1.4.3/LICENSE
+URL:     https://github.com/go-logr/logr/blob/v1.4.4/LICENSE
 ================================================================================
 
                                  Apache License
@@ -5470,9 +5470,9 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring
-Version: v0.91.0
+Version: v0.93.1
 License: Apache-2.0
-URL:     https://github.com/prometheus-operator/prometheus-operator/blob/pkg/apis/monitoring/v0.91.0/pkg/apis/monitoring/LICENSE
+URL:     https://github.com/prometheus-operator/prometheus-operator/blob/pkg/apis/monitoring/v0.93.1/pkg/apis/monitoring/LICENSE
 ================================================================================
 
 Apache License
@@ -6556,9 +6556,9 @@ URL:     https://github.com/prometheus/procfs/blob/v0.20.1/LICENSE
 
 ================================================================================
 Module:  github.com/redis/go-redis/v9
-Version: v9.20.0
+Version: v9.22.0
 License: BSD-2-Clause
-URL:     https://github.com/redis/go-redis/blob/v9.20.0/LICENSE
+URL:     https://github.com/redis/go-redis/blob/v9.22.0/LICENSE
 ================================================================================
 
 Copyright (c) 2013 The github.com/redis/go-redis Authors.
@@ -7290,9 +7290,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  go.opentelemetry.io/otel
-Version: v1.43.0
+Version: v1.44.0
 License: Apache-2.0
-URL:     https://github.com/open-telemetry/opentelemetry-go/blob/v1.43.0/LICENSE
+URL:     https://github.com/open-telemetry/opentelemetry-go/blob/v1.44.0/LICENSE
 ================================================================================
 
                                  Apache License
@@ -8007,9 +8007,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  go.opentelemetry.io/otel/metric
-Version: v1.43.0
+Version: v1.44.0
 License: Apache-2.0
-URL:     https://github.com/open-telemetry/opentelemetry-go/blob/metric/v1.43.0/metric/LICENSE
+URL:     https://github.com/open-telemetry/opentelemetry-go/blob/metric/v1.44.0/metric/LICENSE
 ================================================================================
 
                                  Apache License
@@ -8246,9 +8246,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  go.opentelemetry.io/otel/sdk
-Version: v1.43.0
+Version: v1.44.0
 License: Apache-2.0
-URL:     https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.43.0/sdk/LICENSE
+URL:     https://github.com/open-telemetry/opentelemetry-go/blob/sdk/v1.44.0/sdk/LICENSE
 ================================================================================
 
                                  Apache License
@@ -8485,9 +8485,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  go.opentelemetry.io/otel/trace
-Version: v1.43.0
+Version: v1.44.0
 License: Apache-2.0
-URL:     https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.43.0/trace/LICENSE
+URL:     https://github.com/open-telemetry/opentelemetry-go/blob/trace/v1.44.0/trace/LICENSE
 ================================================================================
 
                                  Apache License
@@ -9323,9 +9323,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  golang.org/x/net
-Version: v0.55.0
+Version: v0.56.0
 License: BSD-3-Clause
-URL:     https://cs.opensource.google/go/x/net/+/v0.55.0:LICENSE
+URL:     https://cs.opensource.google/go/x/net/+/v0.56.0:LICENSE
 ================================================================================
 
 Copyright 2009 The Go Authors.
@@ -9395,9 +9395,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  golang.org/x/sync
-Version: v0.20.0
+Version: v0.21.0
 License: BSD-3-Clause
-URL:     https://cs.opensource.google/go/x/sync/+/v0.20.0:LICENSE
+URL:     https://cs.opensource.google/go/x/sync/+/v0.21.0:LICENSE
 ================================================================================
 
 Copyright 2009 The Go Authors.
@@ -9430,10 +9430,10 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 
 ================================================================================
-Module:  golang.org/x/sys/unix
-Version: v0.45.0
+Module:  golang.org/x/sys
+Version: v0.46.0
 License: BSD-3-Clause
-URL:     https://cs.opensource.google/go/x/sys/+/v0.45.0:LICENSE
+URL:     https://cs.opensource.google/go/x/sys/+/v0.46.0:LICENSE
 ================================================================================
 
 Copyright 2009 The Go Authors.
@@ -9467,9 +9467,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  golang.org/x/term
-Version: v0.43.0
+Version: v0.44.0
 License: BSD-3-Clause
-URL:     https://cs.opensource.google/go/x/term/+/v0.43.0:LICENSE
+URL:     https://cs.opensource.google/go/x/term/+/v0.44.0:LICENSE
 ================================================================================
 
 Copyright 2009 The Go Authors.
@@ -9503,9 +9503,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  golang.org/x/text
-Version: v0.37.0
+Version: v0.39.0
 License: BSD-3-Clause
-URL:     https://cs.opensource.google/go/x/text/+/v0.37.0:LICENSE
+URL:     https://cs.opensource.google/go/x/text/+/v0.39.0:LICENSE
 ================================================================================
 
 Copyright 2009 The Go Authors.
@@ -9786,9 +9786,9 @@ URL:     https://github.com/gomodules/jsonpatch/blob/v2.5.0/v2/LICENSE
 
 ================================================================================
 Module:  google.golang.org/genproto/googleapis/api
-Version: v0.0.0-20260523011958-0a33c5d7ca68
+Version: v0.0.0-20260526163538-3dc84a4a5aaa
 License: Apache-2.0
-URL:     https://github.com/googleapis/go-genproto/blob/0a33c5d7ca68/googleapis/api/LICENSE
+URL:     https://github.com/googleapis/go-genproto/blob/3dc84a4a5aaa/googleapis/api/LICENSE
 ================================================================================
 
 
@@ -9997,9 +9997,9 @@ URL:     https://github.com/googleapis/go-genproto/blob/0a33c5d7ca68/googleapis/
 
 ================================================================================
 Module:  google.golang.org/genproto/googleapis/rpc
-Version: v0.0.0-20260523011958-0a33c5d7ca68
+Version: v0.0.0-20260526163538-3dc84a4a5aaa
 License: Apache-2.0
-URL:     https://github.com/googleapis/go-genproto/blob/0a33c5d7ca68/googleapis/rpc/LICENSE
+URL:     https://github.com/googleapis/go-genproto/blob/3dc84a4a5aaa/googleapis/rpc/LICENSE
 ================================================================================
 
 
@@ -10208,9 +10208,9 @@ URL:     https://github.com/googleapis/go-genproto/blob/0a33c5d7ca68/googleapis/
 
 ================================================================================
 Module:  google.golang.org/grpc
-Version: v1.81.1
+Version: v1.83.1
 License: Apache-2.0
-URL:     https://github.com/grpc/grpc-go/blob/v1.81.1/LICENSE
+URL:     https://github.com/grpc/grpc-go/blob/v1.83.1/LICENSE
 ================================================================================
 
 
@@ -10526,9 +10526,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  k8s.io/api
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/api/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/api/blob/v0.36.3/LICENSE
 ================================================================================
 
 
@@ -10737,9 +10737,9 @@ URL:     https://github.com/kubernetes/api/blob/v0.36.1/LICENSE
 
 ================================================================================
 Module:  k8s.io/apiextensions-apiserver/pkg/apis/apiextensions
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.3/LICENSE
 ================================================================================
 
 
@@ -10948,9 +10948,9 @@ URL:     https://github.com/kubernetes/apiextensions-apiserver/blob/v0.36.1/LICE
 
 ================================================================================
 Module:  k8s.io/apimachinery/pkg
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/apimachinery/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/apimachinery/blob/v0.36.3/LICENSE
 ================================================================================
 
 
@@ -11159,9 +11159,9 @@ URL:     https://github.com/kubernetes/apimachinery/blob/v0.36.1/LICENSE
 
 ================================================================================
 Module:  k8s.io/apimachinery/third_party/forked/golang
-Version: v0.36.1
+Version: v0.36.3
 License: BSD-3-Clause
-URL:     https://github.com/kubernetes/apimachinery/blob/v0.36.1/third_party/forked/golang/LICENSE
+URL:     https://github.com/kubernetes/apimachinery/blob/v0.36.3/third_party/forked/golang/LICENSE
 ================================================================================
 
 Copyright (c) 2009 The Go Authors. All rights reserved.
@@ -11195,9 +11195,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  k8s.io/apiserver
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/apiserver/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/apiserver/blob/v0.36.3/LICENSE
 ================================================================================
 
 
@@ -11406,9 +11406,9 @@ URL:     https://github.com/kubernetes/apiserver/blob/v0.36.1/LICENSE
 
 ================================================================================
 Module:  k8s.io/client-go
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/client-go/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/client-go/blob/v0.36.3/LICENSE
 ================================================================================
 
 
@@ -11617,9 +11617,9 @@ URL:     https://github.com/kubernetes/client-go/blob/v0.36.1/LICENSE
 
 ================================================================================
 Module:  k8s.io/component-base
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/component-base/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/component-base/blob/v0.36.3/LICENSE
 ================================================================================
 
 
@@ -12028,9 +12028,9 @@ third-party archives.
 
 ================================================================================
 Module:  k8s.io/kube-openapi/pkg
-Version: v0.0.0-20260520065146-aa012df4f4af
+Version: v0.0.0-20260603220949-865597e52e25
 License: Apache-2.0
-URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/LICENSE
+URL:     https://github.com/kubernetes/kube-openapi/blob/865597e52e25/LICENSE
 ================================================================================
 
 
@@ -12239,9 +12239,9 @@ URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/LICENSE
 
 ================================================================================
 Module:  k8s.io/kube-openapi/pkg/internal/third_party/go-json-experiment/json
-Version: v0.0.0-20260520065146-aa012df4f4af
+Version: v0.0.0-20260603220949-865597e52e25
 License: BSD-3-Clause
-URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/internal/third_party/go-json-experiment/json/LICENSE
+URL:     https://github.com/kubernetes/kube-openapi/blob/865597e52e25/pkg/internal/third_party/go-json-experiment/json/LICENSE
 ================================================================================
 
 Copyright (c) 2020 The Go Authors. All rights reserved.
@@ -12275,9 +12275,9 @@ OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 ================================================================================
 Module:  k8s.io/kube-openapi/pkg/internal/third_party/govalidator
-Version: v0.0.0-20260520065146-aa012df4f4af
+Version: v0.0.0-20260603220949-865597e52e25
 License: MIT
-URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/internal/third_party/govalidator/LICENSE
+URL:     https://github.com/kubernetes/kube-openapi/blob/865597e52e25/pkg/internal/third_party/govalidator/LICENSE
 ================================================================================
 
 The MIT License (MIT)
@@ -12304,9 +12304,9 @@ SOFTWARE.
 
 ================================================================================
 Module:  k8s.io/kube-openapi/pkg/validation/errors
-Version: v0.0.0-20260520065146-aa012df4f4af
+Version: v0.0.0-20260603220949-865597e52e25
 License: Apache-2.0
-URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/validation/errors/LICENSE
+URL:     https://github.com/kubernetes/kube-openapi/blob/865597e52e25/pkg/validation/errors/LICENSE
 ================================================================================
 
 
@@ -12515,9 +12515,9 @@ URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/valida
 
 ================================================================================
 Module:  k8s.io/kube-openapi/pkg/validation/spec
-Version: v0.0.0-20260520065146-aa012df4f4af
+Version: v0.0.0-20260603220949-865597e52e25
 License: Apache-2.0
-URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/validation/spec/LICENSE
+URL:     https://github.com/kubernetes/kube-openapi/blob/865597e52e25/pkg/validation/spec/LICENSE
 ================================================================================
 
 
@@ -12726,9 +12726,9 @@ URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/valida
 
 ================================================================================
 Module:  k8s.io/kube-openapi/pkg/validation/strfmt
-Version: v0.0.0-20260520065146-aa012df4f4af
+Version: v0.0.0-20260603220949-865597e52e25
 License: Apache-2.0
-URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/validation/strfmt/LICENSE
+URL:     https://github.com/kubernetes/kube-openapi/blob/865597e52e25/pkg/validation/strfmt/LICENSE
 ================================================================================
 
 
@@ -12937,9 +12937,9 @@ URL:     https://github.com/kubernetes/kube-openapi/blob/aa012df4f4af/pkg/valida
 
 ================================================================================
 Module:  k8s.io/streaming/pkg
-Version: v0.36.1
+Version: v0.36.3
 License: Apache-2.0
-URL:     https://github.com/kubernetes/streaming/blob/v0.36.1/LICENSE
+URL:     https://github.com/kubernetes/streaming/blob/v0.36.3/LICENSE
 ================================================================================
 
 
