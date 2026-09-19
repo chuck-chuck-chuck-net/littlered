@@ -1,20 +1,25 @@
+# GIT_EXACT_TAG is the tag pointing at HEAD, empty when HEAD is not tagged. Split out
+# because three different questions key off it and each wants a different answer.
+GIT_EXACT_TAG := $(shell git describe --tags --exact-match 2>/dev/null)
+
 # Get the git tag or short hash
-GIT_TAG := $(shell if [ -n "$$(git describe --tags --exact-match 2>/dev/null)" ]; then \
-                   git describe --tags --exact-match; \
-               else \
-                   git rev-parse --short HEAD; \
-               fi)
+GIT_TAG := $(if $(GIT_EXACT_TAG),$(GIT_EXACT_TAG),$(shell git rev-parse --short HEAD))
 
 # IS_RELEASE_TAG is non-empty only when GIT_TAG is a proper semver release tag (vX.Y.Z or X.Y.Z).
+# It deliberately excludes pre-releases: its job is gating :latest, and an rc must not move it.
+# Do NOT reuse it to decide how an image is addressed -- an rc is published like any other tag.
 IS_RELEASE_TAG := $(shell echo '$(GIT_TAG)' | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+$$' && echo true)
 
 # IMAGE_TAG is how a build is ADDRESSED in a registry, which is not the same question as
 # what version it IS (that is GIT_TAG, and it feeds CHART_VERSION and --app-version).
-# A release tag is used verbatim; an untagged commit becomes sha-<short>, matching what
-# docker/metadata-action's `type=sha` publishes from CI -- its default carries the prefix.
-# Without this the Makefile's defaults could never address a CI-built image: they asked
-# for :9b281ed where CI had published :sha-9b281ed.
-IMAGE_TAG := $(if $(IS_RELEASE_TAG),$(GIT_TAG),sha-$(GIT_TAG))
+# It mirrors exactly what CI publishes, so the defaults below name a real, pullable image:
+#   tagged commit    docker/metadata-action `type=semver,pattern={{version}}`, which strips
+#                    a leading v -- so git tag v0.4.0 is published as :0.4.0, and v0.4.0-rc1
+#                    as :0.4.0-rc1.
+#   untagged commit  `type=sha`, whose DEFAULT prefixes the short sha -- :sha-9b281ed.
+# Without this the Makefile's defaults could never address a CI-built image: they asked for
+# :9b281ed where CI had published :sha-9b281ed.
+IMAGE_TAG := $(if $(GIT_EXACT_TAG),$(shell printf '%s' '$(GIT_TAG)' | sed -E 's/^v([0-9])/\1/'),sha-$(GIT_TAG))
 
 LITTLERED_REGISTRY ?= ghcr.io/chuck-chuck-chuck-net
 
