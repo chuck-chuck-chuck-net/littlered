@@ -5,15 +5,26 @@ GIT_TAG := $(shell if [ -n "$$(git describe --tags --exact-match 2>/dev/null)" ]
                    git rev-parse --short HEAD; \
                fi)
 
+# IS_RELEASE_TAG is non-empty only when GIT_TAG is a proper semver release tag (vX.Y.Z or X.Y.Z).
+IS_RELEASE_TAG := $(shell echo '$(GIT_TAG)' | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+$$' && echo true)
+
+# IMAGE_TAG is how a build is ADDRESSED in a registry, which is not the same question as
+# what version it IS (that is GIT_TAG, and it feeds CHART_VERSION and --app-version).
+# A release tag is used verbatim; an untagged commit becomes sha-<short>, matching what
+# docker/metadata-action's `type=sha` publishes from CI -- its default carries the prefix.
+# Without this the Makefile's defaults could never address a CI-built image: they asked
+# for :9b281ed where CI had published :sha-9b281ed.
+IMAGE_TAG := $(if $(IS_RELEASE_TAG),$(GIT_TAG),sha-$(GIT_TAG))
+
 LITTLERED_REGISTRY ?= ghcr.io/chuck-chuck-chuck-net
 
 IMAGES ?= littlered littlered-chaos-client
 
 # Chaos Client image -- need to know for end-to-end testing
-CHAOS_CLIENT_IMAGE ?= $(LITTLERED_REGISTRY)/littlered-chaos-client:$(GIT_TAG)
+CHAOS_CLIENT_IMAGE ?= $(LITTLERED_REGISTRY)/littlered-chaos-client:$(IMAGE_TAG)
 
 # Operator image
-OPERATOR_IMAGE ?= $(LITTLERED_REGISTRY)/littlered:$(GIT_TAG)
+OPERATOR_IMAGE ?= $(LITTLERED_REGISTRY)/littlered:$(IMAGE_TAG)
 
 # IMG is the canonical kubebuilder knob for the operator image. It defaults to
 # OPERATOR_IMAGE; override it (e.g. `make docker-build docker-push deploy IMG=...`)
@@ -424,10 +435,10 @@ push-images: $(PUSH_TARGETS)
 # (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
 # More info: https://docs.docker.com/develop/develop-images/build_enhancements/
 $(BUILD_TARGETS): %.build_image:
-	$(CONTAINER_TOOL) build -t $(LITTLERED_REGISTRY)/$*:$(GIT_TAG) -f cmd/$*/Dockerfile .
+	$(CONTAINER_TOOL) build -t $(LITTLERED_REGISTRY)/$*:$(IMAGE_TAG) -f cmd/$*/Dockerfile .
 
 $(PUSH_TARGETS): %.push_image:
-	$(CONTAINER_TOOL) push $(LITTLERED_REGISTRY)/$*:$(GIT_TAG)
+	$(CONTAINER_TOOL) push $(LITTLERED_REGISTRY)/$*:$(IMAGE_TAG)
 
 # PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
 # architectures. (i.e. make docker-buildx IMG=myregistry/littlered:0.0.1). To use this option you need to:
@@ -494,9 +505,6 @@ undeploy: ## Uninstall the operator's Helm release from the cluster.
 helm-push: helm-package ## Push the Helm chart to the OCI registry (run 'helm registry login ghcr.io' first).
 	$(HELM) push $(HELM_DIST)/littlered-$(CHART_VERSION).tgz oci://$(LITTLERED_REGISTRY)/charts
 
-# IS_RELEASE_TAG is non-empty only when GIT_TAG is a proper semver release tag (vX.Y.Z or X.Y.Z).
-IS_RELEASE_TAG := $(shell echo '$(GIT_TAG)' | grep -qE '^v?[0-9]+\.[0-9]+\.[0-9]+$$' && echo true)
-
 .PHONY: push-latest
 push-latest: ## Re-tag images as :latest (only runs on release tags, no-ops otherwise).
 	@if [ -z "$(IS_RELEASE_TAG)" ]; then \
@@ -505,7 +513,7 @@ push-latest: ## Re-tag images as :latest (only runs on release tags, no-ops othe
 	fi; \
 	echo "Pushing :latest for release $(GIT_TAG)..."; \
 	$(foreach img,$(IMAGES), \
-		$(CONTAINER_TOOL) tag $(LITTLERED_REGISTRY)/$(img):$(GIT_TAG) $(LITTLERED_REGISTRY)/$(img):latest && \
+		$(CONTAINER_TOOL) tag $(LITTLERED_REGISTRY)/$(img):$(IMAGE_TAG) $(LITTLERED_REGISTRY)/$(img):latest && \
 		$(CONTAINER_TOOL) push $(LITTLERED_REGISTRY)/$(img):latest && ) true
 # NOTE: No :latest tag for the Helm chart. Helm treats the OCI tag / --version as a
 # semver constraint, so a 'latest' tag is unusable (`helm pull --version latest` ->
