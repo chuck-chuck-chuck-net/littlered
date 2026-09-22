@@ -33,6 +33,25 @@ success. A held rollout stalls loudly and is never released on a timeout.
 No change to the persistence posture: LittleRed remains a pure in-memory store with
 no RDB/AOF and no PersistentVolumes.
 
+**Upgrading: apply the CRDs before the operator.** `helm upgrade` does not update
+CustomResourceDefinitions — they are cluster-scoped and shared between releases, so
+Helm deliberately declines to own them. Skipping this does not fail: the API server
+prunes unknown fields silently, so the operator comes up against the 0.3.0 schema and
+every field 0.4.0 added is dropped on write — `spec.sentinel.masterName`,
+`spec.appName` and `spec.failover` in the spec, and `status.operation`,
+`status.acknowledgedOperations`, `status.quarantinedSince`, `status.forsakenSince`
+and `status.failover` in the status. The spec half is visible (the field you set is
+simply not there); the status half is not, and it silently disables the quarantine of
+a captured instance (ADR-016) and the acknowledgment of a declared operation
+(ADR-020). The CRD ships as a release asset from 0.4.0 on:
+
+```bash
+kubectl apply --server-side --force-conflicts -f \
+  https://github.com/chuck-chuck-chuck-net/littlered/releases/download/v0.4.0/littlered-crds.yaml
+helm upgrade littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
+  -n littlered-system --version 0.4.0
+```
+
 ### Added
 
 - **`failover` mode (experimental)** — a fourth deployment mode: 1 master +
@@ -323,6 +342,19 @@ Data-loss and data-safety fixes first; each names its entry in
   again before the release job pushes to the registry) in the default,
   allow-list and deny-list scoping modes. A chart template error is invisible to
   the Go linter and previously only surfaced on the user's cluster.
+
+- **The CRD is now published as a release asset** (`littlered-crds.yaml`), and the
+  release notes say to apply it first. `helm upgrade` never updates a chart's
+  `crds/` directory, so upgrading users have always had to apply the CRD
+  themselves — but the only published copy of it was inside the chart tarball, so
+  the instruction could not be followed without cloning the repository. Found by
+  upgrading a 0.3.0 install to 0.4.0-rc1 by chart: the operator upgraded, the CRD
+  did not, and `spec.sentinel.masterName` was pruned without an error on apply.
+
+- **The generated release notes printed a `helm install` command that fails.**
+  `--version` was rendered from the tag (`v0.4.0`) while the chart is pushed with
+  the leading `v` stripped (`0.4.0`), so the one command a new user is most likely
+  to copy returned `chart not found`.
 
 ### Known issues
 

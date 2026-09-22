@@ -6,6 +6,40 @@ LittleRed is built for workloads where persistence is explicitly disabled and ne
 
 ## Upgrading to v0.4.0
 
+### Apply the CRDs before upgrading the operator
+
+`helm upgrade` does **not** update CustomResourceDefinitions — CRDs are cluster-scoped and shared
+between releases, so Helm deliberately declines to own them. Apply them yourself, then upgrade:
+
+```bash
+kubectl apply --server-side --force-conflicts -f \
+  https://github.com/chuck-chuck-chuck-net/littlered/releases/download/v0.4.0/littlered-crds.yaml
+
+helm upgrade littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
+  -n littlered-system --version 0.4.0
+```
+
+**Skipping this does not fail — it fails silently.** The API server prunes fields the CRD does not
+know about, without an error: `kubectl apply` reports success and the field is simply not there.
+Against a 0.3.0 CRD, that drops everything v0.4.0 added: `spec.sentinel.masterName` — so the
+instance stays on the shared legacy master name this release exists to get you off — plus the
+status a captured instance needs in order to quarantine itself, and the record a declared
+operation needs in order to complete. If an instance you just configured still reports `SentinelMasterNameUnscoped`, check
+the CRD first:
+
+```bash
+kubectl get crd littlereds.redis.chuck-chuck-chuck.net \
+  -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.sentinel.properties.masterName}'
+```
+
+An empty result means the old CRD is still installed. Re-apply it, then re-apply your CR — the
+pruned values are gone from the stored object and have to be sent again.
+
+`--force-conflicts` is required, not defensive: Helm installed the CRD as the field manager
+`helm`, so a plain server-side apply refuses with `conflict with "helm": .spec.versions`. Forcing
+transfers ownership of the schema to `kubectl`, which is the correct outcome — Helm skips a CRD
+that already exists on install and never updates one on upgrade, so nothing takes it back.
+
 ### The project has moved to `chuck-chuck-chuck-net`
 
 **Existing deployments keep working.** Git URLs redirect automatically, and the packages at
@@ -54,6 +88,8 @@ helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/litt
 ```
 
 This installs the latest release. For a pinned version, add `--version <version>` — **without the leading `v`**, e.g. `--version 0.4.0` for the `v0.4.0` release. See the [releases page](https://github.com/chuck-chuck-chuck-net/littlered/releases).
+
+Upgrading an existing install? Apply the CRDs first — Helm does not — see [Upgrading to v0.4.0](#apply-the-crds-before-upgrading-the-operator).
 
 By default the operator is cluster-scoped (watches all namespaces). To scope it to specific namespaces — for multi-tenancy, least-privilege RBAC, or running two operators side by side — see [Namespace Scoping](docs/USAGE.md#namespace-scoping).
 

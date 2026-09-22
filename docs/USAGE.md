@@ -96,17 +96,51 @@ helm upgrade --install littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/litt
 
 #### Upgrade
 
-```bash
-helm upgrade littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered -n littlered-system
-```
-
-**Important: Upgrading CRDs**
-
-Helm does not automatically update CRDs on `helm upgrade`. If the LittleRed CRD schema has changed (e.g., new fields like `spec.cluster`), you must apply the CRD manually:
+**Apply the CRDs first.** Helm never updates a chart's CRDs on `helm upgrade` — they are
+cluster-scoped and shared between releases, so Helm declines to own them. Each release
+publishes them as an asset (`littlered-crds.yaml`); apply that, then upgrade:
 
 ```bash
-kubectl apply -f charts/littlered/crds/redis.chuck-chuck-chuck.net_littlereds.yaml
+kubectl apply --server-side --force-conflicts -f \
+  https://github.com/chuck-chuck-chuck-net/littlered/releases/download/v0.4.0/littlered-crds.yaml
+
+helm upgrade littlered oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered \
+  -n littlered-system --version 0.4.0
 ```
+
+Substitute the version you are upgrading to; the chart version carries no leading `v`, the
+release tag does. From a clone, `charts/littlered/crds/` holds the same file. Both forms work
+for a mirrored install:
+
+```bash
+helm pull oci://ghcr.io/chuck-chuck-chuck-net/charts/littlered --version 0.4.0 --untar
+kubectl apply --server-side --force-conflicts -f littlered/crds/
+```
+
+**`--force-conflicts` is required.** Helm installs the CRD as the field manager `helm`, so a
+plain server-side apply refuses:
+
+```
+error: Apply failed with 1 conflict: conflict with "helm": .spec.versions
+```
+
+Forcing hands ownership of the schema to `kubectl`, which is what you want: Helm skips a CRD that
+already exists on install, and never updates one on upgrade, so there is no manager to fight.
+
+**Skipping the CRD does not fail; it fails silently.** The API server prunes fields the
+installed CRD does not know about without erroring, so `kubectl apply` reports success and
+every field the new version added — in `spec` *and* in `status` — is dropped on write. The spec
+half is at least visible on a `kubectl get -o yaml`; the status half is not, and status fields
+are load-bearing state, not decoration. To check which CRD is installed, ask it for a field the
+new version added:
+
+```bash
+kubectl get crd littlereds.redis.chuck-chuck-chuck.net \
+  -o jsonpath='{.spec.versions[0].schema.openAPIV3Schema.properties.spec.properties.sentinel.properties.masterName}'
+```
+
+An empty result means the CRD predates v0.4.0. Re-apply it, then re-apply any CR whose fields
+were pruned — the values are gone from the stored object and have to be sent again.
 
 #### Uninstall
 
