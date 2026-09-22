@@ -4130,8 +4130,20 @@ ADR-020.
 - **Commit:** (pending)
 - **ID note:** the highest ID visible on **any** branch, local or remote, was LR-059. Allocated
   with the LR-039 cross-branch loop over every branch, not by reading the tip of one line.
-- **Status: IMPLEMENTED, red-first, unit + envtest green, lint clean against a 0-issue baseline.
-  NOT YET e2e-verified** — the deterministic fixture below is the tier-3 red that is still owed.
+- **Status: FIXED and e2e-verified.** Red-first, unit + envtest green, lint clean against a
+  0-issue baseline, and the e2e tier landed the same day as the fix (`Sentinel Failover Window`,
+  `test/e2e/sentinel_failover_window_test.go`) with its **red banked live against the deployed
+  pre-fix operator `47154d7`** — Step 7 timing out over its full 60s on *"Rule R must repoint the
+  stray pod at the consensus master"*, every precondition asserted first. Green in two full
+  green after (60s timeout → 8.9s). Two full suites have covered it since; see "Verification
+  record" at the end, including the one run in which the tier did NOT cover it.
+  **⚠ This line read "NOT YET e2e-verified — the deterministic fixture is the tier-3 red that is
+  still owed" until 2026-09-22, and it was already false the day after it was written.** It was
+  the entry's own status, nobody re-read it when the tier landed hours later, and three weeks on
+  it was still the first thing a reader saw — enough to put a release decision in doubt and to
+  cost an afternoon re-deriving the answer from a shell history. **An entry's status line is the
+  one part of it that goes stale, and it is the part read first: when a follow-up commit
+  discharges what it says is owed, the status line is part of that commit.**
 - **Scope:** the design pass **LR-055 declined to pre-empt**, and the closure of the residual
   **LR-052** recorded. Not an ADR-020 defect: the mechanism predates it and is reachable with no
   operation in flight.
@@ -4404,8 +4416,8 @@ ADR-020.
       pod template, so shipping it at all triggers one rolling update of every sentinel instance
       (ADR-017 Decision 4's hazard), and it would introduce a second promotion authority beside
       `BestDataHolder`/`electMaster`, which key on offset and keys and would ignore it.
-    - **No e2e yet.** The fixture above is the deterministic tier-3 reproduction and is what the
-      red must be observed against.
+    - ~~**No e2e yet.**~~ **Discharged the same day** — the fixture above became
+      `Sentinel Failover Window` in the commit directly after the fix. See the record below.
 
 - **Tests, red-first at every tier, with the red observed BEHAVIOURALLY rather than as an undefined
   symbol (the plumbing landed first with the semantics unchanged — LR-050's precedent).**
@@ -4431,6 +4443,41 @@ ADR-020.
       `state.FailoverReported` at 17 sites and one added `false` argument to `sentinelVerifyFailure`
       — LR-053's precedent for adapting a renamed symbol. Full suite green (envtest included); lint
       **0 issues against a 0-issue baseline**, verified by stashing the change and re-running.
+
+- **Verification record (reconstructed 2026-09-22, and the reconstruction is itself worth
+  keeping).**
+    1. **The tier's live RED**, against the deployed pre-fix operator `47154d7`, banked before
+       the fix was written — recorded in the tier's own commit message rather than here, which is
+       part of why this entry's status line was never corrected.
+    2. **Full suite, t3e, 2026-09-04: `131 Passed | 0 Failed | 6 Skipped` in 2h29m** against
+       operator `d4d7d6c`. Both this fix and its tier are ancestors of that build, so the suite
+       covered them. It is recorded under **LR-059**, because that is the entry whose fix the run
+       was made for — which is the second reason this one looked unverified.
+    3. **The tier's own GREEN**, immediately after the fix: 60s timeout → **8.9s**, recorded in
+       `BACKLOG.md` beside the resolved item rather than here.
+    4. **`MODE=sentinel` run, 2026-09-19 ~07:47 UTC**, against the published images at
+       `sha-9b281ed`: the tier **passed**.
+    5. **Full suite against the release candidate, 2026-09-19 09:49 UTC** — `make test-e2e-all`
+       with `SKIP_OPERATOR_DEPLOY=true`, minutes after `v0.4.0-rc1` was tagged and
+       `helm upgrade --install … --version 0.4.0-rc1` had installed the **published** chart, so it
+       exercised the released rc1 image rather than a local build. **143 specs, and in this one the
+       LR-060 tier did NOT cover the guard**: it failed its own precondition on a test-only flake —
+       the fixture pins `victimOrdinal = 2` and assumes that pod is a replica, and in that run
+       redis-2 was the master, so `SENTINEL failover` promoted one of the other two, the single
+       remaining replica reconfigured in under a second and **no stuck rung ever existed**. Triaged
+       in `BACKLOG.md` as test-only (no rule implicated, fix is to choose the victim dynamically),
+       with the honest consequence written down there: *"LR-060's guard was NOT exercised by this
+       run."* Left as the record it is: the guard's evidence is (1)-(4), not (5).
+  **Three general points fall out.** A run is recorded under the entry that *motivated* it, and
+  the green here went to `BACKLOG.md` while the status line stayed in the changelog, so **the
+  evidence and the claim about the evidence lived in different files and drifted apart** — a
+  cross-reference at both ends costs one line. A **fixture that pins an ordinal assumes a topology
+  the product is free to change**: this tier needs its victim to be a *replica*, which redis-2
+  usually is and was not that day, and the failure then looks like the product until somebody reads
+  the report. And **an ancestry check is the wrong instrument in a tree that
+  cherry-picks**: this fix reaches `main` as a copy with a different hash, so
+  `git merge-base --is-ancestor` on the public line answers "no" about a build whose *content*
+  contains it. Follow the `(cherry picked from …)` trailer, or ask what was actually run.
 
 - **Impacts:** **ADR-003** (amended 2026-09-03 — Rule A's second half is partitioned; the amendment
   is the review artefact beside this entry); **ADR-020** (its authority-classification vocabulary is
