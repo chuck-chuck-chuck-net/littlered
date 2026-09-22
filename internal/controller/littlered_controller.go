@@ -848,12 +848,12 @@ func (r *LittleRedReconciler) reconcileSentinelStatefulSet(
 	return r.apply(ctx, littleRed, buildSentinelStatefulSet(littleRed, replicas))
 }
 
-// sentinelProcessReplicas is the fixed number of Sentinel processes in sentinel mode.
-// Mirrors littleredv1alpha1.SentinelRedisReplicas (3 Redis pods) for the monitoring side:
-// the quorum is fixed at three, sentinel HA is not horizontally scalable. Kept local
-// because the API package has no such constant and the sentinel StatefulSet is the only
-// consumer.
-const sentinelProcessReplicas int32 = 3
+// sentinelProcessReplicas is the fixed number of Sentinel processes in sentinel mode:
+// the quorum is fixed at three, sentinel HA is not horizontally scalable. It is now an
+// alias of the API constant, which gained a second consumer (`lrctl`) — the exact
+// condition the previous "kept local" comment here named. The value is unchanged, which
+// matters because LR-056's forsakenMonitoringFloor is derived from it.
+const sentinelProcessReplicas = littleredv1alpha1.SentinelProcessReplicas
 
 // sentinelDesiredReplicas is the single source of truth for the sentinel-mode Redis and
 // Sentinel StatefulSet replica counts. Pure: the CR plus a clock, no I/O.

@@ -4594,3 +4594,156 @@ ADR-020.
   state that cannot be reached); **ADR-018** (Rule N's prune is the removal this composes with);
   **ADR-016** (the quarantine release is *not* affected — it returns pods on the current template);
   **LR-023** (the precedent for the candidate fix); `BACKLOG.md`.
+
+---
+
+## [LR-062] `lrctl verify` Called Our Own Just-Replaced Pod a Foreign Deployment — the Capture Diagnostic Had No Churn Caveat
+- **Date:** 2026-09-22
+- **ID note:** the highest ID visible on **any** branch, local or remote, was LR-061. Allocated
+  with the LR-039 cross-branch loop over every branch, not by reading the tip of one line.
+- **Status: FIXED, and live-verified A/B on t3e across three rollouts — with a MEASURED
+  residual the fix does not cover (below).** Unit green, `make lint` 0 issues against a 0-issue
+  baseline. Diagnostic only: no operator decision, no verdict, no pod, no exit code changes.
+- **Scope:** `lrctl verify`, sentinel mode. Not an operator defect — the operator behaved
+  correctly throughout, which is what made the disagreement visible.
+
+- **The finding, in one sentence: during an ordinary operator-driven rollout `lrctl verify`
+  reported one of our own just-replaced pods as evidence of another Sentinel deployment and
+  pointed the reader at the capture runbook — while the operator, reading the same address in
+  the same seconds, correctly called it an ordinary ghost.**
+
+- **Measured on t3e (2026-09-22), found by hand during a supported `spec.sentinel.masterName`
+  rename on an instance upgraded from 0.3.0.** The two verdicts are five seconds apart and name
+  the same address:
+
+      lrctl verify, T+4s into the rename
+        [FAIL] Evidence of another Sentinel deployment sharing this master name:
+               - Sentinel knows live replicas that are not this instance's pods: 10.233.192.146
+               This instance's data may already have been overwritten. See the
+               "Recovering a sentinel instance captured by another Sentinel deployment" runbook
+
+      operator, 17:20:51Z
+        Ghost node detected in Sentinel topology   ip=10.233.192.146
+
+  `10.233.192.146` was `store-sentinel-redis-2`, replaced at 17:20:47 by the rename's own roll.
+  The next `verify`, once `down-after-milliseconds` had elapsed, printed `[OK] No foreign
+  Sentinel contact observed`. **The output also contained its own discriminator three lines
+  above the accusation** — `SentinelMasterNameRename — Running for 4s … the instance is still
+  rolling` — so the tool held the fact that would have qualified the finding and did not use it.
+
+- **Mechanism — the one window no address set can cover, arriving in the CLI.** LR-053 split
+  `ValidIPs` into `LiveTopologyIPs` and `OwnedIPs` and repointed `DetectCrossInstance` at the
+  latter, which fixed the **terminating** pod: it is still in the pod list, so it is still ours.
+  A **replaced** pod is not, and LR-053 says so in as many words — *"no address set can hold an
+  address whose object no longer exists"* — which is why `planForsaken` and Rule N's G5
+  additionally carry **LR-050's** rollout gate. That gate was never extended to the CLI's
+  diagnostic, so `DetectCrossInstance` has exactly one of the two protections the operator has,
+  and the uncovered half is the ordinary one: every rolling update transits it, for as long as
+  Sentinel takes to flag the departed address down.
+
+- **Fix — qualify the evidence, never suppress it.** New pure `crossInstanceChurnCaveat`
+  (`cmd/lrctl/cmd/cross_instance_report.go`): when a pod group of ours is in churn the `[FAIL]`
+  block gains a caveat naming the pods, stating that a departed address or count of ours is
+  unattributable in this window and that the operator withholds the same attribution (LR-050),
+  and telling the reader to let the pods settle and re-run **before** following the runbook.
+  Placed above the runbook pointer, because that pointer is the sentence that sends someone to a
+  procedure that deletes pods.
+- **It took three live runs to get the INPUTS right, and each widening was forced by a
+  measurement rather than by review.** The first build read one signal — a Redis pod terminating
+  or its redis **container** not Ready per the kubelet (LR-023's evidence, the container rather
+  than the pod condition per LR-047). An A/B against the pre-fix binary during an ordinary
+  metadata-edit rollout (pillar 3.17) then said it covered **11 of 29** false-evidence samples,
+  and the other 18 carried no foreign address at all. Two more inputs, each from what the
+  uncovered samples actually contained:
+    - **A pod that is GONE, not unready.** `expectedReplicas` is derived from the pod list, so a
+      departed pod takes the denominator with it and the evidence arrives as a *count surplus*.
+      The caveat therefore also compares the list against what was **deployed** —
+      `SentinelRedisReplicas` / `SentinelProcessReplicas`, the LR-013/LR-056 denominator — and
+      passes 0 under `--unmanaged`, where a foreign deployment may legitimately run any number.
+    - **The SENTINEL pods, which were the larger half.** The uncovered samples were
+      `<pod> reports 3 other sentinels; 2 were deployed`: our own Sentinels still counting a peer
+      the **Sentinel** StatefulSet had just replaced, because a stale known-sentinel entry never
+      ages out on its own (LR-039). Every *Redis* pod is Ready by then, so a Redis-keyed predicate
+      is structurally blind to it. Both groups are now inputs (`churnGroup`).
+  **`SentinelProcessReplicas` moved to the API package** in this change and the controller's
+  `sentinelProcessReplicas` became an alias of it — same value, so LR-056's
+  `forsakenMonitoringFloor` is unchanged. That is the controller-side comment's own stated
+  condition arriving (*"kept local because the API package has no such constant and the sentinel
+  StatefulSet is the only consumer"*): there is now a second consumer, and two definitions of one
+  fixed fact is LR-045's shape.
+- **Why not suppression, and why not the exit code.** Three independent reasons, each sufficient.
+  **(1)** LR-039 built this diagnostic to fire on a *partial* capture, before a takeover
+  completes. **(2)** LR-056 deliberately gave the *verdict* a quorum floor and left the
+  diagnostic without one — *"a floorless diagnostic and a floored verdict, because only one of
+  them deletes pods"*. **(3)** LR-054 is the sharp one: for a victim still holding its own data
+  the operator can no longer arm a verdict at all, and that entry's acceptance ruling rests on
+  *"`lrctl verify` still reports the foreign contact regardless"*. Suppressing here — the
+  tempting fix, and the mutant the wiring test is pointed at — would quietly delete the stated
+  mitigation for an accepted hole. The exit code is untouched for the same reason and because
+  this evidence never fed it: `reportCrossInstance` returns only `scopeFail` (LR-048).
+- **Why ONE clause and not the operator's settledness predicate.** `statefulSetRolloutSettled`
+  is not reachable from `lrctl` (it reads StatefulSets; the CLI reads pods and execs
+  `redis-cli`), and copying it would be worse than the distance: LR-054 has it pending the **R5**
+  split for answering *"is a rollout in flight?"* and *"is every pod healthy?"* at once, and
+  LR-045's lesson is that a duplicated predicate is literally how that class of defect happens.
+  The single clause used here is the one LR-050 says is doing the real work (*"it is what extends
+  the gate from 'a template rollout' to 'any pod of ours that has just left'"*), keyed on the
+  kubelet (LR-023) and on the redis **container** rather than the pod condition (LR-047).
+- **Limits, stated rather than left to be discovered.** The caveat's absence is **not** a
+  guarantee of attribution — see the measured residual below. And it fires for as long as any pod
+  is unready or missing, including permanently, which for a caveat is the safe direction and is
+  **not** LR-054's hole, because nothing is withheld: the finding, its detail and the exit code
+  are unchanged in every case.
+- **Tests, red-first.** `cmd/lrctl/cmd/cross_instance_churn_test.go`. The seam landed as a
+  `return nil` stub with the wiring in place, so the red is behavioural rather than an undefined
+  symbol (LR-050/LR-053's precedent): `TestCrossInstanceChurnCaveat` observed **RED on 3 of 4**
+  (`produced 0 lines, want any = true`), with the fourth — the positive control, every pod Ready
+  and no caveat — green from birth and **disclosed as such**. `TestCrossInstanceEvidenceCarries
+  TheChurnCaveat` drives the real `reportCrossInstance` through `captureStdout` and was **RED**
+  reproducing the live block verbatim, including the address and the runbook pointer with nothing
+  between them. Mutation-checked in **three** directions, by running them: *always in churn*
+  fails exactly the positive control (so the caveat is not a blanket one); *never in churn* (the
+  pre-fix body) fails all three churn rows plus the wiring test; and **the tempting wrong fix** —
+  emptying the evidence during churn instead of qualifying it — fails the wiring test on its
+  first assertion (`the cross-instance evidence was suppressed; it must only be qualified`).
+- **Regresses:** nothing. On an instance whose pods are all Ready the block is byte-identical, so
+  every existing capture report is unchanged; `DetectCrossInstance`, `OwnedIPs`, `planForsaken`,
+  Rule N, the quarantine and the operator's exit paths are untouched, and no verdict, gate,
+  cadence, status field, condition, event, RBAC or Redis round trip changed. `lrctl`'s exit code
+  is unchanged in every case.
+- **Live A/B (t3e, 2026-09-22, four rollouts triggered by a CR metadata edit, the fixed and
+  pre-fix binaries sampled alternately ~1s apart against the same instance).** The false evidence
+  reproduces on an ORDINARY rollout with no rename involved — 29-31 of 60 samples per run — and
+  the pre-fix binary carried a caveat on **0** of them in every run. Coverage of the fixed
+  binary, as the inputs were widened: **11/29** (readiness only), **9/30** (+ deployed-count),
+  **16/31** (+ Sentinel pods).
+- **THE RESIDUAL IS MEASURED, AND IT IS HALF THE WINDOW.** In the final instrumented run, **15 of
+  31** evidence samples occurred while **all six pods were Ready** (`ready=6/6`), in the gaps
+  *between* pod replacements of a serialized roll: the pod is gone, the next has not been taken
+  down yet, and Sentinel still carries the departed entry — its memory of a pod outlives that
+  pod's absence from the pod list, which is LR-039's "never ages out" seen from the diagnostic
+  side. **No pod-state predicate can see that**, so the caveat is silent there and the report
+  reads exactly as it did before this change. Not chased, and the two obvious routes are the ones
+  this file already rules on: a "recently rolled" timer is a margin against a user-settable
+  `down-after-milliseconds` (LR-050's rejected shape), and remembering departed addresses needs
+  cross-invocation state a CLI does not have. **The one candidate worth a decision is reading the
+  StatefulSets** — `updateRevision != currentRevision` covers the whole roll, gaps included, and
+  is exactly the *"is a rollout of ours in flight?"* half that LR-054's R5 split would separate
+  out. It costs `lrctl` a new API read and should land with that split rather than ahead of it.
+  `BACKLOG.md`.
+- **Not covered / owed.** No e2e tier asserts `verify` output during a roll; the committed
+  reproduction is the captured-stdout unit test, and the live evidence is the A/B above.
+- **A second, smaller observation, recorded and NOT fixed:** the cross-instance evidence prints
+  `[FAIL]` while contributing nothing to the exit code — only the name-scope check does
+  (`sentinelVerifyFailure`). On a **captor**, which is otherwise perfectly healthy (LR-042/LR-044),
+  that is a `[FAIL]` line beside an exit 0, which is the exact shape `sentinelVerifyFailure`'s own
+  comment forbids (*"a `[FAIL]` line beside an exit 0 would be worse than no check at all"*). It
+  may be deliberate — `reportCrossInstance` documents the evidence as *"an observation, not a
+  verdict"* — but then the label is wrong, and if it is not deliberate the exit code is. Either
+  way it is a decision, not a patch. `BACKLOG.md`.
+- **Impacts:** **LR-039** (its diagnostic, and its floorlessness, which this preserves); **LR-050**
+  (its gate covers the operator only; this is the CLI half, as a caveat rather than a gate);
+  **LR-053** (the address-set half, and the sentence that says why a set cannot close this);
+  **LR-054** and **LR-056** (both of which require this report to keep firing); **LR-048** (the
+  rename is the operation it was found on); `docs/LRCTL.md`, `docs/USAGE.md` (the capture runbook
+  now says to check for churn first).

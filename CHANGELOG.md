@@ -343,6 +343,18 @@ Data-loss and data-safety fixes first; each names its entry in
   allow-list and deny-list scoping modes. A chart template error is invisible to
   the Go linter and previously only surfaced on the user's cluster.
 
+- **`lrctl verify` no longer reads a pod of your own as another Sentinel deployment without
+  saying so.** During any rolling update — a config change, an image bump, a drain — a replaced
+  pod's address leaves the pod list at once while Sentinel keeps listing it, unflagged, for a
+  whole `down-after-milliseconds`, and a departed pod also takes the expected-replica count with
+  it. `verify` reported that as *"Evidence of another Sentinel deployment sharing this master
+  name"* and pointed at the capture runbook, whose remedy deletes pods. The evidence is still
+  printed — it must be, since it is the only signal for a capture shape the operator cannot
+  diagnose at all — but it now carries a caveat naming the pods in churn and asking you to let
+  them settle and re-run first. Measured during an ordinary rollout on a real cluster; the
+  caveat covers roughly half the window, and the remaining half is recorded in the ledger
+  (LR-062).
+
 - **The CRD is now published as a release asset** (`littlered-crds.yaml`), and the
   release notes say to apply it first. `helm upgrade` never updates a chart's
   `crds/` directory, so upgrading users have always had to apply the CRD

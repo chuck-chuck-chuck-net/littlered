@@ -247,6 +247,20 @@ name means the instance may be captured: **do not rename to escape a capture**, 
 converts a diagnosed, self-healing capture into an undiagnosed leaderless refusal — let the
 quarantine complete first (ADR-016), then rename the empty instance.
 
+**Read the cross-instance evidence with the pod list in view.** The block ends in a pointer to
+the capture runbook, and there is one ordinary state that presents the same way: a pod of yours
+that has just been **replaced** — by a rolling update, a drain, a node loss — leaves the pod list
+at once, while Sentinel goes on listing its address, unflagged, for a whole
+`down-after-milliseconds`. No address set can attribute it (`OwnedIPs` covers the pod that is
+still listed, LR-053, and the object that would attribute a replaced one is gone), which is why
+the **operator withholds the same attribution while the instance is unsettled** (LR-050) and says
+nothing at all. `verify` instead reports the evidence and **qualifies** it: while any Redis pod of
+the instance is terminating or its redis container is not Ready, the block carries a `[!]` caveat
+naming those pods and asking you to let them settle and re-run before following the runbook
+(LR-062). The evidence is never suppressed — this check exists to catch a *partial* capture, and
+it is the only signal for a capture shape the operator cannot diagnose at all (LR-054) — so a
+caveat means "not attributable right now", never "ignore this".
+
 With `--unmanaged` there is no CR to read the wanted name from, so the check is **skipped** with a
 `[WARN]` rather than judged against the fallback guess — classifying against a guess would accuse a
 correctly-named foreign instance of carrying a stale name. The `--json` output omits

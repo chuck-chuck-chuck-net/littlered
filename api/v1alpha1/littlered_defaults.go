@@ -60,6 +60,13 @@ const (
 	// (1 master + 2 replicas). Sentinel HA is not horizontally scalable.
 	SentinelRedisReplicas int32 = 3
 
+	// SentinelProcessReplicas is the fixed number of Sentinel processes in sentinel
+	// mode. The quorum is fixed at three for the same reason: sentinel HA is not
+	// horizontally scalable. It lives here rather than in the controller because it
+	// now has a second consumer (`lrctl`), which is the condition the controller-side
+	// constant's own comment named as the reason to move it.
+	SentinelProcessReplicas int32 = 3
+
 	// Requeue defaults
 	DefaultFastRequeueInterval        = 2 * time.Second
 	DefaultSteadyStateRequeueInterval = 30 * time.Second

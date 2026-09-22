@@ -1856,6 +1856,15 @@ lrctl verify store -n apps
 #          - <pod> reports 8 other sentinels; 2 were deployed
 ```
 
+**Before acting on that output, check whether your own pods are in churn.** A pod of yours that
+has just been replaced — a rolling update, a drain, an evicted node — leaves the pod list
+immediately, while Sentinel keeps listing its address, unflagged, for a whole
+`down-after-milliseconds`; in that window it is indistinguishable from a stranger's, which is why
+the operator itself withholds the judgement and stays quiet (LR-050). `verify` prints a `[!]`
+caveat naming the unready pods when it sees this (LR-062). If the caveat is there, let the
+instance settle and re-run before following anything below: this runbook ends in a quarantine
+that deletes pods.
+
 Note what that check can and cannot tell you: it reports evidence, and a clean result means
 "nothing visible from this vantage", not "isolated" — a deployment yours has not merged with is
 invisible by construction.

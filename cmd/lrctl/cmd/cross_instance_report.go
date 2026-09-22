@@ -17,6 +17,8 @@ limitations under the License.
 package cmd
 
 import (
+	corev1 "k8s.io/api/core/v1"
+
 	"fmt"
 	"strings"
 
@@ -100,8 +102,144 @@ func reportCrossInstance(state *redisclient.ReplicationState, cCtx *types.Cluste
 		fmt.Printf("         - %s reports %d replicas; %d were deployed\n",
 			c.PodName, c.Reported, c.Expected)
 	}
+	// The deployed count is the same denominator the operator uses for its own
+	// wholeness judgements (LR-013, LR-056: key on what we DEPLOYED, never on what
+	// answered), and sentinel mode's is fixed. It is passed as 0 under --unmanaged,
+	// where there is no CR and a foreign deployment may legitimately run any number
+	// of pods — accusing on a guess is the mistake this file already avoids once.
+	expectedRedis, expectedSentinel := 0, 0
+	if cCtx.SentinelMasterName != "" {
+		expectedRedis = int(littleredv1alpha1.SentinelRedisReplicas)
+		expectedSentinel = int(littleredv1alpha1.SentinelProcessReplicas)
+	}
+	for _, l := range crossInstanceChurnCaveat(
+		churnGroup{kind: containerNameRedis, pods: cCtx.RedisPods,
+			container: cCtx.RedisContainer, expected: expectedRedis},
+		churnGroup{kind: containerNameSentinel, pods: cCtx.SentinelPods,
+			container: cCtx.SentinelContainer, expected: expectedSentinel},
+	) {
+		fmt.Println(l)
+	}
 	fmt.Printf("         This instance's data may already have been overwritten. See the\n")
 	fmt.Printf("         \"Recovering a sentinel instance captured by another Sentinel deployment\"\n")
 	fmt.Printf("         runbook in docs/USAGE.md.\n")
 	return scopeFail
+}
+
+// churnGroup is one group of pods this instance deployed — the Redis pods or the
+// Sentinel pods — with the count we DEPLOYED rather than the count that answered
+// (LR-013, LR-056). Both groups matter and for different evidence: a departed Redis
+// pod inflates the replica surplus and leaves an unattributable address behind, while
+// a departed SENTINEL pod inflates `num-other-sentinels`, because a stale
+// known-sentinel entry never ages out on its own (LR-039). Measured on t3e
+// 2026-09-22: the Sentinel side was the larger half of the false-evidence window.
+type churnGroup struct {
+	kind      string
+	pods      []corev1.Pod
+	container string
+	expected  int
+}
+
+// containerNameRedis is the default name of the Redis container, used when discovery
+// could not name one (--unmanaged). It mirrors discovery's own default rather than
+// importing it: that constant is unexported and lives in another package.
+const containerNameRedis = "redis"
+
+// containerNameSentinel is the same for the Sentinel container.
+const containerNameSentinel = "sentinel"
+
+// crossInstanceChurnCaveat qualifies the cross-instance evidence when this instance's
+// OWN pods are in churn, naming the pods that make the addresses above unattributable.
+//
+// It qualifies and never suppresses, and that is the whole of the design. The evidence
+// is the floorless diagnostic LR-039 built to fire on a PARTIAL capture — before a
+// takeover completes — and LR-056 deliberately left it without the quorum floor it
+// gave the verdict, on the ground that only one of the two deletes pods. LR-054 goes
+// further and makes it load-bearing: for a victim still holding its own data the
+// operator can no longer arm a verdict at all, and this report is the remaining signal.
+// So churn changes what the reader is told about the evidence, never whether they are
+// told.
+//
+// WHY THE ADDRESS SETS CANNOT ANSWER THIS. A pod of ours that has just been REPLACED
+// holds an address that no set can contain: OwnedIPs covers the pod still in the pod
+// list, terminating included (LR-053), and LR-050's gate covers the pod whose object
+// is already gone — and neither is reachable from a gathered address, because the
+// object that would attribute it no longer exists. Meanwhile Sentinel keeps listing
+// that address, unflagged, for a whole down-after-milliseconds, which is byte-identical
+// to a captor's live replica. Measured on t3e 2026-09-22: `verify` named our own
+// just-replaced redis-2 as foreign five seconds before the operator logged the same
+// address as an ordinary ghost.
+//
+// The signal is kubelet readiness of the redis CONTAINER — LR-023's blackhole-proof
+// evidence, not the operator's dial (LR-017), and the container rather than the pod
+// condition (the distinction LR-047's mutation table pins). It is deliberately ONE
+// clause rather than a re-implementation of the operator's statefulSetRolloutSettled:
+// that predicate answers two questions at once and is pending the R5 split LR-054
+// names, so a second copy of it here would be LR-045's duplicated predicate in a new
+// place. What this one clause buys is stated in its limits below.
+//
+// Limits, stated rather than left to be discovered. It does not fire for a rollout
+// whose replacement has already gone Ready while the departed address is still listed,
+// so a clean caveat is not a guarantee of attribution. And it fires for as long as any
+// pod is unready, including forever — which for a caveat is the safe direction, and is
+// precisely NOT LR-054's hole, because nothing here is withheld.
+func crossInstanceChurnCaveat(groups ...churnGroup) []string {
+	var reasons []string
+	for _, g := range groups {
+		container := g.container
+		if container == "" {
+			container = g.kind
+		}
+
+		var churning []string
+		for _, p := range g.pods {
+			if podRedisInChurn(p, container) {
+				churning = append(churning, p.Name)
+			}
+		}
+
+		// A pod that is GONE is the other half, and on the live measurement it was
+		// the larger one: with the departed pod absent from the list every pod still
+		// listed reads Ready, and the list is also where the expected counts come
+		// from, so the evidence arrives as a count surplus rather than as an address.
+		// The readiness clause is structurally blind to it.
+		if g.expected > 0 && len(g.pods) < g.expected {
+			reasons = append(reasons, fmt.Sprintf("%d of %d %s pods listed",
+				len(g.pods), g.expected, g.kind))
+		}
+		if len(churning) > 0 {
+			reasons = append(reasons, "not Ready: "+strings.Join(churning, ", "))
+		}
+	}
+	if len(reasons) == 0 {
+		return nil
+	}
+
+	return []string{
+		fmt.Sprintf("         [!] But this instance's OWN pods are in churn (%s), so an address or",
+			strings.Join(reasons, "; ")),
+		"             count above may be explained by a pod of ours that has just been replaced",
+		"             rather than by a stranger: its address leaves the pod list at once — taking",
+		"             the expected-replica count with it — while Sentinel goes on listing it,",
+		"             unflagged, for a whole down-after-milliseconds. The operator withholds this",
+		"             same attribution while the instance is unsettled (LR-050), so it will report",
+		"             nothing here. Let the pods settle and re-run before following the runbook.",
+	}
+}
+
+// podRedisInChurn reports whether this pod is in a state in which an address that was
+// recently its own may still be in Sentinel's view while the pod no longer accounts
+// for it. A pod on its way out counts (lrctl's pod list carries terminating pods —
+// it applies no deletionTimestamp filter, LR-053), and so does one whose redis
+// container has not reported a status yet, which is the same window one moment earlier.
+func podRedisInChurn(p corev1.Pod, redisContainer string) bool {
+	if p.DeletionTimestamp != nil {
+		return true
+	}
+	for _, cs := range p.Status.ContainerStatuses {
+		if cs.Name == redisContainer {
+			return !cs.Ready
+		}
+	}
+	return true
 }
