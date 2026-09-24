@@ -66,6 +66,11 @@ spec:
               TRANSITION rule and does not fire on create. The rationale, and the reason it is
               vacuously true while the registry has one CR-resident member, are on
               heavyOperations in internal/controller/operation_registry.go.
+
+              Multi-site topology immutability (LR-032), the two clauses that need a
+              spec-level view; the site list and sitesPerShard are pinned on MultiSiteSpec.
+              Converting a running instance between single-site and stretched, or resharding
+              a stretched instance, are both undesigned topology changes over EmptyDir data.
             properties:
               appName:
                 default: littlered
@@ -425,6 +430,128 @@ spec:
                 - cluster
                 - failover
                 type: string
+              multiSite:
+                description: |-
+                  MultiSite stretches a Redis Cluster across multiple workload Kubernetes
+                  clusters ("sites") managed by this (hub) operator. Cluster mode only.
+                  Absent means single-site behavior, unchanged. See docs/MULTI_SITE_DESIGN.md.
+                properties:
+                  allowUnsafeSiteTakeover:
+                    description: |-
+                      AllowUnsafeSiteTakeover permits the operator to take over a lost site's
+                      shards (CLUSTER FAILOVER TAKEOVER on surviving replicas) even when the
+                      fence argument is unavailable — the unreachable side could hold a serving
+                      master majority, so a wrong takeover creates a live dual writer. With it
+                      unset the operator refuses (drift-refusal), surfaces a condition and
+                      waits for Kubernetes-confirmed site death or a human. See ADR-012.
+                    type: boolean
+                  network:
+                    description: Network selects the cross-site replication transport.
+                    properties:
+                      mode:
+                        default: pod-routed
+                        description: |-
+                          Mode is the transport for cross-site pod reachability. Only "pod-routed"
+                          is supported: pod CIDRs are routed between all sites (and the hub), so
+                          Redis nodes announce and reach plain pod IPs across sites. Future
+                          transports (nodeport, multus) are not yet accepted.
+                        enum:
+                        - pod-routed
+                        type: string
+                    type: object
+                  sites:
+                    description: |-
+                      Sites lists the workload Kubernetes clusters hosting Redis pods of this
+                      instance. At least 2 sites are required (sitesPerShard >= 2 is what lets
+                      the design descope single-site-loss data repair); site names must be
+                      unique. At most one site may be hub-local (kubeconfigSecretRef omitted).
+
+                      ORDER IS SIGNIFICANT: a site's position in this list is its placement
+                      index — shard K is hosted by sites (K+j) mod S for j < sitesPerShard — so
+                      the list is an ordered sequence of objects, keyed by position, and is
+                      declared listType=atomic accordingly (LR-033). It was previously
+                      listType=map keyed on name, which tells the API machinery the opposite:
+                      that entries are identified by name and order carries no meaning (CEL
+                      equality on such a list is order-blind, and a server-side-apply merge is
+                      free to reorder it — which would silently re-place every shard).
+                    items:
+                      description: |-
+                        SiteSpec identifies one site (workload Kubernetes cluster) of a multi-site
+                        instance.
+                      properties:
+                        kubeconfigSecretRef:
+                          description: |-
+                            KubeconfigSecretRef names a Secret in the operator namespace holding a
+                            kubeconfig whose credentials are bound to a namespaced Role in the target
+                            site (workload CRUD + pod read in the instance namespace — not
+                            cluster-admin). Omitted means the site is hub-local: its workloads live
+                            in the same Kubernetes cluster as the operator.
+                          properties:
+                            name:
+                              description: Name of the Secret.
+                              minLength: 1
+                              type: string
+                          required:
+                          - name
+                          type: object
+                        name:
+                          description: |-
+                            Name is the site's unique name within this instance. It is the operator's
+                            ground-truth key for everything observed in the site (siteQualifiedKey) and
+                            is surfaced in status, so keep it a short identifier. The upper bound is not
+                            cosmetic: CEL cost estimation assumes the declared maximum for every string
+                            comparison, and the uniqueness rule compares names pairwise — without a
+                            MaxLength the CRD is rejected for exceeding the rule-cost budget.
+                          maxLength: 63
+                          minLength: 1
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    maxItems: 16
+                    minItems: 2
+                    type: array
+                    x-kubernetes-list-type: atomic
+                  sitesPerShard:
+                    description: |-
+                      SitesPerShard is how many sites host each shard. REQUIRED and immutable —
+                      deliberately not defaulted (LR-033). This is the copy-factor knob of a
+                      RAM-resident store: total members per shard = sitesPerShard x
+                      (replicasPerShard + 1), so it sets the memory bill, the cross-site
+                      replication traffic, and how many simultaneous site losses the data
+                      survives. Every candidate default is wrong for somebody — the number of
+                      sites multiplies copies as sites are added, a constant is arbitrary — and a
+                      default would also hide the knob from the reader of a CR. Choose it once, at
+                      creation. 2 keeps the design's contract (survive one site loss) at the
+                      lowest cost and lets further sites scale capacity rather than copies; a
+                      higher value buys more simultaneous site losses. Must be between 2 and the
+                      number of sites.
+                    minimum: 2
+                    type: integer
+                required:
+                - sites
+                - sitesPerShard
+                type: object
+                x-kubernetes-validations:
+                - message: spec.multiSite.sitesPerShard cannot exceed the number of
+                    sites
+                  rule: self.sitesPerShard <= self.sites.size()
+                - message: at most one site may be hub-local (kubeconfigSecretRef
+                    omitted)
+                  rule: self.sites.filter(s, !has(s.kubeconfigSecretRef)).size() <=
+                    1
+                - message: spec.multiSite.sites names must be unique
+                  rule: self.sites.all(s, self.sites.filter(x, x.name == s.name).size()
+                    == 1)
+                - message: 'spec.multiSite.sites is immutable: the site list (names
+                    and order) is fixed for an instance''s lifetime — adding, removing
+                    or reordering sites remaps shard placement onto different sites
+                    and is not supported; create a new instance instead'
+                  rule: self.sites.map(s, s.name) == oldSelf.sites.map(s, s.name)
+                - message: 'spec.multiSite.sitesPerShard is immutable: changing it
+                    re-places every shard across sites and would orphan the per-site
+                    StatefulSets it moves away from'
+                  rule: self.sitesPerShard == oldSelf.sitesPerShard
               placement:
                 description: Placement defines topology/failure-domain placement rules
                   (cluster mode only)
@@ -2165,6 +2292,16 @@ spec:
               rule: '(has(self.sentinel) && has(oldSelf.sentinel) && (has(self.sentinel.masterName)
                 ? self.sentinel.masterName : ''mymaster'') != (has(oldSelf.sentinel.masterName)
                 ? oldSelf.sentinel.masterName : ''mymaster'') ? 1 : 0) <= 1'
+            - message: spec.multiSite may only be set when spec.mode is 'cluster'
+              rule: self.mode == 'cluster' || !has(self.multiSite)
+            - message: 'spec.multiSite cannot be added to or removed from an existing
+                instance: converting between single-site and stretched topology is
+                not supported; create a new instance instead'
+              rule: has(self.multiSite) == has(oldSelf.multiSite)
+            - message: 'spec.cluster.shards is immutable while spec.multiSite is set:
+                the multi-site topology is fixed for an instance''s lifetime'
+              rule: '!has(self.multiSite) || !has(self.cluster) || !has(oldSelf.cluster)
+                || self.cluster.shards == oldSelf.cluster.shards'
           status:
             description: LittleRedStatus defines the observed state of LittleRed
             properties:
@@ -2470,6 +2607,192 @@ spec:
                     type: string
                   podName:
                     description: PodName is the current master pod name
+                    type: string
+                type: object
+              multiSite:
+                description: |-
+                  MultiSite contains multi-site observed state (cluster mode with
+                  spec.multiSite only)
+                properties:
+                  clusterState:
+                    description: |-
+                      ClusterState is the stretched cluster's overall cluster_state from the last
+                      gather ("ok"/"fail"/"unknown") — the tier-1 published equivalent of the
+                      live gather's ClusterState.
+                    type: string
+                  crossSiteOK:
+                    description: |-
+                      CrossSiteOK is true when every shard's members span at least two sites (a
+                      master and a replica in different sites) — the multi-site failure-domain
+                      guarantee. False means at least one shard would be lost with a single site.
+                    type: boolean
+                  lastReconcileTime:
+                    description: |-
+                      LastReconcileTime is when the operator last published this cross-site view.
+                      A tier-1 reader reports it as the data's freshness ("as of last reconcile
+                      N ago").
+                    format: date-time
+                    type: string
+                  masterCounts:
+                    description: |-
+                      MasterCounts is the current number of slot-serving masters hosted per site
+                      (ADR-012 D2), from the last gather. Published so a tier-1 (read-only-hub)
+                      reader can render the master-per-site distribution and the balance invariant's
+                      live health (per-site count vs the ceil(K/2)-1 balance target) without any
+                      site access. Monitoring surface only — the balancing decision is re-derived
+                      from the live gather each pass.
+                    items:
+                      description: |-
+                        SiteMasterCount is the number of slot-serving masters currently hosted in one
+                        site (ADR-012 D2 master-per-site distribution). A site holding more than
+                        ceil(K/2)-1 (the balance target, K = shards) violates the balance invariant —
+                        surfaced as informational drift, corrected by the rebalancer.
+                      properties:
+                        masters:
+                          description: |-
+                            Masters is the count of slot-serving masters observed in the site at the last
+                            gather.
+                          format: int32
+                          type: integer
+                        site:
+                          description: Site is the site name from spec.multiSite.sites.
+                          type: string
+                      required:
+                      - masters
+                      - site
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - site
+                    x-kubernetes-list-type: map
+                  rebalancePendingSince:
+                    description: |-
+                      RebalancePendingSince records when the operator last issued a graceful
+                      CLUSTER FAILOVER to correct master-distribution drift (ADR-012 D2). It is a
+                      post-move settle/anti-thrash marker: while it is set and within the
+                      rebalance cooldown, the drift-triggered rebalancer neither re-evaluates nor
+                      re-issues a move for the same shard, so a graceful failover in flight is
+                      never restarted. Cleared once the balance invariant holds again. Monitoring
+                      surface only; nothing load-bearing is persisted (the decision is re-derived
+                      from the live gather each pass).
+                    format: date-time
+                    type: string
+                  shards:
+                    description: |-
+                      Shards is the per-shard site-attributed topology summary (which site holds
+                      the master, which sites hold replicas, and whether the shard is cross-site).
+                    items:
+                      description: |-
+                        ShardSiteView is one shard's site-attributed placement in the published
+                        cross-site view (tier 1). Derived from the union ground truth each reconcile.
+                      properties:
+                        crossSite:
+                          description: |-
+                            CrossSite is true when the shard's master and at least one replica live in
+                            different sites.
+                          type: boolean
+                        linkDown:
+                          description: |-
+                            LinkDown is true when any of this shard's replicas reported its replication
+                            link down at the last gather (reduced redundancy).
+                          type: boolean
+                        masterSite:
+                          description: |-
+                            MasterSite is the site hosting this shard's current master (empty if no
+                            reachable master was observed).
+                          type: string
+                        replicaSites:
+                          description: ReplicaSites are the sites hosting this shard's
+                            replicas, sorted.
+                          items:
+                            type: string
+                          type: array
+                        shard:
+                          description: Shard is the shard index.
+                          type: integer
+                      required:
+                      - shard
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - shard
+                    x-kubernetes-list-type: map
+                  sites:
+                    description: Sites is the per-site observed state.
+                    items:
+                      description: SiteStatus is the observed state of one site.
+                      properties:
+                        lastProbeTime:
+                          description: LastProbeTime is when the operator last probed
+                            the site.
+                          format: date-time
+                          type: string
+                        message:
+                          description: |-
+                            Message is the human-readable detail behind Reason (the underlying error),
+                            empty when the site is reachable.
+                          type: string
+                        name:
+                          description: Name is the site name from spec.multiSite.sites.
+                          type: string
+                        pods:
+                          description: Pods counts this instance's Redis pods observed
+                            in the site.
+                          properties:
+                            ready:
+                              description: Ready is the number of ready Redis pods
+                              format: int32
+                              type: integer
+                            total:
+                              description: Total is the total number of Redis pods
+                              format: int32
+                              type: integer
+                          required:
+                          - ready
+                          - total
+                          type: object
+                        reachable:
+                          description: |-
+                            Reachable reports whether the operator obtained this site's observed state at
+                            the last probe. False means "did not answer, OR we could not ask": both a site
+                            whose Kubernetes API did not respond and a site the operator could not
+                            configure (unresolvable operator namespace, missing/unreadable/malformed
+                            kubeconfig Secret) are false here. The two are NOT the same state — only the
+                            first may heal itself — so read Reason to tell them apart. The boolean keeps
+                            this deliberately broad meaning because it feeds the multi-site observability
+                            arithmetic (allSitesObservable), where "we could not ask" must count exactly
+                            like "did not answer".
+                          type: boolean
+                        reason:
+                          description: |-
+                            Reason is a short, machine-readable classification of why this site is not
+                            reachable; empty when it is. "Unreachable" means the site's Kubernetes API did
+                            not answer — normal, possibly transient, and no action is implied (an
+                            unreachable site is unmanaged, not broken). Any other value is a CONFIGURATION
+                            fault that will never heal on its own and needs a human:
+                            "OperatorNamespaceUnresolvable", "KubeconfigSecretUnreadable" or
+                            "KubeconfigSecretMalformed". This is the field to alert on.
+                          type: string
+                      required:
+                      - name
+                      type: object
+                    type: array
+                    x-kubernetes-list-map-keys:
+                    - name
+                    x-kubernetes-list-type: map
+                  slotsAssigned:
+                    description: |-
+                      SlotsAssigned is how many of the 16384 hash slots are assigned across the
+                      stretched cluster (16384 when whole).
+                    format: int32
+                    type: integer
+                  takeoverPendingSince:
+                    description: |-
+                      TakeoverPendingSince records when the operator first observed a site-loss
+                      state that native Redis failover cannot resolve, arming the cooldown
+                      before an operator-led CLUSTER FAILOVER TAKEOVER (ADR-012). Cleared when
+                      the state clears.
+                    format: date-time
                     type: string
                 type: object
               observedGeneration:

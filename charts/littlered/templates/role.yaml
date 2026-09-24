@@ -57,3 +57,40 @@ rules:
   {{- include "littlered.managerRules" $root | nindent 2 }}
 {{- end }}
 {{- end }}
+{{- /*
+Allow-list scoping (ADR-014) x multi-site (ADR-012): the site kubeconfig Secrets
+live in the OPERATOR's OWN namespace, which is deliberately NOT part of the watch
+scope — the manager cache holds exactly the declared scope, so the operator reads
+them with an uncached client (internal/controller/site_registry.go). In allow mode
+the ClusterRole is not rendered and the manager Role lands only in the WATCHED
+namespaces, so without this Role that read fails `forbidden` and every site is
+reported unreachable.
+
+Deliberately NOT `littlered.managerRules`: this grants `get` on secrets and
+nothing else. Reusing the manager rules would hand the operator full workload
+CRUD in its own namespace, re-opening from the RBAC side the scope widening the
+uncached read exists to avoid.
+
+Unconditional in allow mode, and not narrowed by resourceNames: the Secret names
+come from `spec.multiSite.sites[].kubeconfigSecretRef.name` in a CR created after
+install, so the chart can know neither the names nor whether multi-site is used
+at all. The cost of always rendering it is one Role granting `get secrets` in the
+operator's own namespace; deny/none modes keep the ClusterRole and need nothing.
+*/ -}}
+{{- if eq (include "littlered.scopeMode" .) "allow" }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "littlered.fullname" . }}-site-secrets
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "littlered.labels" . | nindent 4 }}
+rules:
+  - apiGroups:
+      - ""
+    resources:
+      - secrets
+    verbs:
+      - get
+{{- end }}

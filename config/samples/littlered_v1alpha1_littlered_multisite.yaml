@@ -1,0 +1,87 @@
+# Example: Multi-Site (stretched) Redis Cluster mode  --  EXPERIMENTAL
+#
+# One stretched Redis Cluster across several workload Kubernetes clusters ("sites"),
+# managed hub-and-spokes by a single operator on a designated management cluster
+# (the "hub"). Every shard keeps replicas in sitesPerShard >= 2 sites, so the loss
+# of a whole site loses no replicated data. See docs/MULTI_SITE_DESIGN.md and ADR-012.
+#
+# STATUS: experimental. The full mode ships and is e2e-verified, but is pre-1.0 with
+# known deferred items -- most notably per-site scale-down / topology-shrink refusal
+# guards are NOT yet implemented (reducing shards, lowering sitesPerShard, or removing
+# a site leaves the orphaned per-site StatefulSets un-managed drift, not deleted).
+# See docs/MULTI_SITE_DESIGN.md section 10.
+#
+# PREREQUISITES:
+#   - A routed pod network: pod CIDRs routed between all sites and the hub (the only
+#     supported transport, network.mode: pod-routed).
+#   - One per-site kubeconfig Secret in the operator namespace on the hub, generated with
+#       lrctl multisite setup-site --site alpha --repl-endpoint https://<hub-reachable-api>:6443 ...
+#     (grants the site a namespaced workload/pod Role PLUS cluster-scoped `nodes get;list`
+#     for the ADR-012 site-loss witness). See docs/LRCTL.md "Site-Secret setup helper".
+#
+# Total members per shard = sitesPerShard * (replicasPerShard + 1). A shard always has a
+# cross-site replica in multi-site regardless of replicasPerShard: below, replicasPerShard:0
+# with sitesPerShard:2 gives each shard 1 master + 1 cross-site replica (2 members).
+#
+# Usage (apply on the hub):
+#   kubectl --context hub apply -f littlered_v1alpha1_littlered_multisite.yaml
+#   lrctl --context hub status store-multisite          # tier-1 cross-site view
+#   lrctl --context hub verify store-multisite          # tier-2 live via a hub Job
+#   lrctl --context hub multisite preflight store-multisite
+#
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: store-multisite
+spec:
+  mode: cluster
+  cluster:
+    # Minimum 3 shards for Redis Cluster. NOTE: over exactly two sites an odd shard count
+    # is a 2+1 master split, so an automatic dual-site takeover commonly lands in the
+    # fence-gated drift-refusal (expected). For automatic dual-site takeover use an EVEN
+    # split (e.g. shards: 4 => 2+2). With >=3 sites a single-site loss is fully native.
+    shards: 3
+    # Per-SITE shard StatefulSet size = replicasPerShard + 1. 0 still yields one cross-site
+    # replica per shard (the "+1" pod in each hosting site).
+    replicasPerShard: 0
+    clusterNodeTimeout: 15000
+  multiSite:
+    # The workload Kubernetes clusters hosting this instance's Redis pods. Minimum 2; names
+    # unique. Each kubeconfigSecretRef names a Secret in the operator namespace on the hub.
+    # Omit kubeconfigSecretRef for a hub-local site (at most one).
+    #
+    # ORDER MATTERS: a site's position is its placement index (shard K is hosted by sites
+    # (K+j) mod S). The list, sitesPerShard and shards are IMMUTABLE for the instance's
+    # lifetime -- changing any of them would relocate live shard members across sites, and
+    # cluster storage is EmptyDir. To change the topology, create a new instance.
+    sites:
+      - name: alpha
+        kubeconfigSecretRef:
+          name: site-alpha
+      - name: beta
+        kubeconfigSecretRef:
+          name: site-beta
+    # How many sites host each shard (round-robin over the ordered site list).
+    # REQUIRED -- deliberately not defaulted: this is the copy factor of an in-memory
+    # store (members per shard = sitesPerShard * (replicasPerShard + 1)), so it sets the
+    # memory bill and how many simultaneous site losses the data survives. 2 keeps the
+    # design's contract (survive one site loss) at the lowest cost and lets further sites
+    # scale capacity rather than copies. Must be 2 <= sitesPerShard <= len(sites).
+    sitesPerShard: 2
+    network:
+      # Only "pod-routed" is supported (nodeport | multus are future transports).
+      mode: pod-routed
+    # Permit an operator-led site-loss takeover even when the fence argument is unavailable
+    # (the lost side could hold a serving master majority -- a wrong takeover risks a live
+    # split-brain). Default false: the operator refuses (drift-refusal) and waits for
+    # Kubernetes-confirmed site death or a human. See ADR-012.
+    allowUnsafeSiteTakeover: false
+  resources:
+    requests:
+      memory: 256Mi
+      cpu: 250m
+    limits:
+      memory: 512Mi
+      cpu: 500m
+  config:
+    maxmemoryPolicy: noeviction

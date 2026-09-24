@@ -95,6 +95,12 @@ const (
 	// Placement defaults (cluster-mode shard anti-affinity)
 	DefaultShardTopologyKey       = "kubernetes.io/hostname"
 	DefaultShardWhenUnsatisfiable = corev1.ScheduleAnyway
+
+	// Multi-site (cluster mode; see docs/MULTI_SITE_DESIGN.md).
+	// MultiSiteNetworkModePodRouted is the only supported cross-site transport:
+	// pod CIDRs routed between all sites. sitesPerShard has no static default —
+	// it defaults dynamically to the number of sites (MultiSiteSpec.SetDefaults).
+	MultiSiteNetworkModePodRouted = "pod-routed"
 )
 
 // redis-exporter.Dockerfile is the single source of truth for the default
@@ -216,6 +222,26 @@ func (r *LittleRed) SetDefaults() {
 	// Placement defaults (only when the block is present; not mode-gated / never auto-created)
 	if spec.Placement != nil {
 		spec.Placement.SetDefaults()
+	}
+
+	// Multi-site defaults (only when the block is present; never auto-created)
+	if spec.MultiSite != nil {
+		spec.MultiSite.SetDefaults()
+	}
+}
+
+// SetDefaults applies default values to MultiSiteSpec.
+//
+// sitesPerShard is deliberately NOT defaulted (LR-033) — it is required. It used
+// to default dynamically to the number of sites, which had to live here rather
+// than in a +kubebuilder:default marker (a CRD default is a constant), and that
+// dynamism was the whole problem: the stored spec diverged from the effective
+// value, the reconciler's own finalizer Update persisted the computed default
+// back into the user's spec, and a later change to the rule would silently
+// re-place shards on existing instances. A required field has none of that.
+func (m *MultiSiteSpec) SetDefaults() {
+	if m.Network.Mode == "" {
+		m.Network.Mode = MultiSiteNetworkModePodRouted
 	}
 }
 

@@ -68,7 +68,14 @@ func main() {
 	var probeAddr string
 	var secureMetrics bool
 	var enableHTTP2 bool
+	var gatherTarget string
+	var gatherOutput string
 	var tlsOpts []func(*tls.Config)
+	flag.StringVar(&gatherTarget, "gather", "",
+		"One-shot multi-site gather mode: gather the ground truth for LittleRed <namespace>/<name> "+
+			"and exit (used by lrctl's tier-2 hub Job). Not a controller.")
+	flag.StringVar(&gatherOutput, "o", "json",
+		"Output format for --gather (only 'json' is supported).")
 	flag.StringVar(&metricsAddr, "metrics-bind-address", "0", "The address the metrics endpoint binds to. "+
 		"Use :8443 for HTTPS or :8080 for HTTP, or leave as 0 to disable the metrics service.")
 	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
@@ -93,6 +100,24 @@ func main() {
 	ctrl.SetLogger(logger)
 	klog.SetLogger(logger)
 	redis.SetLogger(newRedisLogger(logger))
+
+	// One-shot multi-site gather mode (lrctl tier-2 hub Job): run the operator's
+	// own multi-site gather for one CR and exit, emitting site-attributed ground
+	// truth as JSON. This is a flag-gated early return, NOT a controller — it
+	// never starts the manager. See internal/controller.RunOneShotGather.
+	if gatherTarget != "" {
+		if gatherOutput != "json" {
+			setupLog.Error(fmt.Errorf("unsupported -o %q", gatherOutput), "only -o json is supported for --gather")
+			os.Exit(1)
+		}
+		gatherErr := controller.RunOneShotGather(
+			context.Background(), ctrl.GetConfigOrDie(), scheme, gatherTarget, os.Stdout)
+		if gatherErr != nil {
+			setupLog.Error(gatherErr, "one-shot gather failed")
+			os.Exit(1)
+		}
+		return
+	}
 
 	// if the enable-http2 flag is false (the default), http/2 should be disabled
 	// due to its vulnerabilities. More specifically, disabling http/2 will

@@ -36,6 +36,14 @@ import (
 // vacuously true while the registry has one CR-resident member, are on
 // heavyOperations in internal/controller/operation_registry.go.
 // +kubebuilder:validation:XValidation:rule="(has(self.sentinel) && has(oldSelf.sentinel) && (has(self.sentinel.masterName) ? self.sentinel.masterName : 'mymaster') != (has(oldSelf.sentinel.masterName) ? oldSelf.sentinel.masterName : 'mymaster') ? 1 : 0) <= 1",message="at most one heavy field may change per update (ADR-020): apply them one at a time"
+// +kubebuilder:validation:XValidation:rule="self.mode == 'cluster' || !has(self.multiSite)",message="spec.multiSite may only be set when spec.mode is 'cluster'"
+//
+// Multi-site topology immutability (LR-032), the two clauses that need a
+// spec-level view; the site list and sitesPerShard are pinned on MultiSiteSpec.
+// Converting a running instance between single-site and stretched, or resharding
+// a stretched instance, are both undesigned topology changes over EmptyDir data.
+// +kubebuilder:validation:XValidation:rule="has(self.multiSite) == has(oldSelf.multiSite)",message="spec.multiSite cannot be added to or removed from an existing instance: converting between single-site and stretched topology is not supported; create a new instance instead"
+// +kubebuilder:validation:XValidation:rule="!has(self.multiSite) || !has(self.cluster) || !has(oldSelf.cluster) || self.cluster.shards == oldSelf.cluster.shards",message="spec.cluster.shards is immutable while spec.multiSite is set: the multi-site topology is fixed for an instance's lifetime"
 type LittleRedSpec struct {
 	// Mode is the deployment mode: standalone, sentinel, cluster, or failover (experimental)
 	// +kubebuilder:validation:Enum=standalone;sentinel;cluster;failover
@@ -122,6 +130,12 @@ type LittleRedSpec struct {
 	// Placement defines topology/failure-domain placement rules (cluster mode only)
 	// +optional
 	Placement *PlacementSpec `json:"placement,omitempty"`
+
+	// MultiSite stretches a Redis Cluster across multiple workload Kubernetes
+	// clusters ("sites") managed by this (hub) operator. Cluster mode only.
+	// Absent means single-site behavior, unchanged. See docs/MULTI_SITE_DESIGN.md.
+	// +optional
+	MultiSite *MultiSiteSpec `json:"multiSite,omitempty"`
 }
 
 // PodDisruptionBudgetSpec defines whether a PodDisruptionBudget should be created
@@ -630,6 +644,125 @@ type ClusterSpec struct {
 	ReshardMigrateTimeoutMillis int `json:"reshardMigrateTimeoutMillis,omitempty"`
 }
 
+// MultiSiteSpec configures a stretched Redis Cluster across multiple sites
+// (workload Kubernetes clusters), managed hub-and-spokes by one operator.
+// Cluster mode only. See docs/MULTI_SITE_DESIGN.md and ADR-012.
+// +kubebuilder:validation:XValidation:rule="self.sitesPerShard <= self.sites.size()",message="spec.multiSite.sitesPerShard cannot exceed the number of sites"
+// +kubebuilder:validation:XValidation:rule="self.sites.filter(s, !has(s.kubeconfigSecretRef)).size() <= 1",message="at most one site may be hub-local (kubeconfigSecretRef omitted)"
+//
+// Site names must be unique. This was previously enforced for free by the sites
+// list being a listType=map keyed on name; LR-033 made the list ATOMIC (its ORDER
+// is load-bearing — it is the round-robin placement input — which is exactly what
+// a map-typed list declares to be insignificant), so uniqueness is now an explicit
+// rule. It is still load-bearing beyond tidiness: the site name is the operator's
+// ground-truth key (siteQualifiedKey), so duplicates would collide observations.
+// Quadratic, but MaxItems=16 keeps it far inside the CEL cost budget.
+// +kubebuilder:validation:XValidation:rule="self.sites.all(s, self.sites.filter(x, x.name == s.name).size() == 1)",message="spec.multiSite.sites names must be unique"
+//
+// The multi-site TOPOLOGY is immutable for an instance's lifetime (LR-032): the
+// round-robin placement (shard K -> sites (K+j) mod S) is index-based, so adding,
+// removing or reordering a site remaps shards onto different sites — a relocation
+// of live members, for which no mechanism exists (EmptyDir storage, pillar 3.1).
+// Pinned here at admission rather than refused at runtime, because a runtime
+// detector would have to distinguish "site added" from "site temporarily
+// unobservable" and would fire during the very outage recoverSiteLoss must handle.
+// Only the site NAMES and their ORDER are pinned; a site's kubeconfigSecretRef
+// stays mutable so Secret rotation remains possible. sitesPerShard is a plain
+// equality comparison because it is required and never defaulted (LR-033) — the
+// stored spec always equals the effective value.
+// +kubebuilder:validation:XValidation:rule="self.sites.map(s, s.name) == oldSelf.sites.map(s, s.name)",message="spec.multiSite.sites is immutable: the site list (names and order) is fixed for an instance's lifetime — adding, removing or reordering sites remaps shard placement onto different sites and is not supported; create a new instance instead"
+// +kubebuilder:validation:XValidation:rule="self.sitesPerShard == oldSelf.sitesPerShard",message="spec.multiSite.sitesPerShard is immutable: changing it re-places every shard across sites and would orphan the per-site StatefulSets it moves away from"
+type MultiSiteSpec struct {
+	// Sites lists the workload Kubernetes clusters hosting Redis pods of this
+	// instance. At least 2 sites are required (sitesPerShard >= 2 is what lets
+	// the design descope single-site-loss data repair); site names must be
+	// unique. At most one site may be hub-local (kubeconfigSecretRef omitted).
+	//
+	// ORDER IS SIGNIFICANT: a site's position in this list is its placement
+	// index — shard K is hosted by sites (K+j) mod S for j < sitesPerShard — so
+	// the list is an ordered sequence of objects, keyed by position, and is
+	// declared listType=atomic accordingly (LR-033). It was previously
+	// listType=map keyed on name, which tells the API machinery the opposite:
+	// that entries are identified by name and order carries no meaning (CEL
+	// equality on such a list is order-blind, and a server-side-apply merge is
+	// free to reorder it — which would silently re-place every shard).
+	// +kubebuilder:validation:MinItems=2
+	// +kubebuilder:validation:MaxItems=16
+	// +listType=atomic
+	Sites []SiteSpec `json:"sites"`
+
+	// SitesPerShard is how many sites host each shard. REQUIRED and immutable —
+	// deliberately not defaulted (LR-033). This is the copy-factor knob of a
+	// RAM-resident store: total members per shard = sitesPerShard x
+	// (replicasPerShard + 1), so it sets the memory bill, the cross-site
+	// replication traffic, and how many simultaneous site losses the data
+	// survives. Every candidate default is wrong for somebody — the number of
+	// sites multiplies copies as sites are added, a constant is arbitrary — and a
+	// default would also hide the knob from the reader of a CR. Choose it once, at
+	// creation. 2 keeps the design's contract (survive one site loss) at the
+	// lowest cost and lets further sites scale capacity rather than copies; a
+	// higher value buys more simultaneous site losses. Must be between 2 and the
+	// number of sites.
+	// +kubebuilder:validation:Minimum=2
+	// +kubebuilder:validation:Required
+	SitesPerShard int `json:"sitesPerShard"`
+
+	// Network selects the cross-site replication transport.
+	// +optional
+	Network MultiSiteNetworkSpec `json:"network,omitempty"`
+
+	// AllowUnsafeSiteTakeover permits the operator to take over a lost site's
+	// shards (CLUSTER FAILOVER TAKEOVER on surviving replicas) even when the
+	// fence argument is unavailable — the unreachable side could hold a serving
+	// master majority, so a wrong takeover creates a live dual writer. With it
+	// unset the operator refuses (drift-refusal), surfaces a condition and
+	// waits for Kubernetes-confirmed site death or a human. See ADR-012.
+	// +optional
+	AllowUnsafeSiteTakeover bool `json:"allowUnsafeSiteTakeover,omitempty"`
+}
+
+// SiteSpec identifies one site (workload Kubernetes cluster) of a multi-site
+// instance.
+type SiteSpec struct {
+	// Name is the site's unique name within this instance. It is the operator's
+	// ground-truth key for everything observed in the site (siteQualifiedKey) and
+	// is surfaced in status, so keep it a short identifier. The upper bound is not
+	// cosmetic: CEL cost estimation assumes the declared maximum for every string
+	// comparison, and the uniqueness rule compares names pairwise — without a
+	// MaxLength the CRD is rejected for exceeding the rule-cost budget.
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	Name string `json:"name"`
+
+	// KubeconfigSecretRef names a Secret in the operator namespace holding a
+	// kubeconfig whose credentials are bound to a namespaced Role in the target
+	// site (workload CRUD + pod read in the instance namespace — not
+	// cluster-admin). Omitted means the site is hub-local: its workloads live
+	// in the same Kubernetes cluster as the operator.
+	// +optional
+	KubeconfigSecretRef *KubeconfigSecretRef `json:"kubeconfigSecretRef,omitempty"`
+}
+
+// KubeconfigSecretRef names a Secret in the operator namespace that holds a
+// site kubeconfig under the "kubeconfig" data key.
+type KubeconfigSecretRef struct {
+	// Name of the Secret.
+	// +kubebuilder:validation:MinLength=1
+	Name string `json:"name"`
+}
+
+// MultiSiteNetworkSpec selects the cross-site replication transport.
+type MultiSiteNetworkSpec struct {
+	// Mode is the transport for cross-site pod reachability. Only "pod-routed"
+	// is supported: pod CIDRs are routed between all sites (and the hub), so
+	// Redis nodes announce and reach plain pod IPs across sites. Future
+	// transports (nodeport, multus) are not yet accepted.
+	// +kubebuilder:validation:Enum=pod-routed
+	// +kubebuilder:default=pod-routed
+	// +optional
+	Mode string `json:"mode,omitempty"`
+}
+
 // PlacementSpec defines topology/failure-domain placement rules. Cluster mode only.
 type PlacementSpec struct {
 	// ShardAntiAffinity spreads each shard's pods (its master and replicas) across a
@@ -763,6 +896,49 @@ const (
 	// bare-Sentinel deadlock) keeps the sentinel-vs-failover graduation-gate
 	// comparison honest.
 	ConditionFailoverRecovery = "FailoverRecovery"
+	// ConditionMultiSiteTeardown reflects the multi-site deletion sweep (cluster
+	// mode with spec.multiSite). Spoke-side children carry no owner references
+	// (owner references do not work across Kubernetes clusters), so on CR
+	// deletion the operator sweeps the instance-labeled workload objects
+	// through every site before releasing the CR. True means the sweep is
+	// blocked — a site was unreachable or its sweep failed — and the finalizer
+	// is retained while the operator retries with bounded per-site attempts;
+	// the documented escape hatch is manually removing the
+	// redis.chuck-chuck-chuck.net/multisite-teardown finalizer.
+	ConditionMultiSiteTeardown = "MultiSiteTeardown"
+	// ConditionMultiSiteTakeover reflects the multi-site site-loss takeover (cluster mode
+	// with spec.multiSite; ADR-012). It is the operator-owned recovery of a whole site's
+	// loss that native Redis failover cannot resolve (survivors below the master
+	// majority). True means the instance needs attention — the cooldown is armed, or the
+	// operator is refusing because the fence is unavailable (the unreachable side could
+	// hold a serving master majority, so an automatic takeover risks a live split-brain;
+	// set multiSite.allowUnsafeSiteTakeover to authorise, or act manually). False records
+	// a completed takeover or that no site-loss recovery is needed.
+	ConditionMultiSiteTakeover = "MultiSiteTakeover"
+	// ConditionReducedSiteLossResilience is a surfaced WARNING (not an admission refusal)
+	// for a multi-site topology that cannot structurally auto-survive an arbitrary
+	// single-site loss (cluster mode with spec.multiSite; ADR-012). It is True when the D2
+	// balance invariant is structurally unsatisfiable — S sites x (ceil(K/2)-1) masters/site
+	// < K shards, so pigeonhole forces some site over the balance target and losing that
+	// heavier-master site strands the survivors below quorum (the headline case is K=4 over
+	// 3 sites). The topology is still valid and functional — recovery of the heavier site's
+	// loss simply requires manual action or multiSite.allowUnsafeSiteTakeover — so LittleRed
+	// surfaces this rather than blocking it (the opt-in-not-block norm). Structural
+	// (spec-level) only; transient master drift within a resilient topology is owned by the
+	// rebalancer, not this condition. False records a resilient topology.
+	ConditionReducedSiteLossResilience = "ReducedSiteLossResilience"
+	// ConditionMultiSiteConfigInvalid is a surfaced WARNING for a site the operator cannot
+	// CONFIGURE (cluster mode with spec.multiSite): its own namespace was unresolvable, or
+	// the site's kubeconfig Secret is missing, unreadable or malformed. This is a different
+	// state from an unreachable site, and the difference is whether a human must act: an
+	// unreachable site may heal itself and is treated as normal (an unreachable site is
+	// unmanaged, not broken), whereas the operator failing to read its own hub-local inputs
+	// never heals on its own. Both previously surfaced only as "site unreachable", which
+	// made the actionable alert impossible to write. True means at least one site is
+	// unmanaged until the configuration is fixed — before anything is built the operator
+	// refuses outright (phase Failed); on an existing instance the phase is left alone and
+	// the healthy sites keep being reconciled. False records readable configuration.
+	ConditionMultiSiteConfigInvalid = "MultiSiteConfigInvalid"
 
 	// ConditionClusterRolloutBlocked reports that a cluster shard's rolling update is
 	// HELD because the shard is not redundant: a replaced pod is at the StatefulSet's
@@ -1012,6 +1188,170 @@ type LittleRedStatus struct {
 	// Failover contains failover-mode state (failover mode only)
 	// +optional
 	Failover *FailoverStatus `json:"failover,omitempty"`
+
+	// MultiSite contains multi-site observed state (cluster mode with
+	// spec.multiSite only)
+	// +optional
+	MultiSite *MultiSiteStatus `json:"multiSite,omitempty"`
+}
+
+// MultiSiteStatus contains multi-site observed state (cluster mode with
+// spec.multiSite only). Monitoring surface: per-site observed state is
+// re-derived from live probes; the takeover marker mirrors the
+// leaderlessSince/wipeDeadlockSince cooldown-anchor pattern.
+//
+// The cross-site view fields (ClusterState/SlotsAssigned/CrossSiteOK/Shards)
+// are the operator's published tier-1 surface: the operator gathers every site
+// each reconcile and stamps a compact, site-attributed topology summary here, so
+// a read-only-hub client (lrctl status / verify --from-status) can render the
+// cross-site health with only `get littlered` — no site access. Kept small (a
+// handful of shards) to stay within status size limits; freshness is the
+// reconcile interval, anchored by LastReconcileTime.
+type MultiSiteStatus struct {
+	// Sites is the per-site observed state.
+	// +listType=map
+	// +listMapKey=name
+	// +optional
+	Sites []SiteStatus `json:"sites,omitempty"`
+
+	// TakeoverPendingSince records when the operator first observed a site-loss
+	// state that native Redis failover cannot resolve, arming the cooldown
+	// before an operator-led CLUSTER FAILOVER TAKEOVER (ADR-012). Cleared when
+	// the state clears.
+	// +optional
+	TakeoverPendingSince *metav1.Time `json:"takeoverPendingSince,omitempty"`
+
+	// RebalancePendingSince records when the operator last issued a graceful
+	// CLUSTER FAILOVER to correct master-distribution drift (ADR-012 D2). It is a
+	// post-move settle/anti-thrash marker: while it is set and within the
+	// rebalance cooldown, the drift-triggered rebalancer neither re-evaluates nor
+	// re-issues a move for the same shard, so a graceful failover in flight is
+	// never restarted. Cleared once the balance invariant holds again. Monitoring
+	// surface only; nothing load-bearing is persisted (the decision is re-derived
+	// from the live gather each pass).
+	// +optional
+	RebalancePendingSince *metav1.Time `json:"rebalancePendingSince,omitempty"`
+
+	// ClusterState is the stretched cluster's overall cluster_state from the last
+	// gather ("ok"/"fail"/"unknown") — the tier-1 published equivalent of the
+	// live gather's ClusterState.
+	// +optional
+	ClusterState string `json:"clusterState,omitempty"`
+
+	// SlotsAssigned is how many of the 16384 hash slots are assigned across the
+	// stretched cluster (16384 when whole).
+	// +optional
+	SlotsAssigned int32 `json:"slotsAssigned,omitempty"`
+
+	// CrossSiteOK is true when every shard's members span at least two sites (a
+	// master and a replica in different sites) — the multi-site failure-domain
+	// guarantee. False means at least one shard would be lost with a single site.
+	// +optional
+	CrossSiteOK bool `json:"crossSiteOK,omitempty"`
+
+	// Shards is the per-shard site-attributed topology summary (which site holds
+	// the master, which sites hold replicas, and whether the shard is cross-site).
+	// +listType=map
+	// +listMapKey=shard
+	// +optional
+	Shards []ShardSiteView `json:"shards,omitempty"`
+
+	// MasterCounts is the current number of slot-serving masters hosted per site
+	// (ADR-012 D2), from the last gather. Published so a tier-1 (read-only-hub)
+	// reader can render the master-per-site distribution and the balance invariant's
+	// live health (per-site count vs the ceil(K/2)-1 balance target) without any
+	// site access. Monitoring surface only — the balancing decision is re-derived
+	// from the live gather each pass.
+	// +listType=map
+	// +listMapKey=site
+	// +optional
+	MasterCounts []SiteMasterCount `json:"masterCounts,omitempty"`
+
+	// LastReconcileTime is when the operator last published this cross-site view.
+	// A tier-1 reader reports it as the data's freshness ("as of last reconcile
+	// N ago").
+	// +optional
+	LastReconcileTime *metav1.Time `json:"lastReconcileTime,omitempty"`
+}
+
+// ShardSiteView is one shard's site-attributed placement in the published
+// cross-site view (tier 1). Derived from the union ground truth each reconcile.
+type ShardSiteView struct {
+	// Shard is the shard index.
+	Shard int `json:"shard"`
+
+	// MasterSite is the site hosting this shard's current master (empty if no
+	// reachable master was observed).
+	// +optional
+	MasterSite string `json:"masterSite,omitempty"`
+
+	// ReplicaSites are the sites hosting this shard's replicas, sorted.
+	// +optional
+	ReplicaSites []string `json:"replicaSites,omitempty"`
+
+	// CrossSite is true when the shard's master and at least one replica live in
+	// different sites.
+	// +optional
+	CrossSite bool `json:"crossSite,omitempty"`
+
+	// LinkDown is true when any of this shard's replicas reported its replication
+	// link down at the last gather (reduced redundancy).
+	// +optional
+	LinkDown bool `json:"linkDown,omitempty"`
+}
+
+// SiteMasterCount is the number of slot-serving masters currently hosted in one
+// site (ADR-012 D2 master-per-site distribution). A site holding more than
+// ceil(K/2)-1 (the balance target, K = shards) violates the balance invariant —
+// surfaced as informational drift, corrected by the rebalancer.
+type SiteMasterCount struct {
+	// Site is the site name from spec.multiSite.sites.
+	Site string `json:"site"`
+
+	// Masters is the count of slot-serving masters observed in the site at the last
+	// gather.
+	Masters int32 `json:"masters"`
+}
+
+// SiteStatus is the observed state of one site.
+type SiteStatus struct {
+	// Name is the site name from spec.multiSite.sites.
+	Name string `json:"name"`
+
+	// Reachable reports whether the operator obtained this site's observed state at
+	// the last probe. False means "did not answer, OR we could not ask": both a site
+	// whose Kubernetes API did not respond and a site the operator could not
+	// configure (unresolvable operator namespace, missing/unreadable/malformed
+	// kubeconfig Secret) are false here. The two are NOT the same state — only the
+	// first may heal itself — so read Reason to tell them apart. The boolean keeps
+	// this deliberately broad meaning because it feeds the multi-site observability
+	// arithmetic (allSitesObservable), where "we could not ask" must count exactly
+	// like "did not answer".
+	// +optional
+	Reachable bool `json:"reachable,omitempty"`
+
+	// Reason is a short, machine-readable classification of why this site is not
+	// reachable; empty when it is. "Unreachable" means the site's Kubernetes API did
+	// not answer — normal, possibly transient, and no action is implied (an
+	// unreachable site is unmanaged, not broken). Any other value is a CONFIGURATION
+	// fault that will never heal on its own and needs a human:
+	// "OperatorNamespaceUnresolvable", "KubeconfigSecretUnreadable" or
+	// "KubeconfigSecretMalformed". This is the field to alert on.
+	// +optional
+	Reason string `json:"reason,omitempty"`
+
+	// Message is the human-readable detail behind Reason (the underlying error),
+	// empty when the site is reachable.
+	// +optional
+	Message string `json:"message,omitempty"`
+
+	// Pods counts this instance's Redis pods observed in the site.
+	// +optional
+	Pods *RedisStatus `json:"pods,omitempty"`
+
+	// LastProbeTime is when the operator last probed the site.
+	// +optional
+	LastProbeTime *metav1.Time `json:"lastProbeTime,omitempty"`
 }
 
 // OperationAck is one row of the completion record: the value fingerprint of a
@@ -1260,7 +1600,63 @@ func (r *LittleRed) Validate() error {
 		}
 	}
 
-	return nil
+	return r.validateMultiSite()
+}
+
+// validateMultiSite validates spec.multiSite. Defense-in-depth mirror of the
+// CRD structural rules (CEL, MinItems, listType=map, enum) plus the relational
+// rules the schema cannot express against the dynamically defaulted
+// sitesPerShard. Expects SetDefaults to have run.
+func (r *LittleRed) validateMultiSite() error {
+	ms := r.Spec.MultiSite
+	if ms == nil {
+		return nil
+	}
+
+	if r.Spec.Mode != ModeCluster {
+		return fmt.Errorf("spec.multiSite is only supported in cluster mode (mode is %q)", r.Spec.Mode)
+	}
+
+	if len(ms.Sites) < 2 {
+		return fmt.Errorf("spec.multiSite requires at least 2 sites (found %d); a single-site instance simply omits multiSite", len(ms.Sites))
+	}
+
+	seen := make(map[string]bool, len(ms.Sites))
+	hubLocal := 0
+	for _, s := range ms.Sites {
+		if s.Name == "" {
+			return fmt.Errorf("spec.multiSite.sites[].name must not be empty")
+		}
+		if seen[s.Name] {
+			return fmt.Errorf("duplicate site name %q in spec.multiSite.sites", s.Name)
+		}
+		seen[s.Name] = true
+		if s.KubeconfigSecretRef == nil {
+			hubLocal++
+		} else if s.KubeconfigSecretRef.Name == "" {
+			return fmt.Errorf("site %q: kubeconfigSecretRef.name must not be empty (omit kubeconfigSecretRef entirely for a hub-local site)", s.Name)
+		}
+	}
+	if hubLocal > 1 {
+		return fmt.Errorf("at most one site may be hub-local (kubeconfigSecretRef omitted); found %d", hubLocal)
+	}
+
+	// Required, never defaulted (LR-033): 0 means "the user did not choose", which is
+	// an error here, not a cue to pick for them. The CRD schema rejects it at
+	// admission; this mirror covers objects that predate the requirement.
+	if ms.SitesPerShard == 0 {
+		return fmt.Errorf("spec.multiSite.sitesPerShard is required (between 2 and the number of sites, %d): it sets how many copies of each shard exist, so it is not defaulted", len(ms.Sites))
+	}
+	if ms.SitesPerShard < 2 || ms.SitesPerShard > len(ms.Sites) {
+		return fmt.Errorf("spec.multiSite.sitesPerShard must be between 2 and the number of sites (%d), got %d", len(ms.Sites), ms.SitesPerShard)
+	}
+
+	switch ms.Network.Mode {
+	case "", MultiSiteNetworkModePodRouted:
+		return nil
+	default:
+		return fmt.Errorf("spec.multiSite.network.mode %q is not supported (only %q; nodeport and multus are future transports)", ms.Network.Mode, MultiSiteNetworkModePodRouted)
+	}
 }
 
 // +kubebuilder:object:root=true
