@@ -24,7 +24,7 @@ var verifyCmd = &cobra.Command{
 	Short: "Verify consistency of a Redis instance (omit name to verify all in namespace)",
 	Args:  cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		k8sClient, coreClient, config, defaultNS, err := k8s.NewClient(kubeconfig)
+		k8sClient, coreClient, config, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 		if err != nil {
 			return err
 		}
@@ -57,6 +57,27 @@ var verifyCmd = &cobra.Command{
 		errCount := 0
 
 		for i, key := range targets {
+			// Multi-site cluster: detect from the CR (hub) and aggregate across all
+			// sites. The single-context path would false-FAIL here — the hub hosts
+			// the CR but zero data pods (docs/MULTI_SITE_DESIGN.md §10 item 6).
+			if !unmanaged {
+				if lr, lerr := getLittleRed(ctx, k8sClient, key); lerr == nil && isMultiSite(lr) {
+					if jsonOutput {
+						jsonResults = append(jsonResults, verifyMultiSiteJSON(ctx, k8sClient, coreClient, lr))
+						continue
+					}
+					if i > 0 {
+						fmt.Println(strings.Repeat("=", 40))
+					}
+					fmt.Printf("Verifying Multi-Site Cluster: %s/%s (Mode: cluster, %d sites)\n",
+						key.Namespace, key.Name, len(lr.Spec.MultiSite.Sites))
+					if verr := verifyMultiSite(ctx, k8sClient, coreClient, lr); verr != nil {
+						errCount++
+					}
+					continue
+				}
+			}
+
 			cCtx, err := discovery.GetContext(ctx, k8sClient, key.Namespace, key.Name, kind, unmanaged)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %s/%s: %v\n", key.Namespace, key.Name, err)

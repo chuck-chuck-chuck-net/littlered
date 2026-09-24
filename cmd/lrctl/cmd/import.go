@@ -27,7 +27,7 @@ and generates a LittleRed CR YAML that would deploy an equivalent instance.
 Works with both LittleRed-managed and unmanaged instances (--unmanaged).`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		k8sClient, coreClient, config, defaultNS, err := k8s.NewClient(kubeconfig)
+		k8sClient, coreClient, config, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 		if err != nil {
 			return err
 		}

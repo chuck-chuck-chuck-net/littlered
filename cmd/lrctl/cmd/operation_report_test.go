@@ -32,7 +32,6 @@ import (
 var opNow = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 
 const (
-	tokenOK   = "[OK]"
 	tokenWarn = "[WARN]"
 	opName    = "SentinelMasterNameRename"
 
@@ -248,7 +247,7 @@ func TestOperationViewOf(t *testing.T) {
 func sentinelLR() *littleredv1alpha1.LittleRed {
 	lr := &littleredv1alpha1.LittleRed{}
 	lr.Name = "store-sentinel"
-	lr.Namespace = "default"
+	lr.Namespace = nsDefault
 	lr.Spec.Mode = modeSentinel
 	lr.Status.Phase = phaseRunning
 	lr.Status.Master = &littleredv1alpha1.MasterStatus{PodName: "store-sentinel-redis-0", IP: "10.0.0.1"}

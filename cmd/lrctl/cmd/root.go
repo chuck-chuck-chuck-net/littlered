@@ -24,15 +24,41 @@ const (
 	clusterSubcommand = "cluster"
 	statusUnreachable = "unreachable"
 	valueNone         = "<none>"
+	// tokenOK is the success marker the verify verbs print; named because both the
+	// renderers and their tests assert on it.
+	tokenOK = "[OK]"
+
+	// nsDefault is the "default" namespace literal, named once for the render tests.
+	nsDefault = "default"
+
+	// Added on the multi-site line: used by the multi-site lrctl verbs.
+	containerRedis     = "redis"
+	labelAppInstance   = "app.kubernetes.io/instance"
+	roleReplica        = "replica"
+	sentinelMasterName = "mymaster"
 )
 
 var (
-	namespace     string
-	kubeconfig    string
-	unmanaged     bool
-	kind          string
-	allNamespaces bool
-	jsonOutput    bool
+	namespace          string
+	kubeconfig         string
+	kubeContext        string
+	siteContext        string
+	fromStatus         bool
+	direct             bool
+	operatorNamespace  string
+	operatorDeployment string
+	unmanaged          bool
+	kind               string
+	allNamespaces      bool
+	jsonOutput         bool
+)
+
+// defaultOperatorNamespace / defaultOperatorDeployment are the well-known hub
+// location of the operator, used to discover the SA + image for the tier-2
+// gather Job. Overridable with --operator-namespace / --operator-deployment.
+const (
+	defaultOperatorNamespace  = "littlered-system"
+	defaultOperatorDeployment = "littlered"
 )
 
 var rootCmd = &cobra.Command{
@@ -93,7 +119,7 @@ func completeLittleRedNames(_ *cobra.Command, args []string, _ string) ([]string
 		// Already have a name — suppress all further completions.
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
-	k8sClient, _, _, defaultNS, err := k8s.NewClient(kubeconfig)
+	k8sClient, _, _, defaultNS, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
@@ -114,7 +140,7 @@ func completeLittleRedNames(_ *cobra.Command, args []string, _ string) ([]string
 
 // completeNamespaces is used as the completion function for the --namespace / -n flag.
 func completeNamespaces(_ *cobra.Command, _ []string, _ string) ([]string, cobra.ShellCompDirective) {
-	k8sClient, _, _, _, err := k8s.NewClient(kubeconfig)
+	k8sClient, _, _, _, err := k8s.NewClientForContext(kubeconfig, kubeContext)
 	if err != nil {
 		return nil, cobra.ShellCompDirectiveNoFileComp
 	}
@@ -134,6 +160,26 @@ func init() {
 		&namespace, "namespace", "n", "", "If present, the namespace scope for this CLI request")
 	rootCmd.PersistentFlags().StringVar(
 		&kubeconfig, "kubeconfig", "", "Path to the kubeconfig file to use for CLI requests")
+	rootCmd.PersistentFlags().StringVar(
+		&kubeContext, "context", "", "Kube-context to use (the hub context for multi-site); defaults to the current context")
+	rootCmd.PersistentFlags().StringVar(
+		&siteContext, "site-context", "",
+		"Multi-site tier 3 (direct) only: map site names to kube-contexts, e.g. --site-context alpha=ctxA,beta=ctxB "+
+			"(implies --direct; within tier 3 an unmapped site falls back to the site-name==context-name convention)")
+	rootCmd.PersistentFlags().BoolVar(
+		&fromStatus, "from-status", false,
+		"Multi-site tier 1: render the cross-site view the operator published to status "+
+			"(needs only get littlered on the hub; no site access)")
+	rootCmd.PersistentFlags().BoolVar(
+		&direct, "direct", false,
+		"Multi-site tier 3: gather each site directly through the user's own per-site kube-contexts, "+
+			"bypassing the operator (fallback for when the operator is gone)")
+	rootCmd.PersistentFlags().StringVar(
+		&operatorNamespace, "operator-namespace", defaultOperatorNamespace,
+		"Multi-site tier 2: the operator's namespace on the hub (where the gather Job runs)")
+	rootCmd.PersistentFlags().StringVar(
+		&operatorDeployment, "operator-deployment", defaultOperatorDeployment,
+		"Multi-site tier 2: the operator's Deployment name on the hub (to discover its SA and image)")
 	rootCmd.PersistentFlags().BoolVar(
 		&unmanaged, "unmanaged", false, "If true, skip looking for a LittleRed CR and use heuristics to find pods")
 	rootCmd.PersistentFlags().StringVar(
