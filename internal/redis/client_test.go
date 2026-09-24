@@ -80,7 +80,7 @@ repl_backlog_histlen:1234
 			name:     "parse role slave",
 			info:     sampleReplicaInfo,
 			field:    fieldRole,
-			expected: "slave",
+			expected: fsRoleSlave,
 		},
 		{
 			name:     "parse master_host",

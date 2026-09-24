@@ -165,18 +165,19 @@ func GatherClusterGroundTruth(ctx context.Context, g Gatherer, clusterPods map[s
 		}
 	}
 
-	// 2. Query topology (CLUSTER INFO + NODES) from all reachable nodes and merge.
+	// 2. Query topology (CLUSTER INFO + NODES) from all reachable nodes and merge. This
+	// populates each reachable node's FailFlagged/PFailFlagged from its own gossip view.
 	adj := gatherTopology(ctx, g, gt)
 	// Retain the per-node adjacency (who each node directly knows) so repair can
 	// gate CLUSTER REPLICATE on the empty master actually knowing its target.
 	gt.KnownNodes = adj
 
-	// Detect ghosts: NodeIDs seen in the mesh that have no backing pod.
-	for nodeID := range gt.AllNodeIDs {
-		if _, hasPod := nodeIDtoPod[nodeID]; !hasPod {
-			gt.GhostNodes = append(gt.GhostNodes, nodeID)
-		}
-	}
+	// Detect ghosts from Redis's own quorum verdict, NOT from the hub's dial reachability
+	// (LR-030): a ghost is a NodeID that a reachable peer's gossip marks objectively FAIL
+	// (flagFail). Classifying every dial-unreachable NodeID as a ghost would FORGET the
+	// live masters of a hub-blind-but-gossip-healthy site and manufacture an outage. See
+	// deriveGhostNodes, ADR-012, and pillars 3.4 / 3.15.
+	gt.GhostNodes = deriveGhostNodes(gt.Nodes)
 
 	if gt.ClusterState == "" {
 		gt.ClusterState = "unknown"
@@ -223,6 +224,12 @@ func gatherNodeIdentities(ctx context.Context, g Gatherer, clusterPods map[strin
 			// Replication state is only queried for reachable nodes, so it never hits a dead IP.
 			if rs, err := g.GetRedisState(ctx, p.name, p.ip); err == nil {
 				ns.LinkStatus = rs.LinkStatus
+				// Survivor-vantage lineage fields (ADR-012): kept so the takeover planner can
+				// pick the most-complete surviving replica within one lineage. §7-parity —
+				// single-site gather gets them too, but no single-site decision reads them.
+				ns.MasterReplid = rs.Replid
+				ns.MasterReplid2 = rs.Replid2
+				ns.ReplOffset = rs.Offset
 			}
 			states[i] = ns
 		}(i)
@@ -311,6 +318,10 @@ func probeNodeTopology(ctx context.Context, g Gatherer, n *ClusterNodeState) *to
 		v.state = info.State
 		v.slotsAssigned = info.SlotsAssigned
 		v.asm = info.AtomicSlotMigration
+		// This node's OWN cluster_state — the survivors' first-hand quorum verdict
+		// (ADR-012 condition 2). Distinct from the merged gt.ClusterState, which is
+		// "ok if ANY node says ok".
+		n.ClusterState = info.State
 	}
 
 	nodes, err := g.GetClusterNodes(ctx, n.PodName, n.PodIP)
@@ -322,6 +333,19 @@ func probeNodeTopology(ctx context.Context, g Gatherer, n *ClusterNodeState) *to
 	for _, knownNode := range nodes {
 		v.seenIDs = append(v.seenIDs, knownNode.NodeID)
 
+		// Record this vantage's FAIL/PFAIL verdict on the peer (ADR-012 survivor
+		// corroboration): the survivors' own view of which peers they have given up
+		// on, which is the evidence the site-loss takeover needs — the hub's dial
+		// reachability is transport, not evidence (LR-017). Exact flag compare only,
+		// never a substring match, because PFAIL ("fail?") contains FAIL ("fail").
+		for _, f := range knownNode.Flags {
+			switch f {
+			case flagPFail:
+				n.PFailFlagged = append(n.PFailFlagged, knownNode.NodeID)
+			case flagFail:
+				n.FailFlagged = append(n.FailFlagged, knownNode.NodeID)
+			}
+		}
 		if !nodeFlagsFailed(knownNode.Flags) {
 			v.known = append(v.known, knownNode.NodeID)
 		}

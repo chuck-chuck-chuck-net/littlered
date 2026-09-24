@@ -47,6 +47,23 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 	// Set initial phase
 	if littleRed.Status.Phase == "" {
 		littleRed.Status.Phase = littleredv1alpha1.PhasePending
+		// Experimental-mode warning for multi-site (parity with failover mode's
+		// ADR-011 §8 notice). A multi-site stretched cluster is experimental;
+		// single-site cluster CRs are unaffected (gated on isMultiSite). Phase is
+		// unset only on the very first reconcile(s) of a new CR, so this is a cheap
+		// "once" without a persisted flag; the recorder aggregates any repeats.
+		if isMultiSite(littleRed) {
+			r.event(littleRed, corev1.EventTypeWarning, reasonExperimentalMode,
+				"mode cluster with spec.multiSite (multi-site stretched cluster) is experimental — "+
+					"see docs/MULTI_SITE_DESIGN.md for current status, deferred items, and trade-offs")
+		}
+	}
+
+	// Multi-site cluster mode (docs/MULTI_SITE_DESIGN.md): resources, gather, gating and
+	// bootstrap fan out across every site's SiteClient. Single-site (no spec.multiSite)
+	// falls through to the unchanged path below.
+	if isMultiSite(littleRed) {
+		return r.reconcileMultiSiteCluster(ctx, littleRed)
 	}
 
 	// Legacy single-STS migration (ADR-013). When a pre-0.3.0 single {name}-cluster
@@ -162,17 +179,24 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 			"emptyMasters", gt.HasEmptyMasters(),
 			"masters", gt.CountMasters(),
 			"allNodesView", len(gt.AllNodeIDs))
-		return r.repairCluster(ctx, littleRed, gt)
+		// Single-site: one implicit always-observable "site", so ghost FORGET is always safe.
+		return r.repairCluster(ctx, littleRed, gt, true)
 	}
 
 	// 5. Cluster is healthy and stable — pass gt through to avoid a second gather
 	return r.updateClusterStatus(ctx, littleRed, gt)
 }
 
-// repairCluster handles healing: partitions, ghost nodes, slot restoration, and replication topology
+// repairCluster handles healing: partitions, ghost nodes, slot restoration, and replication topology.
+//
+// forgetSafe gates CLUSTER FORGET: true in single-site (and multi-site with every hosting site
+// observable) so routine ghost cleanup runs; false in multi-site when a hosting site is
+// unobservable, so a gossip-known node on an unreachable site is never forgotten (pillar 3.4).
+// Quorum-loss/orphan TAKEOVER is additionally gated on repairMayForceTakeover(littleRed): in
+// multi-site the fence-gated recoverSiteLoss is the sole takeover authority (ADR-012).
 //
 //nolint:gocyclo
-func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth) (ctrl.Result, error) {
+func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, forgetSafe bool) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	fast, _ := littleRed.GetRequeueIntervals()
 
@@ -188,8 +212,12 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 	shards := littleRed.Spec.Cluster.Shards
 	votingMasters := gt.CountMasters()
 
-	// Quorum is lost if available voting masters are <= shards / 2
-	if votingMasters <= shards/2 {
+	// Quorum is lost if available voting masters are <= shards / 2.
+	// In MULTI-SITE the fence-gated recoverSiteLoss (ADR-012) is the sole takeover authority —
+	// it runs ahead of repair and either acts (blocking repair) or defers to native failover —
+	// so repair must never fire this cooldown-free, reachability-blind takeover across a site
+	// that may be alive-but-unreachable. repairMayForceTakeover is false there.
+	if repairMayForceTakeover(littleRed) && votingMasters <= shards/2 {
 		stateLog.Info("Quorum loss detected", "votingMasters", votingMasters, "targetShards", shards)
 
 		// Build set of live node IDs for fast lookup
@@ -285,8 +313,9 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			}
 
 			age := now.Sub(orphanInfo.DetectedAt.Time)
-			if age >= orphanTimeout {
-				// Timeout exceeded — force-promote
+			if age >= orphanTimeout && repairMayForceTakeover(littleRed) {
+				// Timeout exceeded — force-promote. Suppressed in multi-site: the same
+				// cooldown-free, reachability-blind takeover hazard as Step-0; recoverSiteLoss owns it.
 				auditLog.Info("Force-promoting stuck orphan replica",
 					"pod", node.PodName, "orphanAge", age, "timeout", orphanTimeout)
 				addr := fmt.Sprintf("%s:%d", node.PodIP, littleredv1alpha1.RedisPort)
@@ -418,6 +447,12 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			ghostsToRemove = append(ghostsToRemove, ghostID)
 		}
 
+		// Site-aware FORGET gate (pillar 3.4): in multi-site with a site unobservable this pass,
+		// a no-backing-pod ghost cannot be told apart from a node on the unreachable site, so it
+		// is "unknown, not gone" and must not be forgotten. ghostForgetPlan drops the whole set
+		// then (FORGET trails to a later pass); with every site observable it passes them through.
+		ghostsToRemove = ghostForgetPlan(ghostsToRemove, forgetSafe)
+
 		if len(ghostsToRemove) > 0 {
 			stateLog.Info("Removing ghost nodes", "count", len(ghostsToRemove))
 			for _, ghostID := range ghostsToRemove {
@@ -502,8 +537,11 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		// already-consolidated cluster.
 		intendedMasters := make(map[int]*redisclient.ClusterNodeState) // shardIdx -> Node
 		for i := range shards {
-			podName := shardMasterPodName(littleRed.Name, i)
-			if node, ok := gt.Nodes[podName]; ok && redisclient.SafeMissingShardTarget(node) {
+			// The intended master's ground-truth key differs by mode: single-site keys by
+			// the {name}-shard-K-0 pod name; multi-site keys by the site-qualified initial
+			// master (its primary hosting site), since pod names collide across sites.
+			key := r.intendedShardMasterKey(littleRed, i)
+			if node, ok := gt.Nodes[key]; ok && redisclient.SafeMissingShardTarget(node) {
 				intendedMasters[i] = node
 			}
 		}
@@ -514,7 +552,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 			if targetNode == nil {
 				log.Info("Intended master for shard not available, waiting",
 					"shardIdx", shardIdx,
-					"expectedPod", shardMasterPodName(littleRed.Name, shardIdx))
+					"expectedPod", r.intendedShardMasterKey(littleRed, shardIdx))
 				continue
 			}
 
@@ -550,20 +588,18 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		return res, nil
 	}
 
-	// 4. Replication Repair (Non-Zero Replica Mode)
-	isZeroReplicaMode := littleRed.Spec.Cluster.ReplicasPerShard != nil && *littleRed.Spec.Cluster.ReplicasPerShard == 0
+	// 4. Replication Repair. expectedReplicas is the per-shard replica count the repair
+	// reattaches empty masters up to; 0 disables the step. In multi-site the cross-site
+	// members ARE replicas even when spec.cluster.replicasPerShard is 0, so this is derived
+	// per mode (clusterRepairExpectedReplicas — LR-027), not keyed on replicasPerShard alone.
+	expectedReplicas := clusterRepairExpectedReplicas(littleRed)
 
-	if !isZeroReplicaMode {
+	if expectedReplicas > 0 {
 		emptyMasters := gt.GetEmptyMasters()
 		shardsWithReplicas := gt.GetMastersWithReplicas()
 
 		if len(emptyMasters) > 0 {
 			stateLog.Info("Detected masters with no slots in replication mode, attempting to assign as replicas")
-
-			expectedReplicas := 1
-			if littleRed.Spec.Cluster.ReplicasPerShard != nil {
-				expectedReplicas = *littleRed.Spec.Cluster.ReplicasPerShard
-			}
 
 			// Candidate masters, snapshotted once for a deterministic, shard-aware choice.
 			candidates := make([]*redisclient.ClusterNodeState, 0, len(gt.Nodes))
@@ -694,6 +730,9 @@ func (r *LittleRedReconciler) confirmPodIP(ctx context.Context, namespace, podNa
 
 // gatherGroundTruth queries all pods to build a view of the cluster
 func (r *LittleRedReconciler) gatherGroundTruth(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) *redisclient.ClusterGroundTruth {
+	if isMultiSite(littleRed) {
+		return r.gatherMultiSiteGroundTruth(ctx, littleRed)
+	}
 	cluster := littleRed.Spec.Cluster
 	password := r.getRedisPassword(ctx, littleRed)
 
@@ -724,6 +763,9 @@ func podAtOwnStatefulSetRevision(pod *corev1.Pod, sts *appsv1.StatefulSet) bool 
 }
 
 func (r *LittleRedReconciler) bootstrapCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) (ctrl.Result, error) {
+	if isMultiSite(littleRed) {
+		return r.bootstrapMultiSiteCluster(ctx, littleRed)
+	}
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	auditLog := r.getLogger(ctx, littleRed, LogCategoryAudit)
 	auditLog.Info("Bootstrapping/Healing cluster")
@@ -978,6 +1020,9 @@ func (r *LittleRedReconciler) bootstrapMeetRound(
 // updateClusterStatus updates the LittleRed status for cluster mode.
 // gt may be passed in from the caller to avoid a redundant gather; pass nil to gather fresh.
 func (r *LittleRedReconciler) updateClusterStatus(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth) (ctrl.Result, error) {
+	if isMultiSite(littleRed) {
+		return r.updateMultiSiteClusterStatus(ctx, littleRed, gt, nil)
+	}
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	oldStatus := littleRed.Status.DeepCopy()
 

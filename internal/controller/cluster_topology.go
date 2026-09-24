@@ -77,6 +77,31 @@ func clusterReplicasPerShard(cluster *littleredv1alpha1.ClusterSpec) int {
 	return *cluster.ReplicasPerShard
 }
 
+// clusterRepairExpectedReplicas is the number of replicas the Step-4 replication repair
+// (cluster_reconcile.go) expects PER SHARD; the repair reattaches empty masters as replicas
+// only while a slot-master has fewer, and skips entirely when this is 0.
+//
+// Single-site: replicasPerShard, with a nil spec defaulting to 1 (the historical repair
+// default); an explicit 0 means "no replicas" and disables the step. MULTI-SITE (LR-027):
+// replicas ALWAYS exist regardless of replicasPerShard, because a shard spans
+// sitesPerShard>=2 per-site StatefulSets each sized replicasPerShard+1 — so the per-shard
+// replica count is sitesPerShard*(replicasPerShard+1) - 1 (design §4). Keying the repair on
+// the single-site replicasPerShard==0 wrongly disabled it for a stretched cluster with
+// replicasPerShard:0, leaving the cross-site members stranded as empty masters.
+func clusterRepairExpectedReplicas(lr *littleredv1alpha1.LittleRed) int {
+	if isMultiSite(lr) {
+		_, rps, sps := multiSiteParams(lr)
+		// sitesPerShard is required (LR-033); a zero is a spec that never passed
+		// validation. Clamp rather than return a negative expected-replica count,
+		// which would be a stranger input to the repair loop than "expect none".
+		return max(sps*(rps+1)-1, 0)
+	}
+	if lr.Spec.Cluster == nil || lr.Spec.Cluster.ReplicasPerShard == nil {
+		return 1
+	}
+	return *lr.Spec.Cluster.ReplicasPerShard
+}
+
 // chooseReattachTarget picks which under-replicated slot-owning master an empty pod
 // should replicate when the operator reattaches it (cluster_reconcile.go Step 4).
 //

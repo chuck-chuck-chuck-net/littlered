@@ -25,8 +25,17 @@ const (
 	roleMaster  = "master"
 	roleReplica = "replica"
 
-	// flagFail is the CLUSTER NODES gossip flag marking a node as failed.
+	// flagFail is the CLUSTER NODES gossip flag marking a node objectively down (FAIL).
 	flagFail = "fail"
+	// flagPFail is the CLUSTER NODES gossip flag marking a node subjectively down
+	// (PFAIL) — a single node's suspicion, not yet the cluster-wide FAIL verdict.
+	flagPFail = "fail?"
+
+	// ClusterStateFail is the cluster_state a node reports when it has fail-stopped in the
+	// unconditional minority check (fewer than (size/2)+1 reachable slot-serving masters).
+	// It is the first-hand, survivor-vantage signal a multi-site site loss has exhausted
+	// native failover (ADR-012 condition 2).
+	ClusterStateFail = "fail"
 )
 
 // ClusterNodeState represents the state of a single node in the Redis Cluster
@@ -40,6 +49,31 @@ type ClusterNodeState struct {
 	LinkStatus   string // "up" or "down"
 	Reachable    bool
 
+	// --- Survivor-vantage fields (multi-site site-loss takeover, ADR-012) ---
+	// These carry data already on the wire in the gather (this node's own CLUSTER INFO
+	// and CLUSTER NODES, its replication INFO) that was previously discarded. They give
+	// the operator the SURVIVORS' OWN view of the cluster — the vantage ADR-012 requires,
+	// because the hub's dial reachability is transport, not evidence (LR-017). They are a
+	// §7-parity gather addition: single-site gather populates them too, but no single-site
+	// decision reads them.
+
+	// ClusterState is this node's own cluster_state (from its CLUSTER INFO): "ok" when it
+	// can reach a slot-serving-master majority, "fail" when it has fail-stopped in the
+	// unconditional minority check (the direct, first-hand signal of a quorum loss —
+	// ADR-012 condition 2). Empty when its CLUSTER INFO was not gathered.
+	ClusterState string
+	// FailFlagged is the set of NodeIDs this node's CLUSTER NODES view marks objectively
+	// down (FAIL). PFailFlagged is the set it marks subjectively down (PFAIL). Together
+	// they are the survivors' corroboration of which peers they have given up on.
+	FailFlagged  []string
+	PFailFlagged []string
+	// MasterReplid / MasterReplid2 / ReplOffset are this node's replication lineage
+	// identity and progress (INFO replication). Used to pick the most-complete surviving
+	// replica of an orphaned shard WITHIN one lineage (LR-024: union-find over
+	// {replid, replid2}, never keyed on replid alone), mirroring BestDataHolder.
+	MasterReplid  string
+	MasterReplid2 string
+	ReplOffset    int64
 	// ProbeFailure / ProbeError: why this node is unreachable and what it said.
 	// The cluster-mode half of LR-051 — see RedisNodeState's field comment for the
 	// full rationale. Carried for parity and diagnosis; no cluster-mode decision
@@ -65,12 +99,16 @@ func (gt *ClusterGroundTruth) AuthFailedNodes() []*ClusterNodeState {
 
 // ClusterGroundTruth represents the combined view of the Redis Cluster topology
 type ClusterGroundTruth struct {
-	Nodes        map[string]*ClusterNodeState // Map PodName -> ClusterNodeState
-	Partitions   [][]string                   // Sets of NodeIDs that see each other
-	GhostNodes   []string                     // NodeIDs present in cluster but not in K8s
-	ClusterState string                       // "ok" if ANY node says ok, else "fail" or "unknown"
-	TotalSlots   int                          // Max slots assigned reported by any node
-	AllNodeIDs   map[string]bool              // Set of all NodeIDs seen in the mesh
+	Nodes      map[string]*ClusterNodeState // Map PodName -> ClusterNodeState
+	Partitions [][]string                   // Sets of NodeIDs that see each other
+	// GhostNodes are NodeIDs that reachable peers' gossip marks objectively FAIL —
+	// Redis's own quorum verdict (flagFail) — NOT merely NodeIDs the hub cannot dial.
+	// Deriving these from dial reachability was the LR-030 bug: a hub-blind but
+	// gossip-healthy site's live masters would be FORGOTTEN. See deriveGhostNodes.
+	GhostNodes   []string
+	ClusterState string          // "ok" if ANY node says ok, else "fail" or "unknown"
+	TotalSlots   int             // Max slots assigned reported by any node
+	AllNodeIDs   map[string]bool // Set of all NodeIDs seen in the mesh
 	// KnownNodes maps a reachable node's NodeID to the set of NodeIDs it directly
 	// knows in its own CLUSTER NODES view (excluding fail/noaddr/handshake). It is
 	// the same adjacency used to compute Partitions, retained so the operator can
@@ -84,6 +122,39 @@ type ClusterGroundTruth struct {
 	// mixed-version cluster mid rolling-upgrade falls back to the dance. Unknown
 	// or any node lacking support ⇒ false ⇒ baseline dance. See LR-018 §7.3.
 	AtomicSlotMigration bool
+}
+
+// deriveGhostNodes returns the set of ghost NodeIDs — NodeIDs that reachable peers'
+// gossip marks objectively FAIL, deduplicated and sorted.
+//
+// FAIL is Redis's own quorum verdict (flagFail), propagated across the gossip mesh: a
+// node is FAIL only once a majority of masters agree it is down, so it is never flagged
+// while the cluster can still reach it. A ghost is therefore a NodeID that at least one
+// REACHABLE node marks FAIL — NOT a node the hub merely cannot dial (LR-030). Deriving
+// ghosts from the hub's dial reachability was the bug: in a hub-blind-but-gossip-healthy
+// data cut the operator would classify live, dial-unreachable nodes as ghosts and FORGET
+// them, manufacturing the outage it "repairs". PFAIL (flagPFail, subjective single-node
+// suspicion) is deliberately NOT a ghost. Only reachable nodes carry a first-hand gossip
+// verdict, so an unreachable node's FailFlagged (never populated in practice) is ignored.
+func deriveGhostNodes(nodes map[string]*ClusterNodeState) []string {
+	ghostSet := make(map[string]struct{})
+	for _, n := range nodes {
+		if !n.Reachable {
+			continue
+		}
+		for _, id := range n.FailFlagged {
+			ghostSet[id] = struct{}{}
+		}
+	}
+	if len(ghostSet) == 0 {
+		return nil
+	}
+	ghosts := make([]string, 0, len(ghostSet))
+	for id := range ghostSet {
+		ghosts = append(ghosts, id)
+	}
+	slices.Sort(ghosts)
+	return ghosts
 }
 
 // NewClusterGroundTruth initializes a new cluster ground truth

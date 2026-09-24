@@ -95,9 +95,9 @@ func TestDetectCrossInstance(t *testing.T) {
 
 	t.Run("live foreign replicas are reported, dead ones are not", func(t *testing.T) {
 		s := state(sentinel("s-0", "10.0.0.1", "master", 2, 2,
-			ReplicaInfo{IP: ipPod1},                              // ours
-			ReplicaInfo{IP: ipOurDeadPod, Flags: "s_down,slave"}, // our dead ex-pod: debris
-			ReplicaInfo{IP: ipForeignReplica, Flags: "slave"},    // alive and not ours
+			ReplicaInfo{IP: ipPod1},                               // ours
+			ReplicaInfo{IP: ipOurDeadPod, Flags: "s_down,slave"},  // our dead ex-pod: debris
+			ReplicaInfo{IP: ipForeignReplica, Flags: fsRoleSlave}, // alive and not ours
 		))
 		got := s.DetectCrossInstance(3, 2)
 		if !reflect.DeepEqual(got.ForeignReplicaIPs, []string{ipForeignReplica}) {

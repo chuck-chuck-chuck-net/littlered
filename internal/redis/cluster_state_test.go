@@ -171,15 +171,15 @@ func TestIsHealthy(t *testing.T) {
 			nodes:         healthyNodes(),
 			expectedNodes: 6,
 			expectedShard: 3,
-			state:         "fail",
+			state:         flagFail,
 			totalSlots:    16384,
 			want:          false,
 		},
 		{
 			name: "wrong master count is not healthy",
 			nodes: []*ClusterNodeState{
-				master("m0", "0-8191"),
-				master("m1", "8192-16383"),
+				master("m0", slotsLowerHalf),
+				master("m1", slotsUpperHalf),
 				replica("r0", "m0"),
 				replica("r1", "m1"),
 				replica("r2", "m0"),
