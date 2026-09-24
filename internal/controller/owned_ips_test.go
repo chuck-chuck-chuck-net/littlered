@@ -281,7 +281,7 @@ func TestPlanForsakenCannotArmWhileAVictimPodHoldsItsOwnData(t *testing.T) {
 		for _, rip := range []string{ownedTerminatingMaster, ownedLiveReplica1, ownedLiveReplica2} {
 			s.RedisNodes[rip] = &redisclient.RedisNodeState{
 				PodName: "redis-" + rip, IP: rip, Reachable: true, Role: roleSlave,
-				MasterHost: foreignMaster, LinkStatus: "down",
+				MasterHost: foreignMaster, LinkStatus: linkStatusDown,
 			}
 		}
 		return s

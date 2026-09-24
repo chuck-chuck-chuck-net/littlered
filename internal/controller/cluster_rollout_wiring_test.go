@@ -191,7 +191,7 @@ func TestBuildShardRolloutInputRedundancy(t *testing.T) {
 	lr.Name = rolloutOwnerLR
 	owner := &redisclient.ClusterNodeState{NodeID: "A", Role: RoleMaster, Slots: []string{"0-5461"}}
 	upReplica := &redisclient.ClusterNodeState{NodeID: "a1", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "up"}
-	syncing := &redisclient.ClusterNodeState{NodeID: "a2", Role: RoleReplica, MasterNodeID: "A", LinkStatus: "down"}
+	syncing := &redisclient.ClusterNodeState{NodeID: "a2", Role: RoleReplica, MasterNodeID: "A", LinkStatus: linkStatusDown}
 	gt := &redisclient.ClusterGroundTruth{Nodes: map[string]*redisclient.ClusterNodeState{}}
 	now := time.Now()
 	pods := map[string]*corev1.Pod{}

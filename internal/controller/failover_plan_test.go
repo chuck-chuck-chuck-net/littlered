@@ -452,7 +452,7 @@ func TestPlanFailoverFence(t *testing.T) {
 			// new IP is a different node. The old IP must not be dialed.
 			name: "outgoing master pod replaced with a new IP -> nothing to fence",
 			views: []failoverPodView{
-				{name: podOld, ip: "10.0.0.9"},
+				{name: podOld, ip: ipNode9},
 				{name: podNew, ip: newIP},
 			},
 			outgoingIP: oldIP,

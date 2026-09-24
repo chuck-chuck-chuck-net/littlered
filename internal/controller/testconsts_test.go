@@ -27,6 +27,7 @@ const (
 	ipNode7   = "10.0.0.7"
 	ipNode9   = "10.0.0.9"
 	ipTest    = "1.1.1.1"
+	ipSentA   = "10.1.0.1"
 	roleSlave = "slave"
 
 	podRedis0 = "r-redis-0"

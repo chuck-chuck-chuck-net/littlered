@@ -210,7 +210,7 @@ func TestSentinelGatherCarriesEveryMonitoredName(t *testing.T) {
 		if len(st.MonitoredMasters) != 2 {
 			t.Fatalf("MonitoredMasters = %+v, want 2 entries", st.MonitoredMasters)
 		}
-		if got := st.MonitoredMasters[1]; got.IP != "10.0.0.9" || got.Flags != "s_down,master" {
+		if got := st.MonitoredMasters[1]; got.IP != ipNode9 || got.Flags != "s_down,master" {
 			t.Fatalf("stale entry = %+v, want ip 10.0.0.9 flags s_down,master: the address and "+
 				"flags are what distinguish our own debris from someone else's live master", got)
 		}

@@ -59,7 +59,7 @@ func TestGhostMasterRecoveryRefusesTwoLiveMasters(t *testing.T) {
 	state := twoForkedMasters()
 	// The ghost-master signature: every Sentinel pinned to a dead address, and no
 	// healthy known replica (what a whole-list SENTINEL RESET leaves behind).
-	for i, ip := range []string{"10.1.0.1", "10.1.0.2", "10.1.0.3"} {
+	for i, ip := range []string{ipSentA, "10.1.0.2", "10.1.0.3"} {
 		state.SentinelNodes[ip] = &redisclient.SentinelNodeState{
 			PodName: "sentinel-" + ip, IP: ip, Reachable: true, Monitoring: true,
 			MasterIP: fkGhostIP, MasterFlags: RoleMaster,
