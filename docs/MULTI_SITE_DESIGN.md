@@ -378,8 +378,13 @@ Remaining field-shape details are settled in the ADR, not here.
 1. Takeover trigger: designed in **ADR-012 D1** (quorum-gated site-loss takeover) and
    **implemented** — the pure `planSiteTakeover` (Domain-M quorum arithmetic, no
    Kubernetes failure detector), the survivor-vantage gather fields, and the
-   TAKEOVER→FORGET→recycle executor, all unit/envtest-verified (changelog LR-026,
-   LR-029). Remaining: **live site-loss validation** on the two-site substrate.
+   TAKEOVER→FORGET→recycle executor (changelog LR-026, LR-029). **Live site-loss
+   validation landed 2026-09-24** on the 4-cluster lab: a hypervisor whole-site kill of
+   an even 2+2 split (`shards: 4`, `sitesPerShard: 2`) drove arm → 60s cooldown →
+   per-shard TAKEOVER at the best surviving replica → trailing FORGET, with the
+   hub-blind cut correctly holding. Remaining here: the **fenced-alive rejoin recycle**
+   and the **drift-refusal** path (`allowUnsafeSiteTakeover`), neither of which that
+   topology reaches.
 2. Master rebalancer: **implemented** (ADR-012 D2, changelog LR-029, corrected by
    LR-031) — the pure `planMasterRebalance` + the healthy-path `rebalanceMasters`
    executor hold the two thresholds (§4), planning to the native target
@@ -389,7 +394,10 @@ Remaining field-shape details are settled in the ADR, not here.
    fires when the **floor** is unreachable (`S·⌊K/2⌋ < K`) — given Redis Cluster's
    three-master minimum that is exactly **two sites with an odd `K`**; for `S ≥ 3` the
    floor is always reachable, so the warning never fires there. Unit/envtest-verified;
-   live validation pending.
+   **live validation still pending — and it did NOT ride along with the takeover's**
+   (2026-09-24): a balanced 2+2 never triggers a rebalance or the warning, so both
+   logged zero occurrences in that run. Validating them needs a deliberately drifted
+   master distribution.
 3. ~~Witness-shard exploration~~ — **rejected**, not deferred (§6.1, ADR-012
    Alternatives): only slot-serving masters vote, so an arbiter must hold data and is
    just a third data site. Reopens only if a voting empty primary lands upstream.

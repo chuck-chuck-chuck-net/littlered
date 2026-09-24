@@ -538,7 +538,33 @@ loose for the failover cells, which measured 85-96%.
 - **Fix:** Recast the whole site-loss decision as **pure Domain-M quorum arithmetic + fencing (ADR-012 D1)** — no failure detector. `planSiteTakeover` now decides from the Redis gather alone: condition 0 cluster-formed (LR-026, kept), an orphaned shard with a surviving replica, native path exhausted from the **survivors' own** `cluster_state:fail` vantage (reachable masters `< (size/2)+1`, LR-017), quiet, cooldown, then the **fence** — fire only when the *unreachable* slot-serving masters are themselves `< (size/2)+1`, so an alive-but-isolated lost side has self-fenced within `cluster-node-timeout` (Redis's unconditional minority check — the same check that causes the outage is the split-brain guarantee). Conditions 2 and the fence coincide exactly at the even split (`reachable = unreachable = K/2`); any odd/drifted split is either native or the drift-refusal (`multiSite.allowUnsafeSiteTakeover`, or the Phase-2 STONITH fence). Added the **master rebalancer (ADR-012 D2)**: pure `planMasterRebalance` + healthy-path `rebalanceMasters` keep the balance invariant `max_i mᵢ ≤ ⌈K/2⌉−1 = masterBalanceTarget(K)` with one graceful `CLUSTER FAILOVER` per reconcile (LR-021-style serialization, the no-data-loss LR-025 primitive), quiet-gated, behind a 30s `status.multiSite.rebalancePendingSince` settle cooldown, over-target-donor→under-target-in-sync-replica only (no thrash). Added the **`ReducedSiteLossResilience`** warning condition + one-shot event for structurally-unsatisfiable topologies (`siteLossResilient`: `S·(⌈K/2⌉−1) < K`, the headline `K=4`-over-3-sites trap) — surfaced, never a refusal — plus the master-per-site distribution (`status.multiSite.MasterCounts`, rendered by `lrctl verify`). **Deleted `site_witness.go`** and the **cluster-scoped `nodes` RBAC** (operator-side and per-site): multi-site is back to the M1 **namespaced per-site Role**.
 - **Pure seams (red-first):** `planSiteTakeover` (arithmetic gate: fence-safe even-split fires, drift-majority refuses without opt-in, native-still-possible waits, `!clusterFormed` no-op, arm/wait cooldown), `planMasterRebalance` (invariant restore vs no-op vs unsatisfiable-no-partial-churn), `masterBalanceTarget`/`siteLossResilient` (the D2 threshold + structural predicate), `reconcileReducedResilienceCondition` (warn/clear + one-shot event).
 - **Regresses:** None. Multi-site lives in its own files; single-site cluster/sentinel/failover/standalone paths untouched. The change *narrows* multi-site behaviour (the fence-safe arithmetic refuses strictly more than the witness did on ambiguous partitions) and *removes* an RBAC grant. Supersedes the witness half of LR-026 (the `clusterFormed` condition-0 fix and the sole-authority hardening from LR-026 are retained); LR-027 (Step-4 replica repair) and LR-028 (scale-down guard) are unaffected.
-- **Verification:** unit/envtest green; **live validation pending** for the site-loss recovery. The mode's steady state (stretched-cluster bringup, cross-site replication, round-robin placement, union gather, per-site gating, lrctl tier-1/tier-2 gather) stays live-verified on the 4-cluster lab from the earlier milestones.
+- **Verification:** unit/envtest green. The mode's steady state (stretched-cluster bringup, cross-site replication, round-robin placement, union gather, per-site gating, lrctl tier-1/tier-2 gather) stays live-verified on the 4-cluster lab from the earlier milestones.
+  **⚠ UPDATED 2026-09-24 — the site-loss TAKEOVER is now LIVE-VERIFIED; the master REBALANCER is not.** This entry and LR-031 read *"live validation pending"* for both halves from 2026-08-11 until then, which was correct when written: M4b proved the **witness** design and this entry replaced it, so nothing had exercised the quorum arithmetic on real hardware. It has now, on t3e (hub `scm-cp` + spokes `scm-s1/2/3`, `shards: 4`, `sitesPerShard: 2`, an even 2+2 master split), through `test/e2e/multisite_takeover_test.go` Scenario A — a hypervisor-level whole-site kill, not a reboot. The operator's own log carries the whole ADR-012 D1 ladder in order:
+
+      09:36:05  Site-loss takeover: native failover is exhausted; arming cooldown
+                  reachableMasters=2 size=4 cooldown=1m0s
+      09:36:35  Site-loss takeover: waiting out cooldown before intervening
+      09:37:05  Site-loss takeover: promoting surviving replica via CLUSTER FAILOVER TAKEOVER
+                  shard=1 pod=scm-s1/ms-a-shard-1-0 offset=4888
+      09:37:05  ... shard=3 pod=scm-s1/ms-a-shard-3-0 offset=4875
+      09:37:38  Forgetting ghost node   (x4, the lost site's node IDs)
+
+  Read precisely: `reachableMasters=2, size=4` is condition 2 evaluated from the survivors'
+  own vantage (`2 < (4/2)+1`), and it is also what makes the fence hold, since the
+  unreachable masters are themselves 2 — the even-split identity this entry's own §D1
+  argument turns on. The 60s cooldown is honoured to the second (09:36:05 → 09:37:05), one
+  TAKEOVER per orphaned shard aimed at the surviving replica by offset, and `CLUSTER FORGET`
+  **trails** it, which is LR-026's required ordering. Scenario B (hub-blind data-plane cut,
+  survivors `cluster_state:ok`) armed **nothing** — 0 takeover lines for that instance — the
+  correct hold; note that a correct hold is *silent*, so its evidence is the spec's own
+  assertions rather than a log line, which is weaker evidence than Scenario A's and is
+  recorded as such.
+  **STILL PENDING, and deliberately not claimed:** the **master rebalancer** (D2) and the
+  `ReducedSiteLossResilience` warning — 0 occurrences of either in the run, because a 2+2
+  topology that stays balanced never triggers them — and the **drift-refusal** path
+  (`multiSite.allowUnsafeSiteTakeover`). Those three are what remain of this entry's
+  original "live validation pending". See LR-063, whose fix is what let a stretched cluster
+  form at all on the rebuilt line.
 - **Impacts:** `CLAUDE.md` pillar 3.15 + §6 + §10, `docs/MULTI_SITE_DESIGN.md` §4/§6/§7/§8/§10, ADR-012 (authoritative). Theory references: Fischer–Lynch–Paterson (1985), Chandra–Toueg (1996), Gilbert–Lynch (2002).
 
 ## [LR-030] Ghost Nodes Derived From Dial Reachability, Not Redis's Quorum FAIL Verdict
@@ -559,7 +585,7 @@ loose for the failover cells, which measured 85-96%.
 - **Pure seams (red-first) — and why the existing tables could not catch it:** the load-bearing new guard is a **cross-seam property test**, `internal/controller/site_balance_property_test.go`, which drives the **real** `planSiteTakeover` over every `(K, loss)` pair and asserts the thresholds predict its decisions (a loss auto-survives iff `l ≤ takeoverSurvivalFloor(K)`; `survivorsClusterFail` is *derived* from the arithmetic, not hand-chosen, so the test cannot open a gate reality keeps shut). Observed **red** on `K=4 lost=2: action=Takeover but the predicate says unsurvivable`. The two new `planMasterRebalance` cases (`K=4` over 2 sites `3+1` → one move to `2+2`; `K=4` over 3 sites `3+1+0` → fall back to the floor) were re-verified red against a temporarily single-tier planner (both returned `[]`). This class is precisely what the **pre-existing hand-written expectation tables cannot catch**: authored beside the implementation, they restate its assumption — including the bug. Nothing previously connected D2's thresholds to D1's planner, which is how a bound derived for one path came to gate the other.
 - **Behaviour change (deliberate):** the rebalancer becomes **active where it was inert** — `K=4` over 2 or 3 sites now issues graceful `CLUSTER FAILOVER`s it previously withheld. This is the intended correction (those are exactly the topologies that were left drifted and unrecoverable), and it inherits the existing bounds: healthy path only, quiet-gated, at most one graceful failover per reconcile behind the 30s `status.multiSite.rebalancePendingSince` settle cooldown, using the no-data-loss LR-025 primitive. Worst case is an unnecessary availability blip, never data loss or split-brain.
 - **Regresses:** None. Odd `K` is arithmetically unchanged (the thresholds coincide there), the takeover gate and its fence are byte-for-byte unchanged, and single-site cluster/sentinel/failover/standalone paths are untouched (multi-site-only files; ADR-009 still declines master balancing single-site). The change *widens* the rebalancer's action set and *narrows* the warning regime — both toward the ADR's own prose.
-- **Verification:** unit/envtest green, `make lint` clean. Live site-loss validation stays pending (unchanged by this correction).
+- **Verification:** unit/envtest green, `make lint` clean. **Live site-loss validation landed 2026-09-24 for the TAKEOVER path only** — see the updated verification note on LR-029. The two thresholds this entry introduced were exercised only in their coinciding regime (`K=4`, an even 2+2 split, where the floor `⌊K/2⌋ = 2` is what the fence reads); the **rebalancer** they were derived for, and the drifted splits where the two thresholds differ, are still unvalidated live.
 - **Impacts:** ADR-012 D2/D3 + the reduced-resilience Consequence bullets (rewritten — authoritative), `docs/MULTI_SITE_DESIGN.md` §4/§10 item 2, `CLAUDE.md` pillar 3.15. Supersedes the single `masterBalanceTarget` bound introduced in LR-029.
 
 ## [LR-032] Multi-Site Topology Was Silently Mutable — Immutability Declared and Enforced at Admission
@@ -4966,10 +4992,18 @@ ADR-020.
 - **ID note:** the highest ID visible on **any** branch, local or remote, was LR-062.
   Allocated with the LR-039 cross-branch loop over every branch, not by reading the tip of
   one line.
-- **Status: FIXED.** Unit + envtest green, `make lint` 0 issues against a 0-issue baseline.
-  **NOT yet e2e-verified** — the live confirmation is one `LABEL_FILTER='multisite'` run on
-  the lab, and it is owed. Availability, not durability: the cluster never forms, so there
-  is never any data to lose.
+- **Status: FIXED and e2e-VERIFIED** (t3e, 2026-09-24, hub `scm-cp` + spokes `scm-s1/2/3`).
+  Unit + envtest green, `make lint` 0 issues against a 0-issue baseline. Availability, not
+  durability: the cluster never formed, so there was never any data to lose.
+  **The live evidence is the operator's own log, not the suite's exit code** — a green run
+  is not proof the guard was exercised (LR-060's recorded run that covered nothing is the
+  precedent). Against the fixed build, across two stretched instances:
+  **0 `no longer confirmed as this pod` denials (was 129), 14 `Meeting node`**, and the
+  repair loop ran *past* Step 1 for the first time on this line — `Detected missing shards`
+  ×9 → `Assigning missing shard to master` ×8 → `Assigning empty master as replica` ×8,
+  i.e. Steps 1 → 3 → 4. Pre-fix Step 1 returned on every pass and nothing below it ever ran.
+  Both `Multi-Site Site-Loss Takeover` specs passed (`2 Passed | 0 Failed`); the spec
+  selection was read from `make list-e2e LABEL_FILTER='multisite'` rather than inferred.
 - **Scope:** a **rebase regression**, not a latent defect. `feat/multi-site` was cut before
   LR-043 landed and has never contained `confirmPodIP`
   (`git show feat/multi-site:internal/controller/cluster_reconcile.go | grep -c confirmPodIP`
