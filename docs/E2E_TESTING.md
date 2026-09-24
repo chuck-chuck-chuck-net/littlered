@@ -206,6 +206,110 @@ Auth does not move the durability numbers: re-validated on t3e (`MODE=failover` 
 `MODE=sentinel` 43/43), the failover chaos tiers report 0 MISSING and 0 corruptions on all three
 disruption shapes, with availability inside the previously recorded bands (graceful 96.24% against
 96.07% recorded; kill-9 87.39% inside the recorded 85.13-95.73%).
+### Cross-Topology Cluster Matrix (single-site + multi-site)
+
+A stretched **multi-site** cluster (`spec.multiSite`, experimental — ADR-012,
+`docs/MULTI_SITE_DESIGN.md`) *is* just a Redis Cluster: bring-up, basic ops, and
+pod-failure recovery must all hold whether the cluster lives in one Kubernetes cluster or
+is stretched across sites. So the topology-agnostic cluster behaviours live in **one shared
+spec body** (`cluster_behaviour_test.go`, `clusterBehaviourSpecs`) driven through the
+`clusterHarness` interface (`cluster_harness_test.go`); the only difference between
+topologies is which kube-context a given pod lives in. These specs assert **outcomes** (data
+intact, all 16384 slots served, converges healthy), not the recovery mechanism — multi-site
+pod failure may recover via native cross-site failover or (below quorum) the operator, and
+the shared body must not care which.
+
+The `E2E_TOPOLOGY` env knob selects which topology registers its behaviour Describe (both are
+labelled `cluster-behaviour`):
+
+```bash
+make test-e2e E2E_TOPOLOGY=single   # only single-site (DEFAULT — the suite's historical behaviour)
+make test-e2e E2E_TOPOLOGY=multi    # only multi-site
+make test-e2e E2E_TOPOLOGY=both     # both topologies
+make test-e2e LABEL_FILTER='cluster-behaviour' E2E_TOPOLOGY=both   # just the matrix, both ways
+```
+
+**The multi-site topology needs a real hub+sites substrate** — it is not runnable on the
+single Kind cluster of a default run. It requires a hub kube-context and per-site contexts
+over Kubernetes clusters with **mutually routed pod CIDRs**. Point the run at a **single YAML
+config** with `MS_CONFIG=<file>` — it holds everything (hub context, per-site context + endpoint,
+the whole-site-kill VM inventory, the hub pod CIDR):
+
+```yaml
+# MS_CONFIG schema
+hubContext: scm-cp
+operatorNamespace: littlered-system    # optional (default littlered-system)
+hubPodCIDR: "10.233.224.0/19"          # optional; the Scenario B hub-blind cut denies it
+sites:
+  - name: scm-s1
+    context: scm-s1
+    endpoint: https://10.2.1.10:6443    # site API URL routable FROM HUB PODS (repl-net VIP)
+    vms:                                # optional; the Scenario A whole-site kill inventory
+      - {name: scm-s1-node1, uri: qemu+ssh://user@host/system}
+```
+
+A ready-to-copy sample lives at [`docs/multisite-e2e-config.sample.yaml`](multisite-e2e-config.sample.yaml).
+So the whole invocation collapses to:
+
+```bash
+make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=scm-cp \
+  LABEL_FILTER='multisite' MS_CONFIG=$HOME/scm-littlered-ms-e2e.yaml
+```
+
+The individual `MS_HUB_CONTEXT` / `MS_SITE_CONTEXTS` / `MS_SITE_ENDPOINTS` / `MS_OPERATOR_NS` /
+`MS_HUB_POD_CIDR` / `MS_VM_INVENTORY` env vars remain as a backward-compatible fallback (used only
+when `MS_CONFIG` is unset). The multi-site Describe provisions each site's namespace/RBAC/Secrets in
+a `BeforeAll`. The default `E2E_TOPOLOGY=single` keeps CI on Kind unchanged.
+
+**What runs, by label** (`LABEL_FILTER=…`, same `MS_CONFIG` for all):
+
+| Label | Runs | Needs (in `MS_CONFIG`) |
+|---|---|---|
+| `multisite` | both takeover scenarios (A + B) | sites; `vms` for A; `hubPodCIDR` for B |
+| `multisite-takeover` | Scenario A only — whole-site kill **MUST take over** (survivor serves all 16384 slots, data intact, site rejoins) | per-site `vms` (else skips) |
+| `multisite-hold` | Scenario B only — hub-blind cut **MUST NOT take over** (survivors stay `cluster_state:ok`, no split-brain) | `hubPodCIDR` (else skips) |
+| `ms-heal` | the out-of-band healer (below) — restores the lab + reclaims a leftover instance | whatever the disrupting run needed |
+
+Add `DEBUG_ON_FAILURE=true` to any run to **leave the damage in place** on failure for investigation
+(see the ledger + `ms-heal` below). On a failure it also writes a `debug-artifacts-<ts>-<spec>/`
+directory with the hub CR/events **and per-site** pods, StatefulSets, CiliumNetworkPolicies, redis
+logs, and `CLUSTER NODES`/`CLUSTER INFO` from each site's own vantage — a killed/unreachable site is
+recorded (fast-fail) rather than hung on.
+
+**Shared vs single-site-only.** Shared through the matrix (both topologies): cluster
+bring-up + basic operations, and master-pod-failure recovery under chaos. Deliberately
+**single-site-only** (they do not generalise to the site dimension, and stay in their own
+files): the kill-9-all total-wipe semantics (`cluster_totalwipe_test.go` — `nodes.conf`-on-
+EmptyDir is per-site; the multi-site analogue is the per-site ADR-008 wipe recovery), the
+per-shard `topologySpreadConstraint` node-spread (`cluster_placement_test.go` — the multi-site
+analogue is the *site* dimension, asserted by the takeover suite), and the 0-replica
+self-heal / custom-config / debug-no-slots / rolling-update / multipod specs in
+`cluster_functional_test.go` + `cluster_chaos_test.go`. The inherently-multi-site disruption
+scenarios (whole-site kill, data-plane partition) live in `multisite_takeover_test.go`, not the
+shared body.
+
+**Disruption ledger + `ms-heal` (leave-damaged-then-heal).** Under `DEBUG_ON_FAILURE=true` the
+multi-site disruption specs deliberately **leave the damage in place** for investigation — a killed
+site stays powered off, a data-plane cut stays applied, and the instance stays up (consistent
+across Scenario A and B). Because an in-process cleanup can never survive an interrupted run
+(Ctrl-C / timeout / panic), and a killed site is un-discoverable (you cannot query a powered-off
+cluster), each disruption is recorded **write-ahead** as a ConfigMap in the `e2e-disruptions`
+namespace on the hub (a "poor-man's custom resource"); the matching restore deletes it. The **test
+instance itself** is recorded the same way, so the healer also **tears down a leftover instance** —
+making "after heal, ready for tests" literally true (the instance is a throwaway; you don't heal and
+reuse it — you reclaim it and the next run stands up a fresh one). To restore the lab out-of-band,
+run the healer — it undoes every recorded disruption (restore sites / remove cuts first, then tear
+down leftover instances, reusing the same Go helpers) and asserts the ledger is empty:
+
+```bash
+make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=<hub> \
+  LABEL_FILTER='ms-heal' MS_CONFIG=<same config as the run>
+```
+
+**Clean-slate guard.** If a leftover instance is *not* reclaimed, `msSetupSites` refuses to run onto
+it (fail-fast with the fix in the message, mirroring the default-namespace guard) rather than
+silently reusing a contaminated, mid-recovery cluster — which otherwise shows up as a confusing
+stuck-`Initializing` bring-up timeout.
 
 ### Additional Flags
 
@@ -221,7 +325,7 @@ make test-e2e ARGS="-timeout 90m"
 |----------|---------|-------------|
 | `SKIP_KIND_SETUP` | `false` | Skip Kind cluster creation (use existing) |
 | `SKIP_OPERATOR_DEPLOY` | `false` | Skip operator deployment (use existing) |
-| `TEST_NAMESPACE` | `littlered-e2e` | Namespace for test resources (must not be `default`, and must not already exist) |
+| `TEST_NAMESPACE` | `littlered-e2e` | Namespace for test resources (must not be `default`). BeforeSuite ensures a clean slate: an *empty* leftover is deleted and recreated; one holding a LittleRed instance (a DEBUG leftover under inspection) fails fast so it is not clobbered. |
 | `DEBUG_ON_FAILURE` | `false` | Skip cleanup on failure (leave resources for inspection); also enables Ginkgo `--fail-fast` |
 | `KIND_CLUSTER` | `littlered-test-e2e` | Kind cluster name |
 | `OPERATOR_IMAGE` | `ghcr.io/chuck-chuck-chuck-net/littlered:<git-tag>` | Operator image to deploy |
@@ -230,6 +334,14 @@ make test-e2e ARGS="-timeout 90m"
 | `KUBECONTEXT` | (none) | Pin to a specific named context (implies pinning) |
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |
 | `CLUSTER_REPLICAS_PER_SHARD` | `1` | Replicas per shard for cluster tests that use replicas |
+| `E2E_TOPOLOGY` | `single` | Which topologies the shared **cluster-behaviour** matrix runs under: `single` (default), `multi`, or `both`. See "Cross-Topology Cluster Matrix" below. |
+| `MS_CONFIG` | (none) | **Multi-site: the preferred, single-file config** — a YAML file holding hub context, per-site context/endpoint/VMs, operator namespace, and hub pod CIDR (schema above). Set this and the individual `MS_*` vars below are unnecessary. Absent + no `MS_*` fallback ⇒ multi-site specs `Skip`. |
+| `MS_HUB_CONTEXT` | *(fallback)* | Multi-site (fallback for `MS_CONFIG`): the hub kube-context (where the CR + operator live). |
+| `MS_OPERATOR_NS` | `littlered-system` | Multi-site: the operator namespace on the hub (where per-site kubeconfig Secrets are created). The one project-constant default (the chart's namespace); not lab-specific. |
+| `MS_SITE_CONTEXTS` | *(fallback)* | Multi-site (fallback): comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. |
+| `MS_SITE_ENDPOINTS` | *(fallback)* | Multi-site (fallback): comma list `name=https://host:port,…` of each site's Kubernetes API endpoint reachable **from hub pods** (the repl-net address embedded in the generated site kubeconfig). One entry per `MS_SITE_CONTEXTS` name. |
+| `MS_VM_INVENTORY` | (none) | Multi-site takeover suite (fallback): path to a file of `<site> <vm-name> <virsh-uri>` lines for the whole-site kill (`virsh destroy`/`start`). In `MS_CONFIG` this is the per-site `vms`. Absent ⇒ Scenario A `Skip`s. |
+| `MS_HUB_POD_CIDR` | (none) | **Required for Scenario B** (`multisite-hold`), as `hubPodCIDR` in `MS_CONFIG` or this fallback: the hub operator pod CIDR(s) to deny, so the cut isolates the site **from the hub only** (the sites stay mutually connected) — the hub-blind HOLD case. Absent ⇒ Scenario B `Skip`s. Comma-separated. |
 | `NON_GRACEFUL_RESTART` | (none) | Advanced: when `true`, pod-restart helpers use a hard/non-graceful kill instead of a graceful delete |
 | `MODE` | (none) | Run one deployment mode only: `standalone`, `sentinel`, `cluster`, `failover`. Composes with `FOCUS`/`E2E_ALL`; invalid values fail fast |
 | `LABEL_FILTER` | `!extended` | Any Ginkgo label expression; overrides `MODE`/`E2E_ALL` |
@@ -253,6 +365,10 @@ make test-e2e ARGS="-timeout 90m"
 | `failover_mode_test.go` | Failover Mode / Failover Mode Deadlock Recovery | `mode: failover` (ADR-011): functional (resources, assignment annotations, experimental event), graceful+crash failover (UID-asserted), event-path (<15s) and polling-only tiers, hybrid double-failover (the graduation scenario), kill-9 epoch-gate yield under chaos load, deadlock tiers (total-loss / single-survivor / multi-holder same-lineage), rolling update. Label: `failover-mode` |
 | `sentinel_master_name_test.go` | Sentinel Cross-Instance Isolation / master-name admission | `spec.sentinel.masterName` admission specs, and the injected-hello isolation pair with its positive control (ADR-015, LR-039). **Auth-free by decision** — see "Auth posture of the fixtures" |
 | `sentinel_quarantine_test.go` | Sentinel Forsaken-Gated Quarantine | Full cycle (capture → `Forsaken`/`Quarantined` → both StatefulSets at 0 → captor's Sentinels heal → release → Rule L reseeds empty), `HoldDataPresent` refusal, `Latched` after the attempt budget (ADR-016, LR-044). **Auth-free by decision** |
+| `cluster_behaviour_test.go` | Cluster Behaviour Matrix [single-site] / [multi-site] | The ONE shared body of topology-agnostic cluster behaviours (bring-up to healthy serving 16384 slots, cross-shard ops, master-pod-failure recovery under chaos with data intact), run under single-site and/or multi-site via the `clusterHarness` abstraction. Gated by `E2E_TOPOLOGY`. Labels: `cluster-behaviour` (both); `multisite` (the multi-site Describe). |
+| `cluster_harness_test.go` + `cluster_harness_single_test.go` / `cluster_harness_multi_test.go` | (support) | The `clusterHarness` interface + `topologyEnabled` gating, and its single-site (ambient-context) and multi-site (hub + per-site contexts, per-pod site) implementations. Not specs themselves. |
+| `multisite_takeover_test.go` | Multi-Site Site-Loss Takeover (ADR-012) | `spec.multiSite` disruption: Scenario A whole-site kill of an even 2+2 split (`shards: 4`) MUST take over (survivor serves all slots, data intact); Scenario B data-plane-only partition with the site kept alive MUST NOT take over (no split-brain). Needs the hub+sites substrate + the hypervisor whole-site kill (`MS_VM_INVENTORY`, `virsh destroy`/`start`) / data-plane-partition (`CiliumNetworkPolicy`) mechanisms. Labels: `multisite`, `multisite-takeover`, `multisite-hold`. |
+| `ms_heal_test.go` + `ms_disruption_ledger_test.go` | Multi-Site Disruption Heal | Out-of-band recovery: undoes every disruption still recorded in the ledger (ConfigMaps in `e2e-disruptions` on the hub, written write-ahead by the disrupt helpers) — used after a `DEBUG_ON_FAILURE` run that left a site down / a cut applied. Reuses the inline restore helpers; no-op when the ledger is empty. Label: `ms-heal` (opt-in, not `multisite`). |
 
 > Naming caveat: `sentinel_advanced_failover_test.go` (Describe: *Sentinel Advanced
 > Failover*, formerly `failover_test.go`) tests **sentinel-mode** label mechanics and

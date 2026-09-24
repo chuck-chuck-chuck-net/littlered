@@ -963,7 +963,7 @@ With 3 shards, slots are distributed as:
 
 ### Important notes
 
-- **Supported topologies**: **3 or more shards** with **0 or more replicas per shard** (default: 3 shards, 1 replica). The minimum of 3 is a Redis Cluster requirement — it needs at least 3 masters. Both counts are validated (`shards ≥ 3`, `replicasPerShard ≥ 0`).
+- **Supported Topologies**: The operator validates a **minimum of 3 shards** (`spec.cluster.shards` >= 3, Redis Cluster's own floor) with **0 or more replicas per shard** (`spec.cluster.replicasPerShard` >= 0, default 1); there is no upper bound on either. Fewer than 3 shards is rejected by the validation logic.
 - **In-memory mode**: No persistence. Data will be lost on full cluster restart. By default, 'noeviction' is used, so data is not forgotten when memory is full (Redis will return errors instead).
 - **No PVCs**: Cluster state stored in CR status, not nodes.conf.
 - **Runtime scaling**: reducing `spec.cluster.shards` is refused (`ShardScaleDownRefused` — the operator never deletes data). Automated shard scale-up (resharding slots onto new shards) is not yet supported; treat the shard count as fixed after creation.
@@ -1026,6 +1026,143 @@ kubectl annotate littlered <instance> redis.chuck-chuck-chuck.net/migrate-legacy
 ```
 
 Removing it lets the migration proceed to `Complete`.
+
+---
+
+## Multi-Site Cluster Mode (Experimental)
+
+A **stretched Redis Cluster across several workload Kubernetes clusters ("sites")**,
+managed hub-and-spokes by a single operator running on a designated management
+cluster (the "hub"). Every shard keeps replicas in `sitesPerShard ≥ 2` sites, so
+the loss of a whole site loses no replicated data. It is ordinary cluster mode
+(`mode: cluster`) with `spec.multiSite` added — the data plane stays plain OSS
+Redis/Valkey Cluster. See `docs/MULTI_SITE_DESIGN.md` and ADR-012 for the full
+design.
+
+**Status: experimental.** The full mode ships and is e2e-verified on a real
+multi-cluster lab, but is pre-1.0 with known deferred items: **per-site scale-down
+/ topology-shrink refusal guards are not yet implemented** — reducing `shards`,
+lowering `sitesPerShard`, or removing a site currently leaves the now-orphaned
+per-site StatefulSets **un-managed (drift), not deleted** (no active data loss, but
+no refusal either); `nodeport`/`multus` transports, the witness shard, and master
+rebalance are also deferred (`docs/MULTI_SITE_DESIGN.md` §10). `sentinel` and
+single-site `cluster` remain fully supported.
+
+### Prerequisites
+
+1. **Routed pod network.** The only supported transport is `network.mode:
+   pod-routed`: pod CIDRs must be routed between all sites and the hub, so the
+   operator (on the hub) can dial spoke pod IPs directly, and Redis nodes can
+   reach each other's announced pod IPs across sites. The operator also needs
+   reachability of every site's Kubernetes API endpoint (a *different* network
+   path).
+2. **Per-site kubeconfig Secrets on the hub.** Each site is reached through a
+   kubeconfig Secret in the operator namespace, whose credentials are bound to a
+   namespaced Role in the site (workload CRUD + pod read) **plus a cluster-scoped
+   `nodes get;list`** (required by the site-loss witness, ADR-012). Generate them
+   with the helper — once per site:
+
+   ```bash
+   lrctl multisite setup-site \
+     --site alpha \                            # site name (also the generated context name)
+     --site-admin-context alpha \              # your workstation context for the site
+     --hub-context hub \                       # the hub context
+     -n store \                                # instance namespace
+     --repl-endpoint https://<site-alpha-api-reachable-from-hub-pods>:6443 \
+     --operator-namespace littlered-system     # where the hub Secret is created
+   ```
+
+   `--repl-endpoint` is required: the generated kubeconfig's server must be the
+   site's endpoint **reachable from hub pods** (which cannot be derived from your
+   workstation kubeconfig). Pass `--dry-run` to preview the objects; the command
+   is idempotent. See `docs/LRCTL.md` "Site-Secret setup helper".
+
+### Deploy
+
+```yaml
+# multisite.yaml — experimental (spec.multiSite)
+apiVersion: redis.chuck-chuck-chuck.net/v1alpha1
+kind: LittleRed
+metadata:
+  name: store
+spec:
+  mode: cluster
+  cluster:
+    shards: 3
+    replicasPerShard: 0        # per-site shard STS size = replicasPerShard + 1
+  multiSite:
+    sites:
+      - name: alpha
+        kubeconfigSecretRef:
+          name: site-alpha      # Secret in the operator namespace (from setup-site)
+      - name: beta
+        kubeconfigSecretRef:
+          name: site-beta
+    sitesPerShard: 2            # default: number of sites
+    network:
+      mode: pod-routed         # only supported transport
+    allowUnsafeSiteTakeover: false
+```
+
+```bash
+kubectl --context hub apply -f multisite.yaml
+```
+
+**Reading trap — total members per shard = `sitesPerShard × (replicasPerShard + 1)`.**
+A shard always has cross-site replicas in multi-site regardless of
+`replicasPerShard`: with `replicasPerShard: 0` and `sitesPerShard: 2`, each shard
+is one master + one cross-site replica (2 members); `replicasPerShard: 1` over two
+sites is 4 members (1 master + 3 replicas), not 2.
+
+**Dual-site automatic takeover is fence-gated.** With exactly two sites, an
+operator-led `CLUSTER FAILOVER TAKEOVER` recovers a whole-site loss automatically
+only when the master split is even (the fence-safe case — e.g. an even shard count
+such as `shards: 4` giving a 2+2 split) and the site's death is Kubernetes-confirmed
+or its masters are a provable minority. An odd/drifted split where the lost side
+could hold the master majority is **refused** (drift-refusal) — the operator
+surfaces a `MultiSiteTakeover` condition and waits for Kubernetes-confirmed death,
+a human, or the `allowUnsafeSiteTakeover` opt-in. This is an expected, common
+dual-site outcome (`shards: 3` over two sites is a 2+1 split). With `≥3` sites a
+single-site loss is fully native and no takeover is needed. See ADR-012.
+
+### Verify
+
+`lrctl`'s read verbs (`status`, `verify`, `inspect`, `debug-dump`) are
+**site-aware automatically** — point them at the hub and they detect
+`spec.multiSite`, aggregate across all sites, and announce the transport tier in
+use:
+
+```bash
+# Tier 1 (read-only hub — needs only `get littlered`): render the cross-site view
+# the operator publishes to status.multiSite each reconcile.
+lrctl --context hub status store
+lrctl --context hub verify store --from-status
+
+# Tier 2 (default for verify/inspect/debug-dump): run the operator's own gather as
+# a throwaway hub Job — works from a hub-only kubeconfig, no per-site contexts.
+lrctl --context hub verify store
+
+# Tier 3 (direct site access): gather each site through your own per-site contexts.
+lrctl --context hub verify store --direct \
+  --site-context alpha=alpha,beta=beta
+
+# Connectivity preflight — checks each site Secret + Kubernetes API path honestly.
+lrctl --context hub multisite preflight store
+```
+
+A healthy stretched cluster reports `Cluster State: ok`, `16384 / 16384` slots,
+per-site reachability, and `[OK] every shard spans >= 2 sites (a shard's master and
+replica live in different sites)`. See `docs/LRCTL.md` "Multi-Site Clusters" for the
+full tier model and output.
+
+### Deletion
+
+Owner references do not cross Kubernetes clusters, so on `kubectl delete littlered
+store` the operator sweeps the instance-labeled workloads through each site via a
+`redis.chuck-chuck-chuck.net/multisite-teardown` finalizer before releasing the CR.
+If a site is unreachable at deletion time the finalizer is retained (bounded
+retries) and a `MultiSiteTeardown` condition is surfaced; the escape hatch is
+removing the finalizer manually.
 
 ---
 
