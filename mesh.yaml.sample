@@ -1,0 +1,103 @@
+# mesh.yaml — the lab/mesh inventory for the multi-site e2e. SAMPLE with placeholder values.
+#
+# Copy to <repo-root>/mesh.yaml and fill in your own values, then:
+#
+#   make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true \
+#     KUBECONTEXT=<hub-context> LABEL_FILTER='multisite' E2E_CONFIG=$PWD/mesh.yaml
+#
+# Setting up the hub+sites substrate (Kubernetes clusters with mutually-routed pod networks,
+# the operator deployed on the hub) is external, out-of-scope work — this file only tells the
+# tests where it is. See docs/E2E_TESTING.md ("Multi-site").
+#
+# ─────────────────────────────────────────────────────────────────────────────────────────
+# THIS FORMAT IS SHARED with the sibling project slaptain (../slaptain, docs/MULTI-SITE.md),
+# on purpose: the two projects describe the same clusters, and holding two vocabularies for
+# one lab is how the wrong context ends up in the right-looking field. Three rules:
+#
+#   1. the site inventory is the COMMON part, at the top level under `sites:`;
+#   2. each project's own knobs live under its own key — `littlered:` / `slaptain:`;
+#   3. unknown keys are IGNORED, so ONE file can carry both sections and either project's
+#      extra per-site fields.
+#
+# So this file may be the same file slaptain reads. Neither project needs the other's half.
+# ─────────────────────────────────────────────────────────────────────────────────────────
+
+# ── shared site inventory ────────────────────────────────────────────────────────────────
+#
+# `name` is the site IDENTITY. For littlered it is what appears in spec.multiSite.sites and
+# what every site-qualified ground-truth key is built from ("<site>/<pod>"), so it must be
+# unique. It is matched VERBATIM — trimmed, never case-folded.
+#
+# ORDER MATTERS. spec.multiSite.sites is listType=atomic and a site's POSITION is its
+# placement index: shard K lives in sites (K+j) mod S (LR-032/LR-033). Reordering this list
+# re-places every shard, and the topology is immutable after create — so a mistake here is
+# not editable, it is a delete-and-recreate, which under EmptyDir is the data.
+#
+# `roles` says what a site is FOR. It is a list, it defaults to [workload] when absent, and
+# littlered defines exactly one role beyond that:
+#
+#   workload  — carries pods. Every slaptain site is this; hence the default, which is what
+#               makes an existing slaptain inventory valid here unchanged.
+#   hub       — littlered only: the cluster running the operator and holding the CR. Exactly
+#               one site must carry it. slaptain is peer-to-peer and will never use it.
+#
+# A site may carry BOTH. littlered treats a site with no kubeconfigSecretRef as hub-local, so
+# "the hub also carries shards" is a supported topology — which is why `roles` is a list and
+# not a scalar. ("hub" rather than "control-plane": it is this project's established word,
+# and "control plane" already means something else in Kubernetes.)
+sites:
+  # The hub. Carries no pods in this example, so it needs no `endpoint`: nothing has to build
+  # a kubeconfig for a cluster the operator is already running in.
+  - name: scm-cp
+    context: scm-cp                     # kubectl context; OPTIONAL, defaults to name
+    roles: [hub]
+    podCIDR: "10.233.224.0/19"          # this site's pod network. Required ONLY for the
+                                        # Scenario B hub-blind cut, which denies the hub's
+                                        # CIDR so a site is isolated FROM THE HUB while the
+                                        # sites stay connected to each other (the survivors
+                                        # must still report cluster_state:ok, or the test is
+                                        # not testing what it says). Omit => Scenario B skips.
+
+  - name: scm-s1
+    context: scm-s1
+    # roles: [workload]                 # the default; shown here only to name it once
+    endpoint: https://10.2.1.10:6443    # API URL routable FROM HUB PODS — the repl-net VIP
+                                        # baked into the site kubeconfig the operator dials.
+                                        # On dual-homed nodes this is NOT the address in your
+                                        # kubeconfig; that one is the admin network.
+    vms:                                # libvirt inventory. Required ONLY for the Scenario A
+                                        # whole-site kill, which hard-powers these off
+                                        # (virsh destroy) and back on (virsh start) — a
+                                        # reboot from inside is not a site loss. Needs
+                                        # non-interactive virsh (key-based qemu+ssh).
+                                        # Omit => Scenario A skips.
+      - {name: scm-s1-node1, uri: qemu+ssh://user@hypervisor.example/system}
+      - {name: scm-s1-node2, uri: qemu+ssh://user@hypervisor.example/system}
+
+  - name: scm-s2
+    context: scm-s2
+    endpoint: https://10.2.2.10:6443
+    vms:
+      - {name: scm-s2-node1, uri: qemu+ssh://user@hypervisor.example/system}
+      - {name: scm-s2-node2, uri: qemu+ssh://user@hypervisor.example/system}
+
+  - name: scm-s3
+    context: scm-s3
+    endpoint: https://10.2.3.10:6443
+    vms:
+      - {name: scm-s3-node1, uri: qemu+ssh://user@hypervisor.example/system}
+
+# ── littlered section ────────────────────────────────────────────────────────────────────
+# Everything here is littlered's alone. slaptain ignores it, as littlered ignores `slaptain:`.
+littlered:
+  operatorNamespace: littlered-system   # optional (default littlered-system)
+
+# ── the other project's section, for illustration ────────────────────────────────────────
+# Uncomment to keep one file for both labs. littlered never reads it; note that slaptain's
+# per-site `serverIDIndex` / `nodeAccessIP` also ride along inside `sites:` untouched.
+#
+# slaptain:
+#   registry: registry.k8s.example
+#   operatorNamespace: slaptain-system
+#   replicationNetwork:
+#     mode: pod-routed

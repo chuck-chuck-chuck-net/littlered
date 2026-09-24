@@ -49,3 +49,6 @@ dist/
 # cluster and pod names and absolute home paths, and this repository is public.
 *.weg
 e2e-fail*.txt
+
+# The mesh/lab inventory carries internal addresses and hostnames (see mesh.yaml.sample).
+mesh.yaml

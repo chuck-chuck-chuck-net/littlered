@@ -231,43 +231,70 @@ make test-e2e LABEL_FILTER='cluster-behaviour' E2E_TOPOLOGY=both   # just the ma
 
 **The multi-site topology needs a real hub+sites substrate** — it is not runnable on the
 single Kind cluster of a default run. It requires a hub kube-context and per-site contexts
-over Kubernetes clusters with **mutually routed pod CIDRs**. Point the run at a **single YAML
-config** with `MS_CONFIG=<file>` — it holds everything (hub context, per-site context + endpoint,
-the whole-site-kill VM inventory, the hub pod CIDR):
+over Kubernetes clusters with **mutually routed pod CIDRs**. Point the run at a **mesh
+inventory** with `E2E_CONFIG=<file>` (or `MS_CONFIG`, the older name for the same variable):
+one YAML file holding every site, its kube-context and endpoint, its VMs, and which site is
+the hub.
+
+**The inventory format is SHARED with the sibling project [slaptain](../../slaptain)**
+(`docs/MULTI-SITE.md` there), deliberately: the two projects describe the same clusters, and
+holding two vocabularies for one lab is how the wrong context ends up in the right-looking
+field. Three rules make it shared rather than merely similar — the site list is the **common**
+part at the top level, each project's own knobs live under its own key, and **unknown keys are
+ignored**, so one file can carry both projects.
 
 ```yaml
-# MS_CONFIG schema
-hubContext: scm-cp
-operatorNamespace: littlered-system    # optional (default littlered-system)
-hubPodCIDR: "10.233.224.0/19"          # optional; the Scenario B hub-blind cut denies it
 sites:
+  - name: scm-cp
+    context: scm-cp                     # optional, defaults to name
+    roles: [hub]                        # littlered: operator + CR live here. Exactly one.
+    podCIDR: "10.233.224.0/19"          # only for Scenario B's hub-blind cut
   - name: scm-s1
     context: scm-s1
-    endpoint: https://10.2.1.10:6443    # site API URL routable FROM HUB PODS (repl-net VIP)
-    vms:                                # optional; the Scenario A whole-site kill inventory
+    # roles: [workload]                 # the DEFAULT when absent
+    endpoint: https://10.2.1.10:6443    # API URL routable FROM HUB PODS (repl-net VIP)
+    vms:                                # only for Scenario A's whole-site kill
       - {name: scm-s1-node1, uri: qemu+ssh://user@host/system}
+littlered:
+  operatorNamespace: littlered-system   # optional (default littlered-system)
 ```
 
-A ready-to-copy sample lives at [`docs/multisite-e2e-config.sample.yaml`](multisite-e2e-config.sample.yaml).
-So the whole invocation collapses to:
+**`roles` is a list and defaults to `[workload]`**, which is what makes an existing slaptain
+inventory valid here unchanged — slaptain is peer-to-peer and every one of its sites carries
+pods. littlered adds one role, `hub`. A site may carry **both**: a site with no
+`kubeconfigSecretRef` is hub-local, so "the hub also carries shards" is a supported topology
+and a scalar `role:` could not express it.
+
+**Order matters.** `spec.multiSite.sites` is `listType=atomic` and a site's *position* is its
+placement index (LR-032/LR-033); the topology is immutable after create, so a mistake here is
+a delete-and-recreate, which under EmptyDir is the data.
+
+A ready-to-copy sample lives at [`mesh.yaml.sample`](../mesh.yaml.sample) in the repo root, and
+a test asserts it parses and validates. So the whole invocation collapses to:
 
 ```bash
 make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=scm-cp \
-  LABEL_FILTER='multisite' MS_CONFIG=$HOME/scm-littlered-ms-e2e.yaml
+  LABEL_FILTER='multisite' E2E_CONFIG=$PWD/mesh.yaml
 ```
+
+An inventory carrying the superseded top-level `hubContext` is **refused by name**, with the
+move spelled out, rather than parsing to an empty site list — which would read exactly like
+"no config present" and silently `Skip`.
 
 The individual `MS_HUB_CONTEXT` / `MS_SITE_CONTEXTS` / `MS_SITE_ENDPOINTS` / `MS_OPERATOR_NS` /
 `MS_HUB_POD_CIDR` / `MS_VM_INVENTORY` env vars remain as a backward-compatible fallback (used only
-when `MS_CONFIG` is unset). The multi-site Describe provisions each site's namespace/RBAC/Secrets in
-a `BeforeAll`. The default `E2E_TOPOLOGY=single` keeps CI on Kind unchanged.
+when no inventory file is given); they synthesize the hub as a site carrying the `hub` role, so
+everything downstream sees one shape. The multi-site Describe provisions each site's
+namespace/RBAC/Secrets in a `BeforeAll`. The default `E2E_TOPOLOGY=single` keeps CI on Kind
+unchanged.
 
-**What runs, by label** (`LABEL_FILTER=…`, same `MS_CONFIG` for all):
+**What runs, by label** (`LABEL_FILTER=…`, same inventory for all):
 
-| Label | Runs | Needs (in `MS_CONFIG`) |
+| Label | Runs | Needs (in the inventory) |
 |---|---|---|
-| `multisite` | both takeover scenarios (A + B) | sites; `vms` for A; `hubPodCIDR` for B |
+| `multisite` | both takeover scenarios (A + B) | sites; `vms` for A; the hub site's `podCIDR` for B |
 | `multisite-takeover` | Scenario A only — whole-site kill **MUST take over** (survivor serves all 16384 slots, data intact, site rejoins) | per-site `vms` (else skips) |
-| `multisite-hold` | Scenario B only — hub-blind cut **MUST NOT take over** (survivors stay `cluster_state:ok`, no split-brain) | `hubPodCIDR` (else skips) |
+| `multisite-hold` | Scenario B only — hub-blind cut **MUST NOT take over** (survivors stay `cluster_state:ok`, no split-brain) | the hub site's `podCIDR` (else skips) |
 | `ms-heal` | the out-of-band healer (below) — restores the lab + reclaims a leftover instance | whatever the disrupting run needed |
 
 Add `DEBUG_ON_FAILURE=true` to any run to **leave the damage in place** on failure for investigation
@@ -303,7 +330,7 @@ down leftover instances, reusing the same Go helpers) and asserts the ledger is 
 
 ```bash
 make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=<hub> \
-  LABEL_FILTER='ms-heal' MS_CONFIG=<same config as the run>
+  LABEL_FILTER='ms-heal' E2E_CONFIG=<same inventory as the run>
 ```
 
 **Clean-slate guard.** If a leftover instance is *not* reclaimed, `msSetupSites` refuses to run onto
@@ -335,7 +362,7 @@ make test-e2e ARGS="-timeout 90m"
 | `CLUSTER_SHARDS` | `3` | Number of shards for cluster mode tests (minimum 3) |
 | `CLUSTER_REPLICAS_PER_SHARD` | `1` | Replicas per shard for cluster tests that use replicas |
 | `E2E_TOPOLOGY` | `single` | Which topologies the shared **cluster-behaviour** matrix runs under: `single` (default), `multi`, or `both`. See "Cross-Topology Cluster Matrix" below. |
-| `MS_CONFIG` | (none) | **Multi-site: the preferred, single-file config** — a YAML file holding hub context, per-site context/endpoint/VMs, operator namespace, and hub pod CIDR (schema above). Set this and the individual `MS_*` vars below are unnecessary. Absent + no `MS_*` fallback ⇒ multi-site specs `Skip`. |
+| `E2E_CONFIG` / `MS_CONFIG` | (none) | **Multi-site: the mesh inventory** — the single YAML file holding every site, its context/endpoint/VMs/roles, and the `littlered:` section (schema above). `E2E_CONFIG` is slaptain's variable name and is checked first; `MS_CONFIG` is the older name for the same thing. Set either and the individual `MS_*` vars below are unnecessary. Absent + no `MS_*` fallback ⇒ multi-site specs `Skip`. |
 | `MS_HUB_CONTEXT` | *(fallback)* | Multi-site (fallback for `MS_CONFIG`): the hub kube-context (where the CR + operator live). |
 | `MS_OPERATOR_NS` | `littlered-system` | Multi-site: the operator namespace on the hub (where per-site kubeconfig Secrets are created). The one project-constant default (the chart's namespace); not lab-specific. |
 | `MS_SITE_CONTEXTS` | *(fallback)* | Multi-site (fallback): comma list mapping site name → kube-context, e.g. `site-a=ctx-a,site-b=ctx-b,site-c=ctx-c`. |

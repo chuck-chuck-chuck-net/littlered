@@ -335,7 +335,7 @@ func msPodIPAddrs(reg *msRegistry, ns string) string {
 // vantage, while the site's Kubernetes API — a separate host-network path — stays reachable). From
 // the config's hubPodCIDR (MS_CONFIG) or MS_HUB_POD_CIDR; empty ⇒ Scenario B Skips.
 func msHubPeerCIDRs() []string {
-	if v := strings.TrimSpace(msLoadConfig().HubPodCIDR); v != "" {
+	if v := msLoadConfig().HubPodCIDR(); v != "" {
 		return strings.Split(v, ",")
 	}
 	return nil

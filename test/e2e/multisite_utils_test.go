@@ -88,32 +88,70 @@ type msRegistry struct {
 // MS_* env vars. When neither is provided the multi-site specs Skip, so the rest of the suite is
 // unaffected. See docs/E2E_TESTING.md ("Multi-site").
 //
-// MS_CONFIG schema:
+// Mesh inventory schema — SHARED with the sibling project slaptain (../slaptain,
+// docs/MULTI-SITE.md), deliberately, so one file can describe a lab for both and nobody has
+// to hold two vocabularies for one set of clusters. Three rules make it shared rather than
+// merely similar:
 //
-//	hubContext:        scm-cp                 # hub kubecontext (operator + CR live here)
-//	operatorNamespace: littlered-system       # optional (default littlered-system)
-//	hubPodCIDR:        "10.233.224.0/19"       # optional; the Scenario B hub-blind cut denies it
-//	sites:
-//	  - name: scm-s1
-//	    context: scm-s1
-//	    endpoint: https://10.2.1.10:6443       # site API URL routable FROM HUB PODS (repl-net VIP)
-//	    vms:                                   # optional; the Scenario A whole-site kill inventory
-//	      - {name: scm-s1-node1, uri: qemu+ssh://user@host/system}
+//  1. the site inventory is the COMMON part, at the top level under `sites:`;
 //
-// Env-var fallback (each maps onto the schema): MS_HUB_CONTEXT, MS_SITE_CONTEXTS
-// ("name=ctx,..."), MS_SITE_ENDPOINTS ("name=url,..."), MS_OPERATOR_NS, MS_HUB_POD_CIDR, and the
-// legacy MS_VM_INVENTORY file ("<site> <vm> <uri>" lines).
+//  2. each project's own knobs live under its own key (`littlered:` / `slaptain:`);
+//
+//  3. unknown keys are IGNORED, so one file carries both sections and either project's
+//     extra per-site fields (slaptain's `serverIDIndex`, `nodeAccessIP`, …).
+//
+//     sites:
+//     - name: scm-cp
+//     context: scm-cp                      # kubecontext; OPTIONAL, defaults to name
+//     roles: [hub]                         # littlered: the operator and the CR live here
+//     podCIDR: "10.233.224.0/19"           # this site's pod network; Scenario B denies the hub's
+//     - name: scm-s1
+//     context: scm-s1
+//     endpoint: https://10.2.1.10:6443     # API URL routable FROM THE OTHER SITES' PODS
+//     vms:                                 # optional; the whole-site kill inventory
+//     - {name: scm-s1-node1, uri: qemu+ssh://user@host/system}
+//     littlered:
+//     operatorNamespace: littlered-system    # optional (default littlered-system)
+//
+// ROLES. `roles` is a LIST and defaults to [workload] when absent — which is what makes an
+// existing slaptain inventory valid here unchanged, since slaptain is peer-to-peer and every
+// one of its sites is a workload site. littlered adds exactly one role, `hub`: the cluster
+// running the operator and holding the CR. It is a list rather than a scalar because a site
+// may be BOTH — littlered's own model treats a site with no kubeconfigSecretRef as hub-local
+// (hubSiteClient), so "the hub also carries shards" is a supported topology and a single
+// `role:` could not express it. `hub` is the project's established word (hubClient,
+// IsHubLocal, "hub-and-spokes" throughout MULTI_SITE_DESIGN.md); "control-plane" was rejected
+// because it already means something else in Kubernetes.
+//
+// The file is named by E2E_CONFIG (slaptain's variable) or MS_CONFIG; conventionally
+// mesh.yaml at the repo root. See mesh.yaml.sample and docs/E2E_TESTING.md ("Multi-site").
+//
+// Env-var fallback, unchanged and untouched by the schema change: MS_HUB_CONTEXT,
+// MS_SITE_CONTEXTS ("name=ctx,..."), MS_SITE_ENDPOINTS ("name=url,..."), MS_OPERATOR_NS,
+// MS_HUB_POD_CIDR, and the legacy MS_VM_INVENTORY file ("<site> <vm> <uri>" lines).
 type msConfig struct {
-	HubContext        string         `json:"hubContext"`
-	OperatorNamespace string         `json:"operatorNamespace,omitempty"`
-	HubPodCIDR        string         `json:"hubPodCIDR,omitempty"`
-	Sites             []msConfigSite `json:"sites"`
+	Sites     []msConfigSite  `json:"sites"`
+	LittleRed msConfigProject `json:"littlered,omitempty"`
+
+	// HubContextLegacy catches the superseded top-level field so an old inventory is
+	// NAMED rather than parsing to something that merely looks unconfigured. An
+	// unrecognised schema that yields an empty site list reads exactly like "no config
+	// present", which Skips — the silent outcome this field exists to prevent.
+	HubContextLegacy string `json:"hubContext,omitempty"`
+}
+
+// msConfigProject is one project's own section. Only littlered's is read here; slaptain's
+// rides along in the same file and is ignored.
+type msConfigProject struct {
+	OperatorNamespace string `json:"operatorNamespace,omitempty"`
 }
 
 type msConfigSite struct {
 	Name     string       `json:"name"`
-	Context  string       `json:"context"`
-	Endpoint string       `json:"endpoint"`
+	Context  string       `json:"context,omitempty"`
+	Roles    []string     `json:"roles,omitempty"`
+	Endpoint string       `json:"endpoint,omitempty"`
+	PodCIDR  string       `json:"podCIDR,omitempty"`
 	VMs      []msConfigVM `json:"vms,omitempty"`
 }
 
@@ -122,36 +160,190 @@ type msConfigVM struct {
 	URI  string `json:"uri"`
 }
 
-// msLoadConfig resolves the multi-site config from MS_CONFIG (YAML) or, failing that, the legacy
-// MS_* env vars. Skips the spec when neither is present. Re-reads on each call (the file is tiny);
-// no caching keeps it simple and lets a mid-suite edit take effect.
-func msLoadConfig() *msConfig {
-	if path := strings.TrimSpace(os.Getenv("MS_CONFIG")); path != "" {
-		data, err := os.ReadFile(path)
-		Expect(err).NotTo(HaveOccurred(), "reading MS_CONFIG %s", path)
-		var c msConfig
-		Expect(yaml.Unmarshal(data, &c)).To(Succeed(), "parsing MS_CONFIG %s as YAML", path)
-		Expect(c.HubContext).NotTo(BeEmpty(), "MS_CONFIG %s: hubContext is required", path)
-		Expect(c.Sites).NotTo(BeEmpty(), "MS_CONFIG %s: at least one site is required", path)
-		return &c
+// The two roles the shared format defines. Absent ⇒ roleWorkload.
+const (
+	roleHub      = "hub"
+	roleWorkload = "workload"
+)
+
+// kubeContext is the site's kubecontext, defaulting to its name — slaptain's rule, and the
+// reason its lab.yaml marks `context` optional.
+func (s msConfigSite) kubeContext() string {
+	if c := strings.TrimSpace(s.Context); c != "" {
+		return c
 	}
-	return msConfigFromEnvVars()
+	return strings.TrimSpace(s.Name)
 }
 
-// msConfigFromEnvVars builds the config from the individual MS_* env vars (backward compat).
+func (s msConfigSite) hasRole(want string) bool {
+	if len(s.Roles) == 0 {
+		return want == roleWorkload
+	}
+	for _, r := range s.Roles {
+		if strings.EqualFold(strings.TrimSpace(r), want) {
+			return true
+		}
+	}
+	return false
+}
+
+// HubContext is the kubecontext of the site carrying the hub role.
+func (c *msConfig) HubContext() string {
+	for _, s := range c.Sites {
+		if s.hasRole(roleHub) {
+			return s.kubeContext()
+		}
+	}
+	return ""
+}
+
+// HubPodCIDR is the hub site's pod network, which Scenario B denies to cut the hub off from
+// a site without cutting the sites off from each other. It is a property of that SITE rather
+// than a top-level fact, which is also what lets a future scenario read any site's.
+func (c *msConfig) HubPodCIDR() string {
+	for _, s := range c.Sites {
+		if s.hasRole(roleHub) {
+			return strings.TrimSpace(s.PodCIDR)
+		}
+	}
+	return ""
+}
+
+func (c *msConfig) OperatorNamespace() string {
+	return strings.TrimSpace(c.LittleRed.OperatorNamespace)
+}
+
+// WorkloadSites are the sites that carry pods, in spec order — which is load-bearing:
+// spec.multiSite.sites is listType=atomic and a site's POSITION is its placement index
+// (LR-032/LR-033), so this order must be the order the CR is written with.
+func (c *msConfig) WorkloadSites() []msConfigSite {
+	var out []msConfigSite
+	for _, s := range c.Sites {
+		if s.hasRole(roleWorkload) {
+			out = append(out, s)
+		}
+	}
+	return out
+}
+
+// parseMeshConfig parses the shared inventory. It validates only what the FORMAT requires;
+// what littlered additionally needs is ValidateForLittleRed, so a slaptain inventory parses
+// here cleanly and is refused only when this project tries to use it.
+func parseMeshConfig(data []byte) (*msConfig, error) {
+	var c msConfig
+	if err := yaml.Unmarshal(data, &c); err != nil {
+		return nil, fmt.Errorf("parsing the mesh inventory as YAML: %w", err)
+	}
+	if strings.TrimSpace(c.HubContextLegacy) != "" {
+		return nil, fmt.Errorf("this inventory uses the superseded top-level %q field. "+
+			"The hub is now a SITE carrying `roles: [hub]`, so the `sites:` list is shared "+
+			"verbatim with the sibling project slaptain. Move it: add an entry "+
+			"{name: %s, context: %s, roles: [hub]} to `sites:`, move `hubPodCIDR` onto that "+
+			"entry as `podCIDR`, and move `operatorNamespace` under a `littlered:` key. "+
+			"See mesh.yaml.sample",
+			"hubContext", c.HubContextLegacy, c.HubContextLegacy)
+	}
+	seen := map[string]bool{}
+	for _, s := range c.Sites {
+		name := strings.TrimSpace(s.Name)
+		if name == "" {
+			return nil, fmt.Errorf("every site needs a name")
+		}
+		if seen[name] {
+			return nil, fmt.Errorf("duplicate site name %q: the name is the ground-truth key "+
+				"(it is what a site-qualified pod key is built from), so it must be unique", name)
+		}
+		seen[name] = true
+		for _, r := range s.Roles {
+			r = strings.TrimSpace(r)
+			if !strings.EqualFold(r, roleHub) && !strings.EqualFold(r, roleWorkload) {
+				return nil, fmt.Errorf("site %q declares unknown role %q; known roles are %q and %q",
+					name, r, roleHub, roleWorkload)
+			}
+		}
+	}
+	return &c, nil
+}
+
+// ValidateForLittleRed refuses an inventory this project cannot run on. It is separate from
+// parsing on purpose: the format is shared, and a perfectly valid slaptain inventory declares
+// no hub — that is not a malformed file, it is a file for the other project.
+func (c *msConfig) ValidateForLittleRed() error {
+	hubs := 0
+	for _, s := range c.Sites {
+		if s.hasRole(roleHub) {
+			hubs++
+		}
+	}
+	if hubs != 1 {
+		return fmt.Errorf("littlered needs exactly one site with `roles: [hub]` (the cluster "+
+			"running the operator and holding the CR); this inventory declares %d", hubs)
+	}
+	ws := c.WorkloadSites()
+	if len(ws) == 0 {
+		return fmt.Errorf("no workload sites: at least one site must carry pods " +
+			"(a site with no `roles` is a workload site)")
+	}
+	hubCtx := c.HubContext()
+	for _, s := range ws {
+		// A hub-local workload site is reached through the manager's own client, so it
+		// needs no kubeconfig and therefore no endpoint — littlered's own
+		// "kubeconfigSecretRef == nil ⇒ hub-local" rule, falling out of the inventory.
+		if s.hasRole(roleHub) && s.kubeContext() == hubCtx {
+			continue
+		}
+		if strings.TrimSpace(s.Endpoint) == "" {
+			return fmt.Errorf("site %q carries pods and is not the hub, so the hub needs a "+
+				"kubeconfig for it: set `endpoint` to its API URL as routable FROM HUB PODS "+
+				"(on dual-homed nodes this is NOT the address in your kubeconfig)", s.Name)
+		}
+	}
+	return nil
+}
+
+// msLoadConfig resolves the mesh inventory from E2E_CONFIG or MS_CONFIG, or failing that from
+// the legacy MS_* env vars. Skips the spec when neither is present. Re-reads on each call (the
+// file is tiny); no caching keeps it simple and lets a mid-suite edit take effect.
+//
+// E2E_CONFIG is slaptain's variable name and is checked first: the file is shared, so the way
+// you point at it should be too.
+func msLoadConfig() *msConfig {
+	path := strings.TrimSpace(os.Getenv("E2E_CONFIG"))
+	varName := "E2E_CONFIG"
+	if path == "" {
+		path, varName = strings.TrimSpace(os.Getenv("MS_CONFIG")), "MS_CONFIG"
+	}
+	if path == "" {
+		return msConfigFromEnvVars()
+	}
+	data, err := os.ReadFile(path)
+	Expect(err).NotTo(HaveOccurred(), "reading %s %s", varName, path)
+	c, err := parseMeshConfig(data)
+	Expect(err).NotTo(HaveOccurred(), "%s %s", varName, path)
+	Expect(c.ValidateForLittleRed()).To(Succeed(), "%s %s", varName, path)
+	return c
+}
+
+// msConfigFromEnvVars builds the inventory from the individual MS_* env vars (backward compat).
+// It synthesizes the hub as a site carrying the hub role, so everything downstream sees one
+// shape regardless of where the configuration came from.
 func msConfigFromEnvVars() *msConfig {
 	hub := strings.TrimSpace(os.Getenv("MS_HUB_CONTEXT"))
 	siteSpec := strings.TrimSpace(os.Getenv("MS_SITE_CONTEXTS"))
 	endpointSpec := strings.TrimSpace(os.Getenv("MS_SITE_ENDPOINTS"))
 	if hub == "" || siteSpec == "" || endpointSpec == "" {
-		Skip("multi-site e2e requires MS_CONFIG (a single YAML config file) OR the individual " +
-			"MS_HUB_CONTEXT / MS_SITE_CONTEXTS / MS_SITE_ENDPOINTS env vars — no lab defaults are " +
-			"baked in; see docs/E2E_TESTING.md (\"Multi-site\").")
+		Skip("multi-site e2e requires a mesh inventory (E2E_CONFIG or MS_CONFIG) OR the " +
+			"individual MS_HUB_CONTEXT / MS_SITE_CONTEXTS / MS_SITE_ENDPOINTS env vars — no lab " +
+			"defaults are baked in; see mesh.yaml.sample and docs/E2E_TESTING.md (\"Multi-site\").")
 	}
 	c := &msConfig{
-		HubContext:        hub,
-		OperatorNamespace: strings.TrimSpace(os.Getenv("MS_OPERATOR_NS")),
-		HubPodCIDR:        strings.TrimSpace(os.Getenv("MS_HUB_POD_CIDR")),
+		LittleRed: msConfigProject{OperatorNamespace: strings.TrimSpace(os.Getenv("MS_OPERATOR_NS"))},
+		Sites: []msConfigSite{{
+			Name:    hub,
+			Context: hub,
+			Roles:   []string{roleHub},
+			PodCIDR: strings.TrimSpace(os.Getenv("MS_HUB_POD_CIDR")),
+		}},
 	}
 	endpoints := map[string]string{}
 	for _, e := range strings.Split(endpointSpec, ",") {
@@ -176,19 +368,18 @@ func msConfigFromEnvVars() *msConfig {
 func msRegistryFromEnv() *msRegistry {
 	cfg := msLoadConfig()
 	reg := &msRegistry{
-		hubContext:  cfg.HubContext,
-		operatorNS:  cfgOr(cfg.OperatorNamespace, "littlered-system"),
+		hubContext:  cfg.HubContext(),
+		operatorNS:  cfgOr(cfg.OperatorNamespace(), "littlered-system"),
 		sitesByName: map[string]msSite{},
 	}
-	for _, sc := range cfg.Sites {
-		Expect(sc.Name).NotTo(BeEmpty(), "a site entry is missing its name")
-		Expect(sc.Context).NotTo(BeEmpty(), "site %q is missing its context", sc.Name)
-		Expect(sc.Endpoint).NotTo(BeEmpty(), "site %q is missing its endpoint", sc.Name)
-		s := msSite{name: sc.Name, context: sc.Context, endpoint: sc.Endpoint}
+	// WORKLOAD sites only, and in spec order: a hub-only site carries no pods, and the
+	// order is the placement index the CR is written with (LR-032/LR-033).
+	for _, sc := range cfg.WorkloadSites() {
+		s := msSite{name: sc.Name, context: sc.kubeContext(), endpoint: sc.Endpoint}
 		reg.sitesByName[sc.Name] = s
 		reg.orderedSites = append(reg.orderedSites, s)
 	}
-	Expect(reg.orderedSites).NotTo(BeEmpty(), "the multi-site config has zero sites")
+	Expect(reg.orderedSites).NotTo(BeEmpty(), "the mesh inventory declares no workload sites")
 	return reg
 }
 
