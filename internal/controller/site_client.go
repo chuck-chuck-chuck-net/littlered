@@ -91,6 +91,16 @@ type SiteClient interface {
 	Apply(ctx context.Context, owner *littleredv1alpha1.LittleRed, obj client.Object) error
 	// Get reads an object from the site.
 	Get(ctx context.Context, key client.ObjectKey, obj client.Object) error
+	// UncachedReader reads directly from this site's API server, bypassing the
+	// informer cache. It exists for exactly one caller: LR-043's CLUSTER MEET
+	// address confirmation, whose entire point is that the cache is where the
+	// hazard originates (LR-012 documented it returning a stale Status.PodIP
+	// during churn). Routing that check through the ordinary cached Get above
+	// would leave a guard that reads as present and is not — LR-041/LR-052's
+	// class. Costs one `get` on pods, which the site Role already grants, so no
+	// new RBAC. Never use it for the steady loop: LR-043 declined an uncached
+	// gather on per-pass cost and that reasoning is unchanged.
+	UncachedReader() client.Reader
 	// List lists objects in the site.
 	List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error
 	// Delete deletes an object in the site.
@@ -155,9 +165,13 @@ func ssaApply(ctx context.Context, c client.Client, scheme *runtime.Scheme, obj 
 // Kubernetes cluster, so it wraps the manager's client/cache — zero new
 // connections, and children keep the ordinary controller owner reference.
 type hubSiteClient struct {
-	name   string
-	client client.Client
-	scheme *runtime.Scheme
+	name string
+	// client is the manager's cache-backed client; uncached is its APIReader —
+	// the same reader single-site's confirmPodIP uses, so a hub-local site is
+	// byte-identical to single-site on the MEET path.
+	client   client.Client
+	uncached client.Reader
+	scheme   *runtime.Scheme
 }
 
 func (h *hubSiteClient) Name() string     { return h.name }
@@ -174,6 +188,16 @@ func (h *hubSiteClient) Apply(ctx context.Context, owner *littleredv1alpha1.Litt
 
 func (h *hubSiteClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object) error {
 	return h.client.Get(ctx, key, obj)
+}
+
+func (h *hubSiteClient) UncachedReader() client.Reader {
+	if h.uncached != nil {
+		return h.uncached
+	}
+	// Unit/envtest reconcilers built without a manager: their client is itself a
+	// direct, uncached client, so this is not a silent downgrade (LR-043's own
+	// argument for apiReader()'s fallback).
+	return h.client
 }
 
 func (h *hubSiteClient) List(ctx context.Context, list client.ObjectList, opts ...client.ListOption) error {
@@ -198,6 +222,7 @@ type remoteSiteClient struct {
 	namespace string
 	owner     types.NamespacedName
 	client    client.Client
+	uncached  client.Reader
 	cache     cache.Cache
 	scheme    *runtime.Scheme
 	cancel    context.CancelFunc
@@ -251,12 +276,24 @@ func newRemoteSiteClient(siteName string, kubeconfig []byte, namespace string, o
 			fmt.Errorf("building client: %w", err))
 	}
 
+	// A second, DIRECT client for the MEET confirmation only (see UncachedReader).
+	// It registers no informer and holds no objects, so it adds no watch and no RAM;
+	// it needs only `get`, which the per-site Role already grants. Hub-local, like
+	// everything else in this constructor — client.New does not dial (the REST mapper
+	// is lazy), so a failure here is still siteFaultClientUnbuildable (LR-036).
+	uncached, err := client.New(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		return nil, siteConfigFault(siteName, siteFaultClientUnbuildable,
+			fmt.Errorf("building uncached client: %w", err))
+	}
+
 	bctx, cancel := context.WithCancel(context.Background())
 	c := &remoteSiteClient{
 		name:      siteName,
 		namespace: namespace,
 		owner:     owner,
 		client:    cl,
+		uncached:  uncached,
 		cache:     ca,
 		scheme:    scheme,
 		cancel:    cancel,
@@ -366,6 +403,8 @@ func (c *remoteSiteClient) Apply(ctx context.Context, owner *littleredv1alpha1.L
 	defer cancel()
 	return ssaApply(ctx, c.client, c.scheme, obj)
 }
+
+func (c *remoteSiteClient) UncachedReader() client.Reader { return c.uncached }
 
 func (c *remoteSiteClient) Get(ctx context.Context, key client.ObjectKey, obj client.Object) error {
 	ctx, cancel := bounded(ctx)

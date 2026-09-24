@@ -332,7 +332,9 @@ func (r *LittleRedReconciler) reconcileMultiSiteCluster(ctx context.Context, lr 
 			"masters", gt.CountMasters(), "allNodesView", len(gt.AllNodeIDs))
 		// forgetSafe only when every hosting site answered this pass; otherwise an unreachable
 		// site's nodes are "unknown, not gone" and repair must not FORGET them (pillar 3.4).
-		return r.repairCluster(ctx, lr, gt, allSitesObservable(obs))
+		// The MEET confirmer is built from the sites resolved THIS pass, so a key naming
+		// a site that did not resolve is refused rather than confirmed elsewhere (LR-063).
+		return r.repairCluster(ctx, lr, gt, allSitesObservable(obs), multiSiteConfirmPodIP(siteReaderLookup(sites)))
 	}
 
 	// 3b. Master-balance drift correction (ADR-012 D2). Steady-state MAINTENANCE, healthy path
@@ -1091,4 +1093,70 @@ func errText(err error) string {
 		return ""
 	}
 	return err.Error()
+}
+
+// multiSiteConfirmPodIP builds the LR-043 MEET-address confirmer for multi-site: it
+// routes each question to the API server that actually owns the pod.
+//
+// The ground truth is keyed by siteQualifiedKey ("<site>/<objName>") because the bare
+// object name names a DIFFERENT pod in every hosting site — shard K has a StatefulSet in
+// each of its sitesPerShard sites, so "{name}-shard-K-0" exists in all of them. Handing
+// that whole key to the hub's API server as a resource name is what LR-063 was: the Get
+// can never succeed, the guard denies forever, and because a denied SEED returns the
+// whole repair pass it also skips repairCluster's TotalSlots==0 bootstrap, so a stretched
+// cluster can never form.
+//
+// The evidence is NOT weaker here than in single-site, and the fix is not an
+// approximation. Pod-routed is the only transport spec.multiSite.network.mode accepts, so
+// pod CIDRs are mutually routed and pod IPs are globally unique across the hub and every
+// site. LR-043's premise — Kubernetes holds at most one live pod per IP, so a confirmed
+// address IS our pod — therefore holds across the whole federation. What is per-cluster
+// is the ORACLE, not the fact: only the owning site's API server can answer about its own
+// pods. Routing the question restores the guard at full strength.
+//
+// An address whose key names no resolvable site is REFUSED (podIPUnknownSite), never
+// confirmed against whichever reader is at hand. Falling back to the hub would ask the
+// wrong cluster about a colliding name, and on a hub-local site it would even succeed —
+// confirming a foreign pod's address, which is the cross-instance merge LR-043 exists to
+// prevent.
+func multiSiteConfirmPodIP(readerFor func(site string) (client.Reader, bool)) podIPConfirmer {
+	return func(ctx context.Context, namespace, podKey, ip string) (bool, string) {
+		if podKey == "" || ip == "" {
+			return false, podIPUnknown
+		}
+		site, objName := splitSiteQualifiedKey(podKey)
+		if site == "" || objName == "" {
+			return false, podIPUnknownSite
+		}
+		reader, ok := readerFor(site)
+		if !ok || reader == nil {
+			// The site is not resolved this pass (unreachable API, a configuration
+			// fault, or a key naming a site no longer in the spec). Deny, per LR-043's
+			// direction. This has no domain of effect on the ordinary unreachable-site
+			// path: unionClusterPods drops an unreachable site's pods from the gather
+			// entirely, so they are in no partition and can be neither seed nor target.
+			return false, podIPUnknownSite
+		}
+		pod := &corev1.Pod{}
+		err := reader.Get(ctx, types.NamespacedName{Name: objName, Namespace: namespace}, pod)
+		return podIPVerdict(pod, err, ip)
+	}
+}
+
+// siteReaderLookup turns the sites resolved this pass into the site->uncached-reader
+// lookup multiSiteConfirmPodIP routes over. A site that did not resolve (unreachable API,
+// a configuration fault, or a name no longer in the spec) is simply absent, which the
+// confirmer reads as "refuse" — never as "ask somebody else".
+func siteReaderLookup(sites []resolvedSite) func(string) (client.Reader, bool) {
+	readers := make(map[string]client.Reader, len(sites))
+	for _, s := range sites {
+		if s.client == nil {
+			continue
+		}
+		readers[s.name] = s.client.UncachedReader()
+	}
+	return func(site string) (client.Reader, bool) {
+		rd, ok := readers[site]
+		return rd, ok
+	}
 }

@@ -53,7 +53,13 @@ func (f *fakeSiteClient) List(context.Context, client.ObjectList, ...client.List
 	return nil
 }
 func (f *fakeSiteClient) Delete(context.Context, client.Object) error { return nil }
-func (f *fakeSiteClient) Gatherer(string, bool) redisclient.Gatherer  { return nil }
+
+// UncachedReader: the MEET-confirmation reader (LR-063). These fakes drive paths
+// that issue no CLUSTER MEET, so nil is the honest answer — multiSiteConfirmPodIP
+// refuses a nil reader rather than falling back to another site.
+func (f *fakeSiteClient) UncachedReader() client.Reader { return nil }
+
+func (f *fakeSiteClient) Gatherer(string, bool) redisclient.Gatherer { return nil }
 
 const testOperatorNS = "littlered-system"
 

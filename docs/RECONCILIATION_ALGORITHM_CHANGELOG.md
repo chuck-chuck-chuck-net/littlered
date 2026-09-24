@@ -4956,3 +4956,214 @@ ADR-020.
   **LR-054** and **LR-056** (both of which require this report to keep firing); **LR-048** (the
   rename is the operation it was found on); `docs/LRCTL.md`, `docs/USAGE.md` (the capture runbook
   now says to check for churn first).
+
+---
+
+## [LR-063] `confirmPodIP` Asked the Hub About a Site-Qualified Key — Multi-Site Could Never Form a Cluster
+
+- **Date:** 2026-09-24
+- **Commit:** (pending) — branch `feat/multi-site-rebuild`.
+- **ID note:** the highest ID visible on **any** branch, local or remote, was LR-062.
+  Allocated with the LR-039 cross-branch loop over every branch, not by reading the tip of
+  one line.
+- **Status: FIXED.** Unit + envtest green, `make lint` 0 issues against a 0-issue baseline.
+  **NOT yet e2e-verified** — the live confirmation is one `LABEL_FILTER='multisite'` run on
+  the lab, and it is owed. Availability, not durability: the cluster never forms, so there
+  is never any data to lose.
+- **Scope:** a **rebase regression**, not a latent defect. `feat/multi-site` was cut before
+  LR-043 landed and has never contained `confirmPodIP`
+  (`git show feat/multi-site:internal/controller/cluster_reconcile.go | grep -c confirmPodIP`
+  → **0**); rebuilding that line onto 0.4.0 brought the guard in and multi-site was never
+  exposed to it. One variable, settled by running the check rather than by reading the diff
+  (LR-054's rule).
+
+- **The finding, in one sentence: the ground truth is keyed by `siteQualifiedKey`
+  ("`<site>/<objName>`") because the bare object name names a DIFFERENT pod in every hosting
+  site, and `confirmPodIP` handed that whole key to the HUB's API server as a resource name
+  — so the Get could never succeed, every `CLUSTER MEET` was refused, and a stretched
+  cluster could never bootstrap.**
+
+- **Measured on t3e (2026-09-24), from the hub operator's own log**, 129 consecutive passes
+  over 5 minutes, one every ~2s:
+
+      Skipping partition healing: MEET seed address is no longer confirmed as this pod's
+        pod="scm-s2/ms-b-shard-3-0"  seed="10.233.65.21"  reason="confirm-failed"
+      partitions=8  allNodesView=8  masters=0  orphanedSlots=true  emptyMasters=true
+
+  Eight fresh pods, each its own partition, every one identified by the gather (zero
+  `target not identified` lines — the *only* refusal is this guard) and **zero
+  `Multi-site bootstrap` lines**.
+
+- **Why a denied SEED is worse than a denied target, and this is the part that turns a
+  guard into a deadlock.** A refused *target* `continue`s; a refused *seed* `return`s the
+  whole repair pass — and `repairCluster`'s `TotalSlots == 0 → bootstrapCluster` branch is
+  **below** Step 1. So the denial does not merely skip the MEET, it skips the bootstrap
+  that would have made the MEET unnecessary. The instance cannot form a cluster and cannot
+  bootstrap out of it either.
+
+- **Mechanism, and every component is behaving as designed.** The multi-site gather keys
+  `clusterPods[ip] = siteQualifiedKey(site, objName)` (`unionClusterPods`) because shard K
+  has a StatefulSet in each of its `sitesPerShard` sites, so `{name}-shard-K-0` exists in
+  all of them — confirmed in the field: `ms-b-shard-3-0` was a **different live pod** in
+  scm-s1 and in scm-s2. `confirmPodIP` then did
+  `r.apiReader().Get({Name: podKey, Namespace: ns})` against the hub. Non-`NotFound` error
+  ⇒ `podIPNoAnswer` ⇒ deny, which is `confirmPodIP`'s own correct contract: *an
+  unconfirmed address is exactly what must not be introduced.*
+
+- **The class is R5, and it is the third instance in this file.** `ClusterNodeState.PodName`
+  answers two questions — *"the operator's ground-truth key"* to every consumer, and *"the
+  Kubernetes object name, in this namespace, on this API server"* to `confirmPodIP` alone.
+  **In single-site the two coincide**, which is exactly why it shipped and why no test saw
+  it. That is LR-053's `ValidIPs` split arriving one layer up, and LR-054's *"R5 names a
+  live bug class rather than a tidiness rule"* getting a third worked example. Checked by
+  enumeration rather than assumed: `confirmPodIP` is the **only** Kubernetes lookup in the
+  repair loop keyed on that field — `chooseReattachTarget`, `shardSlotOwner` and `gtNode`
+  string-match keys against keys, which is correct in both modes (LR-027).
+
+- **⚠ A framing correction that came out of review and materially changes the fix's
+  standing.** The first write-up said LR-043's premise — *"Kubernetes holds at most one
+  live pod per IP"* — is *"true per Kubernetes cluster"*, offering multi-site's S+1 clusters
+  as a **weakening**. That is wrong. `spec.multiSite.network.mode` is
+  `+kubebuilder:validation:Enum=pod-routed` and `Validate()` refuses everything else
+  (*"nodeport and multus are future transports"*), so pod CIDRs are mutually routed and pod
+  IPs are **globally unique across the hub and every site**. The invariant therefore holds
+  across the whole federation. What is per-cluster is the **ORACLE, not the fact**: only the
+  owning site's API server can answer about its own pods. Routing the question restores the
+  guard at **full evidentiary strength** — a confirmation from scm-s2 says exactly as much
+  as a single-site one, because no pod anywhere can hold that IP. The fix is not an
+  approximation, and the distinction is worth keeping: *"I cannot check it from here"* is
+  not *"the evidence is weaker here"*.
+
+- **⚠ TRANSPORT PRECONDITION, recorded because nothing else recorded it.** The guard
+  compares `pod.Status.PodIP`, which is the announced address **only** under pod-routed.
+  Under **nodeport** the announced address is `nodeIP:port` and is not in pod status at all;
+  under **multus** it is a secondary-network address that pod status does not report either
+  (it lives in the CNI's `network-status` annotation). Either would make this comparison
+  answer about the wrong address — under multus, deny *everything*, i.e. today's stall
+  arriving through a supported config instead of through a rebase. Today the one-value enum
+  makes both unreachable, but the enum is the **only** thing holding it and the coupling was
+  undocumented. Stated at `confirmPodIP` and on `BACKLOG.md`: re-derive the guard before
+  that enum grows a value. *(Argued from the field's semantics; not verified against a
+  multus cluster.)*
+
+- **Fix — route the question to the API server that owns the pod. Five pieces:**
+    1. **`podIPVerdict(pod, err, ip)`** — the decision behind every confirmer, extracted
+       behaviour-preservingly from `confirmPodIP`. **One** function, called by both, because
+       a duplicated predicate is literally how LR-045 happened, and the reason vocabulary is
+       an operational surface (it is what the audit line prints), so two copies would drift
+       in what the operator *says* as well as in what it does.
+    2. **`podIPConfirmer`**, taken by `repairCluster` as a parameter — for the same reason it
+       already takes `forgetSafe`: the repair loop is shared, and only the caller knows which
+       API server owns a key. Single-site passes `r.confirmPodIP`, byte-identical.
+    3. **`multiSiteConfirmPodIP`** splits the key, finds the site, and reads `objName` from
+       that site's uncached reader. A key naming **no resolvable site is REFUSED**
+       (`podIPUnknownSite`), never confirmed against whichever reader is at hand: asking the
+       wrong cluster about a colliding name is how a *foreign* pod's address gets confirmed,
+       and on a hub-local site it would even succeed — the merge LR-043 exists to prevent.
+    4. **`SiteClient.UncachedReader()`**, implemented by all four implementations. The
+       remote one builds a second, direct `client.New(cfg, …)` with no cache — no informer,
+       no watch, no RAM, and `get` on `pods` is already in `siteRoleRules()`, so **no new
+       RBAC**, the same property LR-043 has. The hub-local one returns the manager's
+       APIReader, so a hub-local site is byte-identical to single-site. **This piece is
+       load-bearing:** routing through the site's ordinary *cached* client would fix the
+       stall while leaving a guard that reads as present and is not — LR-041/LR-052's class
+       — since LR-012 documented that cache returning a stale `Status.PodIP` during churn,
+       and that staleness is the entire origin of the hazard.
+    5. **The per-target confirm goes through the same seam.** Identical defect, currently
+       masked because the seed refusal preempts it; leaving it would have made the fix inert
+       one line later.
+
+- **Failure direction unchanged, and its domain of effect was checked rather than assumed.**
+  Cannot confirm ⇒ deny, which is LR-043's direction — and LR-043's own correction warns the
+  other way (*a deny of a legitimate own node is a permanent stall*), which is precisely this
+  defect. Two facts bound it: an API-unreachable site's pods are **already dropped from the
+  gather** by `unionClusterPods`, so they are in no partition and can be neither seed nor
+  target — the deny has no domain of effect there; and a transient Get failure costs one pass
+  at the 2s cadence, exactly as single-site.
+
+- **`siteClientRegistry.secretReader` renamed `hubReader`**, because it now has a second
+  consumer. They are **one** question, not two — *"read this object from the hub, bypassing
+  the cache"* — so this is not an R5 split but an honest name; LR-034's rationale for the
+  field is kept verbatim beneath it. (Contrast LR-045: two definitions of one fixed fact is
+  the shape to avoid, which is why a second field was not added.)
+
+- **Alternatives rejected.** **Skip the guard in multi-site** — deletes LR-043's primary
+  guard for the mode where the hazard is *worse* (several instances on one routed pod
+  network across clusters is LR-039's precondition, by design), leaving only the clause
+  LR-043 deliberately demoted to advisory: strictly weaker than pre-LR-043. **Route through
+  the site's cached client** — fixes the stall and is tempting for exactly that reason;
+  rejected per (4). **Strip the prefix and confirm against the hub** — would *succeed* for a
+  same-named pod on a hub-local site, confirming a foreign address; it is the mutant the
+  `unknown-site` rows are pointed at, and it answers `ip-changed` about the wrong pod.
+  **Un-qualify the gather key** — names collide across sites by design (§4); it would break
+  the identity map. **Confirm the IP at every site and require exactly one hit** — sound,
+  since IPs are globally unique, and it would additionally catch a key/IP disagreement; S
+  GETs per candidate instead of 1, for a disagreement that can only mean a mis-wired site
+  client. Recorded because it makes explicit that the key-prefix route is a **shortcut
+  justified by the key being trustworthy** (its site half is assigned by the operator from
+  which site client returned the pod), rather than the only possible route.
+
+- **Tests, red-first, with the red observed BEHAVIOURALLY rather than as an undefined
+  symbol** (LR-050/LR-053's precedent: the plumbing landed inert first).
+  `internal/controller/multisite_meet_confirm_test.go`.
+  `TestMultiSiteConfirmPodIPRoutesToTheOwningSite` (5 rows) was observed **RED on 5 of 5**,
+  and the red reproduces the field verbatim — same key, same address, same reason:
+
+      confirm("scm-s2/ms-b-shard-3-0", "10.233.65.21") ok = false ("confirm-failed"), want true
+
+  The fixture is the t3e shape: two sites that BOTH host `ms-b-shard-3-0` at different
+  addresses, so the row *"a same-named pod in another site does not confirm this address"*
+  is what makes the routing load-bearing rather than cosmetic.
+  `TestMultiSiteConfirmPodIPRefusesATerminatingPod` was RED too (LR-043's regression-section
+  clause, reached through the shared predicate). `TestSingleSiteConfirmPodIPIsUnchanged` and
+  LR-043's own `TestConfirmPodIP` passed throughout, which is what makes the extraction
+  provably behaviour-preserving.
+  **Mutation-checked in four directions, by RUNNING them** (the LR-056/LR-057 method note:
+  a mutation check written from inspection is a claim):
+
+  | mutant | failed |
+  |---|---|
+  | always confirm | 3 rows — the two attribution rows plus terminating |
+  | strip the prefix, ask whatever reader is at hand (*the tempting wrong fix*) | both `unknown-site` rows, and it answers **`ip-changed` about the wrong pod** |
+  | `siteReaderLookup` returns an empty map | `TestSiteReaderLookupMapsEveryResolvedSite` |
+  | `UncachedReader()` returns the cache-backed client | `TestRemoteSiteClientUncachedReaderIsNotTheCachedClient` |
+
+  The last two tests are **green from birth and disclosed as such** — they pin wiring rather
+  than drive new decisions — and each guards a regression that would silently restore the
+  stall (an empty lookup makes *every* key unattributable) or silently hollow the guard.
+- **Stop condition (LR-048's K2b) verified: no existing decision-table row's inputs or
+  expected verdict was edited.** The only edits to existing tests are the two `SiteClient`
+  fakes gaining `UncachedReader()` and the mechanical `secretReader` → `hubReader` rename —
+  LR-053's precedent for adapting a renamed symbol.
+
+- **Regresses:** nothing single-site — same function, same reader, passed as the parameter,
+  and LR-043's table is untouched and green. No gate, cadence, requeue interval, status
+  field, condition, event, RBAC or Redis round trip changed. The cost is one extra uncached
+  GET per MEET candidate, only while partitioned — the single-site cost, per site. Sentinel,
+  failover and standalone are not reached. `cluster_migration.go`'s confirm is **not**
+  reachable in multi-site (`migrateLegacyCluster` runs after the multi-site branch returns
+  at `reconcileCluster:66`) and is unchanged.
+
+- **NOT closed, recorded rather than folded in.**
+    - **`bootstrapMultiSiteCluster`'s own MEET is unguarded** (`site_cluster_reconcile.go`)
+      — it reads pods through the site's *cached* client behind a revision gate, i.e. the
+      pre-LR-043 shape, in the mode that most needs the guard. It is the same guard missing
+      from the same mode, and it should be next; it is deliberately not folded in here
+      because it is a **widening** with the opposite failure direction and needs its own red.
+      `BACKLOG.md`.
+    - **No e2e.** The live confirmation is one `LABEL_FILTER='multisite'` run; the unit tier
+      pins the decision deterministically, which is where it is decidable, but the failure
+      mode of the *fix* is over-suppression and unit tests cannot prove its absence.
+    - **Sequencing finding:** this makes multi-site form a cluster for the first time on this
+      line, which makes the ADR-017/LR-047 gap recorded under **LR-026** reachable for the
+      first time — multi-site shard rollouts pass `partition=nil` and are not state-gated.
+      Nothing could roll while nothing could form. That should be ruled on before a
+      multi-site instance is trusted with data.
+
+- **Impacts:** **LR-043** (its guard, its reader discipline, and its correction's asymmetry —
+  *a deny of a legitimate own node is a permanent stall* — which is this entry); **LR-053**
+  (the same R5 split one layer up, and its *"no address set can hold an address whose object
+  no longer exists"* neighbour); **LR-045** (why the predicate is shared); **LR-027** (the
+  site-qualified key's other consumers, which were correct); **LR-034** (`hubReader`'s
+  original rationale); **LR-026** (the sequencing finding); `docs/MULTI_SITE_DESIGN.md` §8,
+  `CLAUDE.md` pillar 3.4, `BACKLOG.md`.

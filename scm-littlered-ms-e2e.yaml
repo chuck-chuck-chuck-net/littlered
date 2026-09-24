@@ -1,0 +1,29 @@
+# Multi-site e2e config for the scm lab — replaces the MS_* env vars.
+# Usage:
+#   make test-e2e SKIP_KIND_SETUP=true SKIP_OPERATOR_DEPLOY=true KUBECONTEXT=scm-cp \
+#     LABEL_FILTER='multisite' MS_CONFIG=$HOME/Downloads/scm-littlered-ms-e2e.yaml
+hubContext: scm-cp
+operatorNamespace: littlered-system
+hubPodCIDR: "10.233.224.0/19"          # Scenario B (hub-blind cut) denies this
+sites:
+  - name: scm-s1
+    context: scm-s1
+    endpoint: https://10.2.1.10:6443    # site API URL routable FROM HUB PODS
+    vms:                                # Scenario A whole-site kill inventory
+      - {name: scm-s1-node1, uri: qemu+ssh://dominik@bento/system}
+      - {name: scm-s1-node2, uri: qemu+ssh://dominik@bento/system}
+      - {name: scm-s1-node3, uri: qemu+ssh://dominik@bento/system}
+  - name: scm-s2
+    context: scm-s2
+    endpoint: https://10.2.2.10:6443
+    vms:
+      - {name: scm-s2-node1, uri: qemu+ssh://dominik@t3e/system}
+      - {name: scm-s2-node2, uri: qemu+ssh://dominik@t3e/system}
+      - {name: scm-s2-node3, uri: qemu+ssh://dominik@t3e/system}
+  - name: scm-s3
+    context: scm-s3
+    endpoint: https://10.2.3.10:6443
+    vms:
+      - {name: scm-s3-node1, uri: qemu+ssh://dominik@t3e/system}
+      - {name: scm-s3-node2, uri: qemu+ssh://dominik@t3e/system}
+      - {name: scm-s3-node3, uri: qemu+ssh://dominik@t3e/system}

@@ -63,7 +63,13 @@ type siteClientRegistry struct {
 	hubScheme *runtime.Scheme
 	events    chan event.GenericEvent
 
-	// secretReader reads the site kubeconfig Secrets from the operator's OWN
+	// hubReader is the hub's UNCACHED reader (the manager's APIReader). It answers
+	// one question — "read this object from the hub, bypassing the cache" — for two
+	// callers, and they are one question rather than two: the site kubeconfig
+	// Secrets, and (through hubSiteClient.UncachedReader) LR-043's MEET address
+	// confirmation for a hub-local site.
+	//
+	// It reads the site kubeconfig Secrets from the operator's OWN
 	// namespace. It is the manager's APIReader — uncached, and deliberately NOT
 	// hubClient: under ADR-014 namespace scoping the manager's client is
 	// cache-backed for every type including Secrets, and its cache holds exactly
@@ -83,7 +89,7 @@ type siteClientRegistry struct {
 	// secrets there (charts/littlered: the allow-mode `-site-secrets` Role),
 	// where a cache would need `list`+`watch` and would hold every Secret of that
 	// namespace in memory.
-	secretReader client.Reader
+	hubReader client.Reader
 
 	// operatorNamespace resolves the namespace holding the site kubeconfig
 	// Secrets (the operator's own namespace). Injectable for tests.
@@ -94,12 +100,12 @@ type siteClientRegistry struct {
 	entries map[siteKey]*siteEntry
 }
 
-// newSiteClientRegistry builds the production registry. secretReader must be an
+// newSiteClientRegistry builds the production registry. hubReader must be an
 // UNCACHED reader (the manager's APIReader) — see the field comment.
-func newSiteClientRegistry(hubClient client.Client, secretReader client.Reader, scheme *runtime.Scheme, events chan event.GenericEvent) *siteClientRegistry {
+func newSiteClientRegistry(hubClient client.Client, hubReader client.Reader, scheme *runtime.Scheme, events chan event.GenericEvent) *siteClientRegistry {
 	return &siteClientRegistry{
 		hubClient:         hubClient,
-		secretReader:      secretReader,
+		hubReader:         hubReader,
 		hubScheme:         scheme,
 		events:            events,
 		operatorNamespace: detectOperatorNamespace,
@@ -125,7 +131,7 @@ func (reg *siteClientRegistry) siteClient(ctx context.Context, lr *littleredv1al
 			return e.client, nil
 		}
 		reg.replaceLocked(key, &siteEntry{
-			client: &hubSiteClient{name: site.Name, client: reg.hubClient, scheme: reg.hubScheme},
+			client: &hubSiteClient{name: site.Name, client: reg.hubClient, uncached: reg.hubReader, scheme: reg.hubScheme},
 		})
 		return reg.entries[key].client, nil
 	}
@@ -141,7 +147,7 @@ func (reg *siteClientRegistry) siteClient(ctx context.Context, lr *littleredv1al
 	}
 
 	secret := &corev1.Secret{}
-	if err := reg.secretReader.Get(ctx, types.NamespacedName{Namespace: opNS, Name: site.KubeconfigSecretRef.Name}, secret); err != nil {
+	if err := reg.hubReader.Get(ctx, types.NamespacedName{Namespace: opNS, Name: site.KubeconfigSecretRef.Name}, secret); err != nil {
 		return nil, siteConfigFault(site.Name, siteFaultSecretUnreadable,
 			fmt.Errorf("reading kubeconfig secret %s/%s: %w", opNS, site.KubeconfigSecretRef.Name, err))
 	}

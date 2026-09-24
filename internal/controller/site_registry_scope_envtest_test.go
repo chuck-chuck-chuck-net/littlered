@@ -158,11 +158,11 @@ var _ = Describe("site kubeconfig Secret read under a scoped cache (envtest)", f
 		r := &LittleRedReconciler{Client: mgr.GetClient(), Scheme: mgr.GetScheme()}
 		Expect(r.SetupWithManager(mgr)).To(Succeed())
 		Expect(r.sites).NotTo(BeNil())
-		Expect(r.sites.secretReader).NotTo(BeNil(), "SetupWithManager must supply an uncached secret reader")
+		Expect(r.sites.hubReader).NotTo(BeNil(), "SetupWithManager must supply an uncached secret reader")
 
 		// The out-of-scope read succeeds — which a cache-backed client cannot do.
 		got := &corev1.Secret{}
-		Expect(r.sites.secretReader.Get(ctx, types.NamespacedName{Namespace: opNS, Name: secretName}, got)).
+		Expect(r.sites.hubReader.Get(ctx, types.NamespacedName{Namespace: opNS, Name: secretName}, got)).
 			To(Succeed(), "the wired reader must reach the operator's own namespace, outside the watch scope")
 		Expect(got.Data).To(HaveKey(siteKubeconfigSecretKey))
 	})

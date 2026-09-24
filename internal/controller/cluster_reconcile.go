@@ -180,7 +180,7 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 			"masters", gt.CountMasters(),
 			"allNodesView", len(gt.AllNodeIDs))
 		// Single-site: one implicit always-observable "site", so ghost FORGET is always safe.
-		return r.repairCluster(ctx, littleRed, gt, true)
+		return r.repairCluster(ctx, littleRed, gt, true, r.confirmPodIP)
 	}
 
 	// 5. Cluster is healthy and stable — pass gt through to avoid a second gather
@@ -195,8 +195,13 @@ func (r *LittleRedReconciler) reconcileCluster(ctx context.Context, littleRed *l
 // Quorum-loss/orphan TAKEOVER is additionally gated on repairMayForceTakeover(littleRed): in
 // multi-site the fence-gated recoverSiteLoss is the sole takeover authority (ADR-012).
 //
+// confirm answers "is this address still the IP of the pod this key names?" for the
+// deployment shape the caller is in — see podIPConfirmer. It is a parameter for the same
+// reason forgetSafe is: the repair loop is shared, and only the caller knows which API
+// server owns a key (LR-063).
+//
 //nolint:gocyclo
-func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, forgetSafe bool) (ctrl.Result, error) {
+func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *littleredv1alpha1.LittleRed, gt *redisclient.ClusterGroundTruth, forgetSafe bool, confirm podIPConfirmer) (ctrl.Result, error) {
 	log := r.getLogger(ctx, littleRed, LogCategoryRecon)
 	fast, _ := littleRed.GetRequeueIntervals()
 
@@ -392,7 +397,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		// is where the whole hazard originates; one uncached pod GET per MEET candidate
 		// answers "is this still OUR live pod's address, right now" exactly, instead of
 		// inferring it from Redis-side state. MEET path only — never the steady loop.
-		if ok, why := r.confirmPodIP(ctx, littleRed.Namespace, plan.Seed.PodName, plan.Seed.PodIP); !ok {
+		if ok, why := confirm(ctx, littleRed.Namespace, plan.Seed.PodName, plan.Seed.PodIP); !ok {
 			auditLog.Info("Skipping partition healing: MEET seed address is no longer confirmed as this pod's",
 				"pod", plan.Seed.PodName, "seed", plan.Seed.PodIP, "reason", why)
 			return ctrl.Result{RequeueAfter: fast}, nil
@@ -403,7 +408,7 @@ func (r *LittleRedReconciler) repairCluster(ctx context.Context, littleRed *litt
 		}
 		seedAddr := fmt.Sprintf("%s:%d", plan.Seed.PodIP, littleredv1alpha1.RedisPort)
 		for _, node := range plan.Targets {
-			if ok, why := r.confirmPodIP(ctx, littleRed.Namespace, node.PodName, node.PodIP); !ok {
+			if ok, why := confirm(ctx, littleRed.Namespace, node.PodName, node.PodIP); !ok {
 				auditLog.Info("Skipping CLUSTER MEET: address is no longer confirmed as this pod's",
 					"pod", node.PodName, "target", node.PodIP, "reason", why)
 				continue
@@ -678,7 +683,26 @@ const (
 	// is what makes confirmPodIP strong enough to be the sole authority on ownership.
 	// See the regression section of changelog LR-043.
 	podIPTerminating = "pod-terminating"
+	// podIPUnknownSite: multi-site only. The ground truth is keyed by siteQualifiedKey
+	// ("<site>/<objName>") because the bare object name names a DIFFERENT pod in every
+	// hosting site, so an address whose key names no resolvable site cannot be confirmed
+	// at all. It is refused rather than being confirmed against whichever API server
+	// happens to be at hand: asking the wrong cluster about a colliding name is how a
+	// foreign pod's address gets confirmed, which is the merge LR-043 exists to prevent.
+	// See changelog LR-063.
+	podIPUnknownSite = "unknown-site"
 )
+
+// podIPConfirmer answers LR-043's question — "is this address STILL the IP of the pod we
+// think it is, right now, per the API server that owns it?" — for one deployment shape.
+// repairCluster takes it as a parameter for the same reason it takes forgetSafe: the
+// repair loop is shared between single-site and multi-site, and only the caller knows
+// which API server owns a given key.
+//
+// podKey is the operator's ground-truth key for the node. In single-site that IS the
+// Kubernetes object name; in multi-site it is siteQualifiedKey(site, objName), and the
+// two must not be confused — that conflation is LR-063.
+type podIPConfirmer func(ctx context.Context, namespace, podKey, ip string) (bool, string)
 
 // apiReader returns the uncached reader for the MEET paths, falling back to the cached
 // Client when APIReader was not wired. The only production construction site
@@ -706,12 +730,32 @@ func (r *LittleRedReconciler) apiReader() client.Reader {
 // because this check denies a TERMINATING pod, which is the sole window in which the pod
 // object can name an address the CNI has handed on. See changelog LR-043, regression
 // section.
+//
+// TRANSPORT PRECONDITION, stated because nothing else states it: this guard compares
+// pod.Status.PodIP, which is the address Redis announces only under the pod-routed
+// transport — the sole value spec.multiSite.network.mode accepts today. Under a future
+// nodeport transport the announced address is nodeIP:port and is not in pod status at
+// all; under multus it is a secondary-network address that pod status does not report
+// either. Either one would make this comparison answer about the wrong address, so the
+// guard must be re-derived before that enum grows a value. See changelog LR-063.
 func (r *LittleRedReconciler) confirmPodIP(ctx context.Context, namespace, podName, ip string) (bool, string) {
 	if podName == "" || ip == "" {
 		return false, podIPUnknown
 	}
 	pod := &corev1.Pod{}
-	if err := r.apiReader().Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod); err != nil {
+	err := r.apiReader().Get(ctx, types.NamespacedName{Name: podName, Namespace: namespace}, pod)
+	return podIPVerdict(pod, err, ip)
+}
+
+// podIPVerdict is the shared decision behind every confirmer: given what one API server
+// said about one pod, may this address be introduced to the cluster?
+//
+// It is one function, called by both the single-site and the multi-site confirmer,
+// deliberately. A duplicated predicate is literally how LR-045 happened, and the reason
+// vocabulary here IS an operational surface (it is what the audit line names), so two
+// copies would drift in what the operator says as well as in what it does.
+func podIPVerdict(pod *corev1.Pod, err error, ip string) (bool, string) {
+	if err != nil {
 		if apierrors.IsNotFound(err) {
 			return false, podIPGone
 		}

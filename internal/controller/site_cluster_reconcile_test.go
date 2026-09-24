@@ -96,9 +96,15 @@ type recordingSiteClient struct {
 	deleted      []string // pod names deleted
 }
 
-func (f *recordingSiteClient) Name() string                               { return f.name }
-func (f *recordingSiteClient) IsHubLocal() bool                           { return false }
-func (f *recordingSiteClient) Stop()                                      {}
+func (f *recordingSiteClient) Name() string     { return f.name }
+func (f *recordingSiteClient) IsHubLocal() bool { return false }
+func (f *recordingSiteClient) Stop()            {}
+
+// UncachedReader: the MEET-confirmation reader (LR-063). These fakes drive paths
+// that issue no CLUSTER MEET, so nil is the honest answer — multiSiteConfirmPodIP
+// refuses a nil reader rather than falling back to another site.
+func (f *recordingSiteClient) UncachedReader() client.Reader { return nil }
+
 func (f *recordingSiteClient) Gatherer(string, bool) redisclient.Gatherer { return nil }
 
 func (f *recordingSiteClient) errIfDown() error {
