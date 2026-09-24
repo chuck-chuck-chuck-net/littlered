@@ -5201,3 +5201,102 @@ ADR-020.
   site-qualified key's other consumers, which were correct); **LR-034** (`hubReader`'s
   original rationale); **LR-026** (the sequencing finding); `docs/MULTI_SITE_DESIGN.md` §8,
   `CLAUDE.md` pillar 3.4, `BACKLOG.md`.
+
+---
+
+## [LR-064] `spec.auth` + Multi-Site: the Password Secret Must Exist at Every Site, and Nothing Says So
+
+- **Date:** 2026-09-24
+- **Commit:** (pending) — branch `feat/multi-site-rebuild`.
+- **ID note:** the highest ID visible on **any** branch, local or remote, was LR-063 (this
+  branch's own). Allocated with the LR-039 cross-branch loop over every branch.
+- **Status: CONFIRMED ON A LAB, NOT FIXED.** Reproduced and then closed again by a
+  one-variable change on t3e (2026-09-24), hub `scm-cp` + sites `scm-s1`/`scm-s2`. Found by
+  comparing littlered's multi-site bootstrap against the sibling project **slaptain**, which
+  has the same constraint and a script for it (`mesh-share-credentials.sh`,
+  `docs/MULTI-SITE.md`).
+- **Not a data defect and not a reconciliation defect.** Nothing is lost and no rule
+  misbehaves — the instance simply never starts. It is recorded here because the *diagnosis*
+  is the defect: the one signal that names the cause is on a spoke site's kubelet, and the
+  operator, the CR and `lrctl` all report something else.
+
+- **The finding, in one sentence: `spec.auth.existingSecret` names a Secret the POD resolves
+  in its OWN namespace, so in multi-site it must exist in the instance namespace at EVERY
+  site — the operator neither creates it, copies it, checks for it, nor mentions it, and no
+  document asks for it.**
+
+- **Mechanism, and every piece is individually correct.** `buildRedisContainer` injects the
+  password as `SecretKeyRef{Name: spec.auth.existingSecret, Key: "password"}`, which is a
+  `LocalObjectReference` — resolved by the kubelet in the pod's own namespace. The OPERATOR
+  reads the same Secret via `getRedisPassword`, from `littleRed.Namespace` on the **hub**,
+  where the CR is. So the operator authenticates to Redis perfectly well while the pods
+  cannot start. `ensureMultiSiteClusterResources` applies the ConfigMap, both Services, the
+  PDBs and the StatefulSets to each site — and **no Secret**; there is no `build*Secret` in
+  the tree at all, because `existingSecret` means the user supplies it.
+
+- **Measured (t3e, 2026-09-24).** Auth Secret created on the hub only — the natural place,
+  since that is where the CR lives — then a `shards: 3`, `sitesPerShard: 2`,
+  `replicasPerShard: 0` instance over two sites, onboarded with the supported
+  `lrctl multisite setup-site`:
+
+  | | |
+  |---|---|
+  | pods, both sites | **6/6 `CreateContainerConfigError`**, indefinitely |
+  | the kubelet, on a spoke | `spec.containers{redis}: Error: secret "redis-auth" not found` |
+  | the CR | `phase: Pending`, `Ready=False/ClusterNotReady: Waiting for the stretched cluster to be healthy across sites` |
+  | `status.multiSite.sites[]` | `reachable: true`, `pods {ready: 0, total: 3}` |
+  | `lrctl status` | `scm-s1: reachable, pods 0/3 Ready` |
+  | `MultiSiteConfigInvalid` | **False** — "Every site's configuration is readable" |
+
+  **One-variable confirmation**: creating that same Secret in the two sites' namespaces and
+  changing nothing else took the instance to `Running`, **16384/16384 slots**, all three
+  shards cross-site, with auth enabled. So the feature works; the precondition is unstated.
+  (Run as a one-variable experiment rather than reasoned from the code — LR-054's rule.)
+
+- **Why the reporting is the defect.** Every surface the product offers says "pods are not
+  ready", which is true of a scheduling problem, an image pull, a crash loop and this. The
+  distinguishing evidence exists only as an event on a pod in a **different Kubernetes
+  cluster** — which is precisely the lookup the three `lrctl` gather tiers were built to
+  spare an operator. And this state **never heals on its own**, which is LR-034's whole
+  distinction: *"an unreachable site may heal itself, 'I cannot read my own configuration'
+  never will — so conflating them makes the actionable alert impossible to write."* This is
+  that class, one namespace over: not hub-local, but equally permanent.
+
+- **The sibling project has the same constraint and treats it as a first-class bootstrap
+  step.** slaptain's `<database>-credentials` Secret *"must be identical at every site … the
+  chart never generates one"*, and `mesh-share-credentials.sh` exists specifically to make
+  that true by construction, because getting it wrong fails replication with `err=49` — an
+  error that *"sends you looking at TLS and firewalls"*. Same shape, same reason, and the
+  comparison is what surfaced this.
+
+- **Proposed fix — DETECT and DOCUMENT; do not distribute.** Recorded as a recommendation,
+  not implemented.
+    1. **The operator must not copy the Secret to the sites.** It would mean carrying a
+       credential across a Kubernetes cluster boundary on the operator's own authority, and
+       it needs RBAC the design deliberately withholds: the per-site Role grants `secrets:
+       [get, list, watch]` — **read only** (`siteRoleRules`). Distribution would need
+       `create`/`patch` at every site, widening the one credential whose scope ADR-012 keeps
+       *"fully namespaced"*. slaptain reaches the same conclusion from the other side.
+    2. **Detection is free and needs no new grant**, precisely because `get` is already
+       there: with `spec.auth.enabled`, check that `spec.auth.existingSecret` exists in the
+       instance namespace at every reachable site, and report a missing one on the existing
+       `MultiSiteConfigInvalid` condition with its own reason. That is LR-034/LR-035's
+       classification work applied to a site-local rather than a hub-local fault, and the
+       precedent settles the polarity: a state that never heals unattended must be named, and
+       an unreadable site must not be reported as a missing Secret (the read failing is
+       unreachability, not absence — LR-051's *"unreachability must carry why"* in a third
+       place).
+    3. **Document it in the multi-site bring-up**, beside the kubeconfig Secrets, which are
+       the only Secrets those docs currently mention.
+- **Not covered, which is why it survived.** **Every multi-site e2e tier is auth-free** —
+  `spec.auth` appears in no multi-site fixture — so nothing has ever stood up a stretched
+  instance with auth on. The cheap guard is one tier that does, and it does not need a
+  disruption: the instance either reaches `Running` or it does not.
+
+- **Regresses:** nothing — no production code changed in this entry.
+- **Impacts:** **LR-034** / **LR-035** (the configuration-vs-reachability classification this
+  extends to a site-local fault, and the polarity rule it must respect); **LR-051**
+  (unreadable evidence is never a finding); **ADR-012** §7 (the per-site Role's deliberately
+  namespaced, read-only `secrets` grant is what makes detection free and distribution a
+  design change); `docs/MULTI_SITE_DESIGN.md` §7, `docs/USAGE.md` (multi-site bring-up),
+  `BACKLOG.md`. Found by comparison with **slaptain** `docs/MULTI-SITE.md`.
