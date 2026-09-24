@@ -1,6 +1,4 @@
-//go:build e2e
-
-package e2e
+package mesh
 
 import (
 	"os"
@@ -14,7 +12,7 @@ func TestMeshSampleIsValid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading mesh.yaml.sample: %v", err)
 	}
-	c, err := parseMeshConfig(data)
+	c, err := Parse(data)
 	if err != nil {
 		t.Fatalf("mesh.yaml.sample does not parse: %v", err)
 	}

@@ -1,5 +1,3 @@
-//go:build e2e
-
 /*
 Copyright 2026 The littlered Authors.
 
@@ -16,11 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-package e2e
+package mesh
 
 import (
 	"strings"
 	"testing"
+)
+
+const (
+	siteHub = "scm-cp"
+	siteOne = "scm-s1"
 )
 
 // The mesh inventory is a SHARED format with the sibling project slaptain
@@ -39,7 +42,7 @@ func TestParseMeshConfigSharedFormat(t *testing.T) {
 		name    string
 		yaml    string
 		wantErr string // substring; empty means it must parse
-		check   func(t *testing.T, c *msConfig)
+		check   func(t *testing.T, c *Inventory)
 	}{
 		{
 			name: "the hub is a site with a role, not a top-level field",
@@ -55,9 +58,9 @@ sites:
 littlered:
   operatorNamespace: littlered-system
 `,
-			check: func(t *testing.T, c *msConfig) {
-				if got := c.HubContext(); got != "scm-cp" {
-					t.Errorf("HubContext() = %q, want %q", got, "scm-cp")
+			check: func(t *testing.T, c *Inventory) {
+				if got := c.HubContext(); got != siteHub {
+					t.Errorf("HubContext() = %q, want %q", got, siteHub)
 				}
 				if got := c.HubPodCIDR(); got != "10.233.224.0/19" {
 					t.Errorf("HubPodCIDR() = %q, want the hub site's podCIDR", got)
@@ -66,7 +69,7 @@ littlered:
 					t.Errorf("OperatorNamespace() = %q", got)
 				}
 				ws := c.WorkloadSites()
-				if len(ws) != 1 || ws[0].Name != "scm-s1" {
+				if len(ws) != 1 || ws[0].Name != siteOne {
 					t.Errorf("WorkloadSites() = %+v, want just scm-s1 (the hub-only site is not a workload site)", ws)
 				}
 			},
@@ -91,7 +94,7 @@ sites:
     context: site-b
     endpoint: https://192.0.2.20:6443
 `,
-			check: func(t *testing.T, c *msConfig) {
+			check: func(t *testing.T, c *Inventory) {
 				if len(c.WorkloadSites()) != 2 {
 					t.Errorf("WorkloadSites() = %d, want 2: a site with no roles is a workload site", len(c.WorkloadSites()))
 				}
@@ -117,11 +120,11 @@ sites:
     context: scm-s1
     endpoint: https://10.2.1.10:6443
 `,
-			check: func(t *testing.T, c *msConfig) {
-				if c.HubContext() != "scm-cp" {
+			check: func(t *testing.T, c *Inventory) {
+				if c.HubContext() != siteHub {
 					t.Errorf("HubContext() = %q", c.HubContext())
 				}
-				names := []string{}
+				names := make([]string, 0, len(c.WorkloadSites()))
 				for _, s := range c.WorkloadSites() {
 					names = append(names, s.Name)
 				}
@@ -191,7 +194,7 @@ sites:
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			c, err := parseMeshConfig([]byte(tc.yaml))
+			c, err := Parse([]byte(tc.yaml))
 			if err == nil && c != nil && tc.wantErr != "" {
 				err = c.ValidateForLittleRed()
 			}

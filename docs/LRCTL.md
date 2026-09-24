@@ -559,6 +559,37 @@ only), `[FAIL]` (any FAIL finding, non-zero exit).
 
 ## Multi-Site Clusters
 
+### `derive-topology` — generate `spec.multiSite` from the mesh inventory
+
+```bash
+lrctl multisite derive-topology --from-mesh mesh.yaml \
+    --sites-per-shard 2 --shards 4 --name cache -n prod > cache.yaml
+```
+
+Reads the **mesh inventory** (`mesh.yaml.sample`; `--from-mesh`, else `$E2E_CONFIG`, else
+`$MS_CONFIG`) and emits an appliable `LittleRed`, or just the `spec.multiSite` block with
+`--fragment`. The manifest goes to **stdout** and the report to **stderr**, so `> file`
+yields something you can apply.
+
+**Why generate it rather than write it.** A site's *position* in `spec.multiSite.sites` is
+its placement index — shard K lives in sites `(K+j) mod S` — and the topology is **immutable
+after create**. So a reordered or mistyped list is not an edit away from correct: it is a
+delete and recreate, which with EmptyDir storage is the data. See LR-032/LR-033.
+
+It derives only **facts about the lab** — which clusters exist, in what order, and which hub
+Secret holds each one's kubeconfig (hub-local sites correctly get *no* `kubeconfigSecretRef`,
+since that absence is what marks them hub-local). The **choices** are yours and are refused
+rather than guessed: `--sites-per-shard` has no default, exactly as the CRD refuses to default
+it, because it is the copy factor of an in-memory store and every candidate default is wrong
+for somebody.
+
+The report on stderr carries the two things a reader cannot get from the CR: where each shard
+lands, and what the topology survives (ADR-012 D2's two thresholds). A topology that cannot
+auto-survive an arbitrary single-site loss — which, given Redis Cluster's three-master
+minimum, is exactly **two sites with an odd shard count** — is marked `[WARN]` and names the
+`ReducedSiteLossResilience` condition the operator will raise for it.
+
+
 For a **stretched (multi-site) cluster** (`spec.multiSite`, managed hub-and-spokes by one
 operator — see `docs/MULTI_SITE_DESIGN.md`), the read verbs (`status`, `verify`, `inspect`,
 `debug-dump`) are **site-aware automatically**: they detect `spec.multiSite` on the CR and

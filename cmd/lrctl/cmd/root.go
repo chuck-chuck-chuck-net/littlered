@@ -26,7 +26,8 @@ const (
 	valueNone         = "<none>"
 	// tokenOK is the success marker the verify verbs print; named because both the
 	// renderers and their tests assert on it.
-	tokenOK = "[OK]"
+	tokenOK   = "[OK]"
+	tokenWarn = "[WARN]"
 
 	// nsDefault is the "default" namespace literal, named once for the render tests.
 	nsDefault = "default"

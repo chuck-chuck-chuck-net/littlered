@@ -55,6 +55,31 @@ func TestBalanceArithmeticDriftGuard(t *testing.T) {
 	}
 }
 
+// TestPlacementDriftGuard is the same guard for the PLACEMENT rule, which lrctl mirrors so
+// `multisite derive-topology` can print where each shard lands (LR-033: a site's position in
+// the list IS its placement index, and the list is immutable after create — so the generated
+// CR and the operator must agree about the rule, or the tool would document a topology the
+// operator does not build).
+func TestPlacementDriftGuard(t *testing.T) {
+	for numSites := 1; numSites <= 6; numSites++ {
+		for sps := 1; sps <= 6; sps++ {
+			for k := range 15 {
+				got, want := climultisite.SitesForShard(k, numSites, sps), sitesForShard(k, numSites, sps)
+				if len(got) != len(want) {
+					t.Fatalf("SitesForShard drift at shard=%d sites=%d sps=%d: cli=%v controller=%v",
+						k, numSites, sps, got, want)
+				}
+				for i := range got {
+					if got[i] != want[i] {
+						t.Fatalf("SitesForShard drift at shard=%d sites=%d sps=%d: cli=%v controller=%v",
+							k, numSites, sps, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestBalanceThresholds locks the two ADR-012 D2 thresholds. The NATIVE TARGET ceil(K/2)-1 is
 // the bound for the survivors keeping quorum (Redis elects on its own); the TAKEOVER FLOOR
 // floor(K/2) is the bound for the LOST side lacking quorum (the survivors hold a blocking

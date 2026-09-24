@@ -177,7 +177,7 @@ func verifyMultiSiteFromStatus(lr *littleredv1alpha1.LittleRed) error {
 	for _, r := range v.Reasons {
 		marker := "[FAIL]"
 		if strings.Contains(r, "link:down") {
-			marker = "[WARN]"
+			marker = tokenWarn
 		}
 		fmt.Printf("  %s %s\n", marker, r)
 	}

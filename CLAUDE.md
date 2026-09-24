@@ -247,6 +247,7 @@ internal/controller/        # Core Reconciliation Logic
   ├── site_cross_view.go      # Published tier-1 cross-site status view (buildCrossSiteView, incl. master-per-site MasterCounts)
   ├── site_gather_oneshot.go  # Operator `--gather` one-shot mode (lrctl tier-2 hub Job)
   └── repair_guards.go        # Pure repairMayForceTakeover / ghostForgetPlan (sole-authority gating)
+internal/mesh/              # Shared lab/mesh inventory (the sites file; format shared with slaptain)
 internal/multisitegather/   # Wire types for the tier-2 one-shot gather result (JSON round-trip)
 internal/redis/             # Redis/Cluster API clients
   ├── client.go               # Sentinel client wrapper

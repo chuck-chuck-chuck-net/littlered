@@ -32,8 +32,7 @@ import (
 var opNow = time.Date(2026, 9, 1, 12, 0, 0, 0, time.UTC)
 
 const (
-	tokenWarn = "[WARN]"
-	opName    = "SentinelMasterNameRename"
+	opName = "SentinelMasterNameRename"
 
 	// phaseRunning is the CR phase, unrelated to the operation reason of the same value.
 	phaseRunning = "Running"
