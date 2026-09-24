@@ -115,75 +115,10 @@ var _ = Describe("Cluster Mode Chaos Testing", Label("cluster"), Ordered, func()
 			currentCRName = ""
 		})
 
+		// Master-pod-failure recovery now lives in the shared, topology-agnostic
+		// clusterBehaviourSpecs (cluster_behaviour_test.go), run under both single-site and
+		// multi-site. This loop keeps the SINGLE-SITE-ONLY replica-failure scenario.
 		for _, mode := range restartModes {
-			mode := mode // capture range variable
-
-			It(fmt.Sprintf("should maintain high availability during master failure (%s)", mode.Name), func() {
-				crName := fmt.Sprintf("chaos-cluster-master-%s", mode.Name)
-				currentCRName = crName
-				totalNodes := clusterTotalNodes(clusterReplicasPerShard)
-				const testDuration = 60 * time.Second
-
-				AddReportEntry("cr:" + crName)
-				By(fmt.Sprintf("creating a %d-shard cluster with %d replica(s) per shard",
-					clusterShards, clusterReplicasPerShard))
-				cr := clusterCR(crName, clusterReplicasPerShard, "", "")
-				cmd := exec.Command("kubectl", "apply", "-f", "-")
-				cmd.Stdin = strings.NewReader(cr)
-				_, err := utils.Run(cmd)
-				Expect(err).NotTo(HaveOccurred())
-
-				By("deploying chaos client pod simultaneously")
-				chaosPodName, err := deployChaosClient(testNamespace, "master-"+mode.Name, crName+":6379", "chaos-master", true, testDuration)
-				Expect(err).NotTo(HaveOccurred())
-				AddReportEntry("chaos:" + chaosPodName)
-				defer func() {
-					if debugOnFailure && suiteOrSpecFailed() {
-						return
-					}
-					deleteChaosClient(testNamespace, chaosPodName)
-				}()
-
-				By("waiting for cluster to be ready and ok")
-				Eventually(func(g Gomega) {
-					cmd := exec.Command("kubectl", "get", "littlered", crName,
-						"-n", testNamespace, "-o", "jsonpath={.status.phase}")
-					output, err := utils.Run(cmd)
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(output).To(Equal("Running"))
-
-					cmd = exec.Command("kubectl", "exec", clusterMasterPod(crName, 0),
-						"-n", testNamespace, "-c", "redis", "--",
-						"redis-cli", "CLUSTER", "INFO")
-					output, err = utils.Run(cmd)
-					g.Expect(err).NotTo(HaveOccurred())
-					g.Expect(output).To(ContainSubstring("cluster_state:ok"))
-				}, 5*time.Minute, 5*time.Second).Should(Succeed())
-
-				By("waiting 10 seconds for baseline traffic")
-				time.Sleep(10 * time.Second)
-
-				victimPod := clusterMasterPod(crName, 0)
-				victimNodeID, _ := getPodNodeID(testNamespace, victimPod)
-
-				By(fmt.Sprintf("deleting master pod %s (%s)", victimPod, mode.Name))
-				_, err = deletePodMode(testNamespace, victimPod, mode.Graceful)
-				Expect(err).NotTo(HaveOccurred())
-
-				// Wait for cluster to detect failure via shard-1's master (a surviving node in another shard)
-				waitForClusterFailureDetected(testNamespace, crName, clusterMasterPod(crName, 1), totalNodes, []string{victimNodeID})
-
-				err = waitForChaosClientComplete(testNamespace, chaosPodName, testDuration+2*time.Minute)
-				Expect(err).NotTo(HaveOccurred())
-
-				metrics, err := getChaosClientMetrics(testNamespace, chaosPodName)
-				Expect(err).NotTo(HaveOccurred())
-				GinkgoWriter.Printf("Master Failure Availability (%s): %.2f%%\n", mode.Name, metrics.WriteAvailability()*100)
-
-				Expect(metrics.DataCorruptions).To(Equal(int64(0)))
-				Expect(metrics.WriteAvailability()).To(BeNumerically(">=", 0.80))
-			})
-
 			It(fmt.Sprintf("should maintain 100%% availability during replica failure (%s)", mode.Name), func() {
 				crName := fmt.Sprintf("chaos-cluster-replica-%s", mode.Name)
 				currentCRName = crName

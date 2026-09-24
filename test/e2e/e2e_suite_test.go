@@ -170,16 +170,24 @@ var _ = BeforeSuite(func() {
 	// Require the namespace to not exist yet. Stale resources from a previous run
 	// (Pods, LittleRed CRs, etc.) would corrupt the tests, so we refuse to start
 	// rather than silently inheriting leftover state.
-	By("verifying test namespace " + testNamespace + " does not exist")
-	cmd := exec.Command("kubectl", "get", "ns", testNamespace)
-	_, err := utils.Run(cmd)
-	Expect(err).To(HaveOccurred(),
-		"Test namespace %q already exists — delete it first to ensure a clean slate:\n  kubectl delete ns %s",
-		testNamespace, testNamespace)
+	By("ensuring test namespace " + testNamespace + " is a clean slate")
+	if _, err := utils.Run(exec.Command("kubectl", "get", "ns", testNamespace)); err == nil {
+		// The namespace already exists. A DEBUG_ON_FAILURE run leaves it behind; multi-site runs
+		// create it but never use it (the instance lives in its own namespace). If it holds no
+		// LittleRed instance it is a harmless vestige — delete it and proceed. If it holds an
+		// instance (a single-site DEBUG_ON_FAILURE leftover under inspection) fail rather than
+		// clobber it, so a re-run does not destroy what was left for debugging.
+		insts, _ := utils.Run(exec.Command("kubectl", "-n", testNamespace, "get", "littlered", "-o", "name"))
+		Expect(strings.TrimSpace(insts)).To(BeEmpty(),
+			"Test namespace %q already exists and holds a LittleRed instance (%s) — a DEBUG_ON_FAILURE "+
+				"leftover under inspection? Delete it first to ensure a clean slate:\n  kubectl delete ns %s",
+			testNamespace, strings.TrimSpace(insts), testNamespace)
+		By("deleting the empty leftover test namespace " + testNamespace)
+		_, _ = utils.Run(exec.Command("kubectl", "delete", "ns", testNamespace, "--timeout=2m"))
+	}
 
 	By("creating test namespace " + testNamespace)
-	cmd = exec.Command("kubectl", "create", "ns", testNamespace)
-	_, err = utils.Run(cmd)
+	_, err := utils.Run(exec.Command("kubectl", "create", "ns", testNamespace))
 	Expect(err).NotTo(HaveOccurred(), "Failed to create test namespace %q", testNamespace)
 
 	// The kill-9 chaos tests launch a helper pod with hostPID:true and a
@@ -191,7 +199,7 @@ var _ = BeforeSuite(func() {
 	// the helper pod. Pin this test-only namespace to the "privileged" level so
 	// the helper is admitted regardless of the cluster default.
 	By("labeling test namespace " + testNamespace + " as pod-security privileged")
-	cmd = exec.Command("kubectl", "label", "ns", testNamespace,
+	cmd := exec.Command("kubectl", "label", "ns", testNamespace,
 		"pod-security.kubernetes.io/enforce=privileged",
 		"pod-security.kubernetes.io/warn=privileged",
 		"pod-security.kubernetes.io/audit=privileged",
@@ -218,6 +226,9 @@ var _ = BeforeEach(func() {
 	resetPreDeleteLogs()
 	// Stop any streaming log processes from the previous test
 	resetStreamingLogs()
+	// Clear any multi-site debug target published by a previous test, so a single-site spec
+	// never inherits a stale target (a multi-site spec re-publishes it via setMSDebugTarget).
+	resetMSDebugTarget()
 })
 
 var _ = AfterEach(func() {
@@ -335,22 +346,43 @@ func waitForOperator() {
 
 // pinKubeContext snapshots the effective kubeconfig into a temp file and points
 // KUBECONFIG at it. This isolates the test process from context switches in
-// other terminals.
+// other terminals — the isolation comes from the snapshot FILE, not from
+// minifying (a `use-context` in another terminal edits the original, never this
+// copy).
 //
 //   - contextName == "": pin the current active context
 //   - contextName != "": pin a specific named context
 //
-// Uses "kubectl config view --raw --flatten --minify" which produces a
+// Single-site uses "kubectl config view --raw --flatten --minify", producing a
 // self-contained kubeconfig with only the selected context/cluster/user.
+//
+// A multi-site run MUST keep the sibling site contexts (driven via
+// `kubectl --context <site>`), so it does NOT minify; it snapshots every context and
+// then forces current-context to the pinned one so ambient/hub calls still resolve.
+// "Multi-site run" is detected from the run's actual configuration, not just
+// E2E_TOPOLOGY: the takeover suite is selected by label/focus (not by E2E_TOPOLOGY) and
+// is signalled by its multi-site config — keying only on E2E_TOPOLOGY would --minify
+// away the site contexts for a `LABEL_FILTER=multisite` run.
 func pinKubeContext(contextName string) {
-	args := []string{"config", "view", "--raw", "--flatten", "--minify"}
+	// Any configured multi-site run drives sibling site contexts by name; --minify would
+	// strip them. E2E_TOPOLOGY=multi|both covers the shared behaviour matrix; the multi-site
+	// config covers the takeover suite — either the single-file MS_CONFIG or the legacy
+	// MS_SITE_CONTEXTS env var (the site contexts live inside MS_CONFIG, not in that env var,
+	// so it must be checked too, else an MS_CONFIG run gets --minify'd — the scm-s* "context
+	// does not exist" failure).
+	multiSite := topologyEnabled("multi") ||
+		os.Getenv("MS_CONFIG") != "" || os.Getenv("MS_SITE_CONTEXTS") != ""
+
+	args := []string{"config", "view", "--raw", "--flatten"}
 	label := "current"
 	if contextName != "" {
-		args = append(args, "--context", contextName)
 		label = contextName
+		if !multiSite {
+			args = append(args, "--minify", "--context", contextName)
+		}
 	}
 
-	By(fmt.Sprintf("pinning kubeconfig (context: %s)", label))
+	By(fmt.Sprintf("pinning kubeconfig (context: %s, multi-site: %v)", label, multiSite))
 
 	cmd := exec.Command("kubectl", args...)
 	raw, err := utils.Run(cmd)
@@ -363,5 +395,18 @@ func pinKubeContext(contextName string) {
 	ExpectWithOffset(1, os.WriteFile(tmpFile, []byte(raw), 0o600)).To(Succeed())
 
 	os.Setenv("KUBECONFIG", tmpFile) //nolint:errcheck
+
+	// Multi-site kept every context (no --minify), so the snapshot's current-context
+	// is whatever the source had. Force it to the pinned context so ambient (no
+	// --context) hub calls resolve. `kubectl config use-context` rewrites the file
+	// in place (atomic temp+rename), which can drop our 0600 mode — restore it.
+	if multiSite && contextName != "" {
+		_, err = utils.Run(exec.Command("kubectl", "--kubeconfig", tmpFile,
+			"config", "use-context", contextName))
+		ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+			"Failed to set current-context %q on the pinned kubeconfig", contextName)
+		ExpectWithOffset(1, os.Chmod(tmpFile, 0o600)).To(Succeed())
+	}
+
 	_, _ = fmt.Fprintf(GinkgoWriter, "Pinned KUBECONFIG to %s (context: %s)\n", tmpFile, label)
 }

@@ -99,8 +99,19 @@ func CollectDebugArtifacts(testNamespace, crName, chaosPodName string) {
 
 	_, _ = fmt.Fprintf(GinkgoWriter, "\n=== Collecting debug artifacts to %s ===\n", debugDir)
 
-	// Collect operator logs
+	// Collect operator logs (the operator runs on the hub / ambient context in both single- and
+	// multi-site, so this is collected the same way for both).
 	collectOperatorLogs(debugDir)
+
+	// Multi-site: a stretched-cluster instance lives in its own namespace with pods across the
+	// site clusters, which the single-context helpers below cannot reach. When a multi-site spec
+	// has published its target, collect the hub + per-site ground truth instead and return.
+	if activeMSDebug != nil {
+		collectMultiSiteDebugArtifacts(debugDir, activeMSDebug)
+		writeTestMetadata(debugDir, activeMSDebug.ns, activeMSDebug.crName, chaosPodName)
+		_, _ = fmt.Fprintf(GinkgoWriter, "=== Debug artifacts collected to %s ===\n\n", debugDir)
+		return
+	}
 
 	// Collect LittleRed CR status
 	if crName != "" {

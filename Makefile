@@ -165,6 +165,19 @@ else
   endif
 endif
 
+# E2E_CODEGEN_DEP defines the codegen/format prerequisites for a test run. These matter ONLY
+# when we build+deploy the operator from the current tree (deployOperator -> make deploy ->
+# install -> manifests already regenerates the manifests). With SKIP_OPERATOR_DEPLOY=true the run
+# uses a pre-built image (tag = git hash) against already-applied CRDs, so `manifests`/`generate`
+# regenerate nothing that is used, and `fmt` needlessly rewrites source DURING a test run (a latent
+# hazard: any tool-version skew silently dirties the working tree mid-run). So skip them there.
+# The full build+deploy flow (and CI, which never sets the SKIP flags) is unchanged.
+ifeq ($(SKIP_OPERATOR_DEPLOY),true)
+  E2E_CODEGEN_DEP =
+else
+  E2E_CODEGEN_DEP = manifests generate fmt vet
+endif
+
 E2E_VARS = KIND=$(KIND) KIND_CLUSTER=$(KIND_CLUSTER) SKIP_OPERATOR_DEPLOY=$(SKIP_OPERATOR_DEPLOY) SKIP_KIND_SETUP=$(SKIP_KIND_SETUP)
 
 # FOCUS allows running specific tests by name.
@@ -274,7 +287,7 @@ test-e2e-all: ## Run ALL e2e tests, including 'extended'/opt-in tiers.
 	$(MAKE) test-e2e E2E_ALL=true
 
 .PHONY: run-test-e2e
-run-test-e2e: manifests generate fmt vet bin/lrctl
+run-test-e2e: $(E2E_CODEGEN_DEP) bin/lrctl
 	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
 
 # list-e2e previews the spec selection of an e2e run WITHOUT running anything. It reuses the
@@ -366,6 +379,16 @@ helm-lint: ## Lint the Helm chart and render it in every scoping mode.
 		--set metrics.enabled=true \
 		--set metrics.serviceMonitor.enabled=true \
 		--set networkPolicy.enabled=true > /dev/null
+	@# Allow-list mode drops the ClusterRole, so the operator's OWN namespace must
+	@# still get `get secrets` for the multi-site kubeconfig read (uncached BY
+	@# DESIGN — the manager cache holds only the declared watch scope).
+	@$(HELM) template littlered charts/littlered --namespace littlered-system --set 'scope.watchNamespaces={ns-a}' | python3 -c 'import sys,yaml; docs=[d for d in yaml.safe_load_all(sys.stdin) if d and "site-secrets" in d["metadata"]["name"]]; kinds=sorted(d["kind"] for d in docs); assert kinds==["Role","RoleBinding"], "allow mode must render a site-secrets Role AND RoleBinding in the operator namespace, got "+repr(kinds); role=[d for d in docs if d["kind"]=="Role"][0]; assert role["metadata"]["namespace"]=="littlered-system", "the site-secrets Role must live in the operator namespace"; assert role["rules"]==[{"apiGroups":[""],"resources":["secrets"],"verbs":["get"]}], "the site-secrets Role must grant exactly get on secrets, got "+repr(role["rules"])'
+	@for mode in "" "--set scope.ignoreNamespaces={kube-system}"; do \
+		if $(HELM) template littlered charts/littlered --namespace littlered-system $$mode \
+			| grep -q 'littlered-site-secrets'; then \
+			echo "FAIL: deny/none modes keep the ClusterRole and must NOT render the site-secrets Role"; exit 1; \
+		fi; \
+	done
 	@echo "Helm chart lints and renders in all scoping modes."
 
 ##@ Build
