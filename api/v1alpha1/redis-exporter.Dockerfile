@@ -6,4 +6,4 @@
 # DefaultExporterPath / DefaultExporterTag in littlered_defaults.go.
 #
 # Do not add build stages or other FROM lines — the parser reads the first FROM.
-FROM docker.io/oliver006/redis_exporter:v1.89.0
+FROM docker.io/oliver006/redis_exporter:v1.92.0
