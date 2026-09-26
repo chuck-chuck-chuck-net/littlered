@@ -15,7 +15,7 @@ COPY cmd/littlered-chaos-client/ cmd/littlered-chaos-client/
 RUN CGO_ENABLED=0 GOOS=linux go build -a -o chaos-client ./cmd/littlered-chaos-client
 
 # Runtime image
-FROM alpine:3.24.1
+FROM alpine:3.24.2
 
 RUN apk --no-cache add ca-certificates
 
