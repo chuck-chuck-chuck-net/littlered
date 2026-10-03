@@ -45,7 +45,7 @@ spec:
     exporter:
       # Registry inherits from image.registry if empty
       path: oliver006/redis_exporter
-      tag: v1.89.0
+      tag: v1.92.1
     serviceMonitor:
       enabled: false
       interval: "30s"

@@ -383,7 +383,7 @@ spec:
                             type: object
                         type: object
                       tag:
-                        default: v1.89.0
+                        default: v1.92.1
                         description: |-
                           Tag is the image version tag.
                           Keep in sync with redis-exporter.Dockerfile (the source Dependabot bumps);
