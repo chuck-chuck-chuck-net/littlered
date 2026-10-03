@@ -68,6 +68,18 @@ replicas: 2
 > Leader election is always enabled in the operator, so running multiple
 > replicas is safe: only the pod holding the lease reconciles, regardless of
 > how the deployment is scaled (via Helm or directly with `kubectl`/`k9s`).
+> The standby replicas hold no state and run none of the per-instance
+> background watchers; those start on whichever pod wins the lease. When the
+> leader pod is deleted, the lease (15s duration, renewed every 10s) expires
+> and a standby takes over; expect up to ~30s with no reconciliation, after
+> which the new leader resumes from live state (nothing load-bearing is held
+> in memory, so a handover mid-failover is resumed, not lost). With
+> `replicas > 1` the chart can also render a PodDisruptionBudget for the
+> operator (`podDisruptionBudget.create: true`; it is suppressed at one
+> replica, where it could only block drains). The e2e tier `Operator
+> Redundancy` exercises this:
+> two replicas, one lease holder, leader deleted, handover measured, instance
+> healed by the new leader.
 
 # Optional: spread the operator replicas across nodes (only meaningful with replicas > 1).
 

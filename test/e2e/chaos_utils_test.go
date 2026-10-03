@@ -33,6 +33,19 @@ import (
 )
 
 // getChaosClientImage returns the chaos client image to use
+// e2eImagePullPolicy is the pull policy for images the suite itself runs (the chaos
+// client and the preflight probes). On a generic cluster it is Always, matching what a
+// real deployment does and refusing to be fooled by a stale local cache. In Kind mode the
+// images never reach a registry: they are kind-loaded and the operator is deployed with
+// PULL_POLICY=Never (e2e_suite_test.go), so Always would try the registry in the image
+// name and fail even though the image is present on the node.
+func e2eImagePullPolicy() string {
+	if skipKindSetup {
+		return "Always"
+	}
+	return "Never"
+}
+
 func getChaosClientImage() string {
 	if img := os.Getenv("CHAOS_CLIENT_IMAGE"); img != "" {
 		return img
@@ -80,7 +93,7 @@ spec:
   containers:
   - name: chaos-client
     image: %s
-    imagePullPolicy: Always
+    imagePullPolicy: %s
     args:
     - "-addrs=%s"
     - "-prefix=%s"
@@ -88,7 +101,7 @@ spec:
     - "-status-interval=5s"
     - "-write-rate=100ms"
     - "-timeout=500ms"%s%s
-`, podName, namespace, name, image, addresses, keyPrefix, duration.String(), clusterArg, authArg)
+`, podName, namespace, name, image, e2eImagePullPolicy(), addresses, keyPrefix, duration.String(), clusterArg, authArg)
 
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
 	cmd.Stdin = strings.NewReader(pod)

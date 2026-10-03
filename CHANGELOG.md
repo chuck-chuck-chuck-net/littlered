@@ -12,6 +12,22 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Added
 
+- **e2e coverage for operator redundancy** (#114). A new `Operator Redundancy` tier runs the
+  operator at two replicas against a live sentinel instance and asserts the three things the
+  HA story rests on: exactly one pod holds the lease and the standby neither reconciles nor
+  starts a per-instance watcher; deleting the leader moves the lease to the standby within
+  the lease window and the new leader resumes reconciling and heals the instance; and the
+  replacement standby stays idle. The handover time is recorded in the report. `make
+  helm-lint` additionally asserts the chart's opt-in operator PodDisruptionBudget renders at
+  `replicas: 2` and is suppressed at one replica. Verified on Kind: both specs green with a
+  measured 16.6s handover, and red against an operator built with leader election off.
+  - **The e2e suite runs in Kind mode again.** Its preflight and the chaos client forced
+    `imagePullPolicy: Always`, which in Kind mode asks the registry in the image name for an
+    image that only exists kind-loaded on the node, so every Kind run failed in `BeforeSuite`
+    before any tier ran. They now follow the operator's own policy there (`Never`); on a
+    generic cluster nothing changes, and the Redis image is still probed with `Always` in
+    every mode because it is a real registry pull.
+
 - **`logLevel` chart value.** Sets the operator's `--zap-log-level` (`debug`, `info`, `error`,
   or an integer); default `info`. The binary accepted the flag already, the chart had no way
   to set it. `make deploy LOG_LEVEL=debug` passes it through.
