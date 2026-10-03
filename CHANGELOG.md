@@ -10,6 +10,32 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
+### Security
+
+- **The `Security scan` workflow on `main` failed with 27 reachable vulnerabilities, 26 of
+  them in the Go standard library.** Every CI job selects its toolchain from the `go`
+  directive in `go.mod`, which still read `1.26.0` while both container builders had
+  moved on to `golang:1.26.6` through Dependabot — so govulncheck was scanning a toolchain
+  nobody shipped, and the one-line drift between `go.mod` and the Dockerfiles was
+  invisible until the vulnerability database caught up with it. `go.mod` now declares
+  `go 1.26.8`, the current patch of the 1.26 line, and both builders are pinned to the
+  same tag, which clears every standard-library finding (GO-2026-4599 through
+  GO-2026-6218; the latest of them need 1.26.6). The single module finding, GO-2026-6505
+  in `go.opentelemetry.io/otel/exporters/otlp/otlptrace` (pulled in through
+  `k8s.io/apiserver`), is cleared by moving the OpenTelemetry modules to v1.47.0, which
+  also carries `golang.org/x/net`, `x/crypto` and `google.golang.org/grpc` forward.
+  `govulncheck ./...` reports no reachable vulnerabilities; the remaining uncalled one
+  (`github.com/google/cel-go` v0.28.1, GO-2026-6094) is pinned by `k8s.io/apiserver`
+  v0.36 and will move with the next Kubernetes bump. `THIRD_PARTY_LICENSES` is
+  regenerated.
+
+- **`make licenses` failed when `go.mod` selects a newer toolchain than the host Go.**
+  Under `GOTOOLCHAIN=auto` the module's toolchain lives in the module cache, and
+  `go-licenses` could no longer tell standard-library packages from module-less ones
+  (`Package net/mail does not have module info`). The target now exports the module
+  toolchain's `GOROOT` for the run.
+
+
 ## [0.4.0] - 2026-09-22
 
 Everything below has landed since `v0.3.0`. Three headlines, in the order they are

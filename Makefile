@@ -608,7 +608,10 @@ LICENSE_BINARIES ?= ./cmd/littlered ./cmd/littlered-chaos-client ./cmd/lrctl
 .PHONY: licenses
 licenses: go-licenses ## Regenerate THIRD_PARTY_LICENSES from the linked dependency graph.
 	@echo "Generating THIRD_PARTY_LICENSES..."
-	@$(GO_LICENSES) report $(LICENSE_BINARIES) --template hack/third-party-licenses.tpl > THIRD_PARTY_LICENSES.tmp \
+	@# GOROOT is exported explicitly: when go.mod selects a toolchain newer than the
+	@# host Go (GOTOOLCHAIN=auto), go-licenses otherwise cannot tell standard-library
+	@# packages from module-less ones and fails with "net/mail does not have module info".
+	@GOROOT="$$(go env GOROOT)" $(GO_LICENSES) report $(LICENSE_BINARIES) --template hack/third-party-licenses.tpl > THIRD_PARTY_LICENSES.tmp \
 		&& mv THIRD_PARTY_LICENSES.tmp THIRD_PARTY_LICENSES \
 		|| { rm -f THIRD_PARTY_LICENSES.tmp; echo "go-licenses failed"; exit 1; }
 	@echo "Wrote THIRD_PARTY_LICENSES ($$(grep -c '^Module:' THIRD_PARTY_LICENSES) modules)"
