@@ -10,6 +10,17 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
+### Added
+
+- **An agreement test between the `go` directive and the container builders**
+  (`hack/toolchain`). Every CI job, govulncheck included, selects its toolchain from
+  `go.mod`, while Dependabot patches the `golang:` builder tags in the two Dockerfiles
+  and never the directive, so the two drifted for months and the Security scan went
+  red only once the vulnerability database caught up with the older one. The test
+  reads both and fails until they are moved together, and insists the directive names
+  a full patch release rather than a floor. A Dependabot builder bump now fails CI
+  until `go.mod` follows it, which is the prompt that was missing.
+
 ### Changed
 
 - **Kubernetes client libraries move from 0.36.3 to 0.37.0, controller-runtime from 0.24.1
