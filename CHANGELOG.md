@@ -10,6 +10,15 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
+### Changed
+
+- **Kubernetes client libraries move from 0.36.3 to 0.37.0, controller-runtime from 0.24.1
+  to 0.25.0.** The trigger was the prometheus-operator monitoring API module (v0.94.1), which
+  requires `k8s.io/api` v0.37.0, so minimum-version selection carried the whole stack with it.
+  The only generated-file consequence is a description string in the CRD: the Kubernetes text
+  for `seLinuxChangePolicy` in the embedded pod security context lost its feature-gate
+  explanation. No schema, default or validation changed. envtest now exercises Kubernetes 1.37.
+
 ### Security
 
 - **The `Security scan` workflow on `main` failed with 27 reachable vulnerabilities, 26 of
