@@ -982,6 +982,27 @@ With 3 shards, slots are distributed as:
 - **Known open — cluster health is an OR over nodes, so `Ready=True` can overstate it.** `status.cluster.state` is "ok if **any** reachable node says ok", the slot count is a MAX and the node-ID set a union, so a cluster where two of three shards are whole reads as perfectly healthy while the third still serves `-CLUSTERDOWN`. Observed: `Ready=True`/`ClusterHealthy` 17s after apply while one master took **122s** to reach `cluster_state:ok`. `lrctl verify` inherits the same aggregation. Until this is changed, confirm a fresh or recovering cluster per pod (`redis-cli CLUSTER INFO` on every master), not from the CR condition. Open, tracked for a decision.
 - **Known open — a cluster rolling update is time-gated, not state-gated.** The operator serialises shard rollouts (LR-021) but advances on elapsed time rather than on the shard having actually converged, and a measured rollout lost two keys while reporting complete success. LR-046 removed the ~100s reconcile starvation that made it likely, but the design is unchanged. Roll shards by hand, one at a time, waiting for each to settle, when the data matters. Open, tracked for an ADR.
 
+### Upgrading the Redis image
+
+Set `spec.image.tag` (or `path`/`registry`) and the operator rolls every pod of the
+instance onto the new image: sentinel mode rolls the Sentinels and the data pods, the
+master last after a Sentinel-led handover; cluster mode rolls one shard at a time and,
+within a shard, releases the next pod only once the previous replacement is a synced
+replica (ADR-017). Storage is EmptyDir, so the dataset survives an upgrade through
+replication alone: each replaced pod full-syncs from a live peer.
+
+```bash
+kubectl patch littlered my-redis --type merge -p '{"spec":{"image":{"tag":"8.4.2"}}}'
+```
+
+**Upgrades are covered, downgrades are not.** A replica running a newer Redis loads the
+RDB an older master streams to it; the reverse fails (`Can't handle RDB format version`),
+so a cross-major *downgrade* leaves replicas unable to sync and the operator does not
+block it. Within a line, any direction works. The e2e tiers `Redis Image Upgrade` run
+the chain `7.4.3 → 7.4.8 → 8.4.2` in sentinel and cluster mode and assert every pod
+was replaced and runs the new version, the instance is Running and topologically sound,
+and every seeded key reads back unchanged.
+
 ### Upgrading a pre-0.3 cluster
 
 0.3.0 restructures cluster mode from a single StatefulSet (`{name}-cluster`, pods
