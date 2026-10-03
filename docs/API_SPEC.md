@@ -248,7 +248,7 @@ spec:
       # Same pattern as main image: {registry}/{path}:{tag}
       registry: ""              # Empty = inherit from spec.image.registry
       path: oliver006/redis_exporter
-      tag: v1.89.0
+      tag: v1.92.1
       resources:
         requests:
           cpu: "50m"
@@ -268,7 +268,7 @@ spec:
 | `metrics.enabled` | `bool` | No | `true` | Enable redis_exporter sidecar |
 | `metrics.exporter.registry` | `string` | No | (inherit) | Registry; empty = use `spec.image.registry` |
 | `metrics.exporter.path` | `string` | No | `oliver006/redis_exporter` | Image path |
-| `metrics.exporter.tag` | `string` | No | `v1.89.0` | Image tag |
+| `metrics.exporter.tag` | `string` | No | `v1.92.1` | Image tag |
 | `metrics.exporter.resources` | `ResourceRequirements` | No | See above | Exporter container resources |
 | `metrics.serviceMonitor.enabled` | `bool` | No | `false` | Create ServiceMonitor |
 | `metrics.serviceMonitor.namespace` | `string` | No | `""` | ServiceMonitor namespace |
@@ -282,7 +282,7 @@ spec:
 spec:
   image:
     registry: docker.io   # Mirror for all images
-  # Exporter automatically uses: docker.io/oliver006/redis_exporter:v1.89.0
+  # Exporter automatically uses: docker.io/oliver006/redis_exporter:v1.92.1
 ```
 
 ### 2.8 Update Strategy
@@ -811,7 +811,7 @@ spec:
   image:
     registry: docker.io
     # Result: docker.io/library/redis:8.4.2
-    # Exporter: docker.io/oliver006/redis_exporter:v1.89.0
+    # Exporter: docker.io/oliver006/redis_exporter:v1.92.1
 ```
 
 ### 4.5 Standalone with Auth
@@ -900,7 +900,7 @@ spec:
 
   metrics:
     enabled: true
-    # Exporter inherits registry: docker.io/oliver006/redis_exporter:v1.89.0
+    # Exporter inherits registry: docker.io/oliver006/redis_exporter:v1.92.1
     serviceMonitor:
       enabled: true
       labels:

@@ -19,6 +19,9 @@ cut a release (`scripts/prepare-release.sh`).
   for `seLinuxChangePolicy` in the embedded pod security context lost its feature-gate
   explanation. No schema, default or validation changed. envtest now exercises Kubernetes 1.37.
 
+- Default `redis_exporter` sidecar image is now **v1.92.1** (from v1.89.0). Instances
+  that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
+
 ### Security
 
 - **The `Security scan` workflow on `main` failed with 27 reachable vulnerabilities, 26 of
