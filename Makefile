@@ -366,6 +366,15 @@ helm-lint: ## Lint the Helm chart and render it in every scoping mode.
 		--set metrics.enabled=true \
 		--set metrics.serviceMonitor.enabled=true \
 		--set networkPolicy.enabled=true > /dev/null
+	@# Operator redundancy (#114): the operator's own PodDisruptionBudget is opt-in
+	@# (podDisruptionBudget.create) and must render only with replicas > 1 — over a
+	@# single pod it can only block drains, never protect availability.
+	@$(HELM) template littlered charts/littlered --set replicas=2 --set podDisruptionBudget.create=true \
+		| grep -q 'kind: PodDisruptionBudget' \
+		|| { echo "helm-lint: replicas=2 + create=true did not render the operator PodDisruptionBudget"; exit 1; }
+	@if $(HELM) template littlered charts/littlered --set podDisruptionBudget.create=true \
+		| grep -q 'kind: PodDisruptionBudget'; then \
+		echo "helm-lint: replicas=1 rendered an operator PodDisruptionBudget despite the replicas > 1 guard"; exit 1; fi
 	@echo "Helm chart lints and renders in all scoping modes."
 
 ##@ Build

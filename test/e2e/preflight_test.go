@@ -23,16 +23,16 @@ const defaultRedis = "docker.io/library/redis:8.4.2"
 // entire suite immediately with a clear message instead of producing confusing
 // failures 40 minutes later.
 func preflightImageChecks() {
-	// Always use imagePullPolicy: Always to match the actual test behavior.
-	// The chaos client is deployed with Always (chaos_utils_test.go), and the
-	// redis image is pulled by the kubelet on pod creation.
-	// Using IfNotPresent here would mask issues where the image is cached locally
-	// but not actually pullable from the registry.
-	verifyImagePullable("chaos-client", getChaosClientImage())
-	verifyImagePullable("redis", defaultRedis)
+	// Each probe uses the pull policy the real consumer of that image uses. The chaos
+	// client follows e2eImagePullPolicy: Always on a generic cluster, so a stale local
+	// cache cannot mask an image that is not actually pullable from the registry; Never
+	// in Kind mode, where it is kind-loaded and no registry is involved. The redis image
+	// is a registry pull by the kubelet in every mode, so it is always probed with Always.
+	verifyImagePullable("chaos-client", getChaosClientImage(), e2eImagePullPolicy())
+	verifyImagePullable("redis", defaultRedis, "Always")
 }
 
-func verifyImagePullable(label, img string) {
+func verifyImagePullable(label, img, pullPolicy string) {
 	podName := fmt.Sprintf("preflight-%s", label)
 
 	pod := fmt.Sprintf(`apiVersion: v1
@@ -45,9 +45,9 @@ spec:
   containers:
   - name: check
     image: %s
-    imagePullPolicy: Always
+    imagePullPolicy: %s
     command: ["true"]
-`, podName, testNamespace, img)
+`, podName, testNamespace, img, pullPolicy)
 
 	By(fmt.Sprintf("preflight: verifying image %s (%s) is pullable", label, img))
 	cmd := exec.Command("kubectl", "apply", "-f", "-")
