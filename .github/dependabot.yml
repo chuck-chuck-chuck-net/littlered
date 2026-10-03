@@ -9,6 +9,11 @@ updates:
         patterns:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
+          # Pinned to a Kubernetes minor: v0.94.1 requires k8s.io/api v0.37.0,
+          # so a lone bump drags the whole stack along by minimum-version
+          # selection under a prometheus-operator title (#145). Move it with
+          # the group it actually belongs to.
+          - "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring"
 
   - package-ecosystem: github-actions
     directory: /
