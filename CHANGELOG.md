@@ -28,6 +28,15 @@ cut a release (`scripts/prepare-release.sh`).
     generic cluster nothing changes, and the Redis image is still probed with `Always` in
     every mode because it is a real registry pull.
 
+- **e2e coverage for Redis image upgrades keeping the data** (#95). Two new tiers, `Redis
+  Image Upgrade` in sentinel and in cluster mode, seed a dataset on Redis 7.4.3 and upgrade
+  through `spec.image.tag` twice: a patch step to 7.4.8 and a major step to the operator
+  default 8.4.2. After each step every pod must have been replaced and run the new version
+  per `INFO server`, the instance must be Running with a sound topology, and every seeded
+  key must read back with its exact value. USAGE gains an "Upgrading the Redis image"
+  section, including the one shape that is not covered: a cross-major downgrade, which a
+  replica cannot sync through and the operator does not block.
+
 - **`logLevel` chart value.** Sets the operator's `--zap-log-level` (`debug`, `info`, `error`,
   or an integer); default `info`. The binary accepted the flag already, the chart had no way
   to set it. `make deploy LOG_LEVEL=debug` passes it through.
