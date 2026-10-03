@@ -12,12 +12,17 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Changed
 
-- **Kubernetes client libraries move from 0.36.3 to 0.37.0, controller-runtime from 0.24.1
-  to 0.25.0.** The trigger was the prometheus-operator monitoring API module (v0.94.1), which
-  requires `k8s.io/api` v0.37.0, so minimum-version selection carried the whole stack with it.
-  The only generated-file consequence is a description string in the CRD: the Kubernetes text
-  for `seLinuxChangePolicy` in the embedded pod security context lost its feature-gate
-  explanation. No schema, default or validation changed. envtest now exercises Kubernetes 1.37.
+- **Kubernetes client libraries move from 0.36.3 to 0.37.1, controller-runtime from 0.24.1
+  to 0.25.1.** The move arrived in two steps. The prometheus-operator monitoring API module
+  (v0.94.1) requires `k8s.io/api` v0.37.0, so minimum-version selection carried the whole
+  stack to 0.37.0 under a prometheus-operator title; the k8s group bump then completed it at
+  0.37.1 / 0.25.1. The only generated-file consequence is a description string in the CRD:
+  the Kubernetes text for `seLinuxChangePolicy` in the embedded pod security context lost
+  its feature-gate explanation. No schema, default or validation changed. envtest now
+  exercises Kubernetes 1.37.
+  - The monitoring API module now belongs to Dependabot's `k8s` group, so the three move
+    together in one PR from here on instead of one dragging the others in by minimum-version
+    selection.
 
 ### Security
 
