@@ -151,8 +151,9 @@ var _ = Describe("Redis Image Upgrade — Cluster Mode", Label("cluster", "image
 			5*time.Minute, 5*time.Second).Should(Succeed())
 		expectRedisVersionOnPods(crName, pods, imageUpgradeFrom)
 
-		By("seeding a dataset that spans every shard")
+		By("seeding a dataset that spans every shard, and waiting for every shard to replicate it")
 		data = writeDatasetSpanningShards(clusterMasterPod(crName, 0), imageUpgradeClusterKeysPerShard)
+		expectShardDatasetReplicated(crName)
 	})
 
 	AfterAll(func() {
@@ -307,6 +308,34 @@ func verifySentinelDataset(masterPod string, data map[string]string) {
 		}
 		g.Expect(changed).To(BeZero(), "%d of %d keys changed value across the upgrade", changed, len(keys))
 	}, 2*time.Minute, 5*time.Second).Should(Succeed())
+}
+
+// expectShardDatasetReplicated requires at least one replica of EVERY shard to have
+// acknowledged the seed — WAIT 1 5000 on each shard's master — before the upgrade is
+// triggered. It is the cluster-mode twin of seedSentinelDataset's connected_slaves wait,
+// for the same reason: a master replaced before its replica holds the keys loses them for
+// a reason that is not an upgrade's. It is also the direct answer to the question the
+// 2026-10-05 incident could not settle, whether shard 2's keys had replicated at all when
+// the tag was patched 0.7s after the last SET.
+//
+// Deliberately loud rather than vacuous if {name}-shard-K-0 is not that shard's master:
+// Redis refuses WAIT on a replica, so the exec fails instead of returning 0. Skipped at
+// replicasPerShard 0, where there is no redundancy to wait for and the roll is ungated by
+// construction (ADR-017 Decision 3).
+func expectShardDatasetReplicated(crName string) {
+	if clusterReplicasPerShard == 0 {
+		return
+	}
+	for k := range clusterShards {
+		master := clusterMasterPod(crName, k)
+		Eventually(func(g Gomega) {
+			out, err := redisExec(testNamespace, master, "WAIT", "1", "5000")
+			g.Expect(err).NotTo(HaveOccurred(), "WAIT on %s — it must be shard %d's master", master, k)
+			acked, err := strconv.Atoi(strings.TrimSpace(out))
+			g.Expect(err).NotTo(HaveOccurred(), "WAIT on %s did not return a count: %q", master, out)
+			g.Expect(acked).To(BeNumerically(">=", 1), "no replica of shard %d has acknowledged the seed", k)
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
+	}
 }
 
 // expectClusterServingAllSlots asserts cluster_state:ok with all 16384 slots assigned.
