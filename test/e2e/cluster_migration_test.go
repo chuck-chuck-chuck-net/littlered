@@ -884,14 +884,11 @@ func writeDatasetSpanningShards(seedPod string, perShard int) map[string]string 
 
 // verifyDataset asserts every seeded key still resolves to its exact value, read via a -c
 // client through readPod (redirection resolves whichever new master now owns the slot).
+// The read-back and its report live in dataset_report_test.go: every mismatch is
+// collected and reported grouped by hash tag, i.e. by shard, so a lost shard reads as a
+// lost shard rather than as one arbitrary key.
 func verifyDataset(readPod string, data map[string]string) {
-	Eventually(func(g Gomega) {
-		for key, want := range data {
-			out, err := redisExec(testNamespace, readPod, "-c", "GET", key)
-			g.Expect(err).NotTo(HaveOccurred(), "GET %s failed", key)
-			g.Expect(strings.TrimSpace(out)).To(Equal(want), "value mismatch for key %s", key)
-		}
-	}, 3*time.Minute, 10*time.Second).Should(Succeed(), "seeded dataset was not preserved across migration")
+	verifyDatasetWithin(readPod, data, 3*time.Minute, "seeded dataset was not preserved across the operation")
 }
 
 // assertSharedServiceCoexistence asserts the structural coexistence property (DESIGN §3 /
