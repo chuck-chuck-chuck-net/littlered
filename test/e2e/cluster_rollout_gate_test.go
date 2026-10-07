@@ -303,6 +303,25 @@ var _ = Describe("Cluster Rolling Update Redundancy Gate (LR-047)", Label("clust
 		_, _ = fmt.Fprintf(GinkgoWriter, "operator down %.1fs after the replica roll began\n",
 			tOperatorDown.Sub(tReplica).Seconds())
 
+		// --- the gate ENGAGED, asserted (ADR-017) ------------------------------------
+		// The cursor is the StatefulSet's own rollingUpdate.partition, written in the SAME
+		// server-side apply as the template change, so by the time the replica is being
+		// replaced it already sits at the shard's highest ordinal. Read it uncached (kubectl
+		// is) and assert it. This is the one place the suite checks that the gate is
+		// applied at all: at replicasPerShard 1 its advance finishes underneath
+		// minReadySeconds, so a rollout with the partition and one with no rollingUpdate
+		// block take the same wall-clock time, and the data assertion below is satisfied
+		// on margin whenever the operator happens to be fast enough. Without this a
+		// silently absent gate goes FAST instead of RED.
+		partition, applied, err := shardRolloutPartition(crName, targetShard)
+		Expect(err).NotTo(HaveOccurred())
+		Expect(applied).To(BeTrue(),
+			"shard %d's StatefulSet carries no rollingUpdate.partition — the ADR-017 gate is not applied", targetShard)
+		Expect(partition).To(Equal(clusterReplicasPerShard),
+			"shard %d's partition is %d while its replica is being replaced; the gate holds at the "+
+				"highest ordinal (%d) until the replacement is a link-up replica",
+			targetShard, partition, clusterReplicasPerShard)
+
 		By(fmt.Sprintf("holding the operator down while shard %d's roll proceeds", targetShard))
 		// This window is BOUNDED and must stay bounded, because the tier has to be able to
 		// go green once ADR-017 lands. Pre-fix the StatefulSet deletes the shard's master
@@ -322,6 +341,14 @@ var _ = Describe("Cluster Rolling Update Redundancy Gate (LR-047)", Label("clust
 			Expect(operatorAvailableReplicas()).To(Equal(0),
 				"the operator came back up during the pause window — the repro did not hold, "+
 					"so neither a pass nor a failure below would mean anything")
+			// Only the operator lowers the cursor (ADR-017: the pre-gather apply can hold or
+			// raise, advanceClusterRollout is the one place it comes down), and the operator
+			// is away. A cursor that moves here was moved by something else.
+			p, ok, err := shardRolloutPartition(crName, targetShard)
+			Expect(err).NotTo(HaveOccurred())
+			Expect(ok && p == clusterReplicasPerShard).To(BeTrue(),
+				"shard %d's partition read %d (present=%t) while the operator was down; it must stay at %d",
+				targetShard, p, ok, clusterReplicasPerShard)
 			if masterReplacedAt < 0 && podUID(testNamespace, targetMaster) != oldUIDs[targetMaster] {
 				masterReplacedAt = time.Since(tReplica)
 				// Give the fresh master a moment to come up with no operator to seed it,
@@ -334,9 +361,9 @@ var _ = Describe("Cluster Rolling Update Redundancy Gate (LR-047)", Label("clust
 			time.Sleep(time.Second)
 		}
 
-		// Recorded, NOT asserted. Pre-fix this is the defect (the master is destroyed with
-		// zero synced copies of its range); post-fix its absence is the fix working. The
-		// tier's verdict is the data assertion at the end, in both worlds.
+		// Recorded here, asserted once the operator is back (below). Pre-fix this is the
+		// defect (the master is destroyed with zero synced copies of its range); post-fix
+		// its absence is the fix working.
 		if masterReplacedAt >= 0 {
 			_, _ = fmt.Fprintf(GinkgoWriter,
 				"shard %d: replica roll at T+0, operator down at T+%.1fs, MASTER REPLACED at T+%.1fs "+
@@ -356,6 +383,18 @@ var _ = Describe("Cluster Rolling Update Redundancy Gate (LR-047)", Label("clust
 		By("restoring the operator")
 		scaleOperator(1)
 
+		// --- the gate's EFFECT, asserted rather than only recorded ---------------------
+		// With the cursor held at the highest ordinal and nothing to lower it, the
+		// StatefulSet may not touch the master. Pre-fix this is where the tier goes red
+		// (the master replaced at T+37.2s on t3e, LR-047), and for the right reason — the
+		// handover was time-released — before the data assertion at the end says what
+		// that cost. Asserted after the operator is restored so a failure here never
+		// leaves it down for the rest of the run.
+		Expect(masterReplacedAt).To(BeNumerically("<", 0),
+			"shard %d's master was replaced at T+%.1fs while the operator was down: the "+
+				"intra-shard handover was released by something other than the ADR-017 gate",
+			targetShard, masterReplacedAt.Seconds())
+
 		By("waiting for every cluster pod to be replaced (the rollout really did complete)")
 		// Positive control #4. Without this the tier could pass simply by not rolling.
 		Eventually(func(g Gomega) {
@@ -371,6 +410,21 @@ var _ = Describe("Cluster Rolling Update Redundancy Gate (LR-047)", Label("clust
 			g.Expect(err).NotTo(HaveOccurred())
 			g.Expect(out).To(Equal("Running"))
 		}, 12*time.Minute, 5*time.Second).Should(Succeed())
+
+		// The gate COMPLETED through the operator: ADR-017's Complete verdict emits
+		// partition 0 on a settled shard, so every shard's cursor is back at 0 once the
+		// instance is Running. A cursor left above 0 here is a rollout the gate never
+		// released, i.e. the stall ADR-017 chooses over loss — loud, and not this tier's
+		// subject, so it is asserted so that it is not mistaken for a pass.
+		By("every shard's rollout cursor is back at 0 (ADR-017 Complete)")
+		Eventually(func(g Gomega) {
+			for k := range clusterShards {
+				p, ok, err := shardRolloutPartition(crName, k)
+				g.Expect(err).NotTo(HaveOccurred())
+				g.Expect(ok).To(BeTrue(), "shard %d's StatefulSet has no rollingUpdate.partition", k)
+				g.Expect(p).To(BeZero(), "shard %d's partition is still %d after the rollout settled", k, p)
+			}
+		}, 2*time.Minute, 5*time.Second).Should(Succeed())
 
 		// --- the silence, captured BEFORE the data assertion -------------------------
 		// This is what made the field incident invisible, and it is recorded rather than
@@ -407,6 +461,27 @@ var _ = Describe("Cluster Rolling Update Redundancy Gate (LR-047)", Label("clust
 })
 
 // --- helpers -----------------------------------------------------------------
+
+// shardRolloutPartition reads shard k's StatefulSet rollingUpdate.partition — ADR-017's
+// cursor — straight from the API server (kubectl reads are uncached). applied is false
+// when the field is absent, which Kubernetes reads as 0 and this tier reads as "no gate".
+func shardRolloutPartition(crName string, k int) (partition int, applied bool, err error) {
+	out, err := utils.Run(exec.Command("kubectl", "get", "statefulset",
+		fmt.Sprintf("%s-shard-%d", crName, k), "-n", testNamespace,
+		"-o", "jsonpath={.spec.updateStrategy.rollingUpdate.partition}"))
+	if err != nil {
+		return 0, false, err
+	}
+	raw := strings.TrimSpace(out)
+	if raw == "" {
+		return 0, false, nil
+	}
+	partition, err = strconv.Atoi(raw)
+	if err != nil {
+		return 0, true, fmt.Errorf("shard %d's partition is not an integer: %q", k, out)
+	}
+	return partition, true, nil
+}
 
 // podTerminating reports whether a pod has a deletionTimestamp. This fires EARLIER than a
 // UID change (the replacement is only created once the old pod is gone), which is what
