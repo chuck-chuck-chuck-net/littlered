@@ -109,6 +109,29 @@ make verify-e2e-mode-labels    # per-mode selections must sum to the full select
 See `test/e2e/mode_labels_test.go` for the scheme and where to attach the label when adding
 a tier.
 
+### Reproducing a run's spec order (`SEED`)
+
+Ginkgo shuffles the order of the top-level containers on **every** run, so two runs with the
+same `MODE` or `LABEL_FILTER` select the same specs but do not run them in the same order. A
+failure that depends on what ran *before* it — one spec's six pods still being torn down while
+the next spec's fixture comes up on the same node — therefore reproduces only under the seed of
+the run that produced it. Ginkgo prints that seed in the run's header:
+
+```
+Random Seed: 1759650000
+```
+
+Pass it back with `SEED` to replay that order. It composes with `MODE`, `FOCUS` and
+`LABEL_FILTER`, and `list-e2e` honours it too, so the order can be previewed without a cluster:
+
+```bash
+make list-e2e MODE=cluster SEED=1759650000   # the cluster specs, in that run's order
+make test-e2e MODE=cluster SEED=1759650000   # replay them
+```
+
+A reproduction attempt that omits `SEED` is a different experiment: it has removed the ordering
+variable it set out to test.
+
 ### Filtering Tests
 
 Use `FOCUS` to run a subset of tests (passed to Ginkgo's `-focus` flag). For whole-mode
@@ -234,6 +257,7 @@ make test-e2e ARGS="-timeout 90m"
 | `MODE` | (none) | Run one deployment mode only: `standalone`, `sentinel`, `cluster`, `failover`. Composes with `FOCUS`/`E2E_ALL`; invalid values fail fast |
 | `LABEL_FILTER` | `!extended` | Any Ginkgo label expression; overrides `MODE`/`E2E_ALL` |
 | `FOCUS` | (none) | Ginkgo focus filter (regex) |
+| `SEED` | (none) | Ginkgo random seed; replays the spec ORDER of the run that printed it (`Random Seed: N`). Honoured by `list-e2e` too |
 | `ARGS` | (none) | Extra arguments passed to `go test` |
 
 ---
