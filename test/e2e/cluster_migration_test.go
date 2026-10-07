@@ -862,11 +862,15 @@ func stsExists(name string) bool {
 	return err == nil
 }
 
-// writeDatasetSpanningShards writes perShard keys into EACH shard's slot range (via a hash
-// tag routing into GenerateSlotRanges(shards)[K]) through a -c client on seedPod, and returns
-// the key→value map for a later integrity check. Guarantees the dataset genuinely spans all
-// shards (not just probabilistically). Reuses findHashTagInSlotRange/keySlot from the reshard
-// tier (same package).
+// writeDatasetSpanningShards seeds perShard keys behind one hash tag per expected shard
+// range through seedPod (a -c client, so each SET lands on the slot's owner) and returns
+// the dataset ONLY once every key reads back as written.
+//
+// The read-back is what makes a later failure attributable. Without it a tier cannot tell
+// "the operation lost it" from "it was never there" — the question the 2026-10-05
+// image-upgrade incident left open, where the tag patch landed 0.7s after the last SET.
+// It is one EXISTS and one MGET per tag (dataset_report_test.go), so it costs about a
+// second, not one exec per key.
 func writeDatasetSpanningShards(seedPod string, perShard int) map[string]string {
 	data := make(map[string]string, clusterShards*perShard)
 	for _, rng := range redisclient.GenerateSlotRanges(clusterShards) {
@@ -879,6 +883,9 @@ func writeDatasetSpanningShards(seedPod string, perShard int) map[string]string 
 			data[key] = val
 		}
 	}
+	verifyDatasetWithin(seedPod, data, 2*time.Minute,
+		"seeded dataset did not read back BEFORE the operation — the seed itself is incomplete, "+
+			"so nothing after it is attributable")
 	return data
 }
 
