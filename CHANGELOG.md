@@ -85,7 +85,7 @@ cut a release (`scripts/prepare-release.sh`).
     together in one PR from here on instead of one dragging the others in by minimum-version
     selection.
 
-- Default `redis_exporter` sidecar image is now **v1.92.1** (from v1.89.0). Instances
+- Default `redis_exporter` sidecar image is now **v1.93.0** (from v1.89.0). Instances
   that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
 
 ### Fixed
