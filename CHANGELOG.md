@@ -110,6 +110,18 @@ cut a release (`scripts/prepare-release.sh`).
   `go.mod` now declares `go 1.26.9` and both container builders are pinned to the same
   tag, as the toolchain agreement test in `hack/toolchain` requires.
 
+- **`golang.org/x/net` moved to v0.61.0.** The other five findings of that scan are in
+  `x/net`'s HTTP/2 implementation at v0.59.0 and fixed in v0.60.0: GO-2026-6617 (server
+  crash from an HPACK encoder race), GO-2026-6612 (double flow-control refund on server
+  streams), GO-2026-6611 (excessive CPU from repeated initial window changes),
+  GO-2026-6610 (transport accepts malformed framing-related headers) and GO-2026-6603
+  (server memory exhaustion through `Trailer` headers). The module is indirect, reached
+  through `client-go` and `controller-runtime`, so the bump carries `x/crypto`, `x/sync`,
+  `x/sys`, `x/term`, `x/text` and `x/tools` forward with it. `govulncheck ./...` reports
+  no reachable vulnerabilities; the one uncalled finding (`github.com/google/cel-go`
+  v0.29.2, GO-2026-6094) is still pinned by `k8s.io/apiserver` v0.37.
+  `THIRD_PARTY_LICENSES` is regenerated.
+
 - **The `Security scan` workflow on `main` failed with 27 reachable vulnerabilities, 26 of
   them in the Go standard library.** Every CI job selects its toolchain from the `go`
   directive in `go.mod`, which still read `1.26.0` while both container builders had
