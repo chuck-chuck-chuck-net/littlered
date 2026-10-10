@@ -101,6 +101,15 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Security
 
+- **Go toolchain moved to 1.26.9.** The `Security scan` on the open Dependabot PRs reported
+  eleven reachable vulnerabilities, six of them in the Go standard library and fixed in
+  go1.26.9: GO-2026-6613 and GO-2026-6605 (HTTP/1 connection desynchronization around
+  `CONNECT` in `net/http`), GO-2026-6608 (memory limit bypass when parsing MIME headers in
+  `net/textproto`), GO-2026-6607 (malformed ECH outer extension references in
+  `crypto/tls`) and GO-2026-6600/GO-2026-6599 (context tracking in `html/template`).
+  `go.mod` now declares `go 1.26.9` and both container builders are pinned to the same
+  tag, as the toolchain agreement test in `hack/toolchain` requires.
+
 - **The `Security scan` workflow on `main` failed with 27 reachable vulnerabilities, 26 of
   them in the Go standard library.** Every CI job selects its toolchain from the `go`
   directive in `go.mod`, which still read `1.26.0` while both container builders had

@@ -1,6 +1,6 @@
 module github.com/chuck-chuck-chuck-net/littlered
 
-go 1.26.8
+go 1.26.9
 
 require (
 	github.com/go-logr/logr v1.4.4
