@@ -1,7 +1,8 @@
-# ADR-010: Ghost-Replica Prune Policy in Sentinel Mode (Rule D) — Draft
+# ADR-010: Ghost-Replica Prune Policy in Sentinel Mode (Rule D)
 
 ## Status
-**DRAFT — for discussion. No decision has been made.**
+**DORMANT — no decision, and none needed now.** Nothing forces this; see
+*Reassessment (2026-10-27)*, which also overturns the leaning recorded below.
 
 This ADR decides the *prevention* half of LR-024. The *recovery* half already shipped
 (operator-led ghost-master recovery; see LR-024, pillar 3.10) and is e2e-verified, so the
@@ -9,6 +10,9 @@ ghost-master failover deadlock is **no longer permanent regardless of what we de
 this decision is now about monitoring-signal quality, churn, and philosophy, **not**
 correctness. The options and the claims under "Facts" are written to be argued with; fill in
 the decision at the end once we agree.
+
+The paragraph above is the 2026-08-20 framing and the reassessment below corrects it: the
+cost of not pruning is no longer confined to signal quality.
 
 ## Context
 
@@ -91,7 +95,41 @@ Present a benign ghost **replica** as *informational*, not `[FAIL]`. This addres
 alert-fatigue cost at the **presentation** layer rather than by a risky prune — and may on its own
 neutralize most of A1's downside.
 
-## Tentative leaning (to be confirmed or overturned)
+## Reassessment (2026-10-27)
+
+Two things changed since the draft.
+
+Rule D has not bitten again. The hardening chain (LR-001, LR-007/LR-008, LR-011, LR-013) plus
+LR-024's recovery leaves no open incident, and LR-041 restored the rule to its designed behaviour
+after it had been silently inert for a while. Nothing is pressing.
+
+The cost of *not* pruning rose, and the draft measured the wrong list. "Harm of a lingering ghost
+replica" above reasons entirely over Sentinel's **replica** list and concludes the cost is
+monitoring noise. The same `SENTINEL RESET` also clears the known-**sentinel** list, and that list
+is the introduction vector for a cross-instance capture: a Sentinel connects to every address it
+knows and hands over its hello unprompted, so holding a stale peer address is sufficient to
+introduce yourself to whoever owns it now (LR-039;
+`docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` §3.2). Because a known-sentinel entry never
+expires and `SENTINEL RESET` is one of only two code paths that delete one (§3.3), on an
+otherwise-healthy instance Rule D is the only rule that prunes it — LR-008's `REMOVE`+`MONITOR`
+reaches the same lists but fires only for a Sentinel stuck on a ghost master, and Rule N never
+RESETs and never `REMOVE`s the desired name.
+
+→ A1 does not merely leave the monitoring signal dirty. It retires the sole prune path for the
+capture vector, and the cross-cutting verify-softening is no substitute: relabelling a ghost as
+benign does nothing about a peer address that still introduces us to a stranger.
+
+A2's quiet window is unsound on its own terms. It gates the RESET on a period with no failover,
+which requires forecasting that none is imminent — and a failover is precisely the unforecastable
+event. The quiet windows such a heuristic would pick are also the maintenance windows: a node
+drain or a cluster upgrade is scheduled into quiet hours and generates failovers itself. The gate
+would fire most eagerly right before the disruption it exists to avoid.
+
+→ Whoever picks this up pays more than the draft implies. A0 keeps a cause we traced, A1 opens a
+vector we closed elsewhere, A2's gate is not computable, and A3 leaves the vector open until a
+human acts. Re-derive the decision; do not inherit the leaning below.
+
+## Tentative leaning (2026-08-20, superseded — see above)
 
 **A1 (retire Rule D) + soften `lrctl verify`, with A3 (on-request verb) as an optional manual
 escape hatch.** Reasoning: recovery makes correctness a non-issue; the *only* remaining value of
@@ -133,6 +171,8 @@ signal vs. never issuing a risky autonomous RESET again.
 - `docs/GHOST_MASTER_FAILOVER_DEADLOCK_DESIGN.md` — full RCA, the source research (no surgical
   prune; ghosts never age out), the option matrix, and the contained blast radius (§6.1).
 - Rule D history: LR-001 / LR-007 / LR-008 / LR-011 / LR-013 (same changelog).
+- LR-039 + `docs/SENTINEL_CROSS_INSTANCE_CAPTURE_ANALYSIS.md` §3.2-3.3 — the known-sentinel
+  list as the capture introduction vector, and why it never expires.
 - ADR-003 (ghost master pruning / IP-only identity), ADR-005 (leaderless recovery, the
   `allowUnsafeRebootstrapOnDeadlock` precedent), pillars 3.5 (minimal interference), 3.7 (IP-only
   identity), 3.9 (ghost node healing), 3.10 (leaderless + ghost-master recovery).
