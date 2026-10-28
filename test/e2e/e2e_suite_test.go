@@ -201,6 +201,7 @@ var _ = BeforeSuite(func() {
 
 	if skipOperatorDeploy {
 		_, _ = fmt.Fprintf(GinkgoWriter, "Skipping operator deployment (SKIP_OPERATOR_DEPLOY=true)\n")
+		ensureOperatorDebugLogging()
 	} else {
 		deployOperator()
 	}
@@ -276,11 +277,81 @@ var _ = AfterSuite(func() {
 	_, _ = utils.Run(cmd)
 
 	if skipOperatorDeploy {
+		restoreOperatorLogLevel()
 		return
 	}
 
 	undeployOperator()
 })
+
+// operatorLogLevelRestore holds the --zap-log-level an inherited operator carried
+// before the suite switched it to debug. Empty means nothing to restore.
+var operatorLogLevelRestore string
+
+// operatorLogLevel reads --zap-log-level off the deployed operator, "" if absent.
+func operatorLogLevel() string {
+	cmd := exec.Command("kubectl", "get", "deployment", "-n", operatorNamespace,
+		"-l", "control-plane=controller-manager",
+		"-o", "jsonpath={.items[0].spec.template.spec.containers[0].args}")
+	out, err := utils.Run(cmd)
+	if err != nil {
+		return ""
+	}
+	for _, arg := range strings.Split(strings.Trim(out, "[]"), ",") {
+		arg = strings.Trim(strings.TrimSpace(arg), `"`)
+		if level, found := strings.CutPrefix(arg, "--zap-log-level="); found {
+			return level
+		}
+	}
+	return ""
+}
+
+// ensureOperatorDebugLogging switches an inherited operator to debug logging.
+//
+// Three tiers prove something about the operator by matching its log output, and
+// the lines they match are V(1) — debug-only since the per-reconcile restatements
+// were demoted. deployOperator() passes LOG_LEVEL=debug for exactly this reason;
+// under SKIP_OPERATOR_DEPLOY the suite inherits whatever the release carries, and
+// at the chart default (info) that evidence is simply absent. A positive assertion
+// then times out, and a NEGATIVE one — "the standby never reconciled" — passes
+// while checking nothing. Switching the release is the cheaper fix than teaching
+// three tiers to prove a negative without logs.
+//
+// Restarting the operator is safe here: BeforeSuite runs before any CR exists.
+func ensureOperatorDebugLogging() {
+	current := operatorLogLevel()
+	if current == "debug" {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Operator log level: debug (unchanged)\n")
+		return
+	}
+
+	By(fmt.Sprintf("switching the inherited operator from %q to debug logging", current))
+	cmd := exec.Command("helm", "upgrade", "littlered", "charts/littlered",
+		"-n", operatorNamespace, "--reuse-values", "--set", "logLevel=debug")
+	_, err := utils.Run(cmd)
+	ExpectWithOffset(1, err).NotTo(HaveOccurred(),
+		"Failed to switch the inherited operator to debug logging; tiers that assert on "+
+			"operator log lines cannot run against an info-level operator")
+	waitForOperator()
+	operatorLogLevelRestore = current
+}
+
+// restoreOperatorLogLevel puts an inherited operator back on the level it had.
+// Best-effort by design: the suite has already reported by the time this runs, so
+// a failure here must not fail the run, and leaving the operator on debug is
+// harmless. It cycles on every SKIP_OPERATOR_DEPLOY run; that is accepted.
+func restoreOperatorLogLevel() {
+	if operatorLogLevelRestore == "" {
+		return
+	}
+	By("restoring the operator log level to " + operatorLogLevelRestore)
+	cmd := exec.Command("helm", "upgrade", "littlered", "charts/littlered",
+		"-n", operatorNamespace, "--reuse-values", "--set", "logLevel="+operatorLogLevelRestore)
+	if _, err := utils.Run(cmd); err != nil {
+		_, _ = fmt.Fprintf(GinkgoWriter, "Could not restore operator log level: %v\n", err)
+	}
+	operatorLogLevelRestore = ""
+}
 
 func deployOperator() {
 	By("building the operator images")
