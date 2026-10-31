@@ -101,6 +101,12 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Security
 
+- **Go toolchain moved to 1.26.10.** `govulncheck ./...` at go1.26.9 reports one reachable
+  standard-library vulnerability, GO-2026-6809 (distrust compromised intermediate
+  certificates in `crypto/x509`), fixed in go1.26.10. Dependabot moved only the chaos
+  client's builder image (#161); `go.mod` and the operator's builder now move with it, as
+  the toolchain agreement test in `hack/toolchain` requires.
+
 - **Go toolchain moved to 1.26.9.** The `Security scan` on the open Dependabot PRs reported
   eleven reachable vulnerabilities, six of them in the Go standard library and fixed in
   go1.26.9: GO-2026-6613 and GO-2026-6605 (HTTP/1 connection desynchronization around
