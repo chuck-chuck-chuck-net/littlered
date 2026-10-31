@@ -276,6 +276,9 @@ Four properties matter:
    `littlered_controller.go:143` and `config/rbac/role.yaml:34`). The uncached `r.apiReader()`
    is never used for Secrets. So **the operator sees a Secret edit at informer speed and the
    pods see it only when they restart** — that skew *is* the rotation problem.
+   *Update:* Secrets are no longer cached. `controller.ManagerClientOptions` disables the cache
+   for the type, so `r.Get` is a live read and the RBAC is `get` only. The operator now sees an
+   edit on its next read rather than at informer speed; the skew against the pods is unchanged.
 3. **It is not cached by the reconciler** — re-called per pass, per subsystem.
 4. **Eleven call sites**, all in `internal/controller`: `:842` (the whole sentinel healing pass →
    the gatherer at `:931`, every `NewSentinelClient` at `:1042`/`:1129`/`:1149`, the

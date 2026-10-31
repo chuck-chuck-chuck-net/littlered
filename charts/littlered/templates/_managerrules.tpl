@@ -30,8 +30,6 @@
   - secrets
   verbs:
   - get
-  - list
-  - watch
 - apiGroups:
   - ''
   - events.k8s.io
