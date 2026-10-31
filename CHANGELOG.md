@@ -90,6 +90,19 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Fixed
 
+- **The operator no longer caches every Secret in its scope.** Auth, TLS and CA Secrets
+  were read through the manager's cached client, and the first such read started an
+  informer over every Secret the operator could see, Helm release Secrets included. On
+  an unscoped install that is the whole cluster, so the operator's memory grew with the
+  cluster rather than with the instances it manages (the same defect as
+  chuck-chuck-chuck-net/slaptain#28). The manager's client now reads Secrets live from the
+  API server, which costs a few GETs per reconcile pass beside the server-side applies a
+  pass already sends. The operator's RBAC on `secrets` drops `list` and `watch` and keeps
+  `get` only, so a cached Secret read reintroduced later fails rather than quietly
+  rebuilding the cache. Pods, ConfigMaps, Services, StatefulSets and PDBs are still
+  cached unfiltered within the operator's scope; namespace scoping (`scope.watchNamespaces`)
+  remains the way to bound those.
+
 - **`spec.config.maxmemory` is now validated.** The field is parsed as a Kubernetes
   quantity, where `m` is the *milli* suffix — so `maxmemory: 375m` meant 0.375 bytes and
   was rendered into `redis.conf` as `maxmemory 1`, silently capping the instance at one
