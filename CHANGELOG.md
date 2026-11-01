@@ -99,9 +99,16 @@ cut a release (`scripts/prepare-release.sh`).
   API server, which costs a few GETs per reconcile pass beside the server-side applies a
   pass already sends. The operator's RBAC on `secrets` drops `list` and `watch` and keeps
   `get` only, so a cached Secret read reintroduced later fails rather than quietly
-  rebuilding the cache. Pods, ConfigMaps, Services, StatefulSets and PDBs are still
-  cached unfiltered within the operator's scope; namespace scoping (`scope.watchNamespaces`)
-  remains the way to bound those.
+  rebuilding the cache.
+
+- **The operator caches only its own ConfigMaps, Services, StatefulSets and PDBs.** Those
+  four types were cached unfiltered, so the operator held every ConfigMap and Service in
+  its scope, which on an unscoped install is the whole cluster. The cache now selects them
+  on `app.kubernetes.io/managed-by=littlered-operator`, which every object the operator
+  creates has carried since v0.1.0, so nothing is relabeled and nothing rolls. The selector
+  composes with namespace scoping. Because the label now decides what the operator can
+  see, `spec.service.labels` may no longer set it: CRD validation rejects the key, and the
+  Service builders drop it. Pods are still cached unfiltered within the operator's scope.
 
 - **`spec.config.maxmemory` is now validated.** The field is parsed as a Kubernetes
   quantity, where `m` is the *milli* suffix — so `maxmemory: 375m` meant 0.375 bytes and

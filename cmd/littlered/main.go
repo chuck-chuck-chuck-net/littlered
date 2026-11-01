@@ -179,14 +179,16 @@ func main() {
 	// inferred from the in-cluster config / --leader-election-namespace default).
 	leaderElectionNamespace := os.Getenv("POD_NAMESPACE")
 
-	// Client: Secrets are read live, never cached — a cached read would hold every Secret
-	// in the operator's scope in memory. See controller.ManagerClientOptions.
+	// Cache: owned types are cached only when labeled managed-by=littlered-operator; see
+	// controller.ManagerCacheOptions. Client: Secrets are read live, never cached — a cached
+	// read would hold every Secret in the operator's scope in memory. See
+	// controller.ManagerClientOptions.
 	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
 		Scheme:                  scheme,
 		Metrics:                 metricsServerOptions,
 		WebhookServer:           webhookServer,
 		HealthProbeBindAddress:  probeAddr,
-		Cache:                   scope.CacheOptions(),
+		Cache:                   controller.ManagerCacheOptions(scope.CacheOptions()),
 		Client:                  controller.ManagerClientOptions(),
 		LeaderElection:          true,
 		LeaderElectionID:        scope.LeaderElectionID,

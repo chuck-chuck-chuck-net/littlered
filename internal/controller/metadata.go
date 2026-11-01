@@ -131,6 +131,21 @@ func objectLabels(lr *littleredv1alpha1.LittleRed, owned map[string]string) map[
 	return out
 }
 
+// serviceLabels returns the labels of a client-facing Service: the operator's own, then
+// spec.service.labels. The per-object layer may add labels and override descriptive
+// ones, but never app.kubernetes.io/managed-by: the manager's cache selects Services on
+// it (ManagerCacheOptions), so overriding it would hide the Service from the operator.
+func serviceLabels(lr *littleredv1alpha1.LittleRed) map[string]string {
+	out := commonLabels(lr)
+	for k, v := range lr.Spec.Service.Labels {
+		if k == labelAppManagedBy {
+			continue
+		}
+		out[k] = v
+	}
+	return out
+}
+
 // podTemplateLabels builds the labels for a pod template: labels inherited from the LittleRed
 // resource, then the operator's own (which include the selector this pod must match),
 // then spec.podTemplate.labels as the most specific layer.

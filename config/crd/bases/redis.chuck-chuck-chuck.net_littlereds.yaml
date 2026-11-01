@@ -2103,8 +2103,15 @@ spec:
                   labels:
                     additionalProperties:
                       type: string
-                    description: Labels are additional Service labels
+                    description: |-
+                      Labels are additional Service labels. They may not set
+                      app.kubernetes.io/managed-by: the operator's cache selects its Services on that
+                      label, so a Service carrying another value would be invisible to it.
                     type: object
+                    x-kubernetes-validations:
+                    - message: spec.service.labels may not set app.kubernetes.io/managed-by;
+                        the operator selects its Services on that label
+                      rule: '!(''app.kubernetes.io/managed-by'' in self)'
                   type:
                     default: ClusterIP
                     description: Type is the Service type
