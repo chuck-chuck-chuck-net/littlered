@@ -393,7 +393,10 @@ type ServiceSpec struct {
 	// +optional
 	Annotations map[string]string `json:"annotations,omitempty"`
 
-	// Labels are additional Service labels
+	// Labels are additional Service labels. They may not set
+	// app.kubernetes.io/managed-by: the operator's cache selects its Services on that
+	// label, so a Service carrying another value would be invisible to it.
+	// +kubebuilder:validation:XValidation:rule="!('app.kubernetes.io/managed-by' in self)",message="spec.service.labels may not set app.kubernetes.io/managed-by; the operator selects its Services on that label"
 	// +optional
 	Labels map[string]string `json:"labels,omitempty"`
 }
