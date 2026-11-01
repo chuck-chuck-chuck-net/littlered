@@ -124,6 +124,25 @@ var _ = Describe("Metadata contract validation", func() {
 		})
 	})
 
+	Context("spec.service.labels", func() {
+		It("accepts ordinary user labels", func() {
+			cr := newCR()
+			cr.Spec.Service.Labels = map[string]string{metaTeamKey: metaTeamValue}
+			Expect(k8sClient.Create(ctx, cr)).To(Succeed())
+			DeferCleanup(func() { _ = k8sClient.Delete(ctx, cr) })
+		})
+
+		// The manager's cache selects Services on app.kubernetes.io/managed-by, so a
+		// Service labeled otherwise would be invisible to the operator.
+		It("rejects app.kubernetes.io/managed-by", func() {
+			cr := newCR()
+			cr.Spec.Service.Labels = map[string]string{labelAppManagedBy: metaHijackValue}
+			err := k8sClient.Create(ctx, cr)
+			Expect(err).To(HaveOccurred())
+			Expect(err.Error()).To(ContainSubstring("may not set app.kubernetes.io/managed-by"))
+		})
+	})
+
 	Context("inherited metadata", func() {
 		// Propagation itself is unit-tested; what needs a real apiserver is that the
 		// labels survive a round trip through it, i.e. that nothing in the CRD schema

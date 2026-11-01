@@ -28,6 +28,8 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 )
@@ -106,5 +108,55 @@ var _ = Describe("Manager client options", func() {
 		Expect(mgr.GetClient().Get(readCtx, types.NamespacedName{Name: secretName, Namespace: ns.Name}, got)).
 			To(Succeed(), "a Secret read through the manager's client must not depend on list/watch")
 		Expect(got.Data).To(HaveKeyWithValue("password", []byte("s3cret")))
+	})
+})
+
+// The cache for the types the operator owns (ConfigMap, Service, StatefulSet, PDB) is
+// narrowed to objects labeled app.kubernetes.io/managed-by=littlered-operator, so the
+// operator does not hold every ConfigMap and Service in the cluster. An object of one of
+// those types without the label is not visible through the manager's client.
+var _ = Describe("Manager cache options", func() {
+	It("caches owned types only when they carry the operator's managed-by label", func() {
+		ns := &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{GenerateName: "mgr-cache-"}}
+		Expect(k8sClient.Create(ctx, ns)).To(Succeed())
+		DeferCleanup(func() { _ = k8sClient.Delete(context.Background(), ns) })
+
+		ours := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{
+			Name: "ours", Namespace: ns.Name,
+			Labels: map[string]string{labelAppManagedBy: managedByValue},
+		}}
+		foreign := &corev1.ConfigMap{ObjectMeta: metav1.ObjectMeta{Name: "foreign", Namespace: ns.Name}}
+		Expect(k8sClient.Create(ctx, ours)).To(Succeed())
+		Expect(k8sClient.Create(ctx, foreign)).To(Succeed())
+
+		mgr, err := ctrl.NewManager(cfg, ctrl.Options{
+			Scheme:                 scheme.Scheme,
+			Metrics:                metricsserver.Options{BindAddress: "0"},
+			HealthProbeBindAddress: "0",
+			Cache:                  ManagerCacheOptions(cache.Options{}),
+			Client:                 ManagerClientOptions(),
+		})
+		Expect(err).NotTo(HaveOccurred())
+
+		mgrCtx, stop := context.WithCancel(ctx)
+		DeferCleanup(stop)
+		go func() {
+			defer GinkgoRecover()
+			Expect(mgr.Start(mgrCtx)).To(Succeed())
+		}()
+		Expect(mgr.GetCache().WaitForCacheSync(mgrCtx)).To(BeTrue())
+
+		c := mgr.GetClient()
+		Eventually(func() error {
+			return c.Get(mgrCtx, types.NamespacedName{Name: "ours", Namespace: ns.Name}, &corev1.ConfigMap{})
+		}).Should(Succeed())
+
+		list := &corev1.ConfigMapList{}
+		Expect(c.List(mgrCtx, list, client.InNamespace(ns.Name))).To(Succeed())
+		names := make([]string, 0, len(list.Items))
+		for _, cm := range list.Items {
+			names = append(names, cm.Name)
+		}
+		Expect(names).To(ConsistOf("ours"), "an unlabeled ConfigMap must not be in the operator's cache")
 	})
 })

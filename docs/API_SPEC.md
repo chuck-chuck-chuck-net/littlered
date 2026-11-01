@@ -317,7 +317,7 @@ spec:
 |-------|------|----------|---------|-------------|
 | `service.type` | `string` | No | `ClusterIP` | `ClusterIP`, `NodePort`, `LoadBalancer` |
 | `service.annotations` | `map[string]string` | No | `{}` | Annotations |
-| `service.labels` | `map[string]string` | No | `{}` | Additional labels |
+| `service.labels` | `map[string]string` | No | `{}` | Additional labels. May not set `app.kubernetes.io/managed-by` (rejected at admission) |
 
 ### 2.10 Pod Template
 
@@ -1164,7 +1164,8 @@ Never inherited, and never overridable:
 | `app.kubernetes.io/component` | Part of every selector (`redis`, `sentinel`, `cluster`) |
 | `redis.chuck-chuck-chuck.net/shard` | Per-shard StatefulSet selector (cluster mode) |
 | `redis.chuck-chuck-chuck.net/role` | Master Service selector (sentinel mode) |
-| `app.kubernetes.io/managed-by`, `app.kubernetes.io/version` | Operator-maintained; a user value would go stale |
+| `app.kubernetes.io/managed-by` | The operator's cache selects ConfigMaps, Services, StatefulSets and PDBs on it; an object labeled otherwise is invisible to the operator. Setting it in `spec.service.labels` is rejected by CRD validation |
+| `app.kubernetes.io/version` | Operator-maintained; a user value would go stale |
 | anything under `redis.chuck-chuck-chuck.net/` | The operator's own key namespace |
 
 The first five are **structural**: they make up the Service and StatefulSet selectors.

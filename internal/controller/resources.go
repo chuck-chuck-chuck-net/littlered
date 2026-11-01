@@ -784,9 +784,7 @@ func serviceAnnotations(lr *littleredv1alpha1.LittleRed) map[string]string {
 
 // buildService creates the Service for Redis
 func buildService(lr *littleredv1alpha1.LittleRed) *corev1.Service {
-	labels := commonLabels(lr)
-	// Add user-defined labels
-	maps.Copy(labels, lr.Spec.Service.Labels)
+	labels := serviceLabels(lr)
 
 	ports := []corev1.ServicePort{
 		{
@@ -1683,8 +1681,7 @@ exec redis-sentinel /data/sentinel.conf --sentinel announce-ip ${POD_IP} $AUTH_A
 // does not expose metrics or Prometheus scrape annotations: the all-pods
 // replicas headless service is the scrape target, so the master is scraped once.
 func buildMasterService(lr *littleredv1alpha1.LittleRed) *corev1.Service {
-	labels := commonLabels(lr)
-	maps.Copy(labels, lr.Spec.Service.Labels)
+	labels := serviceLabels(lr)
 
 	annotations := inheritedAnnotations(lr)
 	maps.Copy(annotations, lr.Spec.Service.Annotations)
@@ -2580,8 +2577,7 @@ func buildClusterHeadlessService(lr *littleredv1alpha1.LittleRed) *corev1.Servic
 
 // buildClusterClientService creates the client Service for cluster mode
 func buildClusterClientService(lr *littleredv1alpha1.LittleRed) *corev1.Service {
-	labels := commonLabels(lr)
-	maps.Copy(labels, lr.Spec.Service.Labels)
+	labels := serviceLabels(lr)
 
 	ports := []corev1.ServicePort{
 		{
