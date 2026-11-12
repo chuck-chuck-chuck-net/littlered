@@ -46,7 +46,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          cache-from: type=gha,scope=littlered
 
   chaos-client-image:
     name: Build and push chaos client image
@@ -84,7 +84,7 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
+          cache-from: type=gha,scope=littlered-chaos-client
 
   lrctl:
     name: Build and publish release assets

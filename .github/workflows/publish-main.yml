@@ -45,8 +45,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=littlered
+          cache-to: type=gha,scope=littlered,mode=max,ignore-error=true
 
   chaos-client-image:
     name: Build and push chaos client image
@@ -83,5 +83,5 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=gha,scope=littlered-chaos-client
+          cache-to: type=gha,scope=littlered-chaos-client,mode=max,ignore-error=true
