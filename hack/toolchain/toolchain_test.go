@@ -19,6 +19,7 @@ package toolchain
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -85,6 +86,17 @@ func TestBuilderGoVersion(t *testing.T) {
 			dockerfile: "FROM golang:1.26.8 AS builder\nFROM gcr.io/distroless/static:nonroot\n",
 			want:       sample,
 		},
+		{
+			name:       "pinned by digest",
+			dockerfile: "FROM golang:1.26.8@sha256:" + strings.Repeat("a", 64) + " AS builder\n",
+			want:       sample,
+		},
+		{
+			name:       "variant and digest",
+			dockerfile: "FROM golang:1.26.8-alpine@sha256:" + strings.Repeat("b", 64) + " AS builder\n",
+			want:       sample,
+		},
+		{name: "truncated digest", dockerfile: "FROM golang:1.26.8@sha256:abc AS builder\n", wantErr: true},
 		{name: "release candidate tag", dockerfile: "FROM golang:1.27rc2 AS builder\n", wantErr: true},
 		{name: "no builder stage", dockerfile: "FROM alpine:3.24.1\n", wantErr: true},
 	}

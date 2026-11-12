@@ -36,9 +36,11 @@ var (
 	goDirectiveRe = regexp.MustCompile(`(?m)^go\s+(\S+)\s*$`)
 
 	// builderFromRe matches the builder stage of a Dockerfile:
-	// `FROM golang:<version>[-<variant>] AS builder`. The variant suffix
-	// (`-alpine`) is deliberately not part of the version.
-	builderFromRe = regexp.MustCompile(`(?m)^FROM\s+golang:(\d+\.\d+(?:\.\d+)?)(?:-[A-Za-z0-9.]+)?\s+AS\s+builder\s*$`)
+	// `FROM golang:<version>[-<variant>][@sha256:<digest>] AS builder`. The
+	// variant suffix (`-alpine`) is deliberately not part of the version, and
+	// the digest pin is accepted but must be a full one.
+	builderFromRe = regexp.MustCompile(`(?m)^FROM\s+golang:(\d+\.\d+(?:\.\d+)?)(?:-[A-Za-z0-9.]+)?` +
+		`(?:@sha256:[0-9a-f]{64})?\s+AS\s+builder\s*$`)
 
 	// fullVersionRe is the shape go.mod must declare: `major.minor.patch`.
 	// A two-component directive such as `1.26` reads as a floor and lets
@@ -47,7 +49,7 @@ var (
 	fullVersionRe = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 
 	errNoGoDirective = errors.New("no `go` directive found")
-	errNoBuilderFrom = errors.New("no `FROM golang:<version> AS builder` line found")
+	errNoBuilderFrom = errors.New("no `FROM golang:<version>[@sha256:<digest>] AS builder` line found")
 )
 
 // GoDirective returns the version declared by the `go` directive in the
