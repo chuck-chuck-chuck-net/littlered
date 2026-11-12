@@ -61,6 +61,14 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Changed
 
+- **Images build with `docker buildx bake`.** `docker-bake.hcl` is the one description of both
+  images; the publish workflows run it in a single job, and the Makefile's image targets are
+  aliases onto it. `CONTAINER_TOOL` is gone: set `BUILDX` (default `docker buildx`; `buildx`
+  for a standalone client with a BuildKit worker of its own, see `docs/DEVELOPMENT.md`).
+  `kind-load` has the builder write image archives, so it needs no local image store;
+  `push-latest` retags in the registry; the unused multi-arch `docker-buildx` target is
+  removed. Published tags and labels are unchanged. Base images are pinned by digest.
+
 - **Per-pass log lines that restate a persisting state are debug-level now.** The
   "Reconciling <mode>" and "Reconciling delete" lines in all four modes, and the lines a
   pass emits while a state it is already reporting in `status` persists: "Not yet Running,

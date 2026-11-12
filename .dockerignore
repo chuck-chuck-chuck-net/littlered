@@ -23,3 +23,6 @@ docs/
 
 # Ignore config/samples (not needed for build)
 config/samples/
+
+# Image archives written by the builder (make kind-load)
+.build/

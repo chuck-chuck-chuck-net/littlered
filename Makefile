@@ -43,11 +43,14 @@ else
 GOBIN=$(shell go env GOBIN)
 endif
 
-# CONTAINER_TOOL defines the container tool to be used for building images.
-# Be aware that the target commands are only tested with Docker which is
-# scaffolded by default. However, you might want to replace it to use other
-# tools. (i.e. podman)
-CONTAINER_TOOL ?= docker
+# Images build with BuildKit through buildx; the graph is docker-bake.hcl, and
+# the image targets below are aliases onto it. BUILDX="docker buildx" is the
+# default; set BUILDX=buildx where buildx is a standalone binary talking to a
+# BuildKit worker of its own (docs/DEVELOPMENT.md). BAKE_FLAGS reaches every
+# bake run, e.g. BAKE_FLAGS=--load to keep a build in a local Docker store.
+BUILDX     ?= docker buildx
+BAKE_FLAGS ?=
+BAKE        = REGISTRY=$(LITTLERED_REGISTRY) TAG=$(IMAGE_TAG) $(BUILDX) bake $(BAKE_FLAGS)
 HELM ?= helm
 SKOPEO ?= skopeo
 
@@ -306,12 +309,17 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@echo "Deleting Kind cluster '$(KIND_CLUSTER)'..."
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
+# The builder writes each image as a docker archive, so no local image store is
+# needed; a build that is already cached costs only the export.
 .PHONY: kind-load
-kind-load: ## Load built images into the Kind cluster.
-	@echo "Loading operator image into Kind cluster $(KIND_CLUSTER)..."
-	$(CONTAINER_TOOL) save $(OPERATOR_IMAGE) | $(KIND) load image-archive /dev/stdin --name $(KIND_CLUSTER)
-	@echo "Loading chaos client image into Kind cluster $(KIND_CLUSTER)..."
-	$(CONTAINER_TOOL) save $(CHAOS_CLIENT_IMAGE) | $(KIND) load image-archive /dev/stdin --name $(KIND_CLUSTER)
+kind-load: ## Build both images and load them into the Kind cluster.
+	@mkdir -p .build
+	$(BAKE) \
+		--set littlered.output=type=docker,dest=.build/littlered.tar \
+		--set littlered-chaos-client.output=type=docker,dest=.build/littlered-chaos-client.tar \
+		default
+	$(KIND) load image-archive .build/littlered.tar --name $(KIND_CLUSTER)
+	$(KIND) load image-archive .build/littlered-chaos-client.tar --name $(KIND_CLUSTER)
 
 # Lint against the Go version the project TARGETS, not whatever the developer's
 # distro happens to ship. staticcheck (bundled into golangci-lint) supports the Go
@@ -422,54 +430,25 @@ run: manifests generate fmt vet ## Run a controller from your host.
 
 .PHONY: docker-build
 docker-build: ## Build the operator image (override registry/tag with IMG=).
-	$(CONTAINER_TOOL) build -t $(IMG) -f cmd/littlered/Dockerfile .
+	$(BAKE) --set littlered.tags=$(IMG) littlered
 
 .PHONY: docker-push
-docker-push: ## Push the operator image (override with IMG=).
-	$(CONTAINER_TOOL) push $(IMG)
+docker-push: ## Build and push the operator image (override with IMG=).
+	$(BAKE) --set littlered.tags=$(IMG) --push littlered
 
-# The project ships two images (operator + chaos client used by e2e). The
-# `images`/`build-images`/`push-images` targets below build/push the whole set;
-# the canonical `docker-build`/`docker-push` above cover just the operator image.
-BUILD_TARGETS = $(addsuffix .build_image,$(IMAGES))
-PUSH_TARGETS  = $(addsuffix .push_image,$(IMAGES))
-
-.PHONY: $(BUILD_TARGETS) $(PUSH_TARGETS)
-
+# The project ships two images (operator + chaos client used by e2e), the
+# `default` group of docker-bake.hcl. Pushing goes through the builder, so
+# push-images rebuilds from cache rather than pushing a local image.
 .PHONY: images
-images: $(BUILD_TARGETS) $(PUSH_TARGETS)
+images: push-images ## Build and push both images.
 
 .PHONY: build-images
-build-images: $(BUILD_TARGETS)
+build-images: ## Build both images (the result stays in the builder's cache unless BAKE_FLAGS says otherwise).
+	$(BAKE) default
 
 .PHONY: push-images
-push-images: $(PUSH_TARGETS)
-
-# If you wish to build the manager image targeting other platforms you can use the --platform flag.
-# (i.e. docker build --platform linux/arm64). However, you must enable docker buildKit for it.
-# More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-$(BUILD_TARGETS): %.build_image:
-	$(CONTAINER_TOOL) build -t $(LITTLERED_REGISTRY)/$*:$(IMAGE_TAG) -f cmd/$*/Dockerfile .
-
-$(PUSH_TARGETS): %.push_image:
-	$(CONTAINER_TOOL) push $(LITTLERED_REGISTRY)/$*:$(IMAGE_TAG)
-
-# PLATFORMS defines the target platforms for the manager image be built to provide support to multiple
-# architectures. (i.e. make docker-buildx IMG=myregistry/littlered:0.0.1). To use this option you need to:
-# - be able to use docker buildx. More info: https://docs.docker.com/build/buildx/
-# - have enabled BuildKit. More info: https://docs.docker.com/develop/develop-images/build_enhancements/
-# - be able to push the image to your registry (i.e. if you do not set a valid value via OPERATOR_IMAGE=<myregistry/image:<tag>> then the export will fail)
-# To adequately provide solutions that are compatible with multiple platforms, you should consider using this option.
-PLATFORMS ?= linux/arm64,linux/amd64,linux/s390x,linux/ppc64le
-.PHONY: docker-buildx
-docker-buildx: ## Build and push the operator image for cross-platform support (override with IMG=).
-	# copy existing Dockerfile and insert --platform=${BUILDPLATFORM} into Dockerfile.cross, and preserve the original Dockerfile
-	sed -e '1 s/\(^FROM\)/FROM --platform=\$$\{BUILDPLATFORM\}/; t' -e ' 1,// s//FROM --platform=\$$\{BUILDPLATFORM\}/' cmd/littlered/Dockerfile > Dockerfile.cross
-	- $(CONTAINER_TOOL) buildx create --name littlered-builder
-	$(CONTAINER_TOOL) buildx use littlered-builder
-	- $(CONTAINER_TOOL) buildx build --push --platform=$(PLATFORMS) --tag $(IMG) -f Dockerfile.cross .
-	- $(CONTAINER_TOOL) buildx rm littlered-builder
-	rm Dockerfile.cross
+push-images: ## Build and push both images.
+	$(BAKE) --push default
 
 ##@ Deployment
 
@@ -532,8 +511,7 @@ push-latest: ## Re-tag images as :latest (only runs on release tags, no-ops othe
 	fi; \
 	echo "Pushing :latest for release $(GIT_TAG)..."; \
 	$(foreach img,$(IMAGES), \
-		$(CONTAINER_TOOL) tag $(LITTLERED_REGISTRY)/$(img):$(IMAGE_TAG) $(LITTLERED_REGISTRY)/$(img):latest && \
-		$(CONTAINER_TOOL) push $(LITTLERED_REGISTRY)/$(img):latest && ) true
+		$(BUILDX) imagetools create --tag $(LITTLERED_REGISTRY)/$(img):latest $(LITTLERED_REGISTRY)/$(img):$(IMAGE_TAG) && ) true
 # NOTE: No :latest tag for the Helm chart. Helm treats the OCI tag / --version as a
 # semver constraint, so a 'latest' tag is unusable (`helm pull --version latest` ->
 # "improper constraint: latest"). Helm resolves the newest chart by picking the

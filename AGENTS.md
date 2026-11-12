@@ -158,7 +158,7 @@ make manifests generate
 
 # 2. Build & push the operator image, then deploy via Helm
 export IMG=<registry>/littlered:tag
-make docker-build docker-push IMG=$IMG   # or: make build-images && make kind-load
+make docker-push IMG=$IMG                # builds and pushes; or: make kind-load
 make deploy IMG=$IMG
 
 # 3. Try a sample

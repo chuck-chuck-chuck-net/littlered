@@ -49,3 +49,6 @@ dist/
 # cluster and pod names and absolute home paths, and this repository is public.
 *.weg
 e2e-fail*.txt
+
+# Image archives written by the builder (make kind-load)
+.build/

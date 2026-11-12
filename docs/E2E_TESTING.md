@@ -21,7 +21,7 @@ E2E tests verify the operator in a real Kubernetes cluster (Kind). They:
 
 - **Go 1.24+**
 - **Kind** (Kubernetes in Docker)
-- **Docker or Podman**
+- **Docker** for Kind, and **buildx** for images (see [Development](DEVELOPMENT.md#getting-a-buildkit-worker))
 - **kubectl**
 
 The Makefile manages everything else automatically: cluster creation, image builds, loading images into Kind, operator deployment, and teardown.
