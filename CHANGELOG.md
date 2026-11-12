@@ -114,6 +114,12 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Security
 
+- **Go toolchain moved to 1.26.11.** `govulncheck ./...` at go1.26.10 reports one reachable
+  standard-library vulnerability, GO-2026-6859 (HTTP/1 server crash due to a
+  `MaxBytesReader` header race in `net/http`), fixed in go1.26.11. `go.mod` and both
+  container builders move together, as the toolchain agreement test in `hack/toolchain`
+  requires.
+
 - **Go toolchain moved to 1.26.10.** `govulncheck ./...` at go1.26.9 reports one reachable
   standard-library vulnerability, GO-2026-6809 (distrust compromised intermediate
   certificates in `crypto/x509`), fixed in go1.26.10. Dependabot moved only the chaos
