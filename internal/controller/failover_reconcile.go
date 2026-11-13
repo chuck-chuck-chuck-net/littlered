@@ -192,9 +192,12 @@ func (r *LittleRedReconciler) reconcileConfigMapFailover(ctx context.Context, li
 	return r.apply(ctx, littleRed, buildConfigMapFailoverMode(littleRed))
 }
 
-// reconcileFailoverStatefulSet ensures the Redis StatefulSet exists for failover mode
+// reconcileFailoverStatefulSet ensures the Redis StatefulSet exists for failover mode, with
+// its rolling update gated one available pod at a time (applyAvailabilityGated, LR-065).
 func (r *LittleRedReconciler) reconcileFailoverStatefulSet(ctx context.Context, littleRed *littleredv1alpha1.LittleRed) error {
-	return r.apply(ctx, littleRed, buildRedisStatefulSetFailover(littleRed))
+	return r.applyAvailabilityGated(ctx, littleRed, func(partition *int32) *appsv1.StatefulSet {
+		return buildRedisStatefulSetFailover(littleRed, partition)
+	})
 }
 
 // reconcileFailoverPDB creates or deletes the PDB for the failover-mode data pods.
@@ -239,13 +242,19 @@ func (r *LittleRedReconciler) bootstrapFailover(ctx context.Context, lr *littler
 		}
 		return err
 	}
-	currentRevision := sts.Status.CurrentRevision
-	podRevision := pod0.Labels["controller-revision-hash"]
-	if pod0.Status.PodIP == "" || currentRevision == "" || podRevision != currentRevision {
+	// EITHER of the StatefulSet's own revisions counts (LR-065, LR-047's bootstrapCluster
+	// precedent): while the rollout partition is above 0 CurrentRevision does not advance, so
+	// a redis-0 already replaced at UpdateRevision would fail a CurrentRevision-only gate, and
+	// the roll could not complete without the bootstrap making the pods Ready. Not reachable
+	// today (the cursor releases redis-0 last, after pods that cannot be Ready before
+	// bootstrap), and kept that way by construction rather than by that ordering. Neither
+	// revision is the stale foreign deployment this guard is aimed at.
+	if pod0.Status.PodIP == "" || !podAtOwnStatefulSetRevision(pod0, sts) {
 		log.Info("Bootstrap: waiting for redis-0 to be ready",
 			"hasIP", pod0.Status.PodIP != "",
-			"podRevision", podRevision,
-			"stsRevision", currentRevision)
+			"podRevision", pod0.Labels[labelControllerRevisionHash],
+			"stsCurrentRevision", sts.Status.CurrentRevision,
+			"stsUpdateRevision", sts.Status.UpdateRevision)
 		return nil
 	}
 

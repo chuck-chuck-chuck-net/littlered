@@ -95,6 +95,13 @@ be gated loud.
    the pod first self-fences with `CONFIG SET min-replicas-to-write 99`, then exits as before.
    This is a mitigation, not a closure, and it ships **after** the gate in the same image.
 
+5. **Amendment (LR-065): the same cursor gates the sentinel- and failover-mode StatefulSets on
+   availability.** The sentinel-mode Redis and Sentinel StatefulSets and the failover-mode Redis
+   StatefulSet hold `partition` the same way, decided by the same planner with two input changes:
+   clause (c) is dropped (there is no slot owner) and an availability clause is added — every pod
+   at or above the partition must have been Ready for the StatefulSet's `minReadySeconds`. See
+   *Amendment: the Parallel StatefulSets of the other modes* below.
+
 ## Rationale
 
 ### Why `partition`, and why the shape is forced rather than chosen
@@ -348,6 +355,85 @@ its own decision if ever wanted.
   redundancy-aware** — it requires `role:master` or `link:up`, which LR-016 explicitly *kept* while
   stripping the liveness probe. That asymmetry is why cluster mode has this hole and sentinel does
   not; it is not a second defect to fix.
+
+  *Amended (LR-065).* The note holds only while the StatefulSet controller applies that gate, and
+  from Kubernetes v1.37 it does not for Parallel pod management — see the amendment below.
+
+## Amendment: the Parallel StatefulSets of the other modes (LR-065)
+
+**Context.** Kubernetes v1.37 enables `MaxUnavailableStatefulSet` by default. For
+`podManagementPolicy: Parallel` the controller then deletes in two phases, and the first deletes
+**every** old-revision pod that is not yet available (Ready for `minReadySeconds`) with no budget
+check; only already-available pods are bounded by `maxUnavailable`. Pods below `partition` are never
+touched. Measured on a single-node v1.37 cluster with a 3-replica Parallel StatefulSet and
+`minReadySeconds: 20`: pods Ready for 2s were all deleted in the same second, with `maxUnavailable`
+unset and with `maxUnavailable: 1`; pods Ready for 30s were replaced one at a time either way. So
+`maxUnavailable` is not a fix — availability decides. The sentinel-mode Redis StatefulSet uses
+`minReadySeconds: 35` and failover mode 15, so any template change made inside that window after
+pods became Ready (shortly after creation, a second edit mid-roll, a mass restart) replaced the
+whole instance at once, which on EmptyDir is the dataset. The cluster shards are unaffected: their
+cursor already exposes one pod.
+
+**Decision.** The operator owns `partition` on the sentinel-mode Redis and Sentinel StatefulSets and
+on the failover-mode Redis StatefulSet. Gate at the highest ordinal on a template change; lower by
+one only once every pod at or above the partition is at `UpdateRevision`, Ready (the pod's own
+`Ready` condition, which is what the StatefulSet controller decides availability by — a Sentinel pod
+has no `redis` container), and available for the StatefulSet's `minReadySeconds`. This restores
+the pre-v1.37 one-at-a-time order exactly; it adds nothing the controller did not already wait for.
+Old pods below the partition are not inspected, so a crash-looping old pod is replaced when the
+cursor reaches it (the stuck-rollout case upstream fixed). A new revision that never becomes Ready
+holds the roll; there is no timer.
+
+**The same planner, not a copy.** `planShardRolloutPartition` takes two more input fields:
+`SkipRedundancyClause` (zero value keeps clause (c), so an omission fails toward holding) and
+`MinReadySeconds` (0 makes the availability clause vacuous). Cluster shards pass neither, so their
+behaviour is byte-identical. Its decision order — template change before `Complete`, `Complete`
+before the clauses — is the load-bearing part, and a second copy would have been a second place to
+get it wrong.
+
+**What differs from the cluster wiring, and why.**
+
+- **Decided entirely at apply time, no post-gather half.** Every input is Kubernetes state, so the
+  split that exists for clause (c) is not needed. The cursor and the pods are still read uncached
+  while a rollout is in flight, for the reason given above.
+- **The change detector lives on the StatefulSet's metadata, not on the pod template.** A cluster
+  shard carries `AnnotationPodSpecHash` on its pod template. Putting a new annotation on these pod
+  templates would itself be a template change and roll every existing instance once on upgrade, for
+  nothing. On the StatefulSet's own metadata it is equally cache-safe, outside the template, and
+  absent on existing objects — which reads as a change and gates at the top ordinal, harmlessly
+  when nothing in the template changed and correctly when the upgrade does change it.
+- **No advisory condition.** The cluster gate needs `ClusterRolloutBlocked` because its hold waits on
+  a full sync that can legitimately take minutes. Here a hold waits on readiness, which the instance
+  already reports (`Ready=False/PodsNotReady`), plus at most `minReadySeconds`. A new condition would
+  restate it.
+- **The two sentinel-mode StatefulSets roll concurrently**, each one pod at a time, as they did
+  before v1.37. Nothing in the ledger records interference between a Sentinel-process roll and a
+  Redis roll (LR-048 measured renames under exactly that concurrency), so no serialization is added.
+
+**Consequences.**
+
+- While the partition is above 0, a pod below it that is deleted is re-created at
+  `CurrentRevision`, i.e. on the **old** template, and is replaced again when the cursor reaches it.
+  The quarantine release (LR-044) is not affected: at 0 replicas a roll is vacuously complete
+  (LR-061's probe row (a) measured the release returning every pod at `updateRevision`), and the
+  cursor emits no partition while there are no pods. **LR-061's manual escape changes**: deleting the
+  parked pods re-creates them from the current template only once the partition has been set to 0
+  by hand; the operator keeps a lower partition it finds.
+- Bootstrap (`bootstrapSentinel`, `bootstrapFailover`) accepts either of the StatefulSet's own
+  revisions for `redis-0`, mirroring `bootstrapCluster` above. Not reachable as a stall today (the
+  cursor releases `redis-0` last, after pods that cannot be Ready before bootstrap), and kept that
+  way by construction.
+- `statefulSetRolloutSettled` and its consumers (LR-021, LR-050's attribution gate, ADR-020's
+  settledness) are unchanged: with `partition > 0` `CurrentRevision` does not advance, so the roll
+  reads unsettled from first step to last, as it did before.
+- Upgrading triggers no rollout of its own; one transient raise and lower of the partition per
+  StatefulSet, with no pod touched.
+
+**Open follow-up (not built).** A redundancy clause for these modes — release the next pod only once
+the replacement is a link-`up` replica of the current master — is this ADR's clause (c) extended to
+sentinel and failover mode. It is a separate, larger decision: their readiness probe already
+requires `link:up` for a replica, so v1 inherits most of it, and the remaining gap (a replica that
+syncs and drops between checks) has no recorded incident.
 
 ## Verification plan
 

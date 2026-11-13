@@ -308,8 +308,8 @@ func TestBuildersCarryInheritedMetadata(t *testing.T) {
 		{
 			mode: ModeSentinel,
 			objects: func(lr *littleredv1alpha1.LittleRed) []object {
-				objs := stsObjects("Redis StatefulSet", buildRedisStatefulSetSentinel(lr, 3))
-				objs = append(objs, stsObjects("Sentinel StatefulSet", buildSentinelStatefulSet(lr, 3))...)
+				objs := stsObjects("Redis StatefulSet", buildRedisStatefulSetSentinel(lr, 3, nil))
+				objs = append(objs, stsObjects("Sentinel StatefulSet", buildSentinelStatefulSet(lr, 3, nil))...)
 				redisCM, sentinelCM := buildConfigMapSentinelMode(lr), buildSentinelConfigMap(lr)
 				master, replicas := buildMasterService(lr), buildReplicasHeadlessService(lr)
 				sentinelSvc := buildSentinelHeadlessService(lr)
@@ -345,7 +345,7 @@ func TestBuildersCarryInheritedMetadata(t *testing.T) {
 			// routing is identical, pillar 3.14) and adds three builders of its own.
 			mode: ModeFailover,
 			objects: func(lr *littleredv1alpha1.LittleRed) []object {
-				objs := stsObjects("failover StatefulSet", buildRedisStatefulSetFailover(lr))
+				objs := stsObjects("failover StatefulSet", buildRedisStatefulSetFailover(lr, nil))
 				cm, pdb := buildConfigMapFailoverMode(lr), buildFailoverRedisPDB(lr)
 				master, replicas := buildMasterService(lr), buildReplicasHeadlessService(lr)
 				return append(objs,

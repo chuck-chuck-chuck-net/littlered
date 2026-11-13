@@ -101,8 +101,8 @@ func TestQuarantinedInstanceNeverGetsItsPodsPutBackByTheBuilders(t *testing.T) {
 
 			// What the operator actually applies is what the BUILDERS stamp; assert on
 			// those, not only on the decision function.
-			redisSTS := buildRedisStatefulSetSentinel(st.lr, redis)
-			sentinelSTS := buildSentinelStatefulSet(st.lr, sntnl)
+			redisSTS := buildRedisStatefulSetSentinel(st.lr, redis, nil)
+			sentinelSTS := buildSentinelStatefulSet(st.lr, sntnl, nil)
 			if got := *redisSTS.Spec.Replicas; got != st.redis {
 				t.Errorf("redis StatefulSet .spec.replicas = %d, want %d", got, st.redis)
 			}

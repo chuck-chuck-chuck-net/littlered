@@ -1045,8 +1045,9 @@ func buildConfigMapSentinelMode(lr *littleredv1alpha1.LittleRed) *corev1.ConfigM
 // .Spec.Replicas is built here wins unconditionally on every pass. Scaling the live
 // object out of band would be force-overwritten right back. The single source of truth is
 // sentinelDesiredReplicas; it is passed in for the same reason the cluster builder takes
-// its shard index — the builder renders a decision, it does not make one.
-func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed, replicas int32) *appsv1.StatefulSet {
+// its shard index — the builder renders a decision, it does not make one. The rollout
+// partition is passed in for the same reason (applyAvailabilityGated, LR-065).
+func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed, replicas int32, partition *int32) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentRedis
 
@@ -1111,7 +1112,7 @@ func buildRedisStatefulSetSentinel(lr *littleredv1alpha1.LittleRed, replicas int
 		},
 	}
 
-	return sts
+	return withAvailabilityGate(sts, partition)
 }
 
 // buildRedisContainerSentinel creates the Redis container for sentinel mode
@@ -1477,8 +1478,9 @@ func buildSentinelVolumes(lr *littleredv1alpha1.LittleRed) []corev1.Volume {
 // quarantine takes the SENTINEL pods away too, and that is not optional — the victim's
 // sentinels publish hellos on the captor's master's channel under the shared master name,
 // so the captor learns them as peers (the num-other-sentinels inflation that distorts its
-// quorum math). See sentinelDesiredReplicas and LR-044.
-func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed, replicas int32) *appsv1.StatefulSet {
+// quorum math). See sentinelDesiredReplicas and LR-044. The rollout partition is passed in
+// likewise (applyAvailabilityGated, LR-065).
+func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed, replicas int32, partition *int32) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentSentinel
 
@@ -1534,7 +1536,7 @@ func buildSentinelStatefulSet(lr *littleredv1alpha1.LittleRed, replicas int32) *
 		},
 	}
 
-	return sts
+	return withAvailabilityGate(sts, partition)
 }
 
 // buildSentinelContainer creates the Sentinel container

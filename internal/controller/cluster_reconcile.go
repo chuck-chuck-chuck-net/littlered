@@ -1163,7 +1163,9 @@ func (r *LittleRedReconciler) reconcileClusterStatefulSet(ctx context.Context, l
 		// about to be acted on. The steady loop keeps the cached read: LR-043 explicitly
 		// declined to make the steady path uncached on per-pass cost, and that reasoning is
 		// unchanged.
-		if existing, err = r.refreshShardSTSForRollout(ctx, littleRed, k, existing, desiredHash); err != nil {
+		inFlight := existing.Spec.Template.Annotations[AnnotationPodSpecHash] != desiredHash ||
+			!statefulSetRolloutSettled(existing)
+		if existing, err = r.refreshStatefulSetForRollout(ctx, existing, inFlight); err != nil {
 			return err
 		}
 
@@ -1219,9 +1221,12 @@ func desiredClusterShardTemplateHash(lr *littleredv1alpha1.LittleRed, shardIdx i
 	return buildClusterShardStatefulSet(lr, shardIdx, nil).Spec.Template.Annotations[AnnotationPodSpecHash]
 }
 
-// refreshShardSTSForRollout re-reads shard k's StatefulSet from the API server, bypassing
-// the informer cache, but ONLY while a rollout is in flight — the applied template differs
-// from desired, or the shard has not settled. See the call site for why.
+// refreshStatefulSetForRollout re-reads a StatefulSet from the API server, bypassing the
+// informer cache, but ONLY while a rollout is in flight — the applied template differs from
+// desired, or the StatefulSet has not settled; the caller decides which, because where the
+// applied hash is kept differs by StatefulSet (cluster shards keep it on the pod template,
+// the sentinel/failover StatefulSets on their own metadata — LR-065). See the call sites for
+// why the cursor must not come from a stale read.
 //
 // Note that the in-flight test is itself taken from the possibly-stale cached object, and
 // that this is sound rather than circular: statefulSetRolloutSettled requires
@@ -1230,19 +1235,14 @@ func desiredClusterShardTemplateHash(lr *littleredv1alpha1.LittleRed, shardIdx i
 // template hash (caught by the first clause) or carries the new spec with a status that has
 // not observed it (caught by the second). "Settled AND at the desired hash" is not a state
 // a mid-rollout object can present.
-func (r *LittleRedReconciler) refreshShardSTSForRollout(
-	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, shardIdx int,
-	cached *appsv1.StatefulSet, desiredHash string,
+func (r *LittleRedReconciler) refreshStatefulSetForRollout(
+	ctx context.Context, cached *appsv1.StatefulSet, inFlight bool,
 ) (*appsv1.StatefulSet, error) {
-	appliedHash := cached.Spec.Template.Annotations[AnnotationPodSpecHash]
-	if appliedHash == desiredHash && statefulSetRolloutSettled(cached) {
+	if !inFlight {
 		return cached, nil
 	}
 	fresh := &appsv1.StatefulSet{}
-	err := r.apiReader().Get(ctx, types.NamespacedName{
-		Name:      clusterShardStatefulSetName(littleRed, shardIdx),
-		Namespace: littleRed.Namespace,
-	}, fresh)
+	err := r.apiReader().Get(ctx, types.NamespacedName{Name: cached.Name, Namespace: cached.Namespace}, fresh)
 	if apierrors.IsNotFound(err) {
 		// Deleted between the two reads. Nothing to gate; the next pass recreates it.
 		return cached, nil
@@ -1316,7 +1316,7 @@ func (r *LittleRedReconciler) advanceClusterRollout(
 			continue // this shard is at rest; look at the next one
 		}
 
-		pods, err := r.shardRolloutPods(ctx, littleRed, k, rps)
+		pods, err := r.rolloutPodsUncached(ctx, littleRed.Namespace, sts.Name, rps)
 		if err != nil {
 			return err
 		}
@@ -1344,23 +1344,24 @@ func (r *LittleRedReconciler) advanceClusterRollout(
 	return r.clearClusterRolloutBlocked(ctx, littleRed)
 }
 
-// shardRolloutPods reads shard k's pods for the gate, keyed by name. Absent ordinals are
-// simply missing from the map (the seam reads that as holdPodAbsent).
+// rolloutPodsUncached reads a StatefulSet's pods for the rollout gate, ordinals 0 through
+// highestOrdinal, keyed by name (a StatefulSet pod is always "<sts>-<ordinal>"). Absent
+// ordinals are simply missing from the map (the seam reads that as holdPodAbsent).
 //
 // UNCACHED, for the same reason as the StatefulSet: clause (a) compares each pod's
 // controller-revision-hash against the StatefulSet's UpdateRevision, and clause (b) is the
 // kubelet's readiness verdict — a cached pod object that still shows the OLD revision as
 // Ready would satisfy neither clause, but a cached object that has not yet caught up with a
 // deletion could satisfy both on behalf of a pod that no longer exists. Bounded cost: at
-// most 1+replicasPerShard reads, and only while a rollout is in flight.
-func (r *LittleRedReconciler) shardRolloutPods(
-	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, shardIdx, replicasPerShard int,
+// most highestOrdinal+1 reads, and only while a rollout is in flight.
+func (r *LittleRedReconciler) rolloutPodsUncached(
+	ctx context.Context, namespace, stsName string, highestOrdinal int,
 ) (map[string]*corev1.Pod, error) {
-	pods := make(map[string]*corev1.Pod, replicasPerShard+1)
-	for ord := 0; ord <= replicasPerShard; ord++ {
-		name := clusterShardPodName(littleRed.Name, shardIdx, ord)
+	pods := make(map[string]*corev1.Pod, highestOrdinal+1)
+	for ord := 0; ord <= highestOrdinal; ord++ {
+		name := fmt.Sprintf("%s-%d", stsName, ord)
 		pod := &corev1.Pod{}
-		if err := r.apiReader().Get(ctx, types.NamespacedName{Name: name, Namespace: littleRed.Namespace}, pod); err != nil {
+		if err := r.apiReader().Get(ctx, types.NamespacedName{Name: name, Namespace: namespace}, pod); err != nil {
 			if apierrors.IsNotFound(err) {
 				continue
 			}
