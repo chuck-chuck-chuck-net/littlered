@@ -862,11 +862,15 @@ func stsExists(name string) bool {
 	return err == nil
 }
 
-// writeDatasetSpanningShards writes perShard keys into EACH shard's slot range (via a hash
-// tag routing into GenerateSlotRanges(shards)[K]) through a -c client on seedPod, and returns
-// the key→value map for a later integrity check. Guarantees the dataset genuinely spans all
-// shards (not just probabilistically). Reuses findHashTagInSlotRange/keySlot from the reshard
-// tier (same package).
+// writeDatasetSpanningShards seeds perShard keys behind one hash tag per expected shard
+// range through seedPod (a -c client, so each SET lands on the slot's owner) and returns
+// the dataset ONLY once every key reads back as written.
+//
+// The read-back is what makes a later failure attributable. Without it a tier cannot tell
+// "the operation lost it" from "it was never there" — the question the 2026-10-05
+// image-upgrade incident left open, where the tag patch landed 0.7s after the last SET.
+// It is one EXISTS and one MGET per tag (dataset_report_test.go), so it costs about a
+// second, not one exec per key.
 func writeDatasetSpanningShards(seedPod string, perShard int) map[string]string {
 	data := make(map[string]string, clusterShards*perShard)
 	for _, rng := range redisclient.GenerateSlotRanges(clusterShards) {
@@ -879,19 +883,19 @@ func writeDatasetSpanningShards(seedPod string, perShard int) map[string]string 
 			data[key] = val
 		}
 	}
+	verifyDatasetWithin(seedPod, data, 2*time.Minute,
+		"seeded dataset did not read back BEFORE the operation — the seed itself is incomplete, "+
+			"so nothing after it is attributable")
 	return data
 }
 
 // verifyDataset asserts every seeded key still resolves to its exact value, read via a -c
 // client through readPod (redirection resolves whichever new master now owns the slot).
+// The read-back and its report live in dataset_report_test.go: every mismatch is
+// collected and reported grouped by hash tag, i.e. by shard, so a lost shard reads as a
+// lost shard rather than as one arbitrary key.
 func verifyDataset(readPod string, data map[string]string) {
-	Eventually(func(g Gomega) {
-		for key, want := range data {
-			out, err := redisExec(testNamespace, readPod, "-c", "GET", key)
-			g.Expect(err).NotTo(HaveOccurred(), "GET %s failed", key)
-			g.Expect(strings.TrimSpace(out)).To(Equal(want), "value mismatch for key %s", key)
-		}
-	}, 3*time.Minute, 10*time.Second).Should(Succeed(), "seeded dataset was not preserved across migration")
+	verifyDatasetWithin(readPod, data, 3*time.Minute, "seeded dataset was not preserved across the operation")
 }
 
 // assertSharedServiceCoexistence asserts the structural coexistence property (DESIGN §3 /
