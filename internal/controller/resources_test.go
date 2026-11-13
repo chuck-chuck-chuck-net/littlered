@@ -874,7 +874,7 @@ func TestBuildSentinelConfigMap(t *testing.T) {
 func TestBuildRedisStatefulSetSentinel(t *testing.T) {
 	lr := newTestLittleRed(testLRName, testNamespace)
 	lr.Spec.Mode = ModeSentinel
-	sts := buildRedisStatefulSetSentinel(lr, littleredv1alpha1.SentinelRedisReplicas)
+	sts := buildRedisStatefulSetSentinel(lr, littleredv1alpha1.SentinelRedisReplicas, nil)
 
 	// Check replicas (should be 3 for sentinel mode)
 	if *sts.Spec.Replicas != 3 {
@@ -909,7 +909,7 @@ func TestBuildRedisStatefulSetSentinel(t *testing.T) {
 func TestBuildSentinelStatefulSet(t *testing.T) {
 	lr := newTestLittleRed(testLRName, testNamespace)
 	lr.Spec.Mode = ModeSentinel
-	sts := buildSentinelStatefulSet(lr, sentinelProcessReplicas)
+	sts := buildSentinelStatefulSet(lr, sentinelProcessReplicas, nil)
 
 	// Check name
 	if sts.Name != testSentinelName {
@@ -976,7 +976,7 @@ func TestBuildSentinelStatefulSetWithoutMetrics(t *testing.T) {
 	lr.Spec.Mode = ModeSentinel
 	enabled := false
 	lr.Spec.Metrics.Enabled = &enabled
-	sts := buildSentinelStatefulSet(lr, sentinelProcessReplicas)
+	sts := buildSentinelStatefulSet(lr, sentinelProcessReplicas, nil)
 
 	// Should only have the sentinel container, no exporter sidecar
 	containers := sts.Spec.Template.Spec.Containers
@@ -1055,10 +1055,10 @@ func TestStatefulSetBuildersPropagatePodTemplateScheduling(t *testing.T) {
 	}{
 		{"standalone", ModeStandalone, buildStatefulSet},
 		{"sentinel-redis", ModeSentinel, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
-			return buildRedisStatefulSetSentinel(lr, littleredv1alpha1.SentinelRedisReplicas)
+			return buildRedisStatefulSetSentinel(lr, littleredv1alpha1.SentinelRedisReplicas, nil)
 		}},
 		{"sentinel-monitor", ModeSentinel, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
-			return buildSentinelStatefulSet(lr, sentinelProcessReplicas)
+			return buildSentinelStatefulSet(lr, sentinelProcessReplicas, nil)
 		}},
 		{"cluster", ModeCluster, func(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
 			return buildClusterShardStatefulSet(lr, 0, nil)

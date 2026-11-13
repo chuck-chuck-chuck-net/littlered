@@ -833,19 +833,25 @@ func (r *LittleRedReconciler) reconcileSentinelService(ctx context.Context, litt
 }
 
 // reconcileRedisStatefulSetSentinel ensures the Redis StatefulSet exists for sentinel mode,
-// at the desired replica count its caller computed (see sentinelDesiredReplicas).
+// at the desired replica count its caller computed (see sentinelDesiredReplicas), with its
+// rolling update gated one available pod at a time (applyAvailabilityGated, LR-065).
 func (r *LittleRedReconciler) reconcileRedisStatefulSetSentinel(
 	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, replicas int32,
 ) error {
-	return r.apply(ctx, littleRed, buildRedisStatefulSetSentinel(littleRed, replicas))
+	return r.applyAvailabilityGated(ctx, littleRed, func(partition *int32) *appsv1.StatefulSet {
+		return buildRedisStatefulSetSentinel(littleRed, replicas, partition)
+	})
 }
 
 // reconcileSentinelStatefulSet ensures the Sentinel StatefulSet exists, at the desired
-// replica count its caller computed (see sentinelDesiredReplicas).
+// replica count its caller computed (see sentinelDesiredReplicas), with its rolling update
+// gated one available pod at a time (applyAvailabilityGated, LR-065).
 func (r *LittleRedReconciler) reconcileSentinelStatefulSet(
 	ctx context.Context, littleRed *littleredv1alpha1.LittleRed, replicas int32,
 ) error {
-	return r.apply(ctx, littleRed, buildSentinelStatefulSet(littleRed, replicas))
+	return r.applyAvailabilityGated(ctx, littleRed, func(partition *int32) *appsv1.StatefulSet {
+		return buildSentinelStatefulSet(littleRed, replicas, partition)
+	})
 }
 
 // sentinelProcessReplicas is the fixed number of Sentinel processes in sentinel mode:
@@ -2202,13 +2208,19 @@ func (r *LittleRedReconciler) bootstrapSentinel(ctx context.Context, lr *littler
 		return err
 	}
 
-	currentRevision := sts.Status.CurrentRevision
-	podRevision := pod0.Labels["controller-revision-hash"]
-	if pod0.Status.PodIP == "" || currentRevision == "" || podRevision != currentRevision {
+	// EITHER of the StatefulSet's own revisions counts (LR-065, LR-047's bootstrapCluster
+	// precedent): while the rollout partition is above 0 CurrentRevision does not advance, so
+	// a redis-0 already replaced at UpdateRevision would fail a CurrentRevision-only gate, and
+	// the roll could not complete without the bootstrap making the pods Ready. Not reachable
+	// today (the cursor releases redis-0 last, after pods that cannot be Ready before
+	// bootstrap), and kept that way by construction rather than by that ordering. Neither
+	// revision is the stale foreign deployment this guard is aimed at.
+	if pod0.Status.PodIP == "" || !podAtOwnStatefulSetRevision(pod0, sts) {
 		log.Info("Bootstrap: waiting for redis-0 to be ready",
 			"hasIP", pod0.Status.PodIP != "",
-			"podRevision", podRevision,
-			"stsRevision", currentRevision)
+			"podRevision", pod0.Labels[labelControllerRevisionHash],
+			"stsCurrentRevision", sts.Status.CurrentRevision,
+			"stsUpdateRevision", sts.Status.UpdateRevision)
 		return nil
 	}
 

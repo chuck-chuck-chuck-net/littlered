@@ -109,6 +109,9 @@ const (
 	// holdRedundancy: clause (c) — not a link-up replica of the shard's slot owner. THE
 	// clause: this is the state the 2026-08-23 run took a shard's master down in.
 	holdRedundancy shardRolloutHold = "PodNotSyncedReplica"
+	// holdAvailability: Ready, but not yet for MinReadySeconds — not "available" in the
+	// StatefulSet controller's sense. Only reachable when MinReadySeconds > 0.
+	holdAvailability shardRolloutHold = "PodNotAvailable"
 	// holdSettling: every clause is satisfied at partition 0 and the StatefulSet is finishing.
 	holdSettling shardRolloutHold = "AwaitingRolloutCompletion"
 )
@@ -159,13 +162,25 @@ type shardRolloutPod struct {
 	IsOwner bool
 }
 
-// shardRolloutInput is everything planShardRolloutPartition decides from: one shard StatefulSet,
-// its pods, and this pass's clock. No client, no context, no reads.
+// shardRolloutInput is everything planShardRolloutPartition decides from: one StatefulSet, its
+// pods, and this pass's clock. No client, no context, no reads. It is a cluster shard's, or —
+// with SkipRedundancyClause and MinReadySeconds set — one of the sentinel/failover StatefulSets
+// whose rollout the same cursor gates on availability (buildStatefulSetRolloutInput, LR-065).
 type shardRolloutInput struct {
 	ShardIdx int
-	// ReplicasPerShard is spec.cluster.replicasPerShard, so the highest ordinal is known
-	// (a shard STS is sized 1+replicasPerShard). 0 means no redundancy exists at all.
-	ReplicasPerShard int
+	// HighestOrdinal is the StatefulSet's highest pod ordinal, i.e. replicas-1. For a cluster
+	// shard that is spec.cluster.replicasPerShard (a shard STS is sized 1+replicasPerShard).
+	// 0 or less means a single pod (or none), so no redundancy exists to wait for.
+	HighestOrdinal int
+	// MinReadySeconds, when > 0, adds the availability clause: a pod at or above the partition
+	// must have been Ready continuously for at least this long (the StatefulSet's own
+	// minReadySeconds) before the next pod is released. Cluster shards pass 0 — their gate is
+	// the redundancy clause — so for them the clause does not exist (ADR-017 Amendment, LR-065).
+	MinReadySeconds int32
+	// SkipRedundancyClause drops clause (c). Only the non-cluster StatefulSets set it: they have
+	// no slot owner to be a replica of, and their v1 gate is availability (ADR-017 Amendment,
+	// LR-065). The zero value keeps the clause, so an omission fails toward holding (LR-041).
+	SkipRedundancyClause bool
 	// DesiredHash / AppliedHash are AnnotationPodSpecHash on the desired and the live pod
 	// template — LR-021's cache-safe change detector, compared as a stored value.
 	DesiredHash string
@@ -203,7 +218,7 @@ type shardRolloutPlan struct {
 	BlockedPods []int
 }
 
-func (in shardRolloutInput) highestOrdinal() int { return in.ReplicasPerShard }
+func (in shardRolloutInput) highestOrdinal() int { return in.HighestOrdinal }
 
 func (in shardRolloutInput) currentPartition() int {
 	p := 0
@@ -251,6 +266,11 @@ func (in shardRolloutInput) currentPartition() int {
 //     signal, not the operator's dial — LR-017), and (c) a link-`up` replica of the shard's slot
 //     owner (`redisclient.IsLinkUpReplicaOf`, the LR-025 predicate, one definition shared with
 //     the migration planner).
+//   - **Availability gate** (sentinel/failover StatefulSets, LR-065): the same decision with
+//     clause (c) dropped (`SkipRedundancyClause` — there is no slot owner) and an availability
+//     clause added (`MinReadySeconds` — Ready for the StatefulSet's minReadySeconds), which is
+//     the gate the StatefulSet controller itself applied before Kubernetes v1.37. Cluster shards
+//     pass neither, so for them nothing here changed.
 //   - **Holding** otherwise: re-emit the current partition unchanged. The old pods keep serving
 //     and the data is intact; a stalled rollout is availability-safe where a time-released one
 //     is the lossy path this seam removes. There is deliberately no timer fallback — one would
@@ -279,7 +299,7 @@ func planShardRolloutPartition(in shardRolloutInput) shardRolloutPlan {
 	plan := shardRolloutPlan{HoldPod: -1}
 
 	// replicasPerShard == 0: no redundancy to wait for, so gating is vacuous (ADR-017 Decision 3).
-	if in.ReplicasPerShard <= 0 {
+	if in.HighestOrdinal <= 0 {
 		plan.Verdict = rolloutUngated
 		return plan
 	}
@@ -321,7 +341,9 @@ func planShardRolloutPartition(in shardRolloutInput) shardRolloutPlan {
 			plan.hold(holdRevision, ord)
 		case !pod.Ready:
 			plan.hold(holdReadiness, ord)
-		case !pod.SyncedWithOwner:
+		case !in.podAvailable(pod):
+			plan.hold(holdAvailability, ord)
+		case !in.SkipRedundancyClause && !pod.SyncedWithOwner:
 			plan.hold(holdRedundancy, ord)
 			if in.podStalled(pod) {
 				plan.Blocked = true
@@ -355,6 +377,21 @@ func (p *shardRolloutPlan) hold(reason shardRolloutHold, ordinal int) {
 	if p.Hold == holdNone {
 		p.Hold, p.HoldPod = reason, ordinal
 	}
+}
+
+// podAvailable is the StatefulSet controller's own notion of "available" — Ready continuously
+// for at least minReadySeconds — so the cursor never releases a pod the controller would not
+// have released before Kubernetes v1.37 (LR-065). With MinReadySeconds 0 the clause is vacuous,
+// which is what keeps cluster shards (which pass 0) byte-identical to LR-047. A Ready pod with
+// no readiness timestamp is not available: unknown is not evidence.
+func (in shardRolloutInput) podAvailable(pod shardRolloutPod) bool {
+	if in.MinReadySeconds <= 0 {
+		return true
+	}
+	if pod.ReadySince.IsZero() {
+		return false
+	}
+	return pod.ReadySince.Add(time.Duration(in.MinReadySeconds) * time.Second).Before(in.Now)
 }
 
 // podStalled reports whether a pod has been Ready long enough, with no attachment to the shard's
@@ -439,10 +476,10 @@ func buildShardRolloutInput(
 	now time.Time,
 ) shardRolloutInput {
 	in := shardRolloutInput{
-		ShardIdx:         shardIdx,
-		ReplicasPerShard: replicasPerShard,
-		DesiredHash:      desiredHash,
-		Now:              now,
+		ShardIdx:       shardIdx,
+		HighestOrdinal: replicasPerShard,
+		DesiredHash:    desiredHash,
+		Now:            now,
 	}
 	if sts != nil {
 		in.AppliedHash = sts.Spec.Template.Annotations[AnnotationPodSpecHash]

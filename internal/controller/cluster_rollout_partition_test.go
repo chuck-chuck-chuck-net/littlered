@@ -77,7 +77,7 @@ func syncingPod(ordinal int, readyFor time.Duration) shardRolloutPod {
 // holds CurrentRevision back, so it never equals UpdateRevision mid-rollout).
 func rolling(rps int, partition *int32, pods ...shardRolloutPod) shardRolloutInput {
 	return shardRolloutInput{
-		ShardIdx: 1, ReplicasPerShard: rps,
+		ShardIdx: 1, HighestOrdinal: rps,
 		DesiredHash: "h2", AppliedHash: "h2",
 		Generation: 7, ObservedGeneration: 7,
 		UpdateRevision: rolloutRevNew, CurrentRevision: rolloutRevOld,
@@ -97,7 +97,7 @@ func TestPlanShardRolloutPartition(t *testing.T) {
 		{
 			name: "template change first seen: gate at the shard's highest ordinal",
 			in: shardRolloutInput{
-				ShardIdx: 1, ReplicasPerShard: 2,
+				ShardIdx: 1, HighestOrdinal: 2,
 				DesiredHash: "h2", AppliedHash: "h1",
 				Generation: 6, ObservedGeneration: 6,
 				UpdateRevision: rolloutRevOld, CurrentRevision: rolloutRevOld,
@@ -110,7 +110,7 @@ func TestPlanShardRolloutPartition(t *testing.T) {
 		{
 			name: "template change first seen is the ONLY raise: an applied 0 goes back up",
 			in: shardRolloutInput{
-				ShardIdx: 1, ReplicasPerShard: 2,
+				ShardIdx: 1, HighestOrdinal: 2,
 				DesiredHash: "h3", AppliedHash: "h2",
 				Generation: 8, ObservedGeneration: 8,
 				UpdateRevision: rolloutRevNew, CurrentRevision: rolloutRevNew,
@@ -156,7 +156,7 @@ func TestPlanShardRolloutPartition(t *testing.T) {
 		{
 			name: "at 0 and settled: complete",
 			in: shardRolloutInput{
-				ShardIdx: 1, ReplicasPerShard: 2,
+				ShardIdx: 1, HighestOrdinal: 2,
 				DesiredHash: "h2", AppliedHash: "h2",
 				Generation: 8, ObservedGeneration: 8,
 				UpdateRevision: rolloutRevNew, CurrentRevision: rolloutRevNew,
@@ -174,7 +174,7 @@ func TestPlanShardRolloutPartition(t *testing.T) {
 		{
 			name: "settled but the generation is not yet observed: hold, never complete",
 			in: shardRolloutInput{
-				ShardIdx: 1, ReplicasPerShard: 2,
+				ShardIdx: 1, HighestOrdinal: 2,
 				DesiredHash: "h2", AppliedHash: "h2",
 				Generation: 9, ObservedGeneration: 8,
 				UpdateRevision: rolloutRevNew, CurrentRevision: rolloutRevNew,
@@ -187,7 +187,7 @@ func TestPlanShardRolloutPartition(t *testing.T) {
 		{
 			name: "replicasPerShard 0: ungated, no partition at all",
 			in: shardRolloutInput{
-				ShardIdx: 1, ReplicasPerShard: 0,
+				ShardIdx: 1, HighestOrdinal: 0,
 				DesiredHash: "h2", AppliedHash: "h1",
 				Generation: 6, ObservedGeneration: 6,
 				UpdateRevision: rolloutRevOld, CurrentRevision: rolloutRevOld,

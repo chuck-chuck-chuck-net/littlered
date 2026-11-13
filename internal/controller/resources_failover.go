@@ -215,8 +215,8 @@ func buildFailoverVolumes(lr *littleredv1alpha1.LittleRed) []corev1.Volume {
 // Same shape as the sentinel-mode data StatefulSet (governing service is the
 // replicas headless service, selector component=redis so the label-routed
 // master Service works unchanged), with the downward-API assignment volume
-// added.
-func buildRedisStatefulSetFailover(lr *littleredv1alpha1.LittleRed) *appsv1.StatefulSet {
+// added. The rollout partition is the caller's decision (applyAvailabilityGated, LR-065).
+func buildRedisStatefulSetFailover(lr *littleredv1alpha1.LittleRed, partition *int32) *appsv1.StatefulSet {
 	labels := commonLabels(lr)
 	labels[labelAppComponent] = ComponentRedis
 
@@ -286,7 +286,7 @@ func buildRedisStatefulSetFailover(lr *littleredv1alpha1.LittleRed) *appsv1.Stat
 		},
 	}
 
-	return sts
+	return withAvailabilityGate(sts, partition)
 }
 
 // buildRedisContainerFailover creates the Redis container for failover mode.
