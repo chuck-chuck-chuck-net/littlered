@@ -90,6 +90,17 @@ cut a release (`scripts/prepare-release.sh`).
 
 ### Fixed
 
+- **Sentinel- and failover-mode rolling updates replace one pod at a time again on Kubernetes
+  v1.37.** From v1.37 the StatefulSet controller deletes every not-yet-available old pod of a
+  `Parallel` StatefulSet at once, so a spec change made shortly after the pods became Ready (after
+  creating the instance, a second edit mid-rollout, a mass restart) replaced the whole instance
+  together and lost its data. The operator now holds
+  `spec.updateStrategy.rollingUpdate.partition` on the sentinel-mode Redis and Sentinel
+  StatefulSets and the failover-mode Redis StatefulSet, and releases the next pod only once every
+  replaced pod is Ready and has been for `minReadySeconds` — the order the controller used to
+  enforce itself. A new pod that never becomes Ready stops the rollout with the old pods serving.
+  Upgrading the operator rolls nothing. Cluster mode was already gated this way (LR-047).
+
 - **The operator no longer caches every Secret in its scope.** Auth, TLS and CA Secrets
   were read through the manager's cached client, and the first such read started an
   informer over every Secret the operator could see, Helm release Secrets included. On
