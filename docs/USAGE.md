@@ -1593,6 +1593,27 @@ nothing — the same limitation the cross-shard serialization has always had. Fo
 shard StatefulSets one at a time by hand as shown under
 [Trigger via kubectl](#trigger-via-kubectl), and prefer a CR update where you can.
 
+### Sentinel and Failover Mode: One Available Pod at a Time
+
+In sentinel and failover mode an operator-triggered rolling update replaces **one pod at a time**,
+and releases the next only once every pod it has already replaced is at the new revision, Ready,
+and has been Ready for `minReadySeconds`. The operator enforces this itself by holding
+`spec.updateStrategy.rollingUpdate.partition` on the Redis StatefulSet (and, in sentinel mode, on
+the Sentinel StatefulSet) and lowering it one ordinal at a time. It is the same order and the same
+wait the StatefulSet controller used to apply on its own; from Kubernetes v1.37 the controller
+replaces every not-yet-available pod at once, which on an instance whose pods became Ready
+recently — shortly after creation, after a second edit mid-rollout, after a mass restart — would
+replace all of them together and lose the dataset (storage is `emptyDir`). Rollouts take as long as
+they did before v1.37; a rollout whose new pods never become Ready stops and keeps the old pods
+serving. Watch it with
+`kubectl get statefulset <name>-redis -o jsonpath='{.spec.updateStrategy.rollingUpdate.partition}'`
+and the operator's `StatefulSet rollout gate` log lines.
+
+While the partition is above 0, a pod below it that is deleted (by hand, by an eviction) comes back
+on the **old** template; the rollout replaces it again when it gets there. If you need such a pod
+on the new template now, set the partition to 0 by hand first — the operator keeps whatever lower
+value it finds. Like the cluster gate, this governs operator-triggered rollouts only.
+
 ### Default Behavior
 
 | Mode | Default minReadySeconds | Reason |
