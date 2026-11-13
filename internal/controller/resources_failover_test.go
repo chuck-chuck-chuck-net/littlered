@@ -81,7 +81,7 @@ func TestFailoverModeAndAnnotationConsts(t *testing.T) {
 
 func TestBuildRedisStatefulSetFailover(t *testing.T) {
 	lr := newFailoverTestLittleRed()
-	sts := buildRedisStatefulSetFailover(lr)
+	sts := buildRedisStatefulSetFailover(lr, nil)
 
 	if sts.Name != testStatefulSetName {
 		t.Errorf("StatefulSet name = %q, want %q", sts.Name, testStatefulSetName)
@@ -125,7 +125,7 @@ func TestBuildRedisStatefulSetFailover(t *testing.T) {
 func TestBuildRedisStatefulSetFailoverReplicaCount(t *testing.T) {
 	lr := newFailoverTestLittleRed()
 	lr.Spec.Failover.Replicas = new(int32(4))
-	sts := buildRedisStatefulSetFailover(lr)
+	sts := buildRedisStatefulSetFailover(lr, nil)
 	if sts.Spec.Replicas == nil || *sts.Spec.Replicas != 5 {
 		t.Errorf("StatefulSet replicas = %v, want 5 (1 + 4)", sts.Spec.Replicas)
 	}
@@ -134,7 +134,7 @@ func TestBuildRedisStatefulSetFailoverReplicaCount(t *testing.T) {
 func TestBuildRedisStatefulSetFailoverPropagatesScheduling(t *testing.T) {
 	lr := newFailoverTestLittleRed()
 	lr.Spec.PodTemplate.NodeSelector = map[string]string{"disktype": diskTypeSSD}
-	sts := buildRedisStatefulSetFailover(lr)
+	sts := buildRedisStatefulSetFailover(lr, nil)
 	if sts.Spec.Template.Spec.NodeSelector["disktype"] != diskTypeSSD {
 		t.Error("StatefulSet should propagate spec.podTemplate.nodeSelector")
 	}
@@ -414,7 +414,7 @@ func TestBuildFailoverRedisPDB(t *testing.T) {
 func TestFailoverServicesSelectPods(t *testing.T) {
 	lr := newFailoverTestLittleRed()
 
-	sts := buildRedisStatefulSetFailover(lr)
+	sts := buildRedisStatefulSetFailover(lr, nil)
 	podLabels := sts.Spec.Template.Labels
 
 	// Master service: selects component=redis + role=master. The role label is
