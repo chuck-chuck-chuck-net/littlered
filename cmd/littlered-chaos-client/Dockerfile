@@ -18,7 +18,7 @@ RUN --mount=type=cache,target=/root/.cache/go-build \
     CGO_ENABLED=0 GOOS=linux go build -o chaos-client ./cmd/littlered-chaos-client
 
 # Runtime image
-FROM alpine:3.24.3
+FROM alpine:3.24.4
 
 RUN apk --no-cache add ca-certificates
 
