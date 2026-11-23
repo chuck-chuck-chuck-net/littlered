@@ -46,7 +46,7 @@ func TestCachedObjectsCarryManagedByLabel(t *testing.T) {
 		},
 		ModeSentinel: func(lr *littleredv1alpha1.LittleRed) []client.Object {
 			return []client.Object{
-				buildRedisStatefulSetSentinel(lr, 3), buildSentinelStatefulSet(lr, 3),
+				buildRedisStatefulSetSentinel(lr, 3, nil), buildSentinelStatefulSet(lr, 3, nil),
 				buildConfigMapSentinelMode(lr), buildSentinelConfigMap(lr),
 				buildMasterService(lr), buildReplicasHeadlessService(lr), buildSentinelHeadlessService(lr),
 				buildSentinelRedisPDB(lr), buildSentinelPDB(lr),
@@ -60,7 +60,7 @@ func TestCachedObjectsCarryManagedByLabel(t *testing.T) {
 		},
 		ModeFailover: func(lr *littleredv1alpha1.LittleRed) []client.Object {
 			return []client.Object{
-				buildRedisStatefulSetFailover(lr), buildConfigMapFailoverMode(lr), buildFailoverRedisPDB(lr),
+				buildRedisStatefulSetFailover(lr, nil), buildConfigMapFailoverMode(lr), buildFailoverRedisPDB(lr),
 				buildMasterService(lr), buildReplicasHeadlessService(lr),
 			}
 		},
