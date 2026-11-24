@@ -130,10 +130,13 @@ jobs:
           # default) `docker save` writes the multi-platform index but only this platform's
           # layers, and kind's `ctr import --all-platforms` then fails on a missing digest.
           # Saving one platform gives an archive whose index names only what it contains.
+          # Through a file, not a pipe: kind reads the archive once per node.
           platform=linux/$(go env GOARCH)
           for img in "${images[@]}"; do
+            archive="$RUNNER_TEMP/image-$RANDOM.tar"
             docker pull -q --platform "$platform" "$img"
-            docker save --platform "$platform" "$img" | kind load image-archive /dev/stdin --name "$KIND_CLUSTER"
+            docker save --platform "$platform" -o "$archive" "$img"
+            kind load image-archive "$archive" --name "$KIND_CLUSTER"
           done
 
       - name: Wait for the compile
