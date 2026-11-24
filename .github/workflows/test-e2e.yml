@@ -156,7 +156,10 @@ jobs:
         if: failure()
         run: |
           mkdir -p e2e-debug
-          mv test/e2e/debug-artifacts-* e2e-debug/ 2>/dev/null || true
+          # The suite writes them relative to its working directory, which test/utils.Run()
+          # switches to the repo root on first use, so they land there, not in test/e2e.
+          shopt -s nullglob
+          for dir in debug-artifacts-* test/e2e/debug-artifacts-*; do mv "$dir" e2e-debug/; done
           kubectl get pods -A -o wide > e2e-debug/pods.txt || true
           kubectl get events -A --sort-by=.lastTimestamp > e2e-debug/events.txt || true
           kind export logs --name "$KIND_CLUSTER" e2e-debug/kind || true
