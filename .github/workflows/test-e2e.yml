@@ -1,34 +1,162 @@
 name: E2E Tests
 
+# The e2e suite on a GitHub-hosted runner, against a local kind cluster.
+#
+# Unlike slaptain, no registry is involved: the suite's BeforeSuite builds the operator and
+# chaos-client images with `make build-images`, `kind load`s them and deploys with
+# PULL_POLICY=Never (test/e2e/e2e_suite_test.go deployOperator). So a run needs no published
+# dev images, no packages:write and no wait on another workflow, and works for fork PRs too.
+#
+# The suite is split by deployment mode. Every spec carries exactly one mode label
+# (hack/verify-e2e-mode-labels.sh checks the partition), so `make test-e2e MODE=<m>` across
+# the four modes runs the whole suite exactly once, in four parallel jobs with a kind
+# cluster each.
+#
+# Triggers:
+#   - Run workflow (workflow_dispatch): pick one mode or all, optionally include 'extended'.
+#   - A pull request labelled "e2e": every push to it, and adding the label.
+#
+# Tiers that skip by themselves here (no fixture on a runner):
+#   - cluster migration (LEGACY_OPERATOR_IMAGE) and the sentinel operations upgrade tier
+#     (PRE_OPERATIONS_OPERATOR_IMAGE) need a second, older operator image.
+
 on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
   workflow_dispatch:
+    inputs:
+      mode:
+        description: Deployment mode to run (all = four parallel jobs)
+        required: true
+        type: choice
+        options: [all, standalone, sentinel, cluster, failover]
+        default: all
+      extended:
+        description: Also run the 'extended' tiers
+        required: false
+        type: boolean
+        default: false
+
+run-name: e2e ${{ github.head_ref || github.ref_name }}
+
+permissions:
+  contents: read
 
 jobs:
-  test-e2e:
-    name: Run on Ubuntu
+  e2e:
+    name: e2e (${{ matrix.mode }})
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (contains(github.event.pull_request.labels.*.name, 'e2e') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'e2e'))
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: >-
+          ${{ fromJSON(
+            (github.event_name == 'workflow_dispatch' && inputs.mode != 'all' && format('["{0}"]', inputs.mode)) ||
+            '["standalone","sentinel","cluster","failover"]') }}
+    concurrency:
+      group: e2e-${{ github.event.pull_request.number || github.ref }}-${{ matrix.mode }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
+    # GitHub-hosted jobs are capped at 6h. The suite's own deadline is set below it so
+    # Ginkgo interrupts and reports instead of the runner being killed mid-spec.
+    timeout-minutes: 330
+    env:
+      KIND_CLUSTER: littlered-test-e2e
+      MODE: ${{ matrix.mode }}
+      E2E_ALL: ${{ inputs.extended && 'true' || 'false' }}
+      E2E_TIMEOUT: 5h
+      E2E_GO_TIMEOUT: 5h15m
+      # Per failed spec: CR, pod logs, operator log and Redis state into
+      # test/e2e/debug-artifacts-*, collected by the AfterEach while the spec's instance
+      # still exists. DEBUG_ON_FAILURE is deliberately NOT set: once any spec fails,
+      # suiteOrSpecFailed() stays true and every later spec's AfterAll skips deleting its
+      # CR. On a 16 GB runner those leftovers starve the specs that follow, so one real
+      # failure would cascade into many unrelated ones.
+      E2E_COLLECT_ARTIFACTS: "true"
     steps:
-      - name: Clone the code
+      - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Setup Go
+      - name: Record the spec-order seed
+        run: |
+          seed=$(date +%s)
+          echo "SEED=$seed" >> "$GITHUB_ENV"
+          echo "\`$MODE\`: Ginkgo seed \`$seed\`, replay with \`make test-e2e MODE=$MODE SEED=$seed\`" >> "$GITHUB_STEP_SUMMARY"
+
+      # The runner starts with ~14 GB free; two locally built images, the kind node image
+      # and a few Redis images per kind node fit, but not with much margin.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h /
+
+      - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      - name: Install the latest version of kind
+      # Compile everything the suite will build while kind starts, so the build cache is warm.
+      - name: Start compiling the suite and lrctl
         run: |
-          curl -Lo "./kind https://kind.sigs.k8s.io/dl/latest/kind-linux-$(go env GOARCH)"
-          chmod +x ./kind
-          sudo mv ./kind /usr/local/bin/kind
+          (
+            rc=0
+            { go test -tags=e2e -c -o /dev/null ./test/e2e/ && make lrctl; } || rc=$?
+            echo "$rc" > "$RUNNER_TEMP/compile.rc"
+          ) > "$RUNNER_TEMP/compile.log" 2>&1 &
 
-      - name: Verify kind installation
-        run: kind version
+      # One control plane plus two workers: two schedulable nodes are what the cluster
+      # placement spec needs (1 + replicasPerShard) and the minimum at which the kill-9 and
+      # failover specs exercise cross-node traffic at all.
+      - name: Create the kind cluster
+        uses: helm/kind-action@v1
+        with:
+          cluster_name: ${{ env.KIND_CLUSTER }}
+          config: test/e2e/kind-config.yaml
 
-      - name: Check tidy
+      # Docker Hub rate-limits anonymous pulls per IP, and every kind node pulls on its own.
+      # Pull once on the runner and side-load, so pods with IfNotPresent never hit the registry.
+      - name: Preload third-party images into kind
         run: |
-          go mod tidy
-          git diff --exit-code go.mod go.sum
+          exporter=$(sed -n 's/^FROM //p' api/v1alpha1/redis-exporter.Dockerfile)
+          images=(docker.io/library/redis:8.4.2 docker.io/library/busybox:latest "$exporter")
+          if [ "$MODE" = cluster ]; then
+            # image_upgrade_test.go walks 7.4.3 -> 7.4.8 -> the default.
+            images+=(docker.io/library/redis:7.4.3 docker.io/library/redis:7.4.8)
+          fi
+          for img in "${images[@]}"; do
+            docker pull -q "$img"
+            kind load docker-image "$img" --name "$KIND_CLUSTER"
+          done
 
-      - name: Running Test e2e
-        run: make test-e2e
+      - name: Wait for the compile
+        run: |
+          until [ -e "$RUNNER_TEMP/compile.rc" ]; do sleep 2; done
+          cat "$RUNNER_TEMP/compile.log"
+          exit "$(cat "$RUNNER_TEMP/compile.rc")"
+
+      # The Makefile sees the existing kind cluster, skips creating it and, since it did not
+      # create it, also skips deleting it, so the failure step below can still read it. The
+      # suite itself undeploys the operator and deletes its namespace in AfterSuite, so the
+      # per-spec artifacts are what carries a failure's state.
+      - name: Run the ${{ matrix.mode }} specs
+        run: make test-e2e MODE="$MODE" E2E_ALL="$E2E_ALL" SEED="$SEED" E2E_TIMEOUT="$E2E_TIMEOUT" E2E_GO_TIMEOUT="$E2E_GO_TIMEOUT"
+
+      - name: Collect cluster state
+        if: failure()
+        run: |
+          mkdir -p e2e-debug
+          mv test/e2e/debug-artifacts-* e2e-debug/ 2>/dev/null || true
+          kubectl get pods -A -o wide > e2e-debug/pods.txt || true
+          kubectl get events -A --sort-by=.lastTimestamp > e2e-debug/events.txt || true
+          kind export logs --name "$KIND_CLUSTER" e2e-debug/kind || true
+
+      - name: Upload cluster state
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-debug-${{ matrix.mode }}
+          path: e2e-debug/
+          retention-days: 7

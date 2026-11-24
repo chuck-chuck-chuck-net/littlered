@@ -52,6 +52,11 @@ var (
 	// debugOnFailure skips cleanup on failure.
 	debugOnFailure = false
 
+	// collectArtifacts collects per-spec debug artifacts on failure WITHOUT skipping
+	// cleanup. debugOnFailure implies it. Meant for CI, where a run must go on after a
+	// failure and leftover instances would starve the specs that follow.
+	collectArtifacts = false
+
 	// suiteFailed tracks if any test in the suite failed.
 	suiteFailed = false
 
@@ -79,7 +84,8 @@ func suiteOrSpecFailed() bool {
 // Environment variables:
 //   - SKIP_OPERATOR_DEPLOY: Set to "true" to skip operator deployment
 //   - SKIP_KIND_SETUP: Set to "true" to skip cluster creation and assume non-Kind (registry-push) deployment
-//   - DEBUG_ON_FAILURE: Set to "true" to skip cleanup on failure
+//   - DEBUG_ON_FAILURE: Set to "true" to skip cleanup on failure (implies E2E_COLLECT_ARTIFACTS)
+//   - E2E_COLLECT_ARTIFACTS: Set to "true" to collect debug artifacts per failed spec, cleanup unchanged
 //   - TEST_NAMESPACE: Namespace for test resources (default: "littlered-e2e"); must not be "default"
 //   - KUBECONTEXT_PINNING: Set to "true" to snapshot the current kubeconfig (prevents accidental context switches)
 //   - KUBECONTEXT: Pin to a specific named context (implies pinning)
@@ -143,6 +149,7 @@ var _ = BeforeSuite(func() {
 	if os.Getenv("DEBUG_ON_FAILURE") == "true" {
 		debugOnFailure = true
 	}
+	collectArtifacts = debugOnFailure || os.Getenv("E2E_COLLECT_ARTIFACTS") == "true"
 	if v := os.Getenv("CLUSTER_SHARDS"); v != "" {
 		n, err := strconv.Atoi(v)
 		Expect(err).NotTo(HaveOccurred(), "CLUSTER_SHARDS must be an integer")
@@ -160,6 +167,7 @@ var _ = BeforeSuite(func() {
 	_, _ = fmt.Fprintf(GinkgoWriter, "Skip operator deploy: %v\n", skipOperatorDeploy)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Skip Kind setup: %v\n", skipKindSetup)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Debug on failure: %v\n", debugOnFailure)
+	_, _ = fmt.Fprintf(GinkgoWriter, "Collect artifacts: %v\n", collectArtifacts)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Cluster shards: %d\n", clusterShards)
 	_, _ = fmt.Fprintf(GinkgoWriter, "Cluster replicas per shard: %d\n", clusterReplicasPerShard)
 
@@ -226,7 +234,7 @@ var _ = AfterEach(func() {
 		suiteFailed = true
 
 		// Collect debug artifacts if enabled
-		if debugOnFailure {
+		if collectArtifacts {
 			// Try to extract namespace and CR name from the spec labels
 			// This is best-effort - if we can't find them, we'll just collect what we can
 			namespace, crName, chaosPod := extractTestContext()

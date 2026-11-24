@@ -56,7 +56,16 @@ DEBUG_ON_FAILURE=true make test-e2e
 
 # Or with individual test
 DEBUG_ON_FAILURE=true go test -tags e2e -v ./test/e2e -ginkgo.focus="should heal cluster"
+
+# Collect artifacts but keep cleaning up after failures (what CI uses)
+E2E_COLLECT_ARTIFACTS=true make test-e2e
 ```
+
+`DEBUG_ON_FAILURE=true` also stops cleanup once any spec has failed, so later specs leave
+their instances running for inspection, and it turns on `--ginkgo.fail-fast`. On a small
+cluster those leftover instances can make later specs fail too. `E2E_COLLECT_ARTIFACTS=true`
+collects the same per-spec artifacts and leaves cleanup unchanged, so the run keeps going
+normally. The GitHub workflow (`.github/workflows/test-e2e.yml`) uses it.
 
 ### What Happens on Failure
 
