@@ -319,11 +319,17 @@ cleanup-test-e2e: ## Tear down the Kind cluster used for e2e tests
 	@$(KIND) delete cluster --name $(KIND_CLUSTER)
 
 .PHONY: kind-load
+# Through a file, not a pipe: kind reads the archive once per node, so streaming it via
+# /dev/stdin works on a single-node cluster and fails with "invalid tar header" on any other.
+KIND_LOAD_DIR ?= $(LOCALBIN)/kind-load
 kind-load: ## Load built images into the Kind cluster.
+	@mkdir -p $(KIND_LOAD_DIR)
 	@echo "Loading operator image into Kind cluster $(KIND_CLUSTER)..."
-	$(CONTAINER_TOOL) save $(OPERATOR_IMAGE) | $(KIND) load image-archive /dev/stdin --name $(KIND_CLUSTER)
+	$(CONTAINER_TOOL) save -o $(KIND_LOAD_DIR)/operator.tar $(OPERATOR_IMAGE)
+	$(KIND) load image-archive $(KIND_LOAD_DIR)/operator.tar --name $(KIND_CLUSTER)
 	@echo "Loading chaos client image into Kind cluster $(KIND_CLUSTER)..."
-	$(CONTAINER_TOOL) save $(CHAOS_CLIENT_IMAGE) | $(KIND) load image-archive /dev/stdin --name $(KIND_CLUSTER)
+	$(CONTAINER_TOOL) save -o $(KIND_LOAD_DIR)/chaos-client.tar $(CHAOS_CLIENT_IMAGE)
+	$(KIND) load image-archive $(KIND_LOAD_DIR)/chaos-client.tar --name $(KIND_CLUSTER)
 
 # Lint against the Go version the project TARGETS, not whatever the developer's
 # distro happens to ship. staticcheck (bundled into golangci-lint) supports the Go
