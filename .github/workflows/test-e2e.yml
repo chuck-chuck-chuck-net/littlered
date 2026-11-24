@@ -126,9 +126,14 @@ jobs:
             # image_upgrade_test.go walks 7.4.3 -> 7.4.8 -> the default.
             images+=(docker.io/library/redis:7.4.3 docker.io/library/redis:7.4.8)
           fi
+          # Not `kind load docker-image`: with Docker's containerd image store (the runner's
+          # default) `docker save` writes the multi-platform index but only this platform's
+          # layers, and kind's `ctr import --all-platforms` then fails on a missing digest.
+          # Saving one platform gives an archive whose index names only what it contains.
+          platform=linux/$(go env GOARCH)
           for img in "${images[@]}"; do
-            docker pull -q "$img"
-            kind load docker-image "$img" --name "$KIND_CLUSTER"
+            docker pull -q --platform "$platform" "$img"
+            docker save --platform "$platform" "$img" | kind load image-archive /dev/stdin --name "$KIND_CLUSTER"
           done
 
       - name: Wait for the compile
