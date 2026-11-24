@@ -84,12 +84,17 @@ spec:
 		AfterAll(func() { cleanup(crName) })
 
 		It("self-heals after every pod is recycled (no opt-in required)", func() {
+			// See tier 3: a status written after the recycle names a new IP.
+			oldMasterIP := getMasterIP(crName)
+			Expect(oldMasterIP).NotTo(BeEmpty())
+
 			By("deleting ALL pods of the instance (sentinels return bare, redis wait-loops)")
 			_, err := deletePodsWithLabel(testNamespace, "app.kubernetes.io/instance="+crName)
 			Expect(err).NotTo(HaveOccurred())
 
 			By("the operator must break the deadlock on its own and return to Running")
 			Eventually(func(g Gomega) {
+				g.Expect(getMasterIP(crName)).NotTo(Equal(oldMasterIP), "status still describes the pre-recycle master")
 				g.Expect(getPhase(crName)).To(Equal("Running"))
 			}, 5*time.Minute, 5*time.Second).Should(Succeed(), "operator did not self-heal the leaderless deadlock")
 
@@ -126,6 +131,10 @@ spec:
 				g.Expect(strings.TrimSpace(out)).NotTo(Equal("0"))
 			}, 30*time.Second, 2*time.Second).Should(Succeed())
 
+			// See tier 3: a status written after the kill names a new IP.
+			killedMasterIP := getMasterIP(crName)
+			Expect(killedMasterIP).NotTo(BeEmpty())
+
 			By("killing the master, one replica, and all sentinels — keeping only the survivor")
 			_, _ = deletePodsWithLabel(testNamespace, "app.kubernetes.io/instance="+crName+",app.kubernetes.io/component=sentinel")
 			_, _ = deletePod(testNamespace, doomedReplica)
@@ -134,6 +143,7 @@ spec:
 
 			By("the operator must promote the survivor and return to Running")
 			Eventually(func(g Gomega) {
+				g.Expect(getMasterIP(crName)).NotTo(Equal(killedMasterIP), "status still describes the killed master")
 				g.Expect(getPhase(crName)).To(Equal("Running"))
 			}, 5*time.Minute, 5*time.Second).Should(Succeed())
 
@@ -185,6 +195,12 @@ spec:
 			// cluster during the 30s cooldown, before Rule L counts holders (observed on a
 			// managed cloud during LR-017 verification — a data-safe recovery, not a
 			// refuse). Hence the dual-outcome handling below. See the changelog (LR-017).
+			// The killed master's IP, so the decision below can tell a status written AFTER
+			// the kill from the pre-kill one. A force-deleted pod returns on a new IP, so this
+			// holds even if the same pod name is elected again.
+			killedMasterIP := getMasterIP(crName)
+			Expect(killedMasterIP).NotTo(BeEmpty())
+
 			By("force-killing the master and all sentinels — both replicas survive with data")
 			_, _ = deletePodsWithLabelMode(testNamespace, "app.kubernetes.io/instance="+crName+",app.kubernetes.io/component=sentinel", false)
 			_, err = deletePodMode(testNamespace, master, false)
@@ -208,6 +224,14 @@ spec:
 					refused = true
 					return
 				}
+				// Running alone is not a decision: the first poll lands within a second of
+				// the kill, before the operator has written anything, and still reads the
+				// pre-kill Running with the killed pod as master. Seen on a GitHub runner
+				// 220ms after the kill; the spec then waited 60s on the dead master's
+				// restarted, empty pod and reported data loss without ever asking the
+				// pod that was actually elected.
+				g.Expect(getMasterIP(crName)).NotTo(Equal(killedMasterIP),
+					"status still describes the killed master — no decision yet")
 				g.Expect(getPhase(crName)).To(Equal("Running"),
 					"operator neither refused (leaderless) nor recovered via failover")
 			}, 4*time.Minute, 5*time.Second).Should(Succeed())
@@ -250,6 +274,11 @@ spec:
 
 func getPhase(crName string) string {
 	out, _ := utils.Run(exec.Command("kubectl", "get", "littlered", crName, "-n", testNamespace, "-o", "jsonpath={.status.phase}"))
+	return strings.TrimSpace(out)
+}
+
+func getMasterIP(crName string) string {
+	out, _ := utils.Run(exec.Command("kubectl", "get", "littlered", crName, "-n", testNamespace, "-o", "jsonpath={.status.master.ip}"))
 	return strings.TrimSpace(out)
 }
 
