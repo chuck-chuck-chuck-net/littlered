@@ -80,7 +80,7 @@ func operatorLogWindow(now time.Time) time.Duration {
 //   - crName: The name of the LittleRed CR being tested
 //   - chaosPodName: Optional chaos client pod name (empty string if not a chaos test)
 func CollectDebugArtifacts(testNamespace, crName, chaosPodName string) {
-	if !debugOnFailure {
+	if !collectArtifacts {
 		return
 	}
 
