@@ -84,8 +84,11 @@ cut a release (`scripts/prepare-release.sh`).
     jobs. The last shard of a mode is everything the listed shards are not, so a new test
     file is never dropped. `make test-e2e MODE=<m> SHARD=<n>` replays one shard locally,
     and `make verify-e2e-mode-labels` checks that the shards add up to the mode. The split
-    is balanced on measured spec times, so the expected wall-clock is about 35 min instead
-    of about 86.
+    is balanced on measured spec times. The first sharded run took 38.5 min, against about
+    87 min unsplit.
+  - **Each job starts its specs sooner.** Code generation, `fmt`/`vet` and both image builds
+    run in the background while kind starts, so the suite's own steps hit warm caches. The
+    disk cleanup step is gone, since the runner image now has over 100 GB free.
 
 ### Changed
 

@@ -128,26 +128,30 @@ jobs:
           sel="MODE=$MODE${SHARD:+ SHARD=$SHARD}"
           echo "\`$sel\`: Ginkgo seed \`$seed\`, replay with \`make test-e2e $sel SEED=$seed\`" >> "$GITHUB_STEP_SUMMARY"
 
-      # The runner starts with ~14 GB free; two locally built images, the kind node image
-      # and a few Redis images per kind node fit, but not with much margin.
-      - name: Free disk space
-        run: |
-          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
-          df -h /
-
       - name: Set up Go
         uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
-      # Compile everything the suite will build while kind starts, so the build cache is warm.
-      - name: Start compiling the suite and lrctl
+      # Do the slow parts of `make test-e2e` while kind starts, so they are cache hits later:
+      #   - the code generation, fmt and vet the run-test-e2e target runs first (~70s cold)
+      #   - the suite binary and lrctl
+      #   - the operator and chaos-client images, which BeforeSuite builds again with the
+      #     same tags (~160s cold); BuildKit's layer cache makes that second build near free
+      # Generation goes first and alone: it rewrites checked-in files (with identical content
+      # on a clean checkout), and the image build must not read them mid-write.
+      - name: Start code generation, compile and image build
         run: |
-          (
-            rc=0
-            { go test -tags=e2e -c -o /dev/null ./test/e2e/ && make lrctl; } || rc=$?
-            echo "$rc" > "$RUNNER_TEMP/compile.rc"
-          ) > "$RUNNER_TEMP/compile.log" 2>&1 &
+          bg() { # bg <name> <command...>: run in the background, record the exit code
+            local name=$1; shift
+            ( rc=0; "$@" || rc=$?; echo "$rc" > "$RUNNER_TEMP/$name.rc" ) > "$RUNNER_TEMP/$name.log" 2>&1 &
+          }
+          prep() {
+            make manifests generate || return
+            bg images make build-images
+            make fmt vet lrctl && go test -tags=e2e -c -o /dev/null ./test/e2e/
+          }
+          bg prep prep
 
       # One control plane plus two workers: two schedulable nodes are what the cluster
       # placement spec needs (1 + replicasPerShard) and the minimum at which the kill-9 and
@@ -181,11 +185,16 @@ jobs:
             kind load image-archive "$archive" --name "$KIND_CLUSTER"
           done
 
-      - name: Wait for the compile
+      - name: Wait for code generation, compile and image build
         run: |
-          until [ -e "$RUNNER_TEMP/compile.rc" ]; do sleep 2; done
-          cat "$RUNNER_TEMP/compile.log"
-          exit "$(cat "$RUNNER_TEMP/compile.rc")"
+          rc=0
+          for name in prep images; do
+            # images starts only once prep's generation succeeded
+            until [ -e "$RUNNER_TEMP/$name.rc" ] || { [ $name = images ] && [ "$(cat "$RUNNER_TEMP/prep.rc")" != 0 ]; }; do sleep 2; done
+            echo "::group::$name"; cat "$RUNNER_TEMP/$name.log" 2>/dev/null; echo "::endgroup::"
+            [ "$(cat "$RUNNER_TEMP/$name.rc" 2>/dev/null || echo 1)" = 0 ] || rc=1
+          done
+          exit "$rc"
 
       # The Makefile sees the existing kind cluster, skips creating it and, since it did not
       # create it, also skips deleting it, so the failure step below can still read it. The
