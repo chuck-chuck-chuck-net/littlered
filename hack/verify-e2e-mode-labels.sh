@@ -23,9 +23,11 @@ count() { # count <make-args...> -> number of selected specs
 
 total=$(count ${ALL_ARG})
 sum=0
+declare -A per_mode
 echo "e2e mode-label partition check${ALL_ARG:+ (including extended)}:"
 for m in ${MODES}; do
   n=$(count "MODE=${m}" ${ALL_ARG})
+  per_mode[${m}]=${n}
   printf '  %-11s %4d\n' "${m}" "${n}"
   sum=$((sum + n))
 done
@@ -49,3 +51,28 @@ fi
 
 echo
 echo "OK: every spec carries exactly one deployment-mode label."
+
+# The CI shards of a mode (test/e2e/shards.txt) must add up to the mode. The last shard is
+# the complement of the listed ones, so this only fails if a filter matches more or less
+# than the file it names, or a listed shard selects nothing.
+echo
+echo "e2e shard check (test/e2e/shards.txt):"
+for m in ${MODES}; do
+  shards=$(hack/e2e-shard.sh count "${m}")
+  [[ "${shards}" -gt 1 ]] || continue
+  ssum=0
+  for ((s = 1; s <= shards; s++)); do
+    n=$(count "MODE=${m}" "SHARD=${s}" ${ALL_ARG} || echo 0)
+    printf '  %-11s %4d\n' "${m} ${s}/${shards}" "${n:-0}"
+    if [[ "${n:-0}" -eq 0 ]]; then
+      echo "FAIL: ${m} shard ${s} selects no specs."
+      exit 1
+    fi
+    ssum=$((ssum + n))
+  done
+  if [[ "${ssum}" -ne "${per_mode[${m}]}" ]]; then
+    echo "FAIL: the ${m} shards select ${ssum} specs, MODE=${m} selects ${per_mode[${m}]}."
+    exit 1
+  fi
+done
+echo "OK: the shards of each mode add up to the mode."

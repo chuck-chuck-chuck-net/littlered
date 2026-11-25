@@ -227,6 +227,22 @@ endif
 ifneq ($(LABEL_FILTER),)
 E2E_LABEL_FILTER = $(LABEL_FILTER)
 endif
+
+# SHARD runs one slice of a MODE, split by test file as test/e2e/shards.txt defines (the
+# GitHub workflow runs each slice on its own runner). The last shard is everything the
+# listed ones are not, so the shards of a mode add up to exactly the MODE run.
+#   make test-e2e MODE=sentinel SHARD=2
+#   make list-e2e MODE=sentinel SHARD=3   # preview a slice
+#   hack/e2e-shard.sh count sentinel      # how many shards a mode has
+ifneq ($(SHARD),)
+ifeq ($(MODE),)
+$(error SHARD needs MODE)
+endif
+E2E_SHARD := $(shell hack/e2e-shard.sh args $(MODE) $(SHARD))
+ifneq ($(.SHELLSTATUS),0)
+$(error hack/e2e-shard.sh args $(MODE) $(SHARD) failed)
+endif
+endif
 ifneq ($(E2E_LABEL_FILTER),)
 E2E_LABELS = --ginkgo.label-filter='$(E2E_LABEL_FILTER)'
 endif
@@ -286,7 +302,7 @@ test-e2e-all: ## Run ALL e2e tests, including 'extended'/opt-in tiers.
 
 .PHONY: run-test-e2e
 run-test-e2e: manifests generate fmt vet bin/lrctl
-	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_SEED) $(E2E_FOCUS) $(E2E_LABELS) $(ARGS)
+	$(E2E_VARS) OPERATOR_IMAGE=$(OPERATOR_IMAGE) CHAOS_CLIENT_IMAGE=$(CHAOS_CLIENT_IMAGE) go test -tags=e2e ./test/e2e/ -v -ginkgo.v -timeout $(E2E_GO_TIMEOUT) --ginkgo.timeout=$(E2E_TIMEOUT) $(FAIL_FAST) $(E2E_SEED) $(E2E_FOCUS) $(E2E_LABELS) $(E2E_SHARD) $(ARGS)
 
 # list-e2e previews the spec selection of an e2e run WITHOUT running anything, in the order
 # the given SEED would run them (seed 1 when none is given, so the listing is stable). It reuses the
@@ -303,7 +319,7 @@ run-test-e2e: manifests generate fmt vet bin/lrctl
 # specs must never rewrite source.
 .PHONY: list-e2e
 list-e2e: ## List the specs an e2e run would select, without touching a cluster (honors FOCUS/LABEL_FILTER/E2E_ALL).
-	@go test -tags=e2e ./test/e2e/ -v -timeout 5m --ginkgo.dry-run --ginkgo.v --ginkgo.no-color --ginkgo.seed=$(or $(SEED),1) $(E2E_FOCUS) $(E2E_LABELS) 2>&1 | awk '/^Will run /{hdr=$$0} /^\/.*_test\.go:[0-9]+$$/{ if (prev !~ /^\[/ && prev != "") { loc=$$0; sub(/.*\/test\/e2e\//,"",loc); printf "%4d  %s\n        %s\n", ++n, prev, loc } } {prev=$$0} END{ if (n == 0) { print "no specs selected"; exit 1 } printf "\n%s (dry run -- nothing was executed)\n", hdr }'
+	@go test -tags=e2e ./test/e2e/ -v -timeout 5m --ginkgo.dry-run --ginkgo.v --ginkgo.no-color --ginkgo.seed=$(or $(SEED),1) $(E2E_FOCUS) $(E2E_LABELS) $(E2E_SHARD) 2>&1 | awk '/^Will run /{hdr=$$0} /^\/.*_test\.go:[0-9]+$$/{ if (prev !~ /^\[/ && prev != "") { loc=$$0; sub(/.*\/test\/e2e\//,"",loc); printf "%4d  %s\n        %s\n", ++n, prev, loc } } {prev=$$0} END{ if (n == 0) { print "no specs selected"; exit 1 } printf "\n%s (dry run -- nothing was executed)\n", hdr }'
 
 .PHONY: verify-generated
 verify-generated: ## Check the checked-in generated files (config/, chart, deepcopy) are up to date.

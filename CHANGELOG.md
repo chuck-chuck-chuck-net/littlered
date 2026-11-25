@@ -79,6 +79,16 @@ cut a release (`scripts/prepare-release.sh`).
     `DEBUG_ON_FAILURE` stops cleanup after the first failed spec. On a 16 GB runner,
     the instances it leaves behind starve the specs that follow, so one real failure turns
     into many unrelated ones.
+  - **Sentinel and cluster are split across runners by test file**, sentinel in three
+    shards and cluster in two (`test/e2e/shards.txt`), so a full run is seven parallel
+    jobs. The last shard of a mode is everything the listed shards are not, so a new test
+    file is never dropped. `make test-e2e MODE=<m> SHARD=<n>` replays one shard locally,
+    and `make verify-e2e-mode-labels` checks that the shards add up to the mode. The split
+    is balanced on measured spec times. The first sharded run took 38.5 min, against about
+    87 min unsplit.
+  - **Each job starts its specs sooner.** Code generation, `fmt`/`vet` and both image builds
+    run in the background while kind starts, so the suite's own steps hit warm caches. The
+    disk cleanup step is gone, since the runner image now has over 100 GB free.
 
 ### Changed
 
