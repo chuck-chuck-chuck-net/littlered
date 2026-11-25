@@ -59,6 +59,27 @@ cut a release (`scripts/prepare-release.sh`).
   [#98](https://github.com/chuck-chuck-chuck-net/littlered/issues/98); the version alignment
   itself shipped in 0.3.0.
 
+- **The e2e suite runs on GitHub-hosted runners** (#179). `.github/workflows/test-e2e.yml`
+  runs one job per deployment mode (`standalone`, `sentinel`, `cluster`, `failover`), each
+  against its own three-node kind cluster (`test/e2e/kind-config.yaml`). The mode labels
+  partition the suite, so the four jobs cover each spec exactly once. No registry is
+  involved: the suite builds both images, `kind load`s them and deploys with
+  `PULL_POLICY=Never`, so fork PRs work too. It runs on pull requests labelled `e2e` and
+  on manual dispatch, where you can pick one mode and optionally include the `extended`
+  tiers. Third-party Redis, busybox and exporter images are preloaded so the kind nodes
+  don't hit Docker Hub's anonymous rate limit. Each job records its Ginkgo seed in the run
+  summary. On failure it uploads the per-spec debug artifacts, pod and event listings, and
+  `kind export logs`.
+  - **First full run: 142 of 142 runnable specs green**, about 1.5 h wall-clock, set by
+    sentinel. Standalone takes 7 min, failover 20, cluster 51 and sentinel 82. The
+    tiers that need an older operator image (`LEGACY_OPERATOR_IMAGE`,
+    `PRE_OPERATIONS_OPERATOR_IMAGE`) skip themselves on a runner.
+  - **New `E2E_COLLECT_ARTIFACTS=true`.** It collects the same per-spec debug artifacts as
+    `DEBUG_ON_FAILURE=true` but leaves cleanup and fail-fast alone. CI uses it because
+    `DEBUG_ON_FAILURE` stops cleanup after the first failed spec. On a 16 GB runner,
+    the instances it leaves behind starve the specs that follow, so one real failure turns
+    into many unrelated ones.
+
 ### Changed
 
 - **Per-pass log lines that restate a persisting state are debug-level now.** The
@@ -89,6 +110,21 @@ cut a release (`scripts/prepare-release.sh`).
   that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
 
 ### Fixed
+
+- **The sentinel leaderless-recovery e2e tiers could accept the status from before the kill.**
+  After force-killing the master, each tier waited for `phase: Running`. The first poll
+  could land before the operator had written anything, so it accepted the stale status and
+  read the data from `status.master.podName`. That was still the killed pod, now restarted
+  empty. On a GitHub runner the multi-holder tier hit this 220 ms after the kill and
+  reported "data was lost", even though it never asked the newly elected master. All three
+  tiers now record the master IP before the kill and accept `Running` only once the status
+  names a different one. A force-deleted pod always returns on a new IP, so re-electing the
+  same pod still fails the data check, as it should.
+
+- **`make kind-load` works with Docker's containerd image store.** It piped `docker save`
+  into `kind load image-archive /dev/stdin`. kind reads the archive once per node, so a
+  multi-node cluster got `invalid tar header` on every node after the first. The archive now
+  goes through a file under `bin/kind-load/`.
 
 - **Sentinel- and failover-mode rolling updates replace one pod at a time again on Kubernetes
   v1.37.** From v1.37 the StatefulSet controller deletes every not-yet-available old pod of a
