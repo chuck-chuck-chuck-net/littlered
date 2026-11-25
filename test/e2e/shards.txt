@@ -1,0 +1,18 @@
+# How the GitHub e2e workflow splits the long modes across runners.
+#
+# Each line: <mode> <shard> <test file>...
+# A mode listed here runs as (highest listed shard + 1) jobs. The listed shards run only
+# their files. The last shard is implicit: it runs every spec of the mode that is NOT in a
+# listed file. A new test file therefore always lands in the last shard and is never
+# dropped. A mode not listed here runs as one job.
+#
+# Balanced by measured spec time on ubuntu-latest (run 45449700993, 2026-11-24):
+#   sentinel 4652s -> 1584 / 1490 / 1578
+#   cluster  2877s -> 1389 / 1488
+# Each job adds about 8 min of fixed cost (runner setup, kind, image build in BeforeSuite).
+# Rebalance from a run's log with `hack/e2e-shard.sh durations <job-log>`.
+# Check the split with `make verify-e2e-mode-labels`.
+
+sentinel 1 sentinel_quarantine_test.go sentinel_standalone_chaos_test.go leaderless_recovery_test.go
+sentinel 2 sentinel_operations_test.go image_upgrade_test.go pdb_test.go
+cluster  1 cluster_chaos_test.go cluster_totalwipe_test.go cluster_reshard_test.go cluster_rollout_gate_test.go

@@ -79,6 +79,13 @@ cut a release (`scripts/prepare-release.sh`).
     `DEBUG_ON_FAILURE` stops cleanup after the first failed spec. On a 16 GB runner,
     the instances it leaves behind starve the specs that follow, so one real failure turns
     into many unrelated ones.
+  - **Sentinel and cluster are split across runners by test file**, sentinel in three
+    shards and cluster in two (`test/e2e/shards.txt`), so a full run is seven parallel
+    jobs. The last shard of a mode is everything the listed shards are not, so a new test
+    file is never dropped. `make test-e2e MODE=<m> SHARD=<n>` replays one shard locally,
+    and `make verify-e2e-mode-labels` checks that the shards add up to the mode. The split
+    is balanced on measured spec times, so the expected wall-clock is about 35 min instead
+    of about 86.
 
 ### Changed
 

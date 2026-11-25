@@ -109,6 +109,23 @@ make verify-e2e-mode-labels    # per-mode selections must sum to the full select
 See `test/e2e/mode_labels_test.go` for the scheme and where to attach the label when adding
 a tier.
 
+### Running one slice of a mode (`SHARD`)
+
+The GitHub workflow splits the two long modes by test file so they run on several runners
+at once: sentinel in three shards, cluster in two. `test/e2e/shards.txt` defines the split.
+The last shard of a mode is everything the listed shards are not, so a new test file always
+lands there and the shards always add up to the whole mode.
+
+```bash
+make test-e2e MODE=sentinel SHARD=2      # replay one CI shard locally
+make list-e2e MODE=cluster SHARD=1       # preview a shard; no cluster needed
+hack/e2e-shard.sh count sentinel         # how many shards a mode has
+hack/e2e-shard.sh durations job.log      # spec seconds per file, to rebalance from a CI log
+```
+
+`make verify-e2e-mode-labels` also checks that each split mode's shards select exactly the
+mode's specs.
+
 ### Reproducing a run's spec order (`SEED`)
 
 Ginkgo shuffles the order of the top-level containers on **every** run, so two runs with the

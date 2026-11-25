@@ -9,8 +9,9 @@ name: E2E Tests
 #
 # The suite is split by deployment mode. Every spec carries exactly one mode label
 # (hack/verify-e2e-mode-labels.sh checks the partition), so `make test-e2e MODE=<m>` across
-# the four modes runs the whole suite exactly once, in four parallel jobs with a kind
-# cluster each.
+# the four modes runs the whole suite exactly once. The two long modes are further split by
+# test file (test/e2e/shards.txt: sentinel in three, cluster in two), so a full run is seven
+# parallel jobs with a kind cluster each, and takes about as long as its slowest shard.
 #
 # Triggers:
 #   - Run workflow (workflow_dispatch): pick one mode or all, optionally include 'extended'.
@@ -43,21 +44,60 @@ permissions:
   contents: read
 
 jobs:
-  e2e:
-    name: e2e (${{ matrix.mode }})
+  # One matrix entry per mode, or per shard for a mode test/e2e/shards.txt splits.
+  plan:
+    name: plan
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (contains(github.event.pull_request.labels.*.name, 'e2e') &&
        (github.event.action != 'labeled' || github.event.label.name == 'e2e'))
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Build the job matrix
+        id: matrix
+        env:
+          MODE_INPUT: ${{ inputs.mode }}
+        run: |
+          modes=""
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$MODE_INPUT" != all ]; then
+            modes=$MODE_INPUT
+          fi
+          matrix=$(hack/e2e-shard.sh matrix "$modes")
+          echo "$matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+
+  # Every spec in exactly one mode, and each split mode's shards adding up to it. A Ginkgo
+  # dry run, no cluster. Runs beside the e2e jobs rather than gating them.
+  split-check:
+    name: check the mode and shard split
+    needs: plan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Check the split
+        run: make verify-e2e-mode-labels
+
+  e2e:
+    name: e2e (${{ matrix.name }})
+    needs: plan
     strategy:
       fail-fast: false
       matrix:
-        mode: >-
-          ${{ fromJSON(
-            (github.event_name == 'workflow_dispatch' && inputs.mode != 'all' && format('["{0}"]', inputs.mode)) ||
-            '["standalone","sentinel","cluster","failover"]') }}
+        include: ${{ fromJSON(needs.plan.outputs.matrix) }}
     concurrency:
-      group: e2e-${{ github.event.pull_request.number || github.ref }}-${{ matrix.mode }}
+      group: e2e-${{ github.event.pull_request.number || github.ref }}-${{ matrix.mode }}-${{ matrix.shard }}
       cancel-in-progress: true
     runs-on: ubuntu-latest
     # GitHub-hosted jobs are capped at 6h. The suite's own deadline is set below it so
@@ -66,6 +106,7 @@ jobs:
     env:
       KIND_CLUSTER: littlered-test-e2e
       MODE: ${{ matrix.mode }}
+      SHARD: ${{ matrix.shard }}
       E2E_ALL: ${{ inputs.extended && 'true' || 'false' }}
       E2E_TIMEOUT: 5h
       E2E_GO_TIMEOUT: 5h15m
@@ -84,7 +125,8 @@ jobs:
         run: |
           seed=$(date +%s)
           echo "SEED=$seed" >> "$GITHUB_ENV"
-          echo "\`$MODE\`: Ginkgo seed \`$seed\`, replay with \`make test-e2e MODE=$MODE SEED=$seed\`" >> "$GITHUB_STEP_SUMMARY"
+          sel="MODE=$MODE${SHARD:+ SHARD=$SHARD}"
+          echo "\`$sel\`: Ginkgo seed \`$seed\`, replay with \`make test-e2e $sel SEED=$seed\`" >> "$GITHUB_STEP_SUMMARY"
 
       # The runner starts with ~14 GB free; two locally built images, the kind node image
       # and a few Redis images per kind node fit, but not with much margin.
@@ -149,8 +191,8 @@ jobs:
       # create it, also skips deleting it, so the failure step below can still read it. The
       # suite itself undeploys the operator and deletes its namespace in AfterSuite, so the
       # per-spec artifacts are what carries a failure's state.
-      - name: Run the ${{ matrix.mode }} specs
-        run: make test-e2e MODE="$MODE" E2E_ALL="$E2E_ALL" SEED="$SEED" E2E_TIMEOUT="$E2E_TIMEOUT" E2E_GO_TIMEOUT="$E2E_GO_TIMEOUT"
+      - name: Run the ${{ matrix.name }} specs
+        run: make test-e2e MODE="$MODE" SHARD="$SHARD" E2E_ALL="$E2E_ALL" SEED="$SEED" E2E_TIMEOUT="$E2E_TIMEOUT" E2E_GO_TIMEOUT="$E2E_GO_TIMEOUT"
 
       - name: Collect cluster state
         if: failure()
@@ -168,6 +210,6 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: e2e-debug-${{ matrix.mode }}
+          name: e2e-debug-${{ matrix.mode }}${{ matrix.shard && format('-{0}', matrix.shard) || '' }}
           path: e2e-debug/
           retention-days: 7
