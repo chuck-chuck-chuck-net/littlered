@@ -80,6 +80,32 @@ cut a release (`scripts/prepare-release.sh`).
     the instances it leaves behind starve the specs that follow, so one real failure turns
     into many unrelated ones.
 
+- **The cluster rolling-update tier asserts the ADR-017 gate itself, not only its effect.**
+  The LR-047 tier's verdict was the data assertion alone; whether the shard's master was
+  replaced during the operator outage went to the report as a line. At `replicasPerShard: 1`
+  the gate's advance (8-16s) finishes inside `minReadySeconds: 30`, so a rollout without the
+  partition takes the same time and the data survives on margin: a missing gate would have
+  gone fast, not red. The tier now reads the partition uncached and asserts it is at the
+  shard's highest ordinal while the replica is replaced, does not move while the operator is
+  down (sampled every second), and is back at 0 on every shard once the instance is Running.
+
+- **Cluster e2e data checks tell "lost" from "never written" and report by shard.**
+  - The cluster seed helper reads the whole dataset back before returning, and the image
+    upgrade tier also runs `WAIT 1 5000` on every shard master so the seed is known to have
+    replicated before the operation starts. Before, the helper issued its SETs and
+    returned, so a missing key could not be blamed on the operation under test. This
+    affects the three migration tiers and the image tier.
+  - A failed read-back now reports every mismatch grouped by hash tag, which is by shard,
+    and separates absent keys from wrong values: `20 of 60 seeded keys did not read back
+    ... {t4}: 20 of 20 seeded -- 20 absent` instead of one random `value mismatch for key`.
+    An exec error retries and is never counted as an absent key.
+
+- **`SEED=` replays an e2e run's spec order.** Ginkgo shuffles top-level containers on every
+  run and `make test-e2e` passed no seed, so rerunning a failed selection never reran it in
+  the same order. `make test-e2e SEED=<n>` passes `--ginkgo.seed`; take the value from the
+  run's `Random Seed:` header. `make list-e2e SEED=<n>` previews that order without a
+  cluster (seed 1 when unset, so the listing is stable).
+
 ### Changed
 
 - **Per-pass log lines that restate a persisting state are debug-level now.** The
@@ -94,12 +120,12 @@ cut a release (`scripts/prepare-release.sh`).
   stays at info. The e2e suite deploys with `LOG_LEVEL=debug` so its captured operator logs
   keep all of them.
 
-- **Kubernetes client libraries move from 0.36.3 to 0.37.1, controller-runtime from 0.24.1
-  to 0.25.1.** The move arrived in two steps. The prometheus-operator monitoring API module
-  (v0.94.1) requires `k8s.io/api` v0.37.0, so minimum-version selection carried the whole
-  stack to 0.37.0 under a prometheus-operator title; the k8s group bump then completed it at
-  0.37.1 / 0.25.1. The only generated-file consequence is a description string in the CRD:
-  the Kubernetes text for `seLinuxChangePolicy` in the embedded pod security context lost
+- **Kubernetes client libraries move from 0.36.3 to 0.37.2, controller-runtime from 0.24.1
+  to 0.25.3, and the prometheus-operator monitoring API module from v0.93.1 to v0.95.2.**
+  The move arrived in several steps. The monitoring API module v0.94.1 requires `k8s.io/api`
+  v0.37.0, so minimum-version selection carried the whole stack to 0.37.0 under a
+  prometheus-operator title; later k8s group bumps took it to 0.37.2 / 0.25.3. The only
+  generated-file consequence is a description string in the CRD: the Kubernetes text for `seLinuxChangePolicy` in the embedded pod security context lost
   its feature-gate explanation. No schema, default or validation changed. envtest now
   exercises Kubernetes 1.37.
   - The monitoring API module now belongs to Dependabot's `k8s` group, so the three move
@@ -109,7 +135,20 @@ cut a release (`scripts/prepare-release.sh`).
 - Default `redis_exporter` sidecar image is now **v1.97.0** (from v1.89.0). Instances
   that do not pin `metrics.exporter.tag` pick the new tag up when the CRD is applied.
 
+- `github.com/redis/go-redis/v9` moves from v9.22.0 to v9.23.0.
+
 ### Fixed
+
+- **The log-asserting e2e tiers checked nothing under `SKIP_OPERATOR_DEPLOY`.** Three tiers
+  match the operator's log output, and the debug-level demotion above moved two of their
+  lines to V(1). The suite deploys with `LOG_LEVEL=debug`, but with `SKIP_OPERATOR_DEPLOY`
+  it inherits the installed operator at the chart default (`info`). The two positive
+  assertions then timed out. The third, the operator-redundancy check that the standby's log
+  does *not* contain "Reconciling sentinel mode", could not fail at all, so it passed while
+  checking nothing. `BeforeSuite` now switches an inherited operator to debug with
+  `helm upgrade --reuse-values` and waits for the rollout; `AfterSuite` restores the previous
+  level, best-effort. The redundancy tier still proves a negative by grepping for an absent
+  line, so renaming that line would make it vacuous again.
 
 - **The sentinel leaderless-recovery e2e tiers could accept the status from before the kill.**
   After force-killing the master, each tier waited for `phase: Running`. The first poll
