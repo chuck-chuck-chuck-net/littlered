@@ -160,6 +160,13 @@ cut a release (`scripts/prepare-release.sh`).
   names a different one. A force-deleted pod always returns on a new IP, so re-electing the
   same pod still fails the data check, as it should.
 
+- **`scripts/prepare-release.sh` could call a full `[Unreleased]` section empty.** It tested
+  the section with `printf | grep -q` under `pipefail`; `grep -q` exits at the first match,
+  `printf` then dies of SIGPIPE on a large section, and the failed pipeline read as "empty".
+  The test now runs in-shell. `make helm-lint`'s two operator-PDB checks had the same race
+  on `helm template` output, one of them in the direction that passes silently; they now
+  let `grep` read its whole input.
+
 - **`make kind-load` works with Docker's containerd image store.** It piped `docker save`
   into `kind load image-archive /dev/stdin`. kind reads the archive once per node, so a
   multi-node cluster got `invalid tar header` on every node after the first. The archive now

@@ -66,7 +66,9 @@ UNRELEASED_BODY="$(awk '
   capture && /^## / { exit }
   capture { print }
 ' "$CHANGELOG")"
-if ! printf '%s' "$UNRELEASED_BODY" | grep -q '[^[:space:]]'; then
+# Test in-shell, not via `printf | grep -q`: under pipefail, grep -q exiting at the
+# first match SIGPIPEs printf on a large body, and the failed pipeline read as "empty".
+if [[ ! "$UNRELEASED_BODY" =~ [^[:space:]] ]]; then
   if [ "$ALLOW_EMPTY" -eq 0 ]; then
     die "the [Unreleased] section is empty; add entries or pass --allow-empty"
   fi
