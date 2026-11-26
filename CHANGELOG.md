@@ -10,6 +10,8 @@ cut a release (`scripts/prepare-release.sh`).
 
 ## [Unreleased]
 
+## [0.4.1] - 2026-11-26
+
 ### Added
 
 - **e2e coverage for operator redundancy** (#114). A new `Operator Redundancy` tier runs the
